@@ -2622,19 +2622,32 @@
 					}
 				};
 
+				// --- OPTIMIZATION: Pre-calculate and cache expensive lookups ---
 				const heightCache = new Int16Array(chunkSize * chunkSize);
+				const riverCache = new Float32Array(chunkSize * chunkSize); // Cache river factor per column
+				const biomeCache = new Array(chunkSize * chunkSize); // Cache biome params per column
+
+				// Pre-calculate all heights, rivers, and biomes (single pass)
 				for (let lx = 0; lx < chunkSize; lx++) {
 					for (let lz = 0; lz < chunkSize; lz++) {
-						heightCache[lx + lz * chunkSize] = blendedHeight(startX + lx, startZ + lz, seed);
+						const idx = lx + lz * chunkSize;
+						const gx = startX + lx;
+						const gz = startZ + lz;
+
+						heightCache[idx] = blendedHeight(gx, gz, seed);
+						riverCache[idx] = getRiverFactor(gx, gz, seed);
+						biomeCache[idx] = getBiomeParams(gx, gz);
 					}
 				}
 
 				// --- PASS 3: SOLIDS ---
 				for (let lx = 0; lx < chunkSize; lx++) {
 					for (let lz = 0; lz < chunkSize; lz++) {
+						const idx = lx + lz * chunkSize;
 						const gx = startX + lx;
 						const gz = startZ + lz;
-						const worldTopY = heightCache[lx + lz * chunkSize];
+						const worldTopY = heightCache[idx];
+						const riverFactor = riverCache[idx]; // Use cached river value
 						const bedrockY = 0;
 
 						for (let ly = 0; ly < chunkHeight; ly++) {
@@ -2647,8 +2660,8 @@
 								const depth = worldTopY - worldY;
 								if (depth === 0) {
 									// Surface block logic
-                                    // Check for river bed
-                                    if (getRiverFactor(gx, gz, seed) < 0.8) {
+                                    // Check for river bed (use cached value)
+                                    if (riverFactor < 0.8) {
                                         id = SAND;
                                     } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) {
 										// Near sea level = Sand
@@ -2663,35 +2676,41 @@
 								}
 							}
 
-							// --- CAVE GENERATION ---
+							// --- OPTIMIZED CAVE GENERATION ---
+							// Reduced from 3 noise3D calls to 2 + simple 2D width variation
 							if (id !== AIR && id !== BEDROCK && id !== WATER) {
-								// 1. Domain warping / Coordinate scaling
-								const caveScale = 0.02; 
-								const caveYScale = 0.03; // Slightly compressed vertically
-								
-								// 2. Sample two distinct noise fields to create 3D "worms"
-								// The magnitude of the vector (n1, n2) creates a hollow tube structure around 0
-								const n1 = noise3D(gx * caveScale, worldY * caveYScale, gz * caveScale);
-								const n2 = noise3D(gx * caveScale + 123.45, worldY * caveYScale + 456.78, gz * caveScale + 789.01);
-								
-								// 3. Determine cave width (radius squared)
-								// Add variations so caves bulge into rooms and shrink into tunnels
-								// Low frequency noise for width variation
-								const widthNoise = noise3D(gx * 0.005, worldY * 0.005, gz * 0.005);
-								// Base width + variation. 
-								let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
-
-								// 4. Surface fading
-								// Fade out caves starting at y=30 up to y=50
+								// Early exit for surface blocks (caves don't exist above y=50)
 								const fadeStart = 30;
 								const fadeEnd = 50;
-								
-								if (worldY > fadeStart) {const fade = 1.0 - Math.min(1.0, (worldY - fadeStart) / (fadeEnd - fadeStart));threshold *= fade;}
-								
-								// 5. Carve
-								// n1^2 + n2^2 creates a circular density function. 
-								// If the value is low (near the origin of the noise space), it's a tunnel.
-								if ((n1 * n1 + n2 * n2) < threshold) {id = AIR;}
+								if (worldY >= fadeEnd) {
+									// Skip cave check entirely
+								} else {
+									// 1. Coordinate scaling
+									const caveScale = 0.02;
+									const caveYScale = 0.03;
+
+									// 2. Two 3D noise calls for tunnel structure
+									const cx = gx * caveScale;
+									const cy = worldY * caveYScale;
+									const cz = gz * caveScale;
+									const n1 = noise3D(cx, cy, cz);
+									const n2 = noise3D(cx + 123.45, cy + 456.78, cz + 789.01);
+
+									// 3. Width variation using 2D noise (cheaper than 3D)
+									const widthNoise = noise2D(gx * 0.005, gz * 0.005);
+									let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
+
+									// 4. Surface fading
+									if (worldY > fadeStart) {
+										const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart);
+										threshold *= fade;
+									}
+
+									// 5. Carve using vector magnitude
+									if ((n1 * n1 + n2 * n2) < threshold) {
+										id = AIR;
+									}
+								}
 							}
 							// PASS 2: Fill water
 							for (let lx = 0; lx < chunkSize; lx++) {
@@ -2717,9 +2736,12 @@
 
 				for (let lx = 0; lx < chunkSize; lx++) {
 					for (let lz = 0; lz < chunkSize; lz++) {
+						const idx = lx + lz * chunkSize;
 						const gx = startX + lx;
 						const gz = startZ + lz;
-						const biome = getBiomeParams(gx, gz);
+						const biome = biomeCache[idx]; // Use cached biome
+						const riverFactor = riverCache[idx]; // Use cached river factor
+
 						if (biome.decorateColumn) {
 							const localTopY = findSurfaceY(data, lx, lz);
 							biome.decorateColumn(cx, cz, gx, gz, lx, lz, localTopY, setAcrossChunks, get, seed);
@@ -2738,8 +2760,8 @@
                         const p = treePlacementValue(gx, gz, seed);
                         if (p > density) continue;
 
-                        // River Check
-                        if (getRiverFactor(gx, gz, seed) < 0.8) continue;
+                        // River Check (use cached value)
+                        if (riverFactor < 0.8) continue;
 
                         const centerY = findSurfaceY(data, lx, lz);
                         if (centerY <= 0) continue;
