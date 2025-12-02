@@ -106,13 +106,14 @@ VoxEx Architecture: ┌───────────────────
 - **Backward Compatibility**: Supports both old (Uint8Array) and new (object) formats.
 
 ### Lighting System
-- **Light Levels**: 1-12 range (1 = minimum visibility, 12 = full sunlight)
-- **Vertical Propagation**: Sunlight (12) travels down from sky, reduced by 1 per solid block
+- **Light Levels**: 1-15 range (1 = minimum visibility, 15 = full sunlight)
+- **Vertical Propagation**: Sunlight (15) travels down from sky, reduced by 1 per solid block
 - **Horizontal Spreading**: Light spreads to neighbors in all 6 directions, -1 per block
 - **Semi-Transparent Blocks**: Leaves reduce light by 1 instead of blocking completely
 - **Vertex Colors**: Light levels multiplied by AO, applied as vertex colors during rendering
 - **Dynamic Updates**: Light recalculated automatically when blocks change
-- **Formula**: `vertexColor = AO × (lightLevel / 12.0)`
+- **Minimum Light**: Never drops to 0 - always at least 1 (0 is absence of light, never used)
+- **Formula**: `vertexColor = AO × (lightLevel / 15.0)`
 
 ### Rendering System
 - **Textures**: Procedurally generated 16x16 pixel art on a canvas (Atlas size: 12 tiles).
@@ -123,9 +124,15 @@ VoxEx Architecture: ┌───────────────────
 
 ### Torch Viewmodel
 - **Type**: 3D voxel model (stick + flame + glow) using BoxGeometry
+- **Materials**: MeshLambertMaterial with emissive properties for shading/AO
+- **Structure**:
+  - Stick (0.04×0.25×0.04) - brown wood voxel
+  - Flame (0.06×0.08×0.06) - orange voxel with 0.5 emissive
+  - Glow (0.04×0.04×0.04) - yellow center, positioned inside flame at (0, 0.165, 0)
 - **Rendering**: Layer 1 with `depthTest: false` and `renderOrder: 1000`
 - **Position**: Attached to camera at (0.35, -0.35, -0.6) with -0.3 rad tilt
-- **Animation**: Flame scale pulsing with sin wave + random jitter
+- **Animation**: Very subtle scale pulsing (0.001-0.0015 frequency, 0.03-0.04 amplitude)
+- **Light Range**: 75 units (3x normal range) for extended illumination
 - **Result**: Never clips through world geometry (FPS viewmodel technique)
 
 ### Persistence
@@ -160,12 +167,13 @@ VoxEx Architecture: ┌───────────────────
 - **Compression**: `ChunkCompressor.compress`, `ChunkCompressor.decompress`
 
 ### Light Level Reference
-- **12**: Full sunlight (directly exposed to sky)
-- **11**: 1 block from sun (under 1 leaf layer)
-- **9-10**: Under tree canopy (2-3 leaf layers)
-- **5-8**: Deep shade or cave opening
-- **2-4**: Deep cave
-- **1**: Minimum light (always faintly visible)
+- **15**: Full sunlight (directly exposed to sky)
+- **14**: 1 block from sun (under 1 leaf layer)
+- **12-13**: Under tree canopy (2-3 leaf layers)
+- **8-11**: Medium shade or cave opening
+- **4-7**: Deep shade
+- **2-3**: Deep cave
+- **1**: Minimum light (always faintly visible - 0 never used)
 
 ### Performance Tips
 - Prefer typed arrays (Uint8Array, Float32Array) over regular arrays
