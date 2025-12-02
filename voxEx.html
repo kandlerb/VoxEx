@@ -41,17 +41,9 @@
 			#crosshair::before { left: 9px; top: 0; width: 2px; height: 20px; }
 			#crosshair::after { top: 9px; left: 0; width: 20px; height: 2px; }
 
-			/* Torch 2D overlay - cannot clip */
+			/* Torch 2D overlay - DISABLED (using 3D model now) */
 			#torch-overlay {
-				position: absolute;
-				bottom: 12%;
-				right: 18%;
-				width: 90px;
-				height: 130px;
-				display: none;
-				z-index: 6;
-				pointer-events: none;
-				filter: drop-shadow(0 0 12px rgba(255, 170, 0, 0.7));
+				display: none !important;
 			}
 			#torch-overlay::before {
 				content: "";
@@ -1058,13 +1050,29 @@
 				const key = getChunkKey(cx, cz);
 				let chunk = chunks.get(key);
 				if (!chunk) {
-					chunk = new Uint8Array(WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight);
+					// Create new chunk with light data
+					const size = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+					chunk = {
+						blocks: new Uint8Array(size),
+						skyLight: new Uint8Array(size).fill(15), // Default full bright
+						blockLight: new Uint8Array(size).fill(0)  // Default no block light
+					};
 					chunks.set(key, chunk);
 					activeChunks.add(key);
 				}
 				const lx = ((x % 16) + 16) % 16;
 				const lz = ((z % 16) + 16) % 16;
-				chunk[lx + lz * 16 + ly * 256] = id;
+				const idx = lx + lz * 16 + ly * 256;
+
+				// Handle both old and new format
+				if (chunk.blocks) {
+					chunk.blocks[idx] = id;
+
+					// Recalculate lighting for the chunk since block changed
+					calculateChunkSunlight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+				} else {
+					chunk[idx] = id;
+				}
 
 				// Mark chunk as modified by player (for smart memory management)
 				modifiedChunks.add(key);
@@ -1090,9 +1098,8 @@
 			}
 			// --- OPTIMIZED RLE COMPRESSION HELPER (Uses Uint16Array) ---
 			const ChunkCompressor = {
-				// Compresses Uint8Array into a Uint16Array [count, id, count, id...]
-				// ~40% faster than JS Array, no GC pressure
-				compress: (uint8Data) => {
+				// Helper to compress a single Uint8Array
+				_compressArray: (uint8Data) => {
 					if (!uint8Data || uint8Data.length === 0) return new Uint16Array(0);
 
 					// First pass: count runs to allocate exact size
@@ -1130,9 +1137,8 @@
 					return result;
 				},
 
-				// Decompresses Uint16Array back to Uint8Array
-				// Manual loop is faster than Array.fill() for our use case
-				decompress: (compressedData) => {
+				// Helper to decompress a single array
+				_decompressArray: (compressedData) => {
 					if (!compressedData || compressedData.length === 0) return new Uint8Array(0);
 
 					// Calculate total size
@@ -1162,6 +1168,41 @@
 						writeIdx = endIdx;
 					}
 					return data;
+				},
+
+				// Compresses chunk data (handles both old and new format)
+				compress: (chunkData) => {
+					if (!chunkData) return null;
+
+					// New format: {blocks, skyLight, blockLight}
+					if (chunkData.blocks && chunkData.skyLight) {
+						return {
+							version: 2, // Mark as new format
+							blocks: Array.from(ChunkCompressor._compressArray(chunkData.blocks)),
+							skyLight: Array.from(ChunkCompressor._compressArray(chunkData.skyLight)),
+							blockLight: chunkData.blockLight ? Array.from(ChunkCompressor._compressArray(chunkData.blockLight)) : null
+						};
+					}
+
+					// Old format: Uint8Array
+					return Array.from(ChunkCompressor._compressArray(chunkData));
+				},
+
+				// Decompresses chunk data (handles both old and new format)
+				decompress: (compressedData) => {
+					if (!compressedData) return null;
+
+					// New format
+					if (compressedData.version === 2) {
+						return {
+							blocks: ChunkCompressor._decompressArray(new Uint16Array(compressedData.blocks)),
+							skyLight: ChunkCompressor._decompressArray(new Uint16Array(compressedData.skyLight)),
+							blockLight: compressedData.blockLight ? ChunkCompressor._decompressArray(new Uint16Array(compressedData.blockLight)) : new Uint8Array(0)
+						};
+					}
+
+					// Old format: just a Uint16Array
+					return ChunkCompressor._decompressArray(new Uint16Array(compressedData));
 				}
 			};
 			function saveWorld() {
@@ -1667,6 +1708,8 @@
 
 				// 4. Camera & Lighting
 				camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.01, 800); // Fix: Small near plane to render blocks close to camera and prevent clipping
+				camera.layers.enable(0); // World layer
+				camera.layers.enable(1); // View model layer (torch, etc.)
 				ambLight = new THREE.AmbientLight(0xffffff, 0.08); // Very dark for underground atmosphere
                 scene.add(ambLight);
                     
@@ -1705,6 +1748,48 @@
                 torchLight.shadow.bias = -0.001;
                 torchLight.shadow.radius = 2;
                 camera.add(torchLight);
+
+				// Create 3D voxel torch model (view model style - always visible)
+				const torchGroup = new THREE.Group();
+
+				// Torch stick (brown/dark wood color)
+				const stickGeo = new THREE.BoxGeometry(0.04, 0.25, 0.04);
+				const stickMat = new THREE.MeshBasicMaterial({ color: 0x4a2511 });
+				const stick = new THREE.Mesh(stickGeo, stickMat);
+				stick.position.set(0, 0, 0);
+				torchGroup.add(stick);
+
+				// Torch flame top (orange/yellow)
+				const flameGeo = new THREE.BoxGeometry(0.06, 0.08, 0.06);
+				const flameMat = new THREE.MeshBasicMaterial({ color: 0xffaa33 });
+				const flame = new THREE.Mesh(flameGeo, flameMat);
+				flame.position.set(0, 0.165, 0);
+				torchGroup.add(flame);
+
+				// Torch ember glow (bright yellow center)
+				const glowGeo = new THREE.BoxGeometry(0.04, 0.04, 0.04);
+				const glowMat = new THREE.MeshBasicMaterial({ color: 0xffff66 });
+				const glow = new THREE.Mesh(glowGeo, glowMat);
+				glow.position.set(0, 0.19, 0);
+				torchGroup.add(glow);
+
+				// Position torch in bottom right of view (like Minecraft)
+				torchGroup.position.set(0.35, -0.35, -0.6);
+				torchGroup.rotation.set(0, 0, -0.3); // Slight tilt
+				torchGroup.visible = false; // Hidden by default
+
+				// Set to layer 1 (view model layer) so it renders on top
+				torchGroup.layers.set(1);
+				torchGroup.traverse(child => {
+					if (child.isMesh) {
+						child.layers.set(1);
+					}
+				});
+
+				camera.add(torchGroup);
+
+				// Store reference for toggling
+				window.torchModel = torchGroup;
 
 				// 5. Init Game Data
 				initTextures();
@@ -2733,7 +2818,83 @@
                 if (biomeName === "swamp")    return d.swamp ?? 0.02;
                 return 0.0;
             }
-			            
+
+			// Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down
+			function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
+				const blocks = chunk.blocks;
+				const skyLight = chunk.skyLight;
+
+				// Step 1: Vertical propagation from sky downward
+				for (let lx = 0; lx < chunkSize; lx++) {
+					for (let lz = 0; lz < chunkSize; lz++) {
+						let currentLight = 15; // Start with full sunlight at top
+
+						// Go from top to bottom
+						for (let ly = chunkHeight - 1; ly >= 0; ly--) {
+							const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+							const blockId = blocks[idx];
+
+							// Set current light level
+							skyLight[idx] = currentLight;
+
+							// If we hit a solid block (not air/water), light stops
+							if (blockId !== 0 && blockId !== 8) { // 0=AIR, 8=WATER
+								currentLight = 0; // Block sunlight completely
+							}
+						}
+					}
+				}
+
+				// Step 2: Horizontal light spreading using flood-fill
+				// Multiple passes to ensure light spreads across the chunk
+				const spreadPasses = 15; // Maximum light level
+
+				for (let pass = 0; pass < spreadPasses; pass++) {
+					for (let ly = 0; ly < chunkHeight; ly++) {
+						for (let lx = 0; lx < chunkSize; lx++) {
+							for (let lz = 0; lz < chunkSize; lz++) {
+								const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+								const blockId = blocks[idx];
+
+								// Skip solid blocks
+								if (blockId !== 0 && blockId !== 8) continue;
+
+								const currentLight = skyLight[idx];
+
+								// Check all 6 neighbors and spread light
+								const neighbors = [
+									[lx + 1, ly, lz],
+									[lx - 1, ly, lz],
+									[lx, ly + 1, lz],
+									[lx, ly - 1, lz],
+									[lx, ly, lz + 1],
+									[lx, ly, lz - 1]
+								];
+
+								for (const [nx, ny, nz] of neighbors) {
+									// Check bounds
+									if (nx < 0 || nx >= chunkSize || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= chunkSize) {
+										continue;
+									}
+
+									const nIdx = nx + nz * chunkSize + ny * chunkSize * chunkSize;
+									const nBlockId = blocks[nIdx];
+
+									// Only spread to air/water blocks
+									if (nBlockId !== 0 && nBlockId !== 8) continue;
+
+									// Spread light if neighbor has less light
+									const propagatedLight = currentLight - 1;
+									if (propagatedLight > skyLight[nIdx]) {
+										skyLight[nIdx] = propagatedLight;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
 			async function generateChunkData(cx, cz) {
 				const key = getChunkKey(cx, cz);
     
@@ -2983,19 +3144,30 @@
 					}
 				}
 
-				chunks.set(key, data);
+				// Create chunk with light data
+				const size = chunkSize * chunkSize * chunkHeight;
+				const chunk = {
+					blocks: data,
+					skyLight: new Uint8Array(size),
+					blockLight: new Uint8Array(size)
+				};
+
+				// Calculate initial sunlight for this chunk
+				calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+
+				chunks.set(key, chunk);
 
 				// Mark as pristine (unmodified generated chunk)
 				pristineChunks.add(key);
 
 				// Save to cache (can be skipped during batch operations)
 				// Individual saves are still used during regular gameplay
-				await saveChunkToCache(key, data);
+				await saveChunkToCache(key, chunk);
 
-				return data;
+				return chunk;
 			}
 			
-			function addFace(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, lx, ly, lz, blockId, vIdx, uvIdx, cIdx) {
+			function addFace(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, lx, ly, lz, blockId, vIdx, uvIdx, cIdx, lightGetter) {
 				// 1. Retrieve pre-calculated relative vertices
 				const verts = getCachedFaceVertices(nx, ny, nz);
 
@@ -3066,13 +3238,22 @@
 					}
 				}
 
-				col[cIdx+0]=ao1; col[cIdx+1]=ao1; col[cIdx+2]=ao1;
-				col[cIdx+3]=ao2; col[cIdx+4]=ao2; col[cIdx+5]=ao2;
-				col[cIdx+6]=ao4; col[cIdx+7]=ao4; col[cIdx+8]=ao4;
-				
-				col[cIdx+9]=ao2; col[cIdx+10]=ao2; col[cIdx+11]=ao2;
-				col[cIdx+12]=ao3; col[cIdx+13]=ao3; col[cIdx+14]=ao3;
-				col[cIdx+15]=ao4; col[cIdx+16]=ao4; col[cIdx+17]=ao4;
+				// Get light level at this block (0-15) and convert to 0-1 range
+				const lightLevel = lightGetter ? lightGetter(lx, ly, lz) / 15.0 : 1.0;
+
+				// Apply both AO and light level to vertex colors
+				const c1 = ao1 * lightLevel;
+				const c2 = ao2 * lightLevel;
+				const c3 = ao3 * lightLevel;
+				const c4 = ao4 * lightLevel;
+
+				col[cIdx+0]=c1; col[cIdx+1]=c1; col[cIdx+2]=c1;
+				col[cIdx+3]=c2; col[cIdx+4]=c2; col[cIdx+5]=c2;
+				col[cIdx+6]=c4; col[cIdx+7]=c4; col[cIdx+8]=c4;
+
+				col[cIdx+9]=c2; col[cIdx+10]=c2; col[cIdx+11]=c2;
+				col[cIdx+12]=c3; col[cIdx+13]=c3; col[cIdx+14]=c3;
+				col[cIdx+15]=c4; col[cIdx+16]=c4; col[cIdx+17]=c4;
 
 				// Push UVs (Preserved)
 				const p = 0.0001; // padding to prevent bleeding
@@ -3118,40 +3299,94 @@
 				const nE = chunks.get(getChunkKey(cx + 1, cz));
 				const nW = chunks.get(getChunkKey(cx - 1, cz));
 
+				// Helper to get block data from chunk (handles both old and new format)
+				const getChunkBlock = (chunk, idx) => {
+					if (!chunk) return 0;
+					return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+				};
+
+				// Helper to get light level from chunk (handles both old and new format)
+				const getChunkLight = (chunk, idx) => {
+					if (!chunk || !chunk.skyLight) return 15; // Default to full bright for old chunks
+					const sky = chunk.skyLight[idx] || 0;
+					const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
+					return Math.max(sky, block);
+				};
+
 				const getLocal = (lx, ly, lz) => {
 					if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-					
+
+					const idx = (localX, localZ) => localX + localZ * 16 + ly * 256;
+
 					// Handle within current chunk
 					if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
-						return centerData[lx + lz * 16 + ly * 256];
+						return getChunkBlock(centerData, idx(lx, lz));
 					}
-					
+
 					// Handle neighbors - need to clamp lx/lz to valid range [0-15] for neighbor lookup
-					if (lz < 0 && lx >= 0 && lx < 16) return nN ? nN[lx + 15 * 16 + ly * 256] : 0;
-					if (lz > 15 && lx >= 0 && lx < 16) return nS ? nS[lx + 0 * 16 + ly * 256] : 0;
-					if (lx > 15 && lz >= 0 && lz < 16) return nE ? nE[0 + lz * 16 + ly * 256] : 0;
-					if (lx < 0 && lz >= 0 && lz < 16) return nW ? nW[15 + lz * 16 + ly * 256] : 0;
-					
+					if (lz < 0 && lx >= 0 && lx < 16) return getChunkBlock(nN, idx(lx, 15));
+					if (lz > 15 && lx >= 0 && lx < 16) return getChunkBlock(nS, idx(lx, 0));
+					if (lx > 15 && lz >= 0 && lz < 16) return getChunkBlock(nE, idx(0, lz));
+					if (lx < 0 && lz >= 0 && lz < 16) return getChunkBlock(nW, idx(15, lz));
+
 					// Handle diagonal corners (when both lx and lz are out of bounds)
 					// These are rare but can happen during AO calculation
 					if (lz < 0 && lx < 0) {
 						const nNW = chunks.get(getChunkKey(cx - 1, cz - 1));
-						return nNW ? nNW[15 + 15 * 16 + ly * 256] : 0;
+						return getChunkBlock(nNW, idx(15, 15));
 					}
 					if (lz < 0 && lx > 15) {
 						const nNE = chunks.get(getChunkKey(cx + 1, cz - 1));
-						return nNE ? nNE[0 + 15 * 16 + ly * 256] : 0;
+						return getChunkBlock(nNE, idx(0, 15));
 					}
 					if (lz > 15 && lx < 0) {
 						const nSW = chunks.get(getChunkKey(cx - 1, cz + 1));
-						return nSW ? nSW[15 + 0 * 16 + ly * 256] : 0;
+						return getChunkBlock(nSW, idx(15, 0));
 					}
 					if (lz > 15 && lx > 15) {
 						const nSE = chunks.get(getChunkKey(cx + 1, cz + 1));
-						return nSE ? nSE[0 + 0 * 16 + ly * 256] : 0;
+						return getChunkBlock(nSE, idx(0, 0));
 					}
-					
+
 					return 0;
+				};
+
+				// Get light level at local position (returns 0-15)
+				const getLocalLight = (lx, ly, lz) => {
+					if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15; // Sky above/below
+
+					const idx = (localX, localZ) => localX + localZ * 16 + ly * 256;
+
+					// Handle within current chunk
+					if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
+						return getChunkLight(centerData, idx(lx, lz));
+					}
+
+					// Handle neighbors
+					if (lz < 0 && lx >= 0 && lx < 16) return getChunkLight(nN, idx(lx, 15));
+					if (lz > 15 && lx >= 0 && lx < 16) return getChunkLight(nS, idx(lx, 0));
+					if (lx > 15 && lz >= 0 && lz < 16) return getChunkLight(nE, idx(0, lz));
+					if (lx < 0 && lz >= 0 && lz < 16) return getChunkLight(nW, idx(15, lz));
+
+					// Handle diagonal corners
+					if (lz < 0 && lx < 0) {
+						const nNW = chunks.get(getChunkKey(cx - 1, cz - 1));
+						return getChunkLight(nNW, idx(15, 15));
+					}
+					if (lz < 0 && lx > 15) {
+						const nNE = chunks.get(getChunkKey(cx + 1, cz - 1));
+						return getChunkLight(nNE, idx(0, 15));
+					}
+					if (lz > 15 && lx < 0) {
+						const nSW = chunks.get(getChunkKey(cx - 1, cz + 1));
+						return getChunkLight(nSW, idx(15, 0));
+					}
+					if (lz > 15 && lx > 15) {
+						const nSE = chunks.get(getChunkKey(cx + 1, cz + 1));
+						return getChunkLight(nSE, idx(0, 0));
+					}
+
+					return 15; // Default full bright
 				};
 
 				const maxFaces = 30000;
@@ -3180,7 +3415,8 @@
 					for (let z = 0; z < 16; z++) {
 						const zOffset = z * 16;
 						for (let x = 0; x < 16; x++) {
-							const id = centerData[x + zOffset + yOffset];
+							const idx = x + zOffset + yOffset;
+							const id = centerData.blocks ? centerData.blocks[idx] : centerData[idx];
 							if (id === AIR) continue;
 
 							const wx = startX + x;
@@ -3217,9 +3453,9 @@
 								const draw = isWater ? (nid === AIR || nid === LEAVES) : IS_TRANSPARENT[nid];
 
 
-								
+
 								if (draw) {
-									addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx);
+									addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight);
 									vIdx += 18; uvIdx += 12; cIdx += 18;
 									
 									if (isWater) {
@@ -3961,9 +4197,25 @@
 
 				controls.getObject().updateMatrixWorld();
 
-                // Torch flicker effect - simple intensity variation
+                // Torch flicker effect - light intensity and flame animation
                 if (torchActive && torchLight) {
                     torchLight.intensity = 2.2 + Math.random() * 0.6;
+
+					// Animate the 3D torch flame
+					if (window.torchModel) {
+						const flame = window.torchModel.children[1]; // Second child is flame
+						const glow = window.torchModel.children[2]; // Third child is glow
+
+						if (flame && glow) {
+							// Subtle scale pulsing for flame
+							const flameScale = 1.0 + Math.sin(Date.now() * 0.008) * 0.1 + Math.random() * 0.05;
+							flame.scale.set(flameScale, flameScale, flameScale);
+
+							// Glow flickers more rapidly
+							const glowScale = 1.0 + Math.sin(Date.now() * 0.012) * 0.15 + Math.random() * 0.1;
+							glow.scale.set(glowScale, glowScale, glowScale);
+						}
+					}
                 }
 				renderer.render(scene, camera);
 			}
@@ -4045,8 +4297,13 @@
 				case 'KeyF':
 					// Toggle torch
 					torchActive = !torchActive;
-					const torchOverlay = document.getElementById('torch-overlay');
-					torchOverlay.style.display = torchActive ? 'block' : 'none';
+
+					// Toggle 3D torch model visibility
+					if (window.torchModel) {
+						window.torchModel.visible = torchActive;
+					}
+
+					// Toggle torch light
 					torchLight.intensity = torchActive ? 2.5 : 0;
 
 					// Update UI
