@@ -1071,6 +1071,16 @@
 
 					// Recalculate lighting for the chunk since block changed
 					calculateChunkSunlight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+
+					// Also recalculate neighbor chunks to fix boundary light propagation
+					const neighbors = [[cx-1,cz],[cx+1,cz],[cx,cz-1],[cx,cz+1]];
+					for (const [ncx,ncz] of neighbors) {
+						const nKey = getChunkKey(ncx, ncz);
+						const nChunk = chunks.get(nKey);
+						if (nChunk && nChunk.blocks) {
+							calculateChunkSunlight(nChunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+						}
+					}
 				} else {
 					chunk[idx] = id;
 				}
@@ -1195,11 +1205,13 @@
 
 					// New format
 					if (compressedData.version === 2) {
-						return {
-							blocks: ChunkCompressor._decompressArray(new Uint16Array(compressedData.blocks)),
-							skyLight: ChunkCompressor._decompressArray(new Uint16Array(compressedData.skyLight)),
-							blockLight: compressedData.blockLight ? ChunkCompressor._decompressArray(new Uint16Array(compressedData.blockLight)) : new Uint8Array(0)
-						};
+						const blocks = ChunkCompressor._decompressArray(new Uint16Array(compressedData.blocks));
+						const skyLight = ChunkCompressor._decompressArray(new Uint16Array(compressedData.skyLight));
+						// Initialize blockLight with proper size (16 * 16 * 128) instead of empty array
+						const blockLight = compressedData.blockLight
+							? ChunkCompressor._decompressArray(new Uint16Array(compressedData.blockLight))
+							: new Uint8Array(blocks.length);
+						return { blocks, skyLight, blockLight };
 					}
 
 					// Old format: just a Uint16Array
@@ -1387,12 +1399,21 @@
 						const record = request.result;
 						if (record && record.seed === finalSeedDisplay) {
 							if (isDebug) {console.log(`Cache HIT for ${chunkKey}`);}
-							
+
 							// OLD: resolve(new Uint8Array(record.data));
-							// NEW: Decompress RLE data back to Uint8Array
-							const decompressed = ChunkCompressor.decompress(record.data);
-							resolve(decompressed); 
-							
+							// NEW: Decompress RLE data back to chunk object (or normalize if old format)
+							let decompressed = ChunkCompressor.decompress(record.data);
+
+							// Normalize old format (Uint8Array) to new format (object)
+							if (!(decompressed.blocks)) {
+								decompressed = {
+									blocks: decompressed,
+									skyLight: new Uint8Array(decompressed.length).fill(15),
+									blockLight: new Uint8Array(decompressed.length)
+								};
+							}
+							resolve(decompressed);
+
 						} else {
 							if (isDebug) {console.log(`Cache MISS for ${chunkKey}`);}
 							resolve(null);
@@ -2851,8 +2872,9 @@
 
 			// Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down
 			function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
-				const blocks = chunk.blocks;
-				const skyLight = chunk.skyLight;
+				// Backward compatibility: handle both old (Uint8Array) and new (object) formats
+				const blocks = chunk.blocks || chunk;
+				const skyLight = chunk.skyLight || (chunk.skyLight = new Uint8Array(blocks.length).fill(15));
 
 				// Step 1: Vertical propagation from sky downward
 				for (let lx = 0; lx < chunkSize; lx++) {
@@ -2868,11 +2890,10 @@
 							skyLight[idx] = Math.max(1, currentLight);
 
 							// Reduce light by 1 for each block (solid or transparent)
-							if (blockId === 0 || blockId === 8) {
-								// AIR (0) and WATER (8) - no reduction
-								// Light passes through at full strength
+							if (blockId === 0) {
+								// AIR (0) only - no reduction, light passes through at full strength
 							} else {
-								// All solid/semi-solid blocks reduce light by 1
+								// All blocks (including water, leaves, etc.) reduce light by 1
 								currentLight = Math.max(1, currentLight - 1);
 							}
 						}
@@ -3486,7 +3507,7 @@
 							for (const [lx, ly, lz, nx, ny, nz, uvCoord] of faces) {
 								const nid = getLocal(lx, ly, lz);
 								// Water needs to draw faces against air, leaves, AND other water blocks for transparency layering
-								const draw = isWater ? (nid === AIR || nid === LEAVES) : IS_TRANSPARENT[nid];
+								const draw = isWater ? (nid === AIR || nid === LEAVES || nid === WATER) : IS_TRANSPARENT[nid];
 
 
 
@@ -3556,13 +3577,10 @@
 					const waterMesh = new THREE.Mesh(waterGeo, waterMaterial);
 					waterMesh.name = "CHUNK_WATER_" + cKey;
 					waterGeo.computeBoundingSphere();
-					if (waterGeo.boundingSphere) {
-						waterGeo.boundingSphere.radius *= 2; // Increase radius to account for camera being inside
-					}
 
 					waterMesh.matrixAutoUpdate = false;
 					waterMesh.updateMatrix();
-					waterMesh.frustumCulled = false;
+					waterMesh.frustumCulled = false; // Water doesn't use frustum culling, so bounding sphere doesn't need adjustment
 					waterMesh.castShadow = false; // Water doesn't cast shadows
 					waterMesh.receiveShadow = false;
 					waterMesh.renderOrder = 1; // Render water after terrain
@@ -4237,7 +4255,8 @@
 
                 // Torch flicker effect - light intensity and flame animation
                 if (torchActive && torchLight) {
-                    torchLight.intensity = 2.5 + Math.random() * 1.0;
+                    // Use sin-based pattern for smooth, consistent flicker (better performance than Math.random)
+                    torchLight.intensity = 2.5 + Math.sin(Date.now() * 0.003) * 0.5;
 
 					// Animate the 3D torch flame (very subtle)
 					if (window.torchModel) {
@@ -4341,8 +4360,10 @@
 						window.torchModel.visible = torchActive;
 					}
 
-					// Toggle torch light
-					torchLight.intensity = torchActive ? 3.0 : 0;
+					// Toggle torch light (with null check)
+					if (torchLight) {
+						torchLight.intensity = torchActive ? 3.0 : 0;
+					}
 
 					// Update UI
 					const torchIcon = document.getElementById('torch-icon');
