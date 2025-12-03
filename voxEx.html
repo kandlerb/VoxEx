@@ -650,7 +650,7 @@
 					<input type="range" id="day-length-slider" min="60" max="1200" step="60">
 				</div>
 				<div class="setting-item">
-					<label>Set Time of Day</label>
+					<div style="font-weight: 500; margin-bottom: 4px;">Set Time of Day</div>
 					<div style="display: flex; gap: 8px; margin-top: 8px;">
 						<button class="menu-btn" id="btn-time-dawn" style="flex: 1; padding: 6px;">Dawn</button>
 						<button class="menu-btn" id="btn-time-noon" style="flex: 1; padding: 6px;">Noon</button>
@@ -1003,6 +1003,60 @@
 				}
 			}
 
+			// Performance profiling system
+			const perfMonitor = {
+				enabled: false, // Enable with window.perfMonitor.enabled = true
+				samples: new Map(),
+				thresholds: {
+					animate: 16, // 16ms = 60fps
+					physics: 5,
+					chunkBuild: 8,
+					chunkUpdate: 10,
+					rendering: 8,
+					mousedown: 50
+				},
+
+				start(label) {
+					if (!this.enabled) return null;
+					return performance.now();
+				},
+
+				end(label, startTime) {
+					if (!this.enabled || startTime === null) return;
+					const duration = performance.now() - startTime;
+					const threshold = this.thresholds[label] || 10;
+
+					if (duration > threshold) {
+						logWarn(`[Performance] ${label} took ${duration.toFixed(2)}ms (threshold: ${threshold}ms)`);
+					}
+
+					// Track samples for averaging
+					if (!this.samples.has(label)) {
+						this.samples.set(label, []);
+					}
+					const samples = this.samples.get(label);
+					samples.push({ time: performance.now(), duration });
+
+					// Keep only last 100 samples
+					if (samples.length > 100) samples.shift();
+				},
+
+				getStats(label) {
+					const samples = this.samples.get(label);
+					if (!samples || samples.length === 0) return null;
+
+					const durations = samples.map(s => s.duration);
+					const avg = durations.reduce((a, b) => a + b, 0) / durations.length;
+					const max = Math.max(...durations);
+					const min = Math.min(...durations);
+
+					return { avg: avg.toFixed(2), max: max.toFixed(2), min: min.toFixed(2), count: samples.length };
+				}
+			};
+
+			// Expose to window for console access
+			window.perfMonitor = perfMonitor;
+
 			let prevTime = performance.now();
 			let frameCount = 0;
 			let playerEyeHeight = 1.8;
@@ -1284,6 +1338,7 @@
 
 			// Back to Main Menu from Settings (when in main menu context)
 			document.getElementById('btn-back-from-settings')?.addEventListener('click', () => {
+				const blocker = document.getElementById('blocker');
 				const seedMenu = document.getElementById('seed-menu');
 				const settingsMenu = document.getElementById('settings-menu');
 				const mainPauseMenu = document.getElementById('main-pause-menu');
@@ -1295,12 +1350,15 @@
 					return;
 				}
 
-				// If main pause menu is visible, go back to that; otherwise go to seed menu
-				if (mainPauseMenu && mainPauseMenu.style.display === 'block') {
-					settingsMenu.style.display = 'none';
-					mainPauseMenu.style.display = 'block';
+				// Hide all settings panels first
+				document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
+				settingsMenu.style.display = 'none';
+
+				// If blocker is visible, we're in-game pause mode - go back to pause menu
+				// Otherwise, we're at the start screen - go back to seed menu
+				if (blocker && blocker.style.display !== 'none' && blocker.style.display !== '') {
+					if (mainPauseMenu) mainPauseMenu.style.display = 'block';
 				} else {
-					settingsMenu.style.display = 'none';
 					if (seedMenu) seedMenu.style.display = 'block';
 				}
 			});
@@ -5131,6 +5189,7 @@
 			
 			function animate() {
 				requestAnimationFrame(animate);
+				const frameStart = perfMonitor.start('animate');
 				try {
 					const time = performance.now();
 					const rawDt = (time - prevTime) / 1000; // Calculate delta time early
@@ -5148,20 +5207,24 @@
 
 					// 1. Throttle Heavy Tasks (Mesh Building)
 					// Only process the build queue if we have frame budget
-					if (time - prevTime < 32) { 
+					if (time - prevTime < 32) {
 						if (chunkBuildQueue.length > 0) {
+							const chunkBuildStart = perfMonitor.start('chunkBuild');
 							const start = performance.now();
 							while(chunkBuildQueue.length > 0 && performance.now() - start < 4) {
 								processChunkQueue();
 							}
+							perfMonitor.end('chunkBuild', chunkBuildStart);
 						}
 					}
 
 					// 2. CRITICAL FIX: Run Update/Cleanup independently of FPS
-					// We throttle this to run every 200ms using a timer, but we DO NOT 
+					// We throttle this to run every 200ms using a timer, but we DO NOT
 					// restrict it based on frame rendering time.
-					if (time - lastChunkUpdate > 200) { 
+					if (time - lastChunkUpdate > 200) {
+						const chunkUpdateStart = perfMonitor.start('chunkUpdate');
 						updateChunks();
+						perfMonitor.end('chunkUpdate', chunkUpdateStart);
 						lastChunkUpdate = time;
 					}
 
@@ -5181,6 +5244,7 @@
 						}
 
 						// --- PHYSICS & MOVEMENT UPDATE ---
+						const physicsStart = perfMonitor.start('physics');
 						// ... (Keep existing physics code exactly as is) ...
 						const inputSpeed = SETTINGS.playerSpeed * (isFlying ? SETTINGS.flySpeedMultiplier : (isCrouching ? SETTINGS.crouchMultiplier : (isSprinting ? SETTINGS.sprintMultiplier : 1.0)));
 						direction.z = Number(moveForward) - Number(moveBackward); 
@@ -5252,6 +5316,7 @@
 							}
 						}
 						updateHighlight();
+						perfMonitor.end('physics', physicsStart);
 					} else {
 						prevTime = performance.now();
 					}
@@ -5290,6 +5355,7 @@
 						}
                 }
 
+					const renderStart = perfMonitor.start('rendering');
 					// Two-pass rendering for proper viewmodel layering
 					// Pass 1: Render world (Layer 0)
 					camera.layers.set(0);
@@ -5305,7 +5371,9 @@
 						// Re-enable both layers for camera (needed for other code that might check layers)
 						camera.layers.enable(0);
 						camera.layers.enable(1);
+					perfMonitor.end('rendering', renderStart);
 				} catch (error) {
+				perfMonitor.end('animate', frameStart);
 					logError("ANIMATE", "Error in animation loop", error);
 				}
 			}
@@ -5340,15 +5408,22 @@
 							return;
 						}
 
-						// If in any pause menu or settings, close everything and resume game
-						if (blocker && blocker.style.display !== 'none') {
-							// Hide all settings panels
+						// Check if we're in a submenu (settings or controls)
+						const inSettingsMenu = settingsMenu && settingsMenu.style.display !== 'none';
+						const inControlsMenu = controlsMenu && controlsMenu.style.display !== 'none';
+						const inSettingsPanel = Array.from(document.querySelectorAll('.settings-panel')).some(p => p.style.display !== 'none' && p !== settingsMenu);
+
+						if (inSettingsPanel) {
+							// If in a settings sub-panel, go back to main settings menu
 							document.querySelectorAll('.settings-panel').forEach(p => p.style.display = 'none');
-							// Hide all menus
+							if (settingsMenu) settingsMenu.style.display = 'block';
+						} else if (inSettingsMenu || inControlsMenu) {
+							// If in settings or controls menu, go back to main pause menu
 							if (settingsMenu) settingsMenu.style.display = 'none';
 							if (controlsMenu) controlsMenu.style.display = 'none';
-							if (mainPauseMenu) mainPauseMenu.style.display = 'block'; // Reset to main pause menu
-							// Resume game by locking controls
+							if (mainPauseMenu) mainPauseMenu.style.display = 'block';
+						} else if (mainPauseMenu && mainPauseMenu.style.display !== 'none') {
+							// If in main pause menu, resume game
 							controls.lock();
 						}
 						event.preventDefault();
@@ -5465,6 +5540,7 @@
 			}
 			
 			function onMouseClick(e) {
+			const mouseStart = perfMonitor.start('mousedown');
 				if (!controls.isLocked) return;
 				const hit = pickVoxel(controls.getObject().position, controls.getDirection(new THREE.Vector3()), SETTINGS.blockReach);
 				if (hit) {
@@ -5486,6 +5562,7 @@
 					}
 				}
 			}
+			perfMonitor.end('mousedown', mouseStart);
 
 			function highlightSlot(i) {
 				document.querySelectorAll(".slot").forEach((s) => s.classList.remove("active"));
