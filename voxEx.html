@@ -5053,39 +5053,54 @@
                         }
                     }
 
-                    // Helper: Trilinear interpolation
+                    // OPTIMIZATION: Pre-compute cache stride values
+                    const cxzStride = cxDim * czDim; // For y-axis indexing
+
+                    // Helper: Trilinear interpolation (OPTIMIZED)
+                    // - Removed inline function creation
+                    // - Use bitwise right-shift for division by 4 (CAVE_STEP = 4 = 2^2)
+                    // - Pre-computed strides
                     function getCaveNoise(lx, ly, lz, cache) {
-                        // Find surrounding grid points
-                        const x0 = Math.floor(lx / CAVE_STEP) * CAVE_STEP;
-                        const y0 = Math.floor(ly / CAVE_STEP) * CAVE_STEP;
-                        const z0 = Math.floor(lz / CAVE_STEP) * CAVE_STEP;
-                        const x1 = x0 + CAVE_STEP;
-                        const y1 = y0 + CAVE_STEP;
-                        const z1 = z0 + CAVE_STEP;
+                        // Find surrounding grid indices using bitwise shift (>> 2 = / 4)
+                        const ix0 = lx >> 2;  // Math.floor(lx / 4)
+                        const iy0 = ly >> 2;  // Math.floor(ly / 4)
+                        const iz0 = lz >> 2;  // Math.floor(lz / 4)
+                        const ix1 = ix0 + 1;
+                        const iy1 = iy0 + 1;
+                        const iz1 = iz0 + 1;
 
-                        // Fractional position within cell
-                        const fx = (lx - x0) / CAVE_STEP;
-                        const fy = (ly - y0) / CAVE_STEP;
-                        const fz = (lz - z0) / CAVE_STEP;
+                        // Fractional position within cell (& 3 = % 4)
+                        const fx = (lx & 3) * 0.25;  // (lx % 4) / 4
+                        const fy = (ly & 3) * 0.25;
+                        const fz = (lz & 3) * 0.25;
 
-                        // Get 8 corner values
-                        const idx = (ix, iy, iz) => ix / CAVE_STEP + (iz / CAVE_STEP) * cxDim + (iy / CAVE_STEP) * cxDim * czDim;
-                        const c000 = cache[idx(x0, y0, z0)];
-                        const c001 = cache[idx(x0, y0, z1)];
-                        const c010 = cache[idx(x0, y1, z0)];
-                        const c011 = cache[idx(x0, y1, z1)];
-                        const c100 = cache[idx(x1, y0, z0)];
-                        const c101 = cache[idx(x1, y0, z1)];
-                        const c110 = cache[idx(x1, y1, z0)];
-                        const c111 = cache[idx(x1, y1, z1)];
+                        // Pre-compute base indices for each corner
+                        const base00 = ix0 + iz0 * cxDim;
+                        const base01 = ix0 + iz1 * cxDim;
+                        const base10 = ix1 + iz0 * cxDim;
+                        const base11 = ix1 + iz1 * cxDim;
+                        const yOff0 = iy0 * cxzStride;
+                        const yOff1 = iy1 * cxzStride;
 
-                        // Trilinear interpolation
-                        const c00 = c000 * (1 - fx) + c100 * fx;
-                        const c01 = c001 * (1 - fx) + c101 * fx;
-                        const c10 = c010 * (1 - fx) + c110 * fx;
-                        const c11 = c011 * (1 - fx) + c111 * fx;
-                        const c0 = c00 * (1 - fy) + c10 * fy;
-                        const c1 = c01 * (1 - fy) + c11 * fy;
+                        // Get 8 corner values (inline index calculation)
+                        const c000 = cache[base00 + yOff0];
+                        const c001 = cache[base01 + yOff0];
+                        const c010 = cache[base00 + yOff1];
+                        const c011 = cache[base01 + yOff1];
+                        const c100 = cache[base10 + yOff0];
+                        const c101 = cache[base11 + yOff0];
+                        const c110 = cache[base10 + yOff1];
+                        const c111 = cache[base11 + yOff1];
+
+                        // Trilinear interpolation (unchanged, already optimal)
+                        const ifx = 1 - fx;
+                        const c00 = c000 * ifx + c100 * fx;
+                        const c01 = c001 * ifx + c101 * fx;
+                        const c10 = c010 * ifx + c110 * fx;
+                        const c11 = c011 * ifx + c111 * fx;
+                        const ify = 1 - fy;
+                        const c0 = c00 * ify + c10 * fy;
+                        const c1 = c01 * ify + c11 * fy;
                         return c0 * (1 - fz) + c1 * fz;
                     }
 
@@ -5093,8 +5108,9 @@
                     const heightCache = new Int16Array(chunkSize * chunkSize);
                     const riverCache = new Float32Array(chunkSize * chunkSize); // Cache river factor per column
                     const biomeCache = new Array(chunkSize * chunkSize); // Cache biome params per column
+                    const widthNoiseCache = new Float32Array(chunkSize * chunkSize); // OPTIMIZATION: Cache cave width noise per column
 
-                    // Pre-calculate all heights, rivers, and biomes (single pass)
+                    // Pre-calculate all heights, rivers, biomes, and cave width noise (single pass)
                     for (let lx = 0; lx < chunkSize; lx++) {
                         for (let lz = 0; lz < chunkSize; lz++) {
                             const idx = lx + lz * chunkSize;
@@ -5104,6 +5120,8 @@
                             heightCache[idx] = blendedHeight(gx, gz, seed);
                             riverCache[idx] = getRiverFactor(gx, gz, seed);
                             biomeCache[idx] = getBiomeParams(gx, gz);
+                            // OPTIMIZATION: Cache width noise per column (was computed 128x per column before!)
+                            widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
                         }
                     }
 
@@ -5143,51 +5161,51 @@
                                 }
 
                                 // --- OPTIMIZED CAVE GENERATION ---
-                                // Reduced from 3 noise3D calls to 2 + simple 2D width variation
+                                // Reduced from 3 noise3D calls to 2 + cached 2D width variation
                                 if (id !== AIR && id !== BEDROCK && id !== WATER) {
                                     // Early exit for surface blocks (caves don't exist above y=50)
                                     const fadeStart = 30;
                                     const fadeEnd = 50;
-                                    if (worldY >= fadeEnd) {
-                                        // Skip cave check entirely
-                                    } else {
-                                        // 1. Coordinate scaling
-                                        const caveScale = 0.02;
-                                        const caveYScale = 0.03;
-
-                                        // 2. Two cheap array lookups + interpolation
+                                    if (worldY < fadeEnd) {
+                                        // Two cheap array lookups + interpolation
                                         const n1 = getCaveNoise(lx, ly, lz, caveCache1);
                                         const n2 = getCaveNoise(lx, ly, lz, caveCache2);
 
-                                        // 3. Width variation using 2D noise (cheaper than 3D)
-                                        const widthNoise = noise2D(gx * 0.005, gz * 0.005);
+                                        // OPTIMIZATION: Use cached width noise (was computed 128x per column before!)
+                                        const widthNoise = widthNoiseCache[idx];
                                         let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
 
-                                        // 4. Surface fading
+                                        // Surface fading
                                         if (worldY > fadeStart) {
                                             const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart);
                                             threshold *= fade;
                                         }
 
-                                        // 5. Carve using vector magnitude
+                                        // Carve using vector magnitude
                                         if (n1 * n1 + n2 * n2 < threshold) {
                                             id = AIR;
                                         }
                                     }
                                 }
-                                // PASS 2: Fill water
-                                for (let lx = 0; lx < chunkSize; lx++) {
-                                    for (let lz = 0; lz < chunkSize; lz++) {
-                                        const worldTopY = heightCache[lx + lz * chunkSize];
-                                        if (worldTopY >= WORLD_DIMS.seaLevel) continue;
-                                        for (let ly = worldTopY + 1; ly <= Math.min(WORLD_DIMS.seaLevel, chunkHeight - 1); ly++) {
-                                            const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
-                                            if (data[idx] === AIR) data[idx] = WATER;
-                                        }
-                                    }
-                                }
 
                                 set(lx, ly, lz, id);
+                            }
+                        }
+                    }
+
+                    // --- PASS 2: FILL WATER ---
+                    // CRITICAL FIX: This was incorrectly nested inside the solid block loop!
+                    // Moving it here fixes 8.3 million unnecessary iterations per chunk
+                    for (let wx = 0; wx < chunkSize; wx++) {
+                        for (let wz = 0; wz < chunkSize; wz++) {
+                            const worldTopY = heightCache[wx + wz * chunkSize];
+                            if (worldTopY >= WORLD_DIMS.seaLevel) continue;
+                            // Fill water from surface+1 up to sea level
+                            const waterStart = worldTopY + 1 + WORLD_DIMS.yOffset;
+                            const waterEnd = Math.min(WORLD_DIMS.seaLevel + WORLD_DIMS.yOffset, chunkHeight - 1);
+                            for (let wy = waterStart; wy <= waterEnd; wy++) {
+                                const waterIdx = wx + wz * chunkSize + wy * chunkSize * chunkSize;
+                                if (data[waterIdx] === AIR) data[waterIdx] = WATER;
                             }
                         }
                     }
