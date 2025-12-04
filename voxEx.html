@@ -1161,6 +1161,44 @@
                 torch: TORCH,
             };
 
+            // --- OPTIMIZATION: Pre-computed neighbor offsets for light propagation ---
+            // Avoids array allocation inside tight loops
+            const NEIGHBOR_OFFSETS = [
+                [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]
+            ];
+
+            // --- OPTIMIZATION: Pre-computed face directions for rendering ---
+            // [dx, dy, dz, nx, ny, nz] - direction offset and normal
+            const FACE_DIRECTIONS = [
+                [0, 1, 0, 0, 1, 0],    // Top
+                [0, -1, 0, 0, -1, 0],  // Bottom
+                [1, 0, 0, 1, 0, 0],    // Right (+X)
+                [-1, 0, 0, -1, 0, 0],  // Left (-X)
+                [0, 0, 1, 0, 0, 1],    // Back (+Z)
+                [0, 0, -1, 0, 0, -1]   // Front (-Z)
+            ];
+
+            // --- OPTIMIZATION: Reusable Vector3 objects for physics ---
+            const _physFwd = new THREE.Vector3();
+            const _physRight = new THREE.Vector3();
+            const _physUp = new THREE.Vector3(0, 1, 0);
+
+            // --- OPTIMIZATION: Cached Color objects for day/night cycle ---
+            // These are initialized later in init() after SETTINGS is available
+            let _nightSkyTop, _daySkyTop, _nightSkyBottom, _daySkyBottom;
+            let _nightFogColor, _dayFogColor;
+            let _colorsInitialized = false;
+
+            // --- OPTIMIZATION: Pre-computed AO power curve lookup table ---
+            // Math.pow((3 - occlusionCount) / 3, 0.6) for occlusion counts 0-3
+            // Avoids expensive Math.pow calls in tight rendering loop
+            const AO_LOOKUP = [
+                1.0,                           // 0 occlusions: (3/3)^0.6 = 1.0
+                Math.pow(2/3, 0.6),           // 1 occlusion: (2/3)^0.6 ≈ 0.774
+                Math.pow(1/3, 0.6),           // 2 occlusions: (1/3)^0.6 ≈ 0.493
+                0.15                          // 3 occlusions: Use 0.15 for deep shadows
+            ];
+
             let camera;
             let scene;
             let renderer;
@@ -1813,17 +1851,27 @@
             function getChunkKey(cx, cz) {
                 return `${cx},${cz}`;
             }
+            // --- OPTIMIZATION: Cache for repeated chunk lookups ---
+            let _lastChunkKey = null;
+            let _lastChunk = null;
+
             function getBlock(x, y, z) {
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Use bitwise right shift for positive division by 16
+                // For negative x/z, we need floor behavior, so use conditional
+                const cx = x >= 0 ? (x >> 4) : ((x + 1) >> 4) - 1;
+                const cz = z >= 0 ? (z >> 4) : ((z + 1) >> 4) - 1;
                 const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
+                // OPTIMIZATION: Cache last accessed chunk to avoid repeated Map lookups
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
                 if (!chunk) return undefined;
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                const idx = lx + lz * 16 + ly * 256;
+                _lastChunkKey = key;
+                _lastChunk = chunk;
+                // OPTIMIZATION: Use bitwise AND for modulo 16 (works for negative numbers too)
+                const lx = x & 15;
+                const lz = z & 15;
+                const idx = lx + (lz << 4) + (ly << 8);
                 return chunk.blocks ? chunk.blocks[idx] : chunk[idx]; // Support both old and new format
             }
 
@@ -1831,53 +1879,61 @@
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0) return 1; // Below world: minimum light
                 if (ly >= WORLD_DIMS.chunkHeight) return 15; // Above world: full sky light
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Bitwise operations for chunk calculation
+                const cx = x >= 0 ? (x >> 4) : ((x + 1) >> 4) - 1;
+                const cz = z >= 0 ? (z >> 4) : ((z + 1) >> 4) - 1;
                 const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
                 if (!chunk || !chunk.skyLight) return 15; // Default full bright for unloaded chunks
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                return chunk.skyLight[lx + lz * 16 + ly * 256];
+                const lx = x & 15;
+                const lz = z & 15;
+                return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
             }
 
             function getBlockLight(x, y, z) {
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Bitwise operations for chunk calculation
+                const cx = x >= 0 ? (x >> 4) : ((x + 1) >> 4) - 1;
+                const cz = z >= 0 ? (z >> 4) : ((z + 1) >> 4) - 1;
                 const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
                 if (!chunk || !chunk.blockLight) return 0;
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                return chunk.blockLight[lx + lz * 16 + ly * 256];
+                const lx = x & 15;
+                const lz = z & 15;
+                return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
             }
 
             function setSkyLight(x, y, z, level) {
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Bitwise operations for chunk calculation
+                const cx = x >= 0 ? (x >> 4) : ((x + 1) >> 4) - 1;
+                const cz = z >= 0 ? (z >> 4) : ((z + 1) >> 4) - 1;
                 const key = getChunkKey(cx, cz);
                 const chunk = chunks.get(key);
                 if (!chunk || !chunk.skyLight) return;
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                chunk.skyLight[lx + lz * 16 + ly * 256] = Math.max(1, Math.min(15, level));
+                const lx = x & 15;
+                const lz = z & 15;
+                // OPTIMIZATION: Inline clamp instead of Math.max/Math.min
+                const clamped = level < 1 ? 1 : (level > 15 ? 15 : level);
+                chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
             }
 
             function setBlockLight(x, y, z, level) {
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Bitwise operations for chunk calculation
+                const cx = x >= 0 ? (x >> 4) : ((x + 1) >> 4) - 1;
+                const cz = z >= 0 ? (z >> 4) : ((z + 1) >> 4) - 1;
                 const key = getChunkKey(cx, cz);
                 const chunk = chunks.get(key);
                 if (!chunk || !chunk.blockLight) return;
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                chunk.blockLight[lx + lz * 16 + ly * 256] = Math.max(0, Math.min(15, level));
+                const lx = x & 15;
+                const lz = z & 15;
+                // OPTIMIZATION: Inline clamp instead of Math.max/Math.min
+                const clamped = level < 0 ? 0 : (level > 15 ? 15 : level);
+                chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
             }
 
             function setBlock(x, y, z, id) {
@@ -4725,78 +4781,101 @@
             }
 
             // Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down
+            // OPTIMIZATION: Uses BFS queue with early termination instead of fixed 15 passes
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
                 // Backward compatibility: handle both old (Uint8Array) and new (object) formats
                 const blocks = chunk.blocks || chunk;
                 const skyLight = chunk.skyLight || (chunk.skyLight = new Uint8Array(blocks.length).fill(15));
 
+                // Pre-compute chunk dimensions for bitwise operations
+                const cs = chunkSize; // 16
+                const cs2 = chunkSize * chunkSize; // 256
+
                 // Step 1: Vertical propagation from sky downward
-                for (let lx = 0; lx < chunkSize; lx++) {
-                    for (let lz = 0; lz < chunkSize; lz++) {
+                // OPTIMIZATION: Use bitwise shifts for index calculation
+                for (let lx = 0; lx < cs; lx++) {
+                    for (let lz = 0; lz < cs; lz++) {
                         let currentLight = 15; // Start with 15 (max sunlight)
+                        const baseIdx = lx + (lz << 4); // lx + lz * 16
 
                         // Go from top to bottom
                         for (let ly = chunkHeight - 1; ly >= 0; ly--) {
-                            const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                            const idx = baseIdx + (ly << 8); // + ly * 256
                             const blockId = blocks[idx];
 
                             // Set current light level (minimum 1)
-                            skyLight[idx] = Math.max(1, currentLight);
+                            // OPTIMIZATION: Inline ternary instead of Math.max
+                            skyLight[idx] = currentLight > 1 ? currentLight : 1;
 
-                            // Reduce light by 1 for each block (solid or transparent)
-                            if (blockId === 0) {
-                                // AIR (0) only - no reduction, light passes through at full strength
-                            } else {
-                                currentLight = Math.max(1, currentLight - 1);
-                            } // All blocks (including water, leaves, etc.) reduce light by 1
+                            // Reduce light by 1 for non-air blocks
+                            if (blockId !== 0) {
+                                currentLight = currentLight > 2 ? currentLight - 1 : 1;
+                            }
                         }
                     }
                 }
 
-                // Step 2: Horizontal light spreading using flood-fill
-                // Multiple passes to ensure light spreads across the chunk
-                const spreadPasses = 15; // Match maximum light level
+                // Step 2: BFS-based horizontal light spreading with early termination
+                // OPTIMIZATION: Queue-based approach only processes blocks that need updating
+                // instead of 15 fixed passes over all 32,768 blocks
+                const queue = [];
 
-                for (let pass = 0; pass < spreadPasses; pass++) {
-                    for (let ly = 0; ly < chunkHeight; ly++) {
-                        for (let lx = 0; lx < chunkSize; lx++) {
-                            for (let lz = 0; lz < chunkSize; lz++) {
-                                const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                // Seed the queue with all blocks that have light > 1 and transparent neighbors
+                for (let ly = 0; ly < chunkHeight; ly++) {
+                    const yOffset = ly << 8;
+                    for (let lz = 0; lz < cs; lz++) {
+                        const zOffset = lz << 4;
+                        for (let lx = 0; lx < cs; lx++) {
+                            const idx = lx + zOffset + yOffset;
+                            const light = skyLight[idx];
+                            if (light > 1) {
                                 const blockId = blocks[idx];
-
-                                // Skip solid blocks (but allow air, water, and leaves)
-                                if (blockId !== 0 && blockId !== 8 && blockId !== 6) continue;
-
-                                const currentLight = skyLight[idx];
-
-                                // Check all 6 neighbors and spread light
-                                const neighbors = [
-                                    [lx + 1, ly, lz],
-                                    [lx - 1, ly, lz],
-                                    [lx, ly + 1, lz],
-                                    [lx, ly - 1, lz],
-                                    [lx, ly, lz + 1],
-                                    [lx, ly, lz - 1],
-                                ];
-
-                                for (const [nx, ny, nz] of neighbors) {
-                                    // Check bounds
-                                    if (nx < 0 || nx >= chunkSize || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= chunkSize) {
-                                        continue;
-                                    }
-
-                                    const nIdx = nx + nz * chunkSize + ny * chunkSize * chunkSize;
-                                    const nBlockId = blocks[nIdx];
-
-                                    // Only spread to air, water, and leaves
-                                    if (nBlockId !== 0 && nBlockId !== 8 && nBlockId !== 6) continue;
-
-                                    // All blocks reduce light by 1 (minimum 1)
-                                    const propagatedLight = Math.max(1, currentLight - 1);
-                                    if (propagatedLight > skyLight[nIdx]) {
-                                        skyLight[nIdx] = propagatedLight;
-                                    }
+                                // Only process transparent blocks (air=0, leaves=6, water=8)
+                                if (blockId === 0 || blockId === 6 || blockId === 8) {
+                                    queue.push(lx, ly, lz, light);
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Process the BFS queue
+                let qIdx = 0;
+                while (qIdx < queue.length) {
+                    const lx = queue[qIdx++];
+                    const ly = queue[qIdx++];
+                    const lz = queue[qIdx++];
+                    const currentLight = queue[qIdx++];
+
+                    const idx = lx + (lz << 4) + (ly << 8);
+                    // Skip if this entry is stale (light was already updated higher)
+                    if (skyLight[idx] > currentLight) continue;
+
+                    // OPTIMIZATION: Use pre-computed NEIGHBOR_OFFSETS constant
+                    for (let i = 0; i < 6; i++) {
+                        const offset = NEIGHBOR_OFFSETS[i];
+                        const nx = lx + offset[0];
+                        const ny = ly + offset[1];
+                        const nz = lz + offset[2];
+
+                        // Bounds check
+                        if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
+
+                        const nIdx = nx + (nz << 4) + (ny << 8);
+                        const nBlockId = blocks[nIdx];
+
+                        // Only spread to transparent blocks (air=0, leaves=6, water=8)
+                        if (nBlockId !== 0 && nBlockId !== 6 && nBlockId !== 8) continue;
+
+                        // Calculate propagated light (minimum 1)
+                        const propagatedLight = currentLight > 2 ? currentLight - 1 : 1;
+
+                        // Only update if we can improve the neighbor's light
+                        if (propagatedLight > skyLight[nIdx]) {
+                            skyLight[nIdx] = propagatedLight;
+                            // Only continue propagating if light > 1
+                            if (propagatedLight > 1) {
+                                queue.push(nx, ny, nz, propagatedLight);
                             }
                         }
                     }
@@ -4804,43 +4883,66 @@
             }
 
             // Calculate block light for a chunk - light emitted by torches and other light sources
+            // OPTIMIZATION: Uses BFS queue with early termination instead of fixed 15 passes
             function calculateBlockLight(chunk, chunkSize, chunkHeight) {
                 const blocks = chunk.blocks || chunk;
                 const blockLight = chunk.blockLight || (chunk.blockLight = new Uint8Array(blocks.length).fill(0));
                 blockLight.fill(0);
+
+                const cs = chunkSize; // 16
+                // BFS queue - stores [x, y, z, light] as flat array for performance
+                const queue = [];
+
+                // Step 1: Find all light sources and seed the queue
                 for (let ly = 0; ly < chunkHeight; ly++) {
-                    for (let lx = 0; lx < chunkSize; lx++) {
-                        for (let lz = 0; lz < chunkSize; lz++) {
-                            const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                    const yOffset = ly << 8;
+                    for (let lz = 0; lz < cs; lz++) {
+                        const zOffset = lz << 4;
+                        for (let lx = 0; lx < cs; lx++) {
+                            const idx = lx + zOffset + yOffset;
                             const blockId = blocks[idx];
-                            if (blockId === TORCH) blockLight[idx] = 15; // Max brightness (2x brighter than before)
+                            if (blockId === TORCH) {
+                                blockLight[idx] = 15; // Max brightness
+                                queue.push(lx, ly, lz, 15);
+                            }
                         }
                     }
                 }
-                const propagatePasses = 15;
-                for (let pass = 0; pass < propagatePasses; pass++) {
-                    for (let ly = 0; ly < chunkHeight; ly++) {
-                        for (let lx = 0; lx < chunkSize; lx++) {
-                            for (let lz = 0; lz < chunkSize; lz++) {
-                                const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
-                                const currentLight = blockLight[idx];
-                                if (currentLight <= 0) continue;
-                                const neighbors = [
-                                    [lx + 1, ly, lz],
-                                    [lx - 1, ly, lz],
-                                    [lx, ly + 1, lz],
-                                    [lx, ly - 1, lz],
-                                    [lx, ly, lz + 1],
-                                    [lx, ly, lz - 1],
-                                ];
-                                for (const [nx, ny, nz] of neighbors) {
-                                    if (nx < 0 || nx >= chunkSize || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= chunkSize) continue;
-                                    const nIdx = nx + nz * chunkSize + ny * chunkSize * chunkSize;
-                                    const nBlockId = blocks[nIdx];
-                                    if (nBlockId !== AIR && nBlockId !== WATER && nBlockId !== LEAVES && nBlockId !== TORCH) continue;
-                                    const propagatedLight = Math.max(0, currentLight - 1);
-                                    if (propagatedLight > blockLight[nIdx]) blockLight[nIdx] = propagatedLight;
-                                }
+
+                // Step 2: BFS propagation with early termination
+                let qIdx = 0;
+                while (qIdx < queue.length) {
+                    const lx = queue[qIdx++];
+                    const ly = queue[qIdx++];
+                    const lz = queue[qIdx++];
+                    const currentLight = queue[qIdx++];
+
+                    // OPTIMIZATION: Use pre-computed NEIGHBOR_OFFSETS constant
+                    for (let i = 0; i < 6; i++) {
+                        const offset = NEIGHBOR_OFFSETS[i];
+                        const nx = lx + offset[0];
+                        const ny = ly + offset[1];
+                        const nz = lz + offset[2];
+
+                        // Bounds check
+                        if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
+
+                        const nIdx = nx + (nz << 4) + (ny << 8);
+                        const nBlockId = blocks[nIdx];
+
+                        // Only spread to transparent blocks (air=0, leaves=6, water=8, torch=10)
+                        if (nBlockId !== AIR && nBlockId !== WATER && nBlockId !== LEAVES && nBlockId !== TORCH) continue;
+
+                        // Calculate propagated light (minimum 0)
+                        // OPTIMIZATION: Inline ternary instead of Math.max
+                        const propagatedLight = currentLight > 1 ? currentLight - 1 : 0;
+
+                        // Only update if we can improve the neighbor's light
+                        if (propagatedLight > blockLight[nIdx]) {
+                            blockLight[nIdx] = propagatedLight;
+                            // Only continue propagating if light > 0
+                            if (propagatedLight > 0) {
+                                queue.push(nx, ny, nz, propagatedLight);
                             }
                         }
                     }
@@ -5269,6 +5371,7 @@
                     ao3 = 1,
                     ao4 = 1;
                 if (SETTINGS.AO && blockId !== WATER) {
+                    // OPTIMIZATION: Use pre-computed AO_LOOKUP table instead of Math.pow
                     const getAO = (dx1, dy1, dz1, dx2, dy2, dz2, dxc, dyc, dzc) => {
                         const s1 = IS_TRANSPARENT[getter(lx + dx1, ly + dy1, lz + dz1)] ? 0 : 1;
                         const s2 = IS_TRANSPARENT[getter(lx + dx2, ly + dy2, lz + dz2)] ? 0 : 1;
@@ -5276,13 +5379,9 @@
                         // Enhanced darkening: both sides blocked creates deep shadows
                         if (s1 && s2) return 0.15;
 
-                        // Smooth gradient with power curve for more dramatic contrast
+                        // OPTIMIZATION: Use lookup table instead of Math.pow
                         const occlusionCount = s1 + s2 + c;
-                        const baseValue = (3 - occlusionCount) / 3;
-
-                        // Power curve makes dark areas darker while keeping bright areas bright
-                        // Values: 0 occlusions=1.0, 1=0.77, 2=0.49, 3=0.15
-                        return Math.pow(baseValue, 0.6);
+                        return AO_LOOKUP[occlusionCount];
                     };
 
                     if (ny > 0) {
@@ -5612,17 +5711,20 @@
                                 let uvIdx = isWater ? wUvIdx : tUvIdx;
                                 let cIdx = isWater ? wCIdx : tCIdx;
 
-                                // Check all 6 faces
-                                const faces = [
-                                    [x, y + 1, z, 0, 1, 0, uv.top], // Top
-                                    [x, y - 1, z, 0, -1, 0, uv.bottom], // Bottom
-                                    [x + 1, y, z, 1, 0, 0, uv.side], // Right
-                                    [x - 1, y, z, -1, 0, 0, uv.side], // Left
-                                    [x, y, z + 1, 0, 0, 1, uv.side], // Back
-                                    [x, y, z - 1, 0, 0, -1, uv.side], // Front
-                                ];
+                                // OPTIMIZATION: Use pre-computed FACE_DIRECTIONS instead of creating array
+                                // UV lookup: index 0=top, 1=bottom, 2-5=side
+                                const uvLookup = [uv.top, uv.bottom, uv.side, uv.side, uv.side, uv.side];
 
-                                for (const [lx, ly, lz, nx, ny, nz, uvCoord] of faces) {
+                                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                    const face = FACE_DIRECTIONS[faceIdx];
+                                    const lx = x + face[0];
+                                    const ly = y + face[1];
+                                    const lz = z + face[2];
+                                    const nx = face[3];
+                                    const ny = face[4];
+                                    const nz = face[5];
+                                    const uvCoord = uvLookup[faceIdx];
+
                                     const nid = getLocal(lx, ly, lz);
                                     // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
                                     const draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
@@ -6214,41 +6316,47 @@
                 }
             }
 
+            // OPTIMIZATION: Inline helper for solid block check
+            function isSolidBlock(x, y, z) {
+                let b = getBlock(x, y, z);
+                if (b === undefined) {
+                    ensureChunk(x, z);
+                    b = getBlock(x, y, z);
+                }
+                return b !== AIR && b !== WATER && b !== TORCH;
+            }
+
             function collide(p) {
                 const r = 0.3;
-                const xCoords = [p.x - r, p.x + r],
-                    zCoords = [p.z - r, p.z + r],
-                    yCoords = [p.y - playerEyeHeight + 0.1, p.y + 0.1];
-                for (let x of xCoords)
-                    for (let z of zCoords)
-                        for (let y of yCoords) {
-                            let b = getBlock(Math.floor(x), Math.floor(y), Math.floor(z));
-                            if (b === undefined) {
-                                ensureChunk(Math.floor(x), Math.floor(z));
-                                b = getBlock(Math.floor(x), Math.floor(y), Math.floor(z));
-                            }
-                            if (b !== AIR && b !== WATER && b !== TORCH) return true; // Allow walking through torches
-                        }
+                // OPTIMIZATION: Pre-compute floor values once instead of repeatedly in loop
+                const x0 = Math.floor(p.x - r), x1 = Math.floor(p.x + r);
+                const z0 = Math.floor(p.z - r), z1 = Math.floor(p.z + r);
+                const y0 = Math.floor(p.y - playerEyeHeight + 0.1), y1 = Math.floor(p.y + 0.1);
+
+                // OPTIMIZATION: Unrolled loop - 8 checks, avoids array iteration overhead
+                if (isSolidBlock(x0, y0, z0)) return true;
+                if (isSolidBlock(x0, y0, z1)) return true;
+                if (isSolidBlock(x0, y1, z0)) return true;
+                if (isSolidBlock(x0, y1, z1)) return true;
+                if (isSolidBlock(x1, y0, z0)) return true;
+                if (isSolidBlock(x1, y0, z1)) return true;
+                if (isSolidBlock(x1, y1, z0)) return true;
+                if (isSolidBlock(x1, y1, z1)) return true;
                 return false;
             }
 
             function checkGround(pos) {
-                const r = 0.3,
-                    y = Math.floor(pos.y - playerEyeHeight - 0.01);
-                const corners = [
-                    { x: pos.x - r, z: pos.z - r },
-                    { x: pos.x + r, z: pos.z - r },
-                    { x: pos.x - r, z: pos.z + r },
-                    { x: pos.x + r, z: pos.z + r },
-                ];
-                for (let c of corners) {
-                    let b = getBlock(Math.floor(c.x), y, Math.floor(c.z));
-                    if (b === undefined) {
-                        ensureChunk(Math.floor(c.x), Math.floor(c.z));
-                        b = getBlock(Math.floor(c.x), y, Math.floor(c.z));
-                    }
-                    if (b !== AIR && b !== WATER && b !== TORCH) return true; // Allow walking through torches
-                }
+                const r = 0.3;
+                // OPTIMIZATION: Pre-compute floor values once
+                const y = Math.floor(pos.y - playerEyeHeight - 0.01);
+                const x0 = Math.floor(pos.x - r), x1 = Math.floor(pos.x + r);
+                const z0 = Math.floor(pos.z - r), z1 = Math.floor(pos.z + r);
+
+                // OPTIMIZATION: Unrolled loop - 4 checks
+                if (isSolidBlock(x0, y, z0)) return true;
+                if (isSolidBlock(x1, y, z0)) return true;
+                if (isSolidBlock(x0, y, z1)) return true;
+                if (isSolidBlock(x1, y, z1)) return true;
                 return false;
             }
 
@@ -6305,10 +6413,22 @@
                 moon.target.position.set(snappedX, snappedY, snappedZ);
                 moon.target.updateMatrixWorld();
                 const t = THREE.MathUtils.clamp((sunHeight + 0.1) / 0.4, 0, 1);
-                skyMaterial.uniforms.topColor.value.lerpColors(new THREE.Color(SETTINGS.nightSkyTop), new THREE.Color(SETTINGS.daySkyTop), t);
-                skyMaterial.uniforms.bottomColor.value.lerpColors(new THREE.Color(SETTINGS.nightSkyBottom), new THREE.Color(SETTINGS.daySkyBottom), t);
+
+                // OPTIMIZATION: Initialize cached colors on first use instead of creating new ones every frame
+                if (!_colorsInitialized) {
+                    _nightSkyTop = new THREE.Color(SETTINGS.nightSkyTop);
+                    _daySkyTop = new THREE.Color(SETTINGS.daySkyTop);
+                    _nightSkyBottom = new THREE.Color(SETTINGS.nightSkyBottom);
+                    _daySkyBottom = new THREE.Color(SETTINGS.daySkyBottom);
+                    _nightFogColor = new THREE.Color(SETTINGS.nightFogColor);
+                    _dayFogColor = new THREE.Color(SETTINGS.dayFogColor);
+                    _colorsInitialized = true;
+                }
+
+                skyMaterial.uniforms.topColor.value.lerpColors(_nightSkyTop, _daySkyTop, t);
+                skyMaterial.uniforms.bottomColor.value.lerpColors(_nightSkyBottom, _daySkyBottom, t);
                 skybox.position.copy(camPos);
-                if (scene.fog) scene.fog.color.lerpColors(new THREE.Color(SETTINGS.nightFogColor), new THREE.Color(SETTINGS.dayFogColor), t);
+                if (scene.fog) scene.fog.color.lerpColors(_nightFogColor, _dayFogColor, t);
             }
 
             function animate() {
@@ -6400,14 +6520,14 @@
                         playerEyeHeight = THREE.MathUtils.lerp(playerEyeHeight, isCrouching ? 1.4 : 1.8, 0.2);
 
                         for (let s = 0; s < steps; s++) {
-                            const fwd = new THREE.Vector3();
-                            controls.getDirection(fwd);
-                            fwd.y = 0;
-                            fwd.normalize();
-                            const right = new THREE.Vector3().crossVectors(fwd, new THREE.Vector3(0, 1, 0));
+                            // OPTIMIZATION: Use pre-allocated Vector3 objects instead of creating new ones
+                            controls.getDirection(_physFwd);
+                            _physFwd.y = 0;
+                            _physFwd.normalize();
+                            _physRight.crossVectors(_physFwd, _physUp);
 
-                            const dX = (fwd.x * -velocity.z + right.x * velocity.x) * stepDt;
-                            const dZ = (fwd.z * -velocity.z + right.z * velocity.x) * stepDt;
+                            const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
+                            const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
                             const dY = velocity.y * stepDt;
 
                             obj.position.x += dX;
