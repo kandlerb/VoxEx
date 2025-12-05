@@ -1,56 +1,85 @@
-# ExecPlan Guidelines for VoxEx
+# Codex Execution Plans (ExecPlans) for VoxEx (Single-File Project)
 
-This document defines what an ExecPlan is, how it should be structured, and how it must be maintained for this repository.
-Every ExecPlan is a living design+implementation document that enables a new contributor to implement a feature or refactor end‑to‑end using only the current working tree and that single ExecPlan file.
+This document defines how to write and maintain execution plans (“ExecPlans”) for this repository.
+ExecPlans are detailed, living design documents that a coding agent or human can follow to implement a feature or refactor end-to-end.
 
-## What ExecPlans are for
+This is a single-file browser-based voxel engine.
+All runtime code lives in one main source file (for example, an `index.html` with an inline `<script type="module">`, or a single `main.js`).
+ExecPlans MUST assume that all implementation changes happen inside this single file; they must never instruct the reader to create or split code into multiple source files.
 
-ExecPlans are required for complex or multi-hour tasks, including:
+If this PLANS.md file is checked into the repo, every ExecPlan must explicitly state that it is written in accordance with this document.
 
-- New systems (e.g., new terrain algorithm, biome system, multi-threaded generation pipeline).
-- Major refactors in core engine modules (e.g., chunk management, voxel meshing, rendering pipeline).
-- Performance or memory overhauls that affect multiple subsystems.
-- Features that produce clearly observable changes in the game (e.g., caves, rivers, advanced vegetation, or LOD).
+## How ExecPlans are used
 
-An ExecPlan must explain, in plain language, what new behavior the user gains and how to observe it in the running game.
-The plan must describe both design and implementation at a level where a novice can follow it safely.
+ExecPlans are required for complex, multi-step work such as:
 
-## Global requirements for ExecPlans
+- Rebuilding or significantly optimizing the chunk system (building, caching, loading).
+- Introducing new terrain/biome systems or complex rendering optimizations.
+- Large refactors that affect multiple logical regions of the main file (e.g., chunk management plus meshing plus input behavior).
+- Any change that is expected to take hours of focused work or require design exploration, prototyping, or benchmarking.
 
-Every ExecPlan in this project must:
+For small, local edits (e.g., a one-line bug fix), ExecPlans are not required, but the AGENTS.md rules still apply.
 
-- Be fully self-contained:
-  - Include all explanations, definitions, and repository orientation needed to complete the work.
-  - Avoid referring to external blogs, docs, or prior plans unless they are already checked into the repo; if they are, restate needed context.
-- Enable observable behavior:
-  - Describe what can be seen or measured after implementation (e.g., terrain differences, FPS improvements, or specific on-screen effects).
-  - Define exact commands or keybindings that demonstrate the new behavior.
-- Define all non-obvious terms:
-  - If you use terms like “chunk”, “greedy meshing”, “domain warping”, or “object pooling”, explain them in plain language and name where they are implemented (e.g., `src/core/ChunkManager.js`, `src/rendering/VoxelMesh.js`).
-- Target this repository specifically:
-  - Discuss files and modules using full repository-relative paths.
-  - Explain how new code integrates into existing architecture (core, generation, rendering, physics, utils).
-- Be a living document:
-  - Keep `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections up to date as work proceeds.
-  - Reflect every major decision and any change of direction in the plan itself.
+When implementing an ExecPlan:
 
-ExecPlans must produce working, testable outcomes, not just code that compiles.
+- Do not ask the user for “next steps”; instead, follow the plan’s milestones.
+- Keep the ExecPlan up to date as you work, particularly the living sections: Progress, Surprises & Discoveries, Decision Log, Outcomes & Retrospective.
+- Resolve ambiguities inside the plan and document your decisions before editing code.
+
+## Non-negotiable requirements
+
+Every ExecPlan in this repository MUST:
+
+1. Be self-contained and novice-friendly  
+   - Assume the reader only has:
+     - The current working tree of the repo.
+     - The single ExecPlan file itself.
+   - Explain the current relevant parts of the main code file clearly enough that a new contributor can navigate and make edits without prior knowledge.
+   - Define any non-obvious term in plain language at first use (e.g., “chunk”, “greedy meshing”, “domain warping”, “object pooling”).
+
+2. Describe observable behavior, not just code changes  
+   - Focus first on what new behavior a user gains and how to see it:
+     - For example: smoother chunk streaming, less visible pop-in, higher FPS, new terrain features, etc.
+   - Provide instructions for running the game and verifying the result visually and/or via logs or tests.
+
+3. Reflect the true state of the work  
+   - Keep the Progress checklist accurate at all times.
+   - Record all important decisions and surprising findings as they occur.
+   - Update the plan when the design changes; do not leave it out of sync with the implementation.
+
+4. Respect single-file constraints  
+   - All ExecPlans must:
+     - Refer to functions, classes, or “regions” inside the one main file (e.g., “Chunk Management section”, “Terrain Generation functions”).
+     - Never instruct the reader to:
+       - Create new `.js`, `.ts`, or `.html` files.
+       - Move code into multiple modules or packages.
+   - If the plan reorganizes code, it must do so by:
+     - Introducing new functions or classes in the same file.
+     - Grouping them under clear comment headers (e.g., `// ==== Chunk Management ====`, `// ==== Terrain Generation ====`, etc.), not by splitting files.
+
+5. Enable safe, testable, incremental progress  
+   - Describe changes in an order that keeps the project running (or quickly recoverable) after each step.
+   - Include validation steps at each major milestone, not just at the end.
 
 ## Formatting rules
 
-Each ExecPlan file under `.agent/plans/` must:
+ExecPlans are stored as Markdown files, typically under a directory such as `.agent/plans/`.
 
-- Be a single Markdown document that could be wrapped in one fenced code block labeled `md` when used inline in a chat context.
-- When stored as a `.md` file in this repo, it should contain only the Markdown content described here (no outer triple backticks).
-- Use normal Markdown headings (`#`, `##`, `###`) with two blank lines after each heading for readability.
-- Prefer prose paragraphs; lists are allowed where they clarify steps or progress, but narrative explanation comes first.
-- Use checklists only in the `Progress` section.
+Each ExecPlan MUST:
 
-Avoid nested code fences inside ExecPlans; show snippets, commands, and diffs using indentation.
+- Be a single Markdown document (no nested fenced code blocks for entire-plan embedding).
+- Use standard Markdown headings:
+  - `#`, `##`, `###` as appropriate.
+  - Two blank lines after each heading for clarity.
+- Prefer prose explanations; lists are allowed where they help (especially in Progress).
+- Use bullet or numbered lists sparingly, except in Progress (where a checklist is mandatory).
 
-## Required sections in every ExecPlan
+When an ExecPlan is embedded into a chat, it may be wrapped in a single fenced code block labeled `md`.
+When saved as a `.md` file in the repo, it must not include outer triple backticks.
 
-Every ExecPlan must contain the following sections in this order, with these exact headings:
+## Required sections of every ExecPlan
+
+Every ExecPlan must contain the following sections, in this order, with these exact headings:
 
 - `# <Short, action-oriented description>`
 - `## Purpose / Big Picture`
@@ -66,188 +95,216 @@ Every ExecPlan must contain the following sections in this order, with these exa
 - `## Artifacts and Notes`
 - `## Interfaces and Dependencies`
 
-The content inside each section is described below.
+Below is what each section must contain, adapted to this single-file voxel project.
 
 ### Purpose / Big Picture
 
-Explain in a few sentences:
+Explain, in a few sentences:
 
-- What new capability or behavior the user gets (for example, “infinite scrolling terrain with biomes and caves”, or “distant chunks render with lower LOD to keep 60 FPS”).
-- How to see it in action (what to run, where to look, what to expect on screen).
+- What new capability or behavior the user gains after this plan is implemented.
+  - Example: “Chunks now stream smoothly around the player with caching to avoid rebuild spikes.”
+- How to see it working:
+  - Which HTML file to open or which dev server command to run.
+  - What to do in the game (e.g., move quickly in different directions) and what to observe (e.g., no major frame hitches).
 
-Focus on user-visible results rather than internal details.
+This section must focus on user-visible outcomes, not just internal refactors.
 
 ### Progress
 
-Maintain a checklist of granular steps with timestamps in UTC:
+Maintain a checklist of granular steps, in chronological order.
 
-- Use `- [ ]` / `- [x]` style items.
-- Include timestamps in ISO-like format, e.g., `(2025-12-05 15:32Z)`.
-- Split partially completed tasks into “completed” vs “remaining” parts when you pause.
+- Use checkboxes:
+  - `- [x] (YYYY-MM-DD HH:MMZ) Completed step description.`
+  - `- [ ] (YYYY-MM-DD HH:MMZ) Incomplete or planned step description.`
+- Include timestamps (UTC) to track when work was done.
+- When pausing mid-task, split it into completed vs remaining parts.
 
-This section must always match the real current state of the work.
-
-Example pattern:
-
-- `[x] (2025-12-05 15:32Z) Implemented basic chunk streaming in ChunkManager.`
-- `[ ] Implement frustum culling for far chunks (completed: basic test harness; remaining: integrate into main render loop).`
+This section must accurately reflect the current state of the work at all times.
 
 ### Surprises & Discoveries
 
-Document unexpected behaviors, bugs, or performance findings.
+Capture unexpected behaviors, bugs, performance characteristics, or environment quirks uncovered while implementing the plan.
 
-For each item:
+For each entry:
 
-- Provide a brief “Observation” sentence.
-- Provide short “Evidence” with logs, benchmark numbers, or visual notes (described in words) that justify the observation.
-
-Use this section to record things like:
-
-- Noise functions that behave differently at certain scales.
-- Browser performance quirks or GPU limits for large voxel scenes.
-- Side effects of new optimizations (e.g., aggressive pooling causing stale state).
-
-### Decision Log
-
-Record each meaningful decision related to the plan.
-
-For each decision, include:
-
-- `Decision:` short description.
-- `Rationale:` why this choice was made, including trade-offs.
-- `Date/Author:` timestamp and agent identifier or name.
+- Start with `- Observation: ...`
+- Follow with `  Evidence: ...` on the next line, summarizing:
+  - Short logs, console output, FPS numbers, or visual artifacts.
+  - Enough detail so a future reader can understand what was found and why it mattered.
 
 Examples:
 
-- Choosing a chunk size of 16×64×16 instead of 32×128×32.
-- Selecting domain-warped noise instead of simple Perlin for terrain features.
-- Deciding to keep an old mesh path temporarily while a new greedy mesher is validated.
+- Discovery that a certain chunk size causes large GC pauses.
+- Realization that a noise parameter drastically changes terrain shape.
+
+### Decision Log
+
+Record every meaningful decision that could affect implementation, maintenance, or behavior.
+
+For each decision:
+
+- `- Decision: ...`
+- `  Rationale: ...`
+- `  Date/Author: ...`
+
+Examples:
+
+- Choosing chunk dimensions or render distance.
+- Selecting a particular caching strategy (e.g., keep voxel data cached but free meshes).
+- Deciding whether to use async generation patterns inside the single file.
 
 ### Outcomes & Retrospective
 
-Summarize:
+Summarize, in narrative form:
 
-- What the plan has achieved so far, especially observable behavior.
-- Any gaps or unfinished work.
-- Lessons learned that should influence future work, especially around performance and architecture.
+- What has been achieved relative to the Purpose.
+- Any gaps or partial implementations left for future work.
+- Lessons learned that should influence other plans or future contributors.
 
-Update this section at major milestones or when the plan is considered done.
+Update this section when the plan reaches major milestones or is effectively “complete”.
 
 ### Context and Orientation
 
-Write as if the reader knows nothing about the repo.
+Write this as if the reader is new to the repo and to voxel engines.
 
 Include:
 
-- A brief overview of the relevant parts of the architecture:
-  - Which core modules are involved (e.g., `src/core/ChunkManager.js`, `src/core/Scene.js`).
-  - Which generation modules participate (e.g., `src/generation/NoiseGenerator.js`, `src/generation/TerrainGenerator.js`, `src/generation/BiomeSystem.js`).
-  - Which rendering modules are affected (e.g., `src/rendering/VoxelMesh.js`, `src/rendering/InstancedVegetation.js`).
-- Definitions of key terms used in the plan (chunk, world coordinates vs chunk coordinates, greedy meshing, domain warping, object pooling, LOD, etc.).
-- A short explanation of how to run the project (install, dev server, tests) as needed for this plan.
+- A description of the current single-file structure:
+  - File name and how it is loaded (directly opened in a browser, via a dev server, etc.).
+  - Major logical regions (e.g., chunk management, terrain generation, rendering, player/input) and how they are separated in the code (comments, function naming, etc.).
+- Definitions of key terms used in the plan:
+  - “Chunk” (for example, a fixed 3D region of voxels, with given dimensions).
+  - “Voxel” (a cubic cell in the world grid).
+  - “Greedy meshing” (algorithm that merges adjacent faces to reduce geometry).
+  - “Object pooling” (reusing objects like meshes or temporary vectors to avoid repeated allocations and GC).
+  - “Domain warping”, “LOD”, or others as needed.
+- Commands or steps to run the project:
+  - For example:
+    - “Open `index.html` in a modern browser.”
+    - Or “Run `npm run dev` and open `http://localhost:5173/`.”
 
-The goal is to let a novice contributor navigate confidently and know exactly where to look.
+This section must be clear enough that someone can locate the exact parts of the single file that the plan will modify.
 
 ### Plan of Work
 
-Describe, in prose, the sequence of edits and additions.
+Describe, in prose, the overall sequence of edits and additions to the single file.
 
-For each major change:
+For each major group of changes:
 
-- Name the file(s) with full paths.
-- Name the functions or classes to update or create.
-- Describe what each change will achieve and how it moves closer to the goal.
+- Reference code by:
+  - Region header comment (if present), e.g., “In the `// ==== Chunk Management ==== ` section...”
+  - Function or class name.
+- Explain what will be changed or added and why.
 
-Keep this narrative high-level enough to read like a story (goal → work → result), but concrete enough that it unambiguously guides the next steps.
+Example content:
 
-For example:
+- “Introduce a `buildChunk(x, z)` function that uses the existing noise and biome helpers to produce voxel data for a chunk.”
+- “Refactor the existing player update loop so it calls the new `updateChunksAroundPlayer()` function that manages loading/unloading.”
 
-- “Add a `generateChunkData(chunkX, chunkZ, chunkSize, chunkHeight)` method in `src/generation/TerrainGenerator.js` that returns a typed array of voxel IDs.”
-- “Integrate `TerrainGenerator` into `src/core/ChunkManager.js` so that newly loaded chunks are filled with voxel data before being meshed.”
+Avoid excessive detail here; keep it readable as a high-level story of how the system will evolve.
 
 ### Concrete Steps
 
-Translate the Plan of Work into explicit, ordered actions.
+Translate the Plan of Work into explicit, ordered actions that an agent or human can follow step by step.
 
-Include:
+For each step:
 
-- Exact files to open and what to add or change.
-- Commands to run in the repo root (e.g., `npm run dev`, `npm test`, `npm run build`).
-- Short expected terminal output snippets or descriptions (no long transcripts).
+- Name the file (the main code file) and the specific section/function/class to edit or create.
+- Describe what code to add, remove, or refactor in enough detail that there is no ambiguity.
+- Include commands to run (if any), such as:
+  - Opening the HTML file.
+  - Running a dev server or light build/test command.
 
-This section should be detailed enough that an agent can follow it step by step with minimal interpretation.
+Where useful, provide short, indented examples of expected terminal output or log messages to confirm success.
+Avoid long transcripts.
+
+This section must be updated if the approach changes.
 
 ### Validation and Acceptance
 
-Define how to prove that the plan’s goals are met.
+Define the criteria for considering the plan’s work “done”, in terms that are observable.
 
 Include:
 
-- Exact commands to run.
-- Runtime actions (e.g., “start dev server, open the browser at `http://localhost:5173/`”).
-- What to observe visually (e.g., “new biomes appear with distinct grass and foliage; FPS remains above 60 when moving quickly through world”).
-- Any tests that should fail before the plan and pass after (name test files or test cases where possible).
+- Exact steps to run and exercise the system:
+  - Which command or file to run/open.
+  - What inputs or player actions to perform (e.g., move forward for 30 seconds, look around quickly).
+- What the user should see or measure:
+  - For example: “Chunks appear smoothly as the player moves; the frame rate does not drop below X on typical hardware; no large stutters occur when crossing chunk boundaries.”
+- Any relevant logs or debug output that signal success (e.g., limits on how many chunks are being rebuilt per second).
 
-Phrase acceptance in terms a human can verify by running the game and/or tests.
+If there are tests:
+
+- State exactly how to run them (`npm test` or similar).
+- Identify any particular test names related to this plan.
 
 ### Idempotence and Recovery
 
-Explain:
-
-- Which steps can be safely repeated (e.g., re-running generation, reapplying migrations, or replaying code transformations).
-- Any potentially risky operations and how to back up or roll back (e.g., how to revert a configuration change or feature flag).
-- How to return the repo to a clean, runnable state if an intermediate step fails.
-
-Favor additive, testable changes that can be validated incremental step by step.
-
-### Artifacts and Notes
-
-Collect the most important evidence here:
-
-- Short diff excerpts (only as much as needed to illustrate key changes).
-- Small benchmark snippets and FPS measurements.
-- Concise logs or console output that prove part of the system works.
-
-These artifacts should be reconstructible by following the plan, not something the reader must paste blindly.
-
-### Interfaces and Dependencies
-
-Define the public surface area and critical dependencies introduced or modified by this plan.
+Explain how to keep the workflow safe and repeatable.
 
 Include:
 
-- New or updated function signatures, classes, and interfaces, with file paths.
-- Description of how modules interact, such as:
-  - How `ChunkManager` calls `TerrainGenerator` and `VoxelMesh`.
-  - How `NoiseGenerator` and `BiomeSystem` are wired into terrain generation.
-  - How new rendering components integrate with the main scene and camera.
-- Any third-party libraries added, with justification and how they are used.
+- Which steps are safe to repeat (e.g., re-running a refactoring script, reloading the page, re-running small benchmarking code).
+- What to do if something goes wrong halfway:
+  - How to revert changes (e.g., `git restore`/`git reset`, undoing certain functions).
+  - How to disable partially integrated features quickly by toggling flags or comments, keeping the game loadable.
 
-Prefer stable names and clearly defined responsibilities so that future contributors can reason about the system without re-reading all implementation details.
+The goal is for someone to be able to run through the steps multiple times without corrupting the project.
 
-## Idempotent use of ExecPlans
+### Artifacts and Notes
 
-ExecPlans should be safe to revisit and continue after interruptions.
+Collect small, focused artifacts that prove progress:
 
-- A contributor should be able to:
-  - Read the ExecPlan.
-  - Sync the repo.
-  - Resume work using the `Progress` section and milestones without guessing what was done.
-- If you change direction mid-implementation:
-  - Update the `Decision Log`.
-  - Adjust `Plan of Work`, `Concrete Steps`, and `Validation and Acceptance` to match the new path.
-  - Leave a note at the bottom of the plan describing what changed and why.
+- Short code excerpts (not full file dumps) to illustrate critical interfaces or patterns.
+- Brief before/after diffs for key functions or sections.
+- Short performance measurements or FPS logs, with context (camera position, movement pattern).
 
-## Maintaining and revising ExecPlans
+These artifacts should be examples that the reader can recreate by following the steps, not things they must copy blind.
 
-When you revise an ExecPlan:
+### Interfaces and Dependencies
 
-- Ensure changes are reflected consistently in all sections that depend on them.
-- Keep the plan self-contained; do not rely on readers knowing earlier versions.
-- Record a short “Change Note” at the very bottom, specifying:
-  - The date.
-  - A one-sentence summary of the revision.
-  - The reason (e.g., new constraints discovered, different optimization strategy chosen).
+Precisely define any new or changed interfaces within the single file.
 
-ExecPlans are authoritative stories of how complex features are implemented in this voxel engine.
-Treat them as durable documentation for future maintainers, not just temporary checklists.
+This includes:
+
+- Function signatures and responsibilities:
+  - For example, `function updateChunksAroundPlayer(playerPosition) { ... }`
+  - Or `class ChunkCache { /* methods */ }`.
+- How these functions or classes interact:
+  - Which parts of the code call them.
+  - What data they expect and return.
+- Any changes to configuration constants (e.g., chunk size, render distance) and where they are defined in the file.
+- Any external libraries used or newly introduced (though, in this project, these should typically already be limited to the existing Three.js and related utilities).
+
+Prefer stable names and clear responsibilities so future plans and contributors can build on them easily.
+
+## Prototyping and parallel implementations
+
+ExecPlans may include small prototype steps when needed to de-risk approaches:
+
+- For instance, a minimal implementation of a new chunk builder or cache that logs behavior without yet replacing the main path.
+- These prototypes should be:
+  - Additive and isolatable.
+  - Clearly labeled as “prototype” in the Plan of Work and Concrete Steps.
+  - Backed by simple validation (e.g., custom logs or debug toggles).
+
+If the plan temporarily keeps old and new code paths in parallel:
+
+- Document how to validate both.
+- Describe how and when one of them will be removed safely.
+- Ensure the project remains runnable during the transition.
+
+## Revising ExecPlans
+
+ExecPlans are living documents.
+
+When an ExecPlan is revised:
+
+- Update all sections that depend on the changes (Context, Plan of Work, Concrete Steps, Validation, Interfaces, etc.).
+- Keep the plan self-contained; do not rely on knowledge of earlier versions.
+- Add a note at the bottom of the plan:
+
+  - `Change Note (YYYY-MM-DD HH:MMZ, Author): <Short description of what changed and why>.`
+
+ExecPlans should always tell the full, current story of how the feature or refactor is being implemented inside the single-file voxel engine.
+They must explain not only what is being done, but also why those decisions were made.
