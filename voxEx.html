@@ -6550,6 +6550,10 @@
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
 
+                    // OPTIMIZATION: Pre-check data format once instead of per-block
+                    const useBlocksFormat = !!centerData.blocks;
+                    const blockData = useBlocksFormat ? centerData.blocks : centerData;
+
                     // Main Generation Loop
                     for (let y = 0; y < height; y++) {
                         const yOffset = y * 256;
@@ -6557,7 +6561,7 @@
                             const zOffset = z * 16;
                             for (let x = 0; x < 16; x++) {
                                 const idx = x + zOffset + yOffset;
-                                const id = centerData.blocks ? centerData.blocks[idx] : centerData[idx];
+                                const id = blockData[idx];
                                 if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
 
                                 const wx = startX + x;
@@ -6578,9 +6582,9 @@
                                 let uvIdx = isWater ? wUvIdx : tUvIdx;
                                 let cIdx = isWater ? wCIdx : tCIdx;
 
-                                // OPTIMIZATION: Use pre-computed FACE_DIRECTIONS instead of creating array
+                                // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
                                 // UV lookup: index 0=top, 1=bottom, 2-5=side
-                                const uvLookup = [uv.top, uv.bottom, uv.side, uv.side, uv.side, uv.side];
+                                const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
 
                                 for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                     const face = FACE_DIRECTIONS[faceIdx];
@@ -6590,7 +6594,8 @@
                                     const nx = face[3];
                                     const ny = face[4];
                                     const nz = face[5];
-                                    const uvCoord = uvLookup[faceIdx];
+                                    // OPTIMIZATION: Use pre-computed UV values instead of array lookup
+                                    const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
 
                                     const nid = getLocal(lx, ly, lz);
                                     // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
@@ -6686,14 +6691,15 @@
                         }
                     }
 
-                    // Create new torches
+                    // OPTIMIZATION: Create torches - use pre-computed blockData instead of re-checking format
                     const torchArray = [];
                     for (let y = 0; y < height; y++) {
+                        const yOff = y * 256;
                         for (let z = 0; z < 16; z++) {
+                            const zOff = z * 16;
                             for (let x = 0; x < 16; x++) {
-                                const idx = x + z * 16 + y * 256;
-                                const id = centerData.blocks ? centerData.blocks[idx] : centerData[idx];
-                                if (id === TORCH) {
+                                const idx = x + zOff + yOff;
+                                if (blockData[idx] === TORCH) {
                                     const wx = startX + x;
                                     const wy = y - WORLD_DIMS.yOffset;
                                     const wz = startZ + z;
@@ -6744,9 +6750,17 @@
                 if (SETTINGS.dynamicRenderDistance) {
                     if (currentTime - renderDistanceChangeTimer > 2000) {
                         // 2s cooldown
-                        // Filter samples from last 10 seconds
-                        const recentSamples = fpsSamples.filter((s) => s.t > currentTime - 10000);
-                        const avgFPS = recentSamples.reduce((a, b) => a + b.fps, 0) / (recentSamples.length || 1);
+                        // OPTIMIZATION: Calculate average directly without filter/reduce - avoids creating temp array
+                        const cutoffTime = currentTime - 10000;
+                        let fpsSum = 0;
+                        let validCount = 0;
+                        for (let i = 0; i < fpsSamples.length; i++) {
+                            if (fpsSamples[i].t > cutoffTime) {
+                                fpsSum += fpsSamples[i].fps;
+                                validCount++;
+                            }
+                        }
+                        const avgFPS = validCount > 0 ? fpsSum / validCount : 60;
 
                         // Hysteresis Buffer (±5 FPS)
                         let newRadius = currentRenderRadius;
@@ -7373,8 +7387,23 @@
                         if (clampedDt > 0) {
                             fpsInstant = 1 / rawDt;
                             fpsSamples.push({ t: time, fps: fpsInstant });
-                            while (fpsSamples.length && fpsSamples[0].t < time - 10000) fpsSamples.shift();
-                            fpsAvg = fpsSamples.reduce((a, b) => a + b.fps, 0) / (fpsSamples.length || 1);
+
+                            // OPTIMIZATION: Remove old samples more efficiently - find first valid index instead of shift() loop
+                            const cutoff = time - 10000;
+                            let firstValid = 0;
+                            while (firstValid < fpsSamples.length && fpsSamples[firstValid].t < cutoff) {
+                                firstValid++;
+                            }
+                            if (firstValid > 0) {
+                                fpsSamples = fpsSamples.slice(firstValid);
+                            }
+
+                            // OPTIMIZATION: Calculate average using single loop instead of reduce
+                            let fpsSum = 0;
+                            for (let i = 0; i < fpsSamples.length; i++) {
+                                fpsSum += fpsSamples[i].fps;
+                            }
+                            fpsAvg = fpsSum / (fpsSamples.length || 1);
                         }
 
                         // --- PHYSICS & MOVEMENT UPDATE ---
@@ -7396,8 +7425,10 @@
                             if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
                             if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
 
-                            velocity.x *= Math.pow(0.00001, dt);
-                            velocity.z *= Math.pow(0.00001, dt);
+                            // OPTIMIZATION: Cache Math.pow result instead of calling twice
+                            const dampingFactor = Math.pow(0.00001, dt);
+                            velocity.x *= dampingFactor;
+                            velocity.z *= dampingFactor;
                             if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
                             if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
 
