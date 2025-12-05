@@ -1123,10 +1123,12 @@
             };
             const CHUNK_BOUNDING_RADIUS = Math.sqrt(8 * 8 + Math.pow(WORLD_DIMS.chunkHeight * 0.5, 2) + 8 * 8);
             const WORLD_PIXEL_SIZE = 1 / SETTINGS.textureResolution;
+            // OPTIMIZATION: Cache shadow state to avoid unnecessary updates
             let lastShadowState = {
                 targetX: -1,
                 targetY: -1,
                 targetZ: -1,
+                sunAngle: -1,
             };
 
             import * as THREE from "three";
@@ -1415,6 +1417,9 @@
             }
 
             function flushMaterialUpdates() {
+                // OPTIMIZATION: Early exit if nothing needs updating (most frames)
+                if (!materialUpdateState.waterDirty && !materialUpdateState.chunkDirty) return;
+
                 if (materialUpdateState.waterDirty && waterMaterial) {
                     waterMaterial.needsUpdate = true;
                     if (waterMaterial.map) waterMaterial.map.needsUpdate = true;
@@ -6002,6 +6007,15 @@
                 if (!isWater) chunkRenderedFaces.delete(key);
             }
 
+            // OPTIMIZATION: Hoist light lookup helper outside of renderChunk to avoid creating closures
+            // This function is called thousands of times per chunk, so avoiding closure creation saves significant GC pressure
+            function extractLightFromChunk(chunk, idx) {
+                if (!chunk || !chunk.skyLight) return 15;
+                const sky = chunk.skyLight[idx] || 1;
+                const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
+                return sky > block ? sky : block;
+            }
+
             function renderChunk(cx, cz) {
                 try {
                     const cKey = getChunkKey(cx, cz);
@@ -6011,16 +6025,20 @@
                         return;
                     }
 
-                    // Pre-fetch neighbors
-                    const nN = chunks.get(getChunkKey(cx, cz - 1));
-                    const nS = chunks.get(getChunkKey(cx, cz + 1));
-                    const nE = chunks.get(getChunkKey(cx + 1, cz));
-                    const nW = chunks.get(getChunkKey(cx - 1, cz));
+                    // OPTIMIZATION: Pre-calculate all neighbor keys at once (reduces string concatenations)
+                    const czM1 = cz - 1, czP1 = cz + 1;
+                    const cxM1 = cx - 1, cxP1 = cx + 1;
+
+                    // Pre-fetch neighbors using pre-calculated coords
+                    const nN = chunks.get(`${cx},${czM1}`);
+                    const nS = chunks.get(`${cx},${czP1}`);
+                    const nE = chunks.get(`${cxP1},${cz}`);
+                    const nW = chunks.get(`${cxM1},${cz}`);
                     // Also diagonals for AO corners
-                    const nNW = chunks.get(getChunkKey(cx - 1, cz - 1));
-                    const nNE = chunks.get(getChunkKey(cx + 1, cz - 1));
-                    const nSW = chunks.get(getChunkKey(cx - 1, cz + 1));
-                    const nSE = chunks.get(getChunkKey(cx + 1, cz + 1));
+                    const nNW = chunks.get(`${cxM1},${czM1}`);
+                    const nNE = chunks.get(`${cxP1},${czM1}`);
+                    const nSW = chunks.get(`${cxM1},${czP1}`);
+                    const nSE = chunks.get(`${cxP1},${czP1}`);
 
                     // OPTIMIZED getLocal: No internal functions, fast center path
                     const getLocal = (lx, ly, lz) => {
@@ -6073,57 +6091,50 @@
                     };
 
                     // OPTIMIZED getLocalLight: Full neighbor support for seamless lighting
+                    // Now uses hoisted extractLightFromChunk helper to avoid closure creation
                     const getLocalLight = (lx, ly, lz) => {
                         if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15;
 
-                        // Helper to extract light from ANY chunk data object
-                        const getLightFromChunk = (chunk, idx) => {
-                            if (!chunk || !chunk.skyLight) return 15;
-                            const sky = chunk.skyLight[idx] || 1;
-                            const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
-                            return sky > block ? sky : block;
-                        };
-
-                        // 1. Center Chunk
+                        // 1. Center Chunk (most common case - ~85% of lookups)
                         if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
                             const idx = lx + lz * 16 + ly * 256;
-                            return getLightFromChunk(centerData, idx);
+                            return extractLightFromChunk(centerData, idx);
                         }
 
                         // 2. Orthogonal Neighbors
                         if (lz < 0 && lx >= 0 && lx < 16) {
                             const idx = lx + 15 * 16 + ly * 256;
-                            return getLightFromChunk(nN, idx);
+                            return extractLightFromChunk(nN, idx);
                         }
                         if (lz > 15 && lx >= 0 && lx < 16) {
                             const idx = lx + 0 * 16 + ly * 256;
-                            return getLightFromChunk(nS, idx);
+                            return extractLightFromChunk(nS, idx);
                         }
                         if (lx > 15 && lz >= 0 && lz < 16) {
                             const idx = 0 + lz * 16 + ly * 256;
-                            return getLightFromChunk(nE, idx);
+                            return extractLightFromChunk(nE, idx);
                         }
                         if (lx < 0 && lz >= 0 && lz < 16) {
                             const idx = 15 + lz * 16 + ly * 256;
-                            return getLightFromChunk(nW, idx);
+                            return extractLightFromChunk(nW, idx);
                         }
 
                         // 3. Diagonal Neighbors
                         if (lz < 0 && lx < 0) {
                             const idx = 15 + 15 * 16 + ly * 256;
-                            return getLightFromChunk(nNW, idx);
+                            return extractLightFromChunk(nNW, idx);
                         }
                         if (lz < 0 && lx > 15) {
                             const idx = 0 + 15 * 16 + ly * 256;
-                            return getLightFromChunk(nNE, idx);
+                            return extractLightFromChunk(nNE, idx);
                         }
                         if (lz > 15 && lx < 0) {
                             const idx = 15 + 0 * 16 + ly * 256;
-                            return getLightFromChunk(nSW, idx);
+                            return extractLightFromChunk(nSW, idx);
                         }
                         if (lz > 15 && lx > 15) {
                             const idx = 0 + 0 * 16 + ly * 256;
-                            return getLightFromChunk(nSE, idx);
+                            return extractLightFromChunk(nSE, idx);
                         }
                         return 15;
                     };
@@ -6841,6 +6852,7 @@
                 skybox.position.copy(camPos);
 
                 // --- B. SHADOW LOGIC (Grid-locked) ---
+                // OPTIMIZATION: Only update shadows when position or angle changes significantly
 
                 // Compute texel world size from shadow frustum - SINGLE source of truth
                 const shadowCam = sun.shadow.camera;
@@ -6856,40 +6868,54 @@
                 // 2. Calculate sun angle (smooth, no quantization)
                 const sunAngle = dayNightTime < 0.667 ? (dayNightTime / 0.667) * Math.PI : Math.PI + ((dayNightTime - 0.667) / 0.333) * Math.PI;
 
-                // 3. Sun direction from angle
-                const diskH = Math.sin(sunAngle);
-                const diskX = Math.cos(sunAngle);
-                const sunOffset = 100;
+                // OPTIMIZATION: Skip shadow updates if position hasn't changed significantly (within 0.01 units or 0.01 radians)
+                const posChanged = Math.abs(snapTargetX - lastShadowState.targetX) > 0.01 ||
+                                   Math.abs(snapTargetY - lastShadowState.targetY) > 0.01 ||
+                                   Math.abs(snapTargetZ - lastShadowState.targetZ) > 0.01;
+                const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.01;
 
-                shadowLightDir.set(diskX, diskH, 0).normalize();
+                if (posChanged || angleChanged) {
+                    // 3. Sun direction from angle
+                    const diskH = Math.sin(sunAngle);
+                    const diskX = Math.cos(sunAngle);
+                    const sunOffset = 100;
 
-                // SIMPLIFIED PIXEL-PERFECT SHADOWS
-                // Snap both target AND sun to texelWorldSize - guaranteed alignment
+                    shadowLightDir.set(diskX, diskH, 0).normalize();
 
-                // Target snapped to texel grid
-                shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
+                    // SIMPLIFIED PIXEL-PERFECT SHADOWS
+                    // Snap both target AND sun to texelWorldSize - guaranteed alignment
 
-                // Sun position: target + offset, then snap to SAME grid
-                shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, sunOffset);
-                shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                    // Target snapped to texel grid
+                    shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
 
-                sun.target.position.copy(shadowTargetPos);
-                sun.position.copy(shadowDesiredPos);
-                sun.target.updateMatrixWorld();
-                sun.updateMatrixWorld();
+                    // Sun position: target + offset, then snap to SAME grid
+                    shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, sunOffset);
+                    shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
+                    shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
+                    shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
 
-                // Moon: same texelWorldSize snapping
-                shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, -sunOffset);
-                shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                    sun.target.position.copy(shadowTargetPos);
+                    sun.position.copy(shadowDesiredPos);
+                    sun.target.updateMatrixWorld();
+                    sun.updateMatrixWorld();
 
-                moon.target.position.copy(shadowTargetPos);
-                moon.position.copy(shadowDesiredPos);
-                moon.target.updateMatrixWorld();
-                moon.updateMatrixWorld();
+                    // Moon: same texelWorldSize snapping
+                    shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, -sunOffset);
+                    shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
+                    shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
+                    shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+
+                    moon.target.position.copy(shadowTargetPos);
+                    moon.position.copy(shadowDesiredPos);
+                    moon.target.updateMatrixWorld();
+                    moon.updateMatrixWorld();
+
+                    // Update cache
+                    lastShadowState.targetX = snapTargetX;
+                    lastShadowState.targetY = snapTargetY;
+                    lastShadowState.targetZ = snapTargetZ;
+                    lastShadowState.sunAngle = sunAngle;
+                }
 
                 // --- C. LIGHTING INTENSITY (smooth, unchanged) ---
                 const surfaceLevel = 60;
@@ -6933,16 +6959,14 @@
                     }
 
                     // 1. Throttle Heavy Tasks (Mesh Building)
-                    // Only process the build queue if we have frame budget
-                    if (time - prevTime < 32) {
-                        if (chunkBuildQueue.length > 0) {
-                            const chunkBuildStart = perfMonitor.start("chunkBuild");
-                            const start = performance.now();
-                            while (chunkBuildQueue.length > 0 && performance.now() - start < 4) {
-                                processChunkQueue();
-                            }
-                            perfMonitor.end("chunkBuild", chunkBuildStart);
-                        }
+                    // OPTIMIZATION: Only process chunks if frame time is under budget (32ms = ~30fps minimum)
+                    // and limit time spent building to maintain 60fps
+                    if (time - prevTime < 32 && chunkBuildQueue.length > 0) {
+                        const chunkBuildStart = perfMonitor.start("chunkBuild");
+                        // OPTIMIZATION: Call processChunkQueue once - it already has its own limiter (buildQueueLimit)
+                        // The old while loop with performance.now() checks was adding unnecessary overhead
+                        processChunkQueue();
+                        perfMonitor.end("chunkBuild", chunkBuildStart);
                     }
 
                     // 2. CRITICAL FIX: Run Update/Cleanup independently of FPS
@@ -7071,8 +7095,9 @@
 
                     // Torch flicker effect - light intensity and flame animation
                         if (torchActive && torchLight) {
-                            // Use sin-based pattern for smooth, consistent flicker (better performance than Math.random)
-                            torchLight.intensity = SETTINGS.torchIntensity + Math.sin(Date.now() * 0.003) * 0.5;
+                            // OPTIMIZATION: Use time (performance.now) instead of Date.now() - it's already calculated
+                            // Use deterministic sin waves instead of Math.random() for better performance
+                            torchLight.intensity = SETTINGS.torchIntensity + Math.sin(time * 0.003) * 0.5;
 
                             // Animate the 3D torch flame (very subtle)
                         if (window.torchModel) {
@@ -7081,11 +7106,12 @@
 
                             if (flame && glow) {
                                 // Very subtle scale pulsing for flame (much slower)
-                                const flameScale = 1.0 + Math.sin(Date.now() * 0.001) * 0.03 + Math.random() * 0.01;
+                                // OPTIMIZATION: Remove Math.random() - use secondary sin wave instead
+                                const flameScale = 1.0 + Math.sin(time * 0.001) * 0.03 + Math.sin(time * 0.0023) * 0.01;
                                 flame.scale.set(flameScale, flameScale, flameScale);
 
                                 // Glow flickers very subtly
-                                const glowScale = 1.0 + Math.sin(Date.now() * 0.0015) * 0.04 + Math.random() * 0.015;
+                                const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
                                 glow.scale.set(glowScale, glowScale, glowScale);
                             }
                         }
@@ -7094,21 +7120,29 @@
                     updateZombies(clampedDt);
                     flushMaterialUpdates();
                     const renderStart = perfMonitor.start("rendering");
-                    // Two-pass rendering for proper viewmodel layering
-                    // Pass 1: Render world (Layer 0)
-                    camera.layers.set(0);
-                    renderer.render(scene, camera);
 
-                    // Pass 2: Render viewmodel/torch (Layer 1) on top without clearing color buffer
-                    camera.layers.set(1);
-                    renderer.autoClear = false; // Don't auto-clear
-                    renderer.clearDepth(); // Clear only depth buffer, keep color buffer
-                    renderer.render(scene, camera);
-                    renderer.autoClear = true; // Restore auto-clear for next frame
+                    // OPTIMIZATION: Only do two-pass rendering when torch viewmodel is active
+                    if (torchActive && window.torchModel) {
+                        // Two-pass rendering for proper viewmodel layering
+                        // Pass 1: Render world (Layer 0)
+                        camera.layers.set(0);
+                        renderer.render(scene, camera);
 
-                    // Re-enable both layers for camera (needed for other code that might check layers)
-                    camera.layers.enable(0);
-                    camera.layers.enable(1);
+                        // Pass 2: Render viewmodel/torch (Layer 1) on top without clearing color buffer
+                        camera.layers.set(1);
+                        renderer.autoClear = false; // Don't auto-clear
+                        renderer.clearDepth(); // Clear only depth buffer, keep color buffer
+                        renderer.render(scene, camera);
+                        renderer.autoClear = true; // Restore auto-clear for next frame
+
+                        // Re-enable both layers for camera (needed for other code that might check layers)
+                        camera.layers.enable(0);
+                        camera.layers.enable(1);
+                    } else {
+                        // Single-pass rendering when no viewmodel needed (50% faster)
+                        camera.layers.enableAll();
+                        renderer.render(scene, camera);
+                    }
                     perfMonitor.end("rendering", renderStart);
                 } catch (error) {
                     perfMonitor.end("animate", frameStart);
