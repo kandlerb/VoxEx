@@ -1,213 +1,110 @@
-# AGENTS.md - VoxEx AI Assistant Guide
+# Project AGENTS.md for VoxEx
 
-## Project Overview
+This file defines how AI coding agents and contributors should work in this repository.
+It focuses on: the tech stack, code conventions for a browser-based voxel engine, and how to use ExecPlans for complex work.
 
-**VoxEx** is a fully-featured, browser-based voxel exploration game inspired by Minecraft. It's a single-file HTML application that runs entirely in the browser without requiring external servers or installations.
+## Tech stack and project goals
 
-**Key Characteristics:**
-- **Type**: Browser-based 3D voxel game engine
-- **Platform**: HTML5 + JavaScript ES6 modules
-- **Main File**: `voxEx.html` (single file - no exceptions)
-- **Architecture**: Self-contained single-page application
-- **Tech Stack**: Three.js r160, WebGL, IndexedDB, LocalStorage
+This project is a 3D voxel game/engine running in the browser using modern JavaScript or TypeScript, ES modules, and Three.js for rendering.
+The game world is chunk-based and procedurally generated, with systems for terrain generation, biomes, voxel meshing, pooling, and instanced rendering organized into modular classes under `src/`. 
 
-## Project Priorities
+Prefer the following structure when adding or modifying systems:
 
-These are the core principles that guide all development decisions:
+- `src/core/` for orchestration and high-level engine modules, e.g.:
+  - `Scene.js` – scene setup, main loop, render loop binding.
+  - `ChunkManager.js` – chunk loading/unloading, world-to-chunk mapping, and player-driven streaming.
+- `src/generation/` for procedural generation and world logic:
+  - `NoiseGenerator.js` – multi-layer noise, domain warping utilities.
+  - `TerrainGenerator.js` – chunk voxel data generation using layered noise and biome data.
+  - `BiomeSystem.js` – biome selection and block composition rules.
+- `src/rendering/` for meshes, materials, and visual optimizations:
+  - `VoxelMesh.js` – greedy meshing over chunk voxel data into optimized `BufferGeometry`.
+  - `InstancedVegetation.js` and similar – instanced meshes for repeated details like grass or foliage.
+  - `MaterialManager.js`, `MeshOptimizer.js` – texture atlases, culling, and draw‑call reduction utilities.
+- `src/physics/` for movement and collisions:
+  - `PlayerController.js` – input, camera, and movement controls.
+  - `CollisionDetector.js` – voxel-based collision checks.
+- `src/utils/` for reusable helpers:
+  - `ObjectPool.js` – reusable object management for meshes and helper objects.
+  - `Constants.js` – shared configuration (chunk size, heights, render distance, etc).
 
-1. **One File to Rule Them All**
-   - The entire game runs from a single HTML file
-   - All CSS, JavaScript, and assets are embedded
-   - This principle is sacred and will never change
-   - No external dependencies, scripts, or resources
+Follow ES module style (`export default class ...` or named exports) and keep each module focused on a single responsibility.
 
-2. **No Circles. Ever. Only Squares (Voxels)**
-   - Everything is made of cubes/boxes
-   - Procedurally generated pixel art textures (16×16)
-   - Minecraft-inspired aesthetic with pure voxel geometry
-   - BoxGeometry for all 3D objects (blocks, torch, etc.)
+## Code style and quality expectations
 
-3. **Optimized to Run on [Almost] Any Device**
-   - Performance-first design with aggressive optimization
-   - Typed arrays (Float32Array, Uint8Array) for memory efficiency
-   - Object pooling for geometries to reduce GC pressure
-   - Face culling and frustum culling to minimize draw calls
-   - RLE compression for chunk storage
-   - Targets 60fps on mid-range hardware
+- Use ES modules everywhere. Do not introduce CommonJS or global script tags.
+- Prefer classes or small focused functions per file; avoid “god objects” that mix generation, rendering, and input logic.
+- Always respect performance constraints for WebGL and the browser main thread:
+  - Use chunked voxel storage and meshing; never create one mesh per block.
+  - Prefer `BufferGeometry` over legacy geometries.
+  - Use greedy meshing, frustum culling, and LOD where appropriate.
+  - Use object pooling for frequently created / destroyed objects like chunks and temporary matrices.
+- Keep APIs clear and typed where possible (TypeScript or JSDoc) for engine-facing modules.
+- When adding new dependencies, prefer small, browser‑friendly libraries and document why they are needed.
 
-4. **Flexible Settings and User Preferences**
-   - Configurable render distance (4-32 chunks)
-   - Graphics options: AO, shadows, fog, frustum culling
-   - Movement options: sprint speed, fly speed
-   - Customizable controls
-   - Multiple save slots with unique seeds
-   - All settings persist via LocalStorage
+## ExecPlans
 
-## Repository Structure
+ExecPlans are structured design+implementation documents used for non-trivial work, such as:
 
-```
-VoxEx/
-├── .git/              # Git repository data
-├── voxEx.html         # Complete application (HTML + CSS + JS)
-└── CLAUDE.md          # This file
-```
+- Adding or refactoring a core engine system (e.g., a new terrain pipeline, LOD system, or physics overhaul).
+- Significant performance changes that affect rendering, meshing, or generation.
+- Features that span multiple subsystems (e.g., new biome system touching generation, rendering, and save/load).
 
+ExecPlans are stored under:
 
-## Technology Stack
+- `.agent/plans/<short-feature-name>.md`
 
-| Technology | Version | Purpose |
-|------------|---------|---------|
-| **Three.js** | 0.160.0 | 3D rendering, lighting, camera control |
-| **PointerLockControls** | Three.js addon | First-person camera/input control |
-| **IndexedDB** | Native browser API | Chunk data persistence with RLE compression |
-| **LocalStorage** | Native browser API | Game saves and settings storage |
-| **Canvas API** | Native | Procedural texture generation (Atlas) |
-| **WebGL** | Via Three.js | GPU-accelerated rendering |
+ExecPlans must follow the rules and section layout defined in `.agent/PLANS.md`.
+They should be written so that a new contributor, with only the current repository and that single ExecPlan file, can implement the feature end‑to‑end.
 
-## Architecture Overview
+### When to create or update an ExecPlan
 
-VoxEx Architecture: 
+Create or update an ExecPlan when:
 
-```
-┌─────────────────────────────────────────────────────────────┐ 
-│ UI Layer (HTML/CSS)                                         │ 
-│ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │ 
-│ - Menus: Start, Pause, Settings, Controls, Seed Selection   │ 
-└───────────────┬─────────────────────────────────────────────┘ 
-                ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Game Engine (Three.js Renderer)                             │
-│ - Camera (First Person), Lighting (Day/Night), Skybox       │
-│ - Voxel Torch Model (BoxGeometry)                           │
-└───────────────┬─────────────────────────────────────────────┘
-                ↓
-┌─────────────────────────────────────────────────────────────┐
-│ World Management System                                     │
-│ ├─ Chunk Generation (16x16x128)                             │
-│ ├─ Biome System (Plains, Hills, Forest, Mountain, Swamp)    │
-│ ├─ Structure Generation (Trees, Caves, Rivers)              │
-│ └─ Block Logic (Optimized Face Culling, AO)                 │
-└───────────────┬─────────────────────────────────────────────┘
-                ↓ 
-┌─────────────────────────────────────────────────────────────┐
-│ Data Persistence Layer                                      │
-│ ├─ IndexedDB (Chunk Cache with RLE Compression)             │
-│ ├─ LocalStorage (Game Saves & Settings)                     │
-└─────────────────────────────────────────────────────────────┘
+- A change will touch more than one major module (e.g., `ChunkManager`, `TerrainGenerator`, and `VoxelMesh` together).
+- A change is expected to take more than one focused coding session or requires careful research or prototyping.
+- A refactor may temporarily require dual code paths (e.g., old and new mesh builders in parallel).
 
-```
-## Version History & Features
+Do not use an ExecPlan for very small, local changes (e.g., fixing a small bug in `NoiseGenerator`, or tweaking a single shader parameter).
 
-**v3.300+ (Current) - Lighting System & Torch Overhaul**
-- **Minecraft-Style Light Levels**: Per-block light system (1-12 range)
-  - Vertical sunlight propagation from sky downward
-  - Horizontal light spreading with natural falloff
-  - Semi-transparent leaves (reduce light by 1 per layer)
-  - Dynamic recalculation when blocks placed/broken
-- **3D Torch Viewmodel**: FPS-style torch rendering
-  - Attached to camera on separate rendering layer
-  - Uses depthTest: false to prevent clipping through walls
-  - Animated flame with flickering effect
-  - Behaves like CoD/Minecraft weapon rendering
-- **Chunk Structure Update**: Changed from Uint8Array to {blocks, skyLight, blockLight}
-- **Camera Clipping Fix**: Near plane adjusted to 0.01 for close-range rendering
-- **Compression Update**: ChunkCompressor handles new light data format with RLE
-- **Bug Fixes**: Block selection, duplicate variable declarations, tree lighting
+### How agents should use ExecPlans
 
-**v3.300 - UI Polish Update**
-- Flight Indicator, Movement Indicators (Sprint/Crouch)
-- Block Name Display above hotbar
-- Mouse wheel hotbar scrolling
-- Texture bleeding fixed (1/12 atlas)
+When asked to implement a complex feature or refactor:
 
-**v3.204 - Previous Major Release**
-- Dynamic render distance, Chunk compression, Pre-generation
+1. If no suitable ExecPlan exists:
+   - Create a new file under `.agent/plans/` using the format and headings prescribed in `.agent/PLANS.md`.
+   - Fill out all sections before significant coding work, including context, plan of work, validation, and progress checklist.
+2. If an ExecPlan already exists:
+   - Read it fully.
+   - Follow the milestones and concrete steps in order, updating the `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections as work proceeds.
+3. Do not ask the user for “next steps” when executing an ExecPlan.
+   - Instead, continue to the next milestone or step already described in the plan.
+   - If ambiguities appear, resolve them inside the plan (and document the decision) before changing code.
 
-## Key Systems Explained
+### Repository commands and assumptions
 
-### Chunk System
-- **Size**: 16×16×128 blocks.
-- **Structure**: `{blocks: Uint8Array, skyLight: Uint8Array, blockLight: Uint8Array}`
-- **Rendering**: Geometries are pooled (Float32Array) and batched per chunk.
-- **Optimization**: Hidden faces culled; Ambient Occlusion (AO) baked into vertex colors.
-- **Backward Compatibility**: Supports both old (Uint8Array) and new (object) formats.
+Unless told otherwise:
 
-### Lighting System
-- **Light Levels**: 1-15 range (1 = minimum visibility, 15 = full sunlight)
-- **Vertical Propagation**: Sunlight (15) travels down from sky, reduced by 1 per solid block
-- **Horizontal Spreading**: Light spreads to neighbors in all 6 directions, -1 per block
-- **Semi-Transparent Blocks**: Leaves reduce light by 1 instead of blocking completely
-- **Vertex Colors**: Light levels multiplied by AO, applied as vertex colors during rendering
-- **Dynamic Updates**: Light recalculated automatically when blocks change
-- **Minimum Light**: Never drops to 0 - always at least 1 (0 is absence of light, never used)
-- **Formula**: `vertexColor = AO × (lightLevel / 15.0)`
+- Install dependencies with `npm install` or `pnpm install` at the project root.
+- Start the dev server with `npm run dev` (or the script configured in `package.json`).
+- Run tests with `npm test` or the configured test script.
 
-### Rendering System
-- **Textures**: Procedurally generated 16x16 pixel art on a canvas (Atlas size: 12 tiles).
-- **Materials**: Lambert material for terrain; Transparent material for water.
-- **Fog**: Custom cylindrical fog shader for smooth horizon blending.
-- **Layers**: Layer 0 (world geometry), Layer 1 (viewmodels like torch).
-- **Camera**: Near plane 0.01, far plane 800, FOV 75° (80° when sprinting).
+ExecPlans must explicitly state which commands to run for validation, including expected visible behavior (e.g., “start dev server and visit a specific URL; you should see generated terrain with X behavior”).
 
-### Torch Viewmodel
-- **Type**: 3D voxel model (stick + flame + glow) using BoxGeometry
-- **Materials**: MeshLambertMaterial with emissive properties for shading/AO
-- **Structure**:
-  - Stick (0.04×0.25×0.04) - brown wood voxel
-  - Flame (0.06×0.08×0.06) - orange voxel with 0.5 emissive
-  - Glow (0.04×0.04×0.04) - yellow center, positioned inside flame at (0, 0.165, 0)
-- **Rendering**: Layer 1 with `depthTest: false` and `renderOrder: 1000`
-- **Position**: Attached to camera at (0.35, -0.35, -0.6) with -0.3 rad tilt
-- **Animation**: Very subtle scale pulsing (0.001-0.0015 frequency, 0.03-0.04 amplitude)
-- **Light Range**: 75 units (3x normal range) for extended illumination
-- **Result**: Never clips through world geometry (FPS viewmodel technique)
+## Folder-specific behavior for agents
 
-### Persistence
-- **RLE Compression**: Chunk data (blocks + light) is Run-Length Encoded before storing.
-- **Format Version**: v2 includes separate compressed arrays for blocks, skyLight, blockLight.
-- **Save Format**: JSON containing Seed, Player Pos/Rot, and RLE-compressed modified chunks.
-- **Backward Compatibility**: Decompressor handles both v1 (old) and v2 (new) formats.
+- For files under `src/generation/`:
+  - Prioritize clarity of math and noise composition; document constants like octaves, persistence, and lacunarity in comments.
+  - Keep noise modules deterministic via seeds and avoid hard-coding randomness in generation logic.
+- For files under `src/rendering/`:
+  - Favor batching and instancing; minimize material and draw-call counts.
+  - Keep shader-related code and material setup centralized in dedicated modules (e.g., `MaterialManager`).
+- For files under `src/core/`:
+  - Preserve a clean separation between orchestration (scene setup, loop) and feature modules (generation, rendering, input).
+  - Add new high-level integrations via composition rather than large monolithic changes.
 
-## Naming Conventions
-- `cx, cz`: Chunk coordinates.
-- `lx, ly, lz`: Local block coordinates (0-15).
-- `gx, gy, gz`: Global block coordinates.
-- `getChunkKey(cx, cz)`: Returns string `"cx,cz"`.
+## Summary for agents
 
-## Development Guidelines
-
-### When Modifying `voxEx.html`:
-1. **Single File Rule**: ALL code stays in this ONE file - CSS, HTML, and JavaScript.
-2. **Texture Atlas**: If adding blocks, update `TOTAL_TILES` in `initBlockOptimization` and `initTextures`. Current count: **12**.
-3. **UI Overlay**: UI elements are toggled via `controls.lock`/`unlock` events to hide during menus.
-4. **Light System**: When changing blocks, always call `calculateChunkSunlight()` to update lighting.
-5. **Chunk Format**: Use `chunk.blocks`, `chunk.skyLight`, `chunk.blockLight` (with backward compatibility checks).
-6. **Voxel Aesthetic**: Use BoxGeometry only - no spheres, cylinders, or curved geometry.
-
-### Common Search Patterns
-- **Config**: `const WORLD_CONFIG`, `const SETTINGS`
-- **Block Types**: `const AIR`, `const GRASS`, `const LEAVES`
-- **Gen**: `function generateChunkData`, `function calculateChunkSunlight`
-- **Render**: `function renderChunk`, `function addFace`
-- **Light**: `function getSkyLight`, `function setSkyLight`, `getLocalLight`
-- **Input**: `function onKeyDown`, `function onMouseWheel`
-- **Compression**: `ChunkCompressor.compress`, `ChunkCompressor.decompress`
-
-### Light Level Reference
-- **15**: Full sunlight (directly exposed to sky)
-- **14**: 1 block from sun (under 1 leaf layer)
-- **12-13**: Under tree canopy (2-3 leaf layers)
-- **8-11**: Medium shade or cave opening
-- **4-7**: Deep shade
-- **2-3**: Deep cave
-- **1**: Minimum light (always faintly visible - 0 never used)
-
-### Performance Tips
-- Prefer typed arrays (Uint8Array, Float32Array) over regular arrays
-- Use object pooling for frequently created geometries
-- Batch chunk updates with `scheduleChunkUpdate()` to avoid redundant rebuilds
-- Keep render distance reasonable (8-16 chunks for most devices)
-
----
-**Last Updated**: 2025-12-02
-**File Version**: v3.300+
+- Use ExecPlans for substantial work and follow `.agent/PLANS.md`.
+- Keep code modular, chunk-based, and performance-aware, respecting existing architecture.
+- Always provide observable validation steps (visual changes in the running game or passing tests) for any non-trivial change.
