@@ -1333,6 +1333,9 @@
             window.perfMonitor = perfMonitor;
 
             let prevTime = performance.now();
+            let physicsAccumulator = 0;
+            const FIXED_TIME_STEP = 1 / 60;
+            const MAX_PHYSICS_STEPS = 5;
             let frameCount = 0;
             let playerEyeHeight = 1.8;
 
@@ -6540,10 +6543,15 @@
                 try {
                     const time = performance.now();
                     const rawDt = (time - prevTime) / 1000; // Calculate delta time early
+                    const clampedDt = Math.min(rawDt, 0.1);
+                    physicsAccumulator = Math.min(
+                        physicsAccumulator + clampedDt,
+                        FIXED_TIME_STEP * MAX_PHYSICS_STEPS
+                    );
 
                     // --- Block breaking logic ---
                     if (breakingBlock && controls.isLocked) {
-                        breakProgress += rawDt / BREAK_TIME;
+                        breakProgress += clampedDt / BREAK_TIME;
                         if (breakProgress >= 1.0) {
                             setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR);
                             updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z);
@@ -6578,12 +6586,9 @@
                     frameCount++;
 
                     if (controls.isLocked) {
-                        const dt = Math.min(rawDt, 0.1);
+                        updateDayNight(clampedDt);
 
-                        updateDayNight(dt);
-                        prevTime = time; // Update prevTime here for physics calc
-
-                        if (dt > 0) {
+                        if (clampedDt > 0) {
                             fpsInstant = 1 / rawDt;
                             fpsSamples.push({ t: time, fps: fpsInstant });
                             while (fpsSamples.length && fpsSamples[0].t < time - 10000) fpsSamples.shift();
@@ -6592,75 +6597,82 @@
 
                         // --- PHYSICS & MOVEMENT UPDATE ---
                         const physicsStart = perfMonitor.start("physics");
-                        // ... (Keep existing physics code exactly as is) ...
-                        const inputSpeed =
-                            SETTINGS.playerSpeed *
-                            (isFlying ? SETTINGS.flySpeedMultiplier : isCrouching ? SETTINGS.crouchMultiplier : isSprinting ? SETTINGS.sprintMultiplier : 1.0);
-                        direction.z = Number(moveForward) - Number(moveBackward);
-                        direction.x = Number(moveLeft) - Number(moveRight);
-                        direction.normalize();
+                        let physicsSteps = 0;
 
-                        if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
-                        if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
+                        while (physicsAccumulator >= FIXED_TIME_STEP && physicsSteps < MAX_PHYSICS_STEPS) {
+                            physicsAccumulator -= FIXED_TIME_STEP;
+                            physicsSteps++;
 
-                        velocity.x *= Math.pow(0.00001, dt);
-                        velocity.z *= Math.pow(0.00001, dt);
-                        if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
-                        if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
+                            const dt = FIXED_TIME_STEP;
+                            const inputSpeed =
+                                SETTINGS.playerSpeed *
+                                (isFlying ? SETTINGS.flySpeedMultiplier : isCrouching ? SETTINGS.crouchMultiplier : isSprinting ? SETTINGS.sprintMultiplier : 1.0);
+                            direction.z = Number(moveForward) - Number(moveBackward);
+                            direction.x = Number(moveLeft) - Number(moveRight);
+                            direction.normalize();
 
-                        if (isFlying) {
-                            velocity.y = 0;
-                            if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25;
-                            if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25;
-                        } else {
-                            velocity.y -= SETTINGS.gravity * dt;
-                        }
+                            if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
+                            if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
 
-                        const steps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
-                        const stepDt = dt / steps;
+                            velocity.x *= Math.pow(0.00001, dt);
+                            velocity.z *= Math.pow(0.00001, dt);
+                            if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
+                            if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
 
-                        const obj = controls.getObject();
-                        playerEyeHeight = THREE.MathUtils.lerp(playerEyeHeight, isCrouching ? 1.4 : 1.8, 0.2);
-
-                        for (let s = 0; s < steps; s++) {
-                            // OPTIMIZATION: Use pre-allocated Vector3 objects instead of creating new ones
-                            controls.getDirection(_physFwd);
-                            _physFwd.y = 0;
-                            _physFwd.normalize();
-                            _physRight.crossVectors(_physFwd, _physUp);
-
-                            const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
-                            const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
-                            const dY = velocity.y * stepDt;
-
-                            obj.position.x += dX;
-                            if (collide(obj.position)) obj.position.x -= dX;
-
-                            obj.position.z += dZ;
-                            if (collide(obj.position)) obj.position.z -= dZ;
-
-                            obj.position.y += dY;
-                            if (collide(obj.position)) {
-                                obj.position.y -= dY;
+                            if (isFlying) {
                                 velocity.y = 0;
+                                if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25;
+                                if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25;
+                            } else {
+                                velocity.y -= SETTINGS.gravity * dt;
                             }
 
-                            if (!isFlying) {
-                                if (velocity.y <= 0 && checkGround(obj.position)) {
-                                    canJump = true;
+                            const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
+                            const stepDt = dt / collisionSteps;
+
+                            const obj = controls.getObject();
+                            playerEyeHeight = THREE.MathUtils.lerp(playerEyeHeight, isCrouching ? 1.4 : 1.8, 0.2);
+
+                            for (let s = 0; s < collisionSteps; s++) {
+                                // OPTIMIZATION: Use pre-allocated Vector3 objects instead of creating new ones
+                                controls.getDirection(_physFwd);
+                                _physFwd.y = 0;
+                                _physFwd.normalize();
+                                _physRight.crossVectors(_physFwd, _physUp);
+
+                                const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
+                                const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
+                                const dY = velocity.y * stepDt;
+
+                                obj.position.x += dX;
+                                if (collide(obj.position)) obj.position.x -= dX;
+
+                                obj.position.z += dZ;
+                                if (collide(obj.position)) obj.position.z -= dZ;
+
+                                obj.position.y += dY;
+                                if (collide(obj.position)) {
+                                    obj.position.y -= dY;
                                     velocity.y = 0;
-                                    const currentFeet = obj.position.y - playerEyeHeight;
-                                    const groundBlockY = Math.floor(currentFeet - 0.001);
-                                    if (Math.abs(currentFeet - (groundBlockY + 1)) < 0.25) {
-                                        obj.position.y = groundBlockY + 1 + playerEyeHeight;
-                                    }
-                                    if (spacePressed) {
-                                        velocity.y = SETTINGS.jumpForce;
+                                }
+
+                                if (!isFlying) {
+                                    if (velocity.y <= 0 && checkGround(obj.position)) {
+                                        canJump = true;
+                                        velocity.y = 0;
+                                        const currentFeet = obj.position.y - playerEyeHeight;
+                                        const groundBlockY = Math.floor(currentFeet - 0.001);
+                                        if (Math.abs(currentFeet - (groundBlockY + 1)) < 0.25) {
+                                            obj.position.y = groundBlockY + 1 + playerEyeHeight;
+                                        }
+                                        if (spacePressed) {
+                                            velocity.y = SETTINGS.jumpForce;
+                                            canJump = false;
+                                            obj.position.y += 0.02;
+                                        }
+                                    } else {
                                         canJump = false;
-                                        obj.position.y += 0.02;
                                     }
-                                } else {
-                                    canJump = false;
                                 }
                             }
                         }
@@ -6668,7 +6680,10 @@
                         perfMonitor.end("physics", physicsStart);
                     } else {
                         prevTime = performance.now();
+                        physicsAccumulator = 0;
                     }
+
+                    prevTime = time;
 
                     if (isDebug) updateDebugInfo(fpsInstant, fpsAvg);
 
