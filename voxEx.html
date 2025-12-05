@@ -1121,6 +1121,7 @@
                 seaLevel: 60,
                 worldHeight: 128,
             };
+            const CHUNK_BOUNDING_RADIUS = Math.sqrt(8 * 8 + Math.pow(WORLD_DIMS.chunkHeight * 0.5, 2) + 8 * 8);
             const WORLD_PIXEL_SIZE = 1 / SETTINGS.textureResolution;
             let lastShadowState = {
                 targetX: -1,
@@ -1133,8 +1134,12 @@
 
             let currentRenderRadius = SETTINGS.renderDistance;
             let fogFar;
+            let lastFogFar = -1;
             const velocity = new THREE.Vector3();
             const direction = new THREE.Vector3();
+
+            // Reusable vectors to avoid per-frame allocations
+            const cameraDirTmp = new THREE.Vector3();
 
             // Reusable vectors for shadow calculations (reduce GC pressure)
             const shadowLightDir = new THREE.Vector3();
@@ -1382,6 +1387,10 @@
             const pendingChunkUpdates = new Set(); // Debounced Chunk Update System
             let updateTimeout = null; // Debounced Chunk Update System
 
+            // --- RENDERING RESOURCE POOLS ---
+            const terrainMeshPool = [];
+            const waterMeshPool = [];
+
             // --- OPTIMIZATION: Modified Chunk Tracking ---
             const modifiedChunks = new Set(); // Tracks chunks modified by player (block place/break)
             const pristineChunks = new Set(); // Tracks unmodified generated chunks (can be safely discarded)
@@ -1539,21 +1548,11 @@
                         const [c, z] = k.split(",").map(Number);
 
                         // Remove BOTH terrain and water meshes if they exist
-                        if (chunkMeshes.has(k)) {
-                            const m = chunkMeshes.get(k);
-                            scene.remove(m);
-                            if (m.geometry) m.geometry.dispose();
-                            chunkMeshes.delete(k);
-                        }
+                        releaseMeshForKey(k);
 
                         // Also remove water mesh
                         const waterKey = k + "_WATER";
-                        if (chunkMeshes.has(waterKey)) {
-                            const waterMesh = chunkMeshes.get(waterKey);
-                            scene.remove(waterMesh);
-                            if (waterMesh.geometry) waterMesh.geometry.dispose();
-                            chunkMeshes.delete(waterKey);
-                        }
+                        releaseMeshForKey(waterKey);
 
                         // Add to the async build queue instead of rebuilding immediately
                         if (!queuedChunkKeys.has(k)) {
@@ -2020,12 +2019,7 @@
                 const chunksToRebuild = [...activeChunks];
                 for (const key of chunksToRebuild) {
                     // Dispose and remove old mesh
-                    const oldMesh = chunkMeshes.get(key);
-                    if (oldMesh) {
-                        if (oldMesh.geometry) oldMesh.geometry.dispose();
-                        scene.remove(oldMesh);
-                        chunkMeshes.delete(key);
-                    }
+                    releaseMeshForKey(key);
                     // Add to build queue to be re-rendered with new settings
                     const [cx, cz] = key.split(",").map(Number);
                     if (!chunkBuildQueue.some((q) => q.key === key)) {
@@ -2208,11 +2202,9 @@
                     activeChunks.clear();
                     // modifiedChunks.clear(); // Uncomment if you have this variable
 
-                    for (const mesh of chunkMeshes.values()) {
-                        scene.remove(mesh);
-                        if (mesh.geometry) mesh.geometry.dispose();
+                    for (const key of Array.from(chunkMeshes.keys())) {
+                        releaseMeshForKey(key);
                     }
-                    chunkMeshes.clear();
                     chunkRenderedFaces.clear();
                     lastChunkUpdate = -Infinity; // Force refresh
                 }
@@ -2938,6 +2930,7 @@
                             currentRenderRadius = val;
                             // Update fog immediately for feedback
                             fogFar = currentRenderRadius * WORLD_DIMS.chunkSize;
+                            lastFogFar = fogFar;
                             if (scene.fog) {
                                 scene.fog.far = fogFar;
                                 scene.fog.near = fogFar * 0.9;
@@ -5054,10 +5047,8 @@
                             if (idx >= 0 && idx < nData.length && (nData[idx] === AIR || nData[idx] === LEAVES)) {
                                 nData[idx] = id;
                                 if (chunkMeshes.has(nKey)) {
-                                    const oldMesh = chunkMeshes.get(nKey);
-                                    if (oldMesh && oldMesh.geometry) oldMesh.geometry.dispose();
-                                    scene.remove(oldMesh);
-                                    chunkMeshes.delete(nKey);
+                                    releaseMeshForKey(nKey);
+                                    releaseMeshForKey(nKey + "_WATER");
                                 }
                                 if (typeof chunkBuildQueue !== "undefined") {
                                     // ONLY queue the neighbor for a rebuild if it is ALREADY VISIBLE (has a mesh)
@@ -5608,6 +5599,51 @@
                 return torchGroup;
             }
 
+            function applyChunkBounds(geo, startX, startZ) {
+                const minY = -WORLD_DIMS.yOffset;
+                const maxY = WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset;
+
+                const box = geo.boundingBox || new THREE.Box3();
+                box.min.set(startX, minY, startZ);
+                box.max.set(startX + WORLD_DIMS.chunkSize, maxY, startZ + WORLD_DIMS.chunkSize);
+                geo.boundingBox = box;
+
+                const sphere = geo.boundingSphere || new THREE.Sphere();
+                sphere.center.set(startX + WORLD_DIMS.chunkSize * 0.5, (minY + maxY) * 0.5, startZ + WORLD_DIMS.chunkSize * 0.5);
+                sphere.radius = CHUNK_BOUNDING_RADIUS;
+                geo.boundingSphere = sphere;
+            }
+
+            function acquireChunkMesh(type) {
+                const pool = type === "water" ? waterMeshPool : terrainMeshPool;
+                const mesh = pool.pop() || new THREE.Mesh(undefined, type === "water" ? waterMaterial : chunkMaterial);
+                mesh.matrixAutoUpdate = false;
+                mesh.material = type === "water" ? waterMaterial : chunkMaterial;
+                mesh.frustumCulled = type === "water" ? false : SETTINGS.enableFrustumCulling;
+                mesh.castShadow = type === "water" ? false : SETTINGS.shadows;
+                mesh.receiveShadow = type === "water" ? false : SETTINGS.shadows;
+                mesh.renderOrder = type === "water" ? 1 : 0;
+                return mesh;
+            }
+
+            function releaseChunkMesh(mesh, type) {
+                if (!mesh) return;
+                scene.remove(mesh);
+                if (mesh.geometry) mesh.geometry.dispose();
+                mesh.geometry = null;
+                const pool = type === "water" ? waterMeshPool : terrainMeshPool;
+                pool.push(mesh);
+            }
+
+            function releaseMeshForKey(key) {
+                const mesh = chunkMeshes.get(key);
+                if (!mesh) return;
+                const isWater = key.includes("_WATER");
+                releaseChunkMesh(mesh, isWater ? "water" : "terrain");
+                chunkMeshes.delete(key);
+                if (!isWater) chunkRenderedFaces.delete(key);
+            }
+
             function renderChunk(cx, cz) {
                 try {
                     const cKey = getChunkKey(cx, cz);
@@ -5842,16 +5878,15 @@
                         terrainGeo.setAttribute("normal", new THREE.Float32BufferAttribute(tNormArray, 3));
                         terrainGeo.setAttribute("uv", new THREE.Float32BufferAttribute(tUvArray, 2));
                         terrainGeo.setAttribute("color", new THREE.Float32BufferAttribute(tColArray, 3));
-                        terrainGeo.computeBoundingSphere(); // Fix: Compute bounding sphere for proper frustum culling
+                        applyChunkBounds(terrainGeo, startX, startZ);
 
-                        const terrainMesh = new THREE.Mesh(terrainGeo, chunkMaterial);
+                        const terrainMesh = acquireChunkMesh("terrain");
                         terrainMesh.name = "CHUNK_TERRAIN_" + cKey;
-                        terrainMesh.matrixAutoUpdate = false;
-                        terrainMesh.updateMatrix();
+                        terrainMesh.geometry = terrainGeo;
                         terrainMesh.frustumCulled = SETTINGS.enableFrustumCulling;
                         terrainMesh.castShadow = SETTINGS.shadows;
                         terrainMesh.receiveShadow = SETTINGS.shadows;
-                        terrainMesh.renderOrder = 0; // Render terrain first
+                        terrainMesh.updateMatrix();
 
                         scene.add(terrainMesh);
                         chunkMeshes.set(cKey, terrainMesh);
@@ -5873,17 +5908,15 @@
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
+                        applyChunkBounds(waterGeo, startX, startZ);
 
-                        const waterMesh = new THREE.Mesh(waterGeo, waterMaterial);
+                        const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
-                        waterGeo.computeBoundingSphere();
-
-                        waterMesh.matrixAutoUpdate = false;
-                        waterMesh.updateMatrix();
-                        waterMesh.frustumCulled = false; // Water doesn't use frustum culling, so bounding sphere doesn't need adjustment
+                        waterMesh.geometry = waterGeo;
+                        waterMesh.frustumCulled = false; // Water doesn't use frustum culling
                         waterMesh.castShadow = false; // Water doesn't cast shadows
                         waterMesh.receiveShadow = false;
-                        waterMesh.renderOrder = 1; // Render water after terrain
+                        waterMesh.updateMatrix();
 
                         scene.add(waterMesh);
                         chunkMeshes.set(cKey + "_WATER", waterMesh);
@@ -5994,12 +6027,16 @@
 
                 // --- 4. Efficient Fog Update ---
                 // Don't create 'new Fog' every frame. Update properties instead.
-                const fogFar = currentRenderRadius * WORLD_DIMS.chunkSize;
-                if (scene.fog) {
-                    scene.fog.far = fogFar;
-                    scene.fog.near = fogFar * 0.9;
-                } else {
-                    scene.fog = new THREE.Fog(SETTINGS.dayFogColor, fogFar * 0.9, fogFar);
+                const fogDistance = currentRenderRadius * WORLD_DIMS.chunkSize;
+                if (fogDistance !== lastFogFar) {
+                    lastFogFar = fogDistance;
+                    fogFar = fogDistance;
+                    if (scene.fog) {
+                        scene.fog.far = fogDistance;
+                        scene.fog.near = fogDistance * 0.9;
+                    } else {
+                        scene.fog = new THREE.Fog(SETTINGS.dayFogColor, fogDistance * 0.9, fogDistance);
+                    }
                 }
 
                 // --- FRUSTUM CULLING HELPER ---
@@ -6058,13 +6095,13 @@
                 const needed = [];
 
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
-                const cameraDir = new THREE.Vector3();
-                controls.getDirection(cameraDir);
+                controls.getDirection(cameraDirTmp);
                 const playerPos = controls.getObject().position;
                 const fov = camera.fov;
                 const aspectRatio = camera.aspect;
 
                 culled = 0; // Reset counter each frame
+                totalChecked = 0;
 
                 for (let dx = -maxR; dx <= maxR; dx++) {
                     for (let dz = -maxR; dz <= maxR; dz++) {
@@ -6075,7 +6112,9 @@
                         const cz = chunkZ + dz;
 
                         // FRUSTUM CULLING with inner radius exception
-                        if (!isChunkInFrustum(cx, cz, chunkX, chunkZ, playerPos, cameraDir, fov, aspectRatio)) {
+                        totalChecked++;
+
+                        if (!isChunkInFrustum(cx, cz, chunkX, chunkZ, playerPos, cameraDirTmp, fov, aspectRatio)) {
                             culled++;
                             continue;
                         }
@@ -6111,29 +6150,19 @@
 
                     chunkDistances.sort((a, b) => b.dist - a.dist);
                     const excess = terrainMeshCount - maxAllowedMeshes;
-                    const toRemove = Math.ceil(excess * 0.3);
+                        const toRemove = Math.ceil(excess * 0.3);
 
-                    for (let i = 0; i < toRemove && i < chunkDistances.length; i++) {
-                        const targetKey = chunkDistances[i].key;
-                        if (!neededKeys.has(targetKey)) {
-                            // Remove terrain mesh
-                            if (chunkMeshes.has(targetKey)) {
-                                const m = chunkMeshes.get(targetKey);
-                                scene.remove(m);
-                                if (m.geometry) m.geometry.dispose();
-                                chunkMeshes.delete(targetKey);
+                        for (let i = 0; i < toRemove && i < chunkDistances.length; i++) {
+                            const targetKey = chunkDistances[i].key;
+                            if (!neededKeys.has(targetKey)) {
+                                // Remove terrain mesh
+                                releaseMeshForKey(targetKey);
+                                // Remove water mesh
+                                const waterKey = targetKey + "_WATER";
+                                releaseMeshForKey(waterKey);
+                                chunkRenderedFaces.delete(targetKey);
                             }
-                            // Remove water mesh
-                            const waterKey = targetKey + "_WATER";
-                            if (chunkMeshes.has(waterKey)) {
-                                const wm = chunkMeshes.get(waterKey);
-                                scene.remove(wm);
-                                if (wm.geometry) wm.geometry.dispose();
-                                chunkMeshes.delete(waterKey);
-                            }
-                            chunkRenderedFaces.delete(targetKey);
                         }
-                    }
                 }
 
                 // --- 6B. Cleanup Old Chunks ---
@@ -6145,11 +6174,7 @@
 
                     // If it's not in our "Needed" list, KILL IT IMMEDIATELY
                     if (!neededKeys.has(baseKey)) {
-                        const mesh = chunkMeshes.get(key);
-                        scene.remove(mesh);
-                        if (mesh.geometry) mesh.geometry.dispose();
-                        chunkMeshes.delete(key);
-                        chunkRenderedFaces.delete(key);
+                        releaseMeshForKey(key);
                     }
                 }
 
@@ -6240,32 +6265,21 @@
                     builds++;
                 }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
-                if (chunkNeighborUpdateQueue.size > 0 && builds < SETTINGS.buildQueueLimit) {
-                    const updateLimit = Math.min(2, SETTINGS.buildQueueLimit - builds);
-                    const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
+                        if (chunkNeighborUpdateQueue.size > 0 && builds < SETTINGS.buildQueueLimit) {
+                            const updateLimit = Math.min(2, SETTINGS.buildQueueLimit - builds);
+                            const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
 
-                    for (const key of toUpdate) {
-                        chunkNeighborUpdateQueue.delete(key);
+                            for (const key of toUpdate) {
+                                chunkNeighborUpdateQueue.delete(key);
 
-                        // Remove old meshes
-                        if (chunkMeshes.has(key)) {
-                            const m = chunkMeshes.get(key);
-                            scene.remove(m);
-                            if (m.geometry) m.geometry.dispose();
-                            chunkMeshes.delete(key);
-                        }
-                        const waterKey = key + "_WATER";
-                        if (chunkMeshes.has(waterKey)) {
-                            const wm = chunkMeshes.get(waterKey);
-                            scene.remove(wm);
-                            if (wm.geometry) wm.geometry.dispose();
-                            chunkMeshes.delete(waterKey);
-                        }
+                                // Remove old meshes
+                                releaseMeshForKey(key);
+                                releaseMeshForKey(key + "_WATER");
 
-                        // Rebuild chunk
-                        const [cx, cz] = key.split(",").map(Number);
-                        renderChunk(cx, cz);
-                    }
+                                // Rebuild chunk
+                                const [cx, cz] = key.split(",").map(Number);
+                                renderChunk(cx, cz);
+                            }
                 }
                 // const loaderEl = document.getElementById('chunk-loader');
                 // const countEl = document.getElementById('chunk-count');
