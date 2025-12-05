@@ -1,110 +1,91 @@
-# Project AGENTS.md for VoxEx
+# Project AGENTS.md for VoxEx (Single-File Version)
 
-This file defines how AI coding agents and contributors should work in this repository.
-It focuses on: the tech stack, code conventions for a browser-based voxel engine, and how to use ExecPlans for complex work.
+This project is a browser-based voxel engine implemented as a single source file.
+All game logic, rendering, and procedural generation live in that one file.
+AI coding agents MUST NOT create new source files; all changes must be made inside the existing file.
 
-## Tech stack and project goals
+## Project structure
 
-This project is a 3D voxel game/engine running in the browser using modern JavaScript or TypeScript, ES modules, and Three.js for rendering.
-The game world is chunk-based and procedurally generated, with systems for terrain generation, biomes, voxel meshing, pooling, and instanced rendering organized into modular classes under `src/`. 
+- There is exactly one code file that contains the entire engine.
+  - Example patterns:
+    - `index.html` with an inline `<script type="module">` block containing all JavaScript/TypeScript, or
+    - A single `main.js` (or similar) file loaded by the HTML page.
+- Inside that file, the code is organized into logical regions and/or classes such as:
+  - Chunk management and world streaming.
+  - Procedural terrain and biome generation.
+  - Voxel meshing and rendering.
+  - Player input, camera control, and collisions.
+  - Shared utilities and constants.
 
-Prefer the following structure when adding or modifying systems:
+When you add or refactor functionality, keep it inside this one file.
+You may introduce new classes or functions, but do NOT split them into separate files or modules.
 
-- `src/core/` for orchestration and high-level engine modules, e.g.:
-  - `Scene.js` – scene setup, main loop, render loop binding.
-  - `ChunkManager.js` – chunk loading/unloading, world-to-chunk mapping, and player-driven streaming.
-- `src/generation/` for procedural generation and world logic:
-  - `NoiseGenerator.js` – multi-layer noise, domain warping utilities.
-  - `TerrainGenerator.js` – chunk voxel data generation using layered noise and biome data.
-  - `BiomeSystem.js` – biome selection and block composition rules.
-- `src/rendering/` for meshes, materials, and visual optimizations:
-  - `VoxelMesh.js` – greedy meshing over chunk voxel data into optimized `BufferGeometry`.
-  - `InstancedVegetation.js` and similar – instanced meshes for repeated details like grass or foliage.
-  - `MaterialManager.js`, `MeshOptimizer.js` – texture atlases, culling, and draw‑call reduction utilities.
-- `src/physics/` for movement and collisions:
-  - `PlayerController.js` – input, camera, and movement controls.
-  - `CollisionDetector.js` – voxel-based collision checks.
-- `src/utils/` for reusable helpers:
-  - `ObjectPool.js` – reusable object management for meshes and helper objects.
-  - `Constants.js` – shared configuration (chunk size, heights, render distance, etc).
+## Tech stack and constraints
 
-Follow ES module style (`export default class ...` or named exports) and keep each module focused on a single responsibility.
+- Runtime: modern browsers, using WebGL via Three.js.
+- Language: JavaScript or TypeScript compiled to JavaScript, using ES module syntax if supported by the single file.
+- Rendering: Three.js with `THREE.Scene`, `THREE.PerspectiveCamera`, `THREE.WebGLRenderer`, etc.
+- World: chunk-based voxel world; do NOT create one mesh per block.
+- Performance:
+  - Use BufferGeometry for voxel meshes.
+  - Use greedy meshing or equivalent batching; minimize draw calls.
+  - Use frustum culling, basic LOD, and object pooling where useful.
+  - Avoid blocking the main thread with large synchronous loops; where possible, break work into smaller batches or use async patterns that still fit within a single file.
 
-## Code style and quality expectations
+## One-file coding rules
 
-- Use ES modules everywhere. Do not introduce CommonJS or global script tags.
-- Prefer classes or small focused functions per file; avoid “god objects” that mix generation, rendering, and input logic.
-- Always respect performance constraints for WebGL and the browser main thread:
-  - Use chunked voxel storage and meshing; never create one mesh per block.
-  - Prefer `BufferGeometry` over legacy geometries.
-  - Use greedy meshing, frustum culling, and LOD where appropriate.
-  - Use object pooling for frequently created / destroyed objects like chunks and temporary matrices.
-- Keep APIs clear and typed where possible (TypeScript or JSDoc) for engine-facing modules.
-- When adding new dependencies, prefer small, browser‑friendly libraries and document why they are needed.
+- Do not create new `.js`, `.ts`, or `.html` files.
+- Do not introduce bundler or build steps that require multiple entry points.
+- Keep any new code as:
+  - New functions or classes in the existing file, or
+  - Refactors of existing functions/classes in that file.
+- When reorganizing code, prefer:
+  - Grouped regions with clear comments, for example:
 
-## ExecPlans
+    // ==== Chunk Management ====
+    // ==== Terrain Generation ====
+    // ==== Rendering / Meshing ====
+    // ==== Player / Input ====
+    // ==== Utilities / Constants ====
 
-ExecPlans are structured design+implementation documents used for non-trivial work, such as:
+- Maintain a clear separation of concerns within the single file:
+  - Chunk management handles which chunks exist and when to build/unload them.
+  - Terrain generation functions compute voxel data.
+  - Rendering/meshing functions turn voxel data into Three.js meshes.
+  - Player/input code deals only with movement and camera, not with generation or meshing.
 
-- Adding or refactoring a core engine system (e.g., a new terrain pipeline, LOD system, or physics overhaul).
-- Significant performance changes that affect rendering, meshing, or generation.
-- Features that span multiple subsystems (e.g., new biome system touching generation, rendering, and save/load).
+## ExecPlans and PLANS.md
 
-ExecPlans are stored under:
+This repository uses `.agent/PLANS.md` to define ExecPlans for complex or multi-hour tasks.
 
-- `.agent/plans/<short-feature-name>.md`
+When performing substantial work such as rebuilding chunk building, caching, or loading:
 
-ExecPlans must follow the rules and section layout defined in `.agent/PLANS.md`.
-They should be written so that a new contributor, with only the current repository and that single ExecPlan file, can implement the feature end‑to‑end.
+- First, read `.agent/PLANS.md` to understand the ExecPlan format.
+- Create or update an ExecPlan under `.agent/plans/` if the task is non-trivial.
+- In that ExecPlan:
+  - Treat the project as a single-file engine.
+  - Refer to functions, classes, and “regions” inside the single file instead of multiple modules.
+  - Explicitly state: “All code changes in this plan are confined to the single source file; no new files are created.”
 
-### When to create or update an ExecPlan
+ExecPlans must:
+- Be self-contained, explain the current single-file layout, and define any terms like “chunk”, “greedy meshing”, or “object pooling” in plain language.
+- Describe exactly which functions or sections of the single file are edited or added.
+- Provide concrete validation steps (how to run the page, what to look for in the browser, how to spot performance regressions).
 
-Create or update an ExecPlan when:
+## Commands and validation
 
-- A change will touch more than one major module (e.g., `ChunkManager`, `TerrainGenerator`, and `VoxelMesh` together).
-- A change is expected to take more than one focused coding session or requires careful research or prototyping.
-- A refactor may temporarily require dual code paths (e.g., old and new mesh builders in parallel).
+Unless otherwise specified:
 
-Do not use an ExecPlan for very small, local changes (e.g., fixing a small bug in `NoiseGenerator`, or tweaking a single shader parameter).
+- Open the HTML file in a modern browser (or run `npm run dev` / equivalent if a simple dev server is configured).
+- After changes:
+  - The page must load without console errors.
+  - The voxel world must render.
+  - Player movement, chunk streaming, and other core behaviors must still function.
 
-### How agents should use ExecPlans
-
-When asked to implement a complex feature or refactor:
-
-1. If no suitable ExecPlan exists:
-   - Create a new file under `.agent/plans/` using the format and headings prescribed in `.agent/PLANS.md`.
-   - Fill out all sections before significant coding work, including context, plan of work, validation, and progress checklist.
-2. If an ExecPlan already exists:
-   - Read it fully.
-   - Follow the milestones and concrete steps in order, updating the `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` sections as work proceeds.
-3. Do not ask the user for “next steps” when executing an ExecPlan.
-   - Instead, continue to the next milestone or step already described in the plan.
-   - If ambiguities appear, resolve them inside the plan (and document the decision) before changing code.
-
-### Repository commands and assumptions
-
-Unless told otherwise:
-
-- Install dependencies with `npm install` or `pnpm install` at the project root.
-- Start the dev server with `npm run dev` (or the script configured in `package.json`).
-- Run tests with `npm test` or the configured test script.
-
-ExecPlans must explicitly state which commands to run for validation, including expected visible behavior (e.g., “start dev server and visit a specific URL; you should see generated terrain with X behavior”).
-
-## Folder-specific behavior for agents
-
-- For files under `src/generation/`:
-  - Prioritize clarity of math and noise composition; document constants like octaves, persistence, and lacunarity in comments.
-  - Keep noise modules deterministic via seeds and avoid hard-coding randomness in generation logic.
-- For files under `src/rendering/`:
-  - Favor batching and instancing; minimize material and draw-call counts.
-  - Keep shader-related code and material setup centralized in dedicated modules (e.g., `MaterialManager`).
-- For files under `src/core/`:
-  - Preserve a clean separation between orchestration (scene setup, loop) and feature modules (generation, rendering, input).
-  - Add new high-level integrations via composition rather than large monolithic changes.
+If tests or simple debug toggles exist, ExecPlans should specify how to run/enable them and what “pass” looks like.
 
 ## Summary for agents
 
-- Use ExecPlans for substantial work and follow `.agent/PLANS.md`.
-- Keep code modular, chunk-based, and performance-aware, respecting existing architecture.
-- Always provide observable validation steps (visual changes in the running game or passing tests) for any non-trivial change.
+- This is a single-file project; never create or split code into multiple files.
+- Make all changes inside the one main source file, using clear function/class boundaries and well-labeled regions.
+- For complex refactors (e.g., chunk building and caching), use ExecPlans as defined in `.agent/PLANS.md`, but always describe work in terms of edits to this single file.
