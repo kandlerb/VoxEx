@@ -1201,6 +1201,24 @@
                 [0, 0, -1, 0, 0, -1], // Front (-Z)
             ];
 
+            // --- SIMPLE MOB SYSTEM (Zombie) ---
+            const ZOMBIE_CONFIG = {
+                maxCount: 6,
+                spawnRadius: 32,
+                despawnRadius: 96,
+                chaseDistance: 26,
+                walkSpeed: 2.2,
+                spawnCooldown: 6,
+            };
+            const ZOMBIE_TILE_COUNT = 8;
+            const zombies = [];
+            const zombiePool = [];
+            let zombieMaterial;
+            let zombieTexture;
+            const zombieTempVec = new THREE.Vector3();
+            const zombieUp = new THREE.Vector3(0, 1, 0);
+            let zombieSpawnTimer = 0;
+
             // --- OPTIMIZATION: Reusable Vector3 objects for physics ---
             const _physFwd = new THREE.Vector3();
             const _physRight = new THREE.Vector3();
@@ -4463,6 +4481,88 @@
                     depthTest: true,
                 });
 
+                // --- ZOMBIE TEXTURE ATLAS (Procedural, same pixel method as blocks) ---
+                const zombieCanvas = document.createElement("canvas");
+                zombieCanvas.width = ZOMBIE_TILE_COUNT * TILE_SIZE;
+                zombieCanvas.height = TILE_SIZE;
+                const zCtx = zombieCanvas.getContext("2d");
+                const zombieTileX = (tileIndex) => tileIndex * TILE_SIZE;
+                const fillZombiePixel = (tileX, gx, gy, color) => {
+                    zCtx.fillStyle = color;
+                    zCtx.fillRect(tileX + gx * STEP, gy * STEP, STEP, STEP);
+                };
+
+                function paintNoisyTile(tileIndex, palette) {
+                    const tileStart = zombieTileX(tileIndex);
+                    for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                        for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                            const r = Math.random();
+                            const color = r > 0.8 ? palette.highlight : r > 0.4 ? palette.base : palette.shadow;
+                            fillZombiePixel(tileStart, x, y, color);
+                        }
+                    }
+                }
+
+                function addBand(tileIndex, yStart, yEnd, color) {
+                    const tileStart = zombieTileX(tileIndex);
+                    for (let y = yStart; y < yEnd; y++) {
+                        for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                            fillZombiePixel(tileStart, x, y, color);
+                        }
+                    }
+                }
+
+                const skin = { base: "#3f6b3f", shadow: "#305330", highlight: "#528452" };
+                const shirt = { base: "#2c2446", shadow: "#221a36", highlight: "#3d2f5f" };
+                const pants = { base: "#1a1d35", shadow: "#14162a", highlight: "#22284a" };
+
+                // Head tiles
+                paintNoisyTile(0, skin); // front
+                paintNoisyTile(1, skin); // side/back
+                paintNoisyTile(2, skin); // top/bottom
+
+                const eyeY = Math.floor(PIXELS_PER_TILE * 0.35);
+                const eyeXStart = Math.floor(PIXELS_PER_TILE * 0.25);
+                const eyeWidth = Math.max(2, Math.floor(PIXELS_PER_TILE * 0.12));
+                const eyeHeight = Math.max(2, Math.floor(PIXELS_PER_TILE * 0.14));
+                for (let y = 0; y < eyeHeight; y++) {
+                    for (let x = 0; x < eyeWidth; x++) {
+                        fillZombiePixel(zombieTileX(0), eyeXStart + x, eyeY + y, "#0b0b0b");
+                        fillZombiePixel(zombieTileX(0), PIXELS_PER_TILE - eyeXStart - eyeWidth + x, eyeY + y, "#0b0b0b");
+                    }
+                }
+
+                const mouthY = Math.floor(PIXELS_PER_TILE * 0.65);
+                const mouthWidth = Math.max(4, Math.floor(PIXELS_PER_TILE * 0.5));
+                for (let x = 0; x < mouthWidth; x++) {
+                    fillZombiePixel(zombieTileX(0), Math.floor((PIXELS_PER_TILE - mouthWidth) / 2) + x, mouthY, "#1a1a1a");
+                }
+
+                // Torso tiles
+                paintNoisyTile(3, shirt);
+                paintNoisyTile(4, shirt);
+                paintNoisyTile(5, shirt);
+                const collarHeight = Math.max(2, Math.floor(PIXELS_PER_TILE * 0.18));
+                addBand(3, 0, collarHeight, skin.highlight);
+                addBand(4, 0, collarHeight, skin.highlight);
+
+                const hemHeight = Math.max(2, Math.floor(PIXELS_PER_TILE * 0.2));
+                addBand(3, PIXELS_PER_TILE - hemHeight, PIXELS_PER_TILE, shirt.shadow);
+                addBand(4, PIXELS_PER_TILE - hemHeight, PIXELS_PER_TILE, shirt.shadow);
+
+                // Limb tiles (arms + legs share palette)
+                paintNoisyTile(6, pants);
+                paintNoisyTile(7, pants);
+                const cuffHeight = Math.max(2, Math.floor(PIXELS_PER_TILE * 0.18));
+                addBand(6, PIXELS_PER_TILE - cuffHeight, PIXELS_PER_TILE, pants.shadow);
+                addBand(7, PIXELS_PER_TILE - cuffHeight, PIXELS_PER_TILE, pants.shadow);
+
+                const zombieTex = new THREE.CanvasTexture(zombieCanvas);
+                zombieTex.magFilter = THREE.NearestFilter;
+                zombieTex.minFilter = THREE.NearestFilter;
+                zombieTexture = zombieTex;
+                zombieMaterial = new THREE.MeshLambertMaterial({ map: zombieTexture, flatShading: true });
+
                 // --- FOG OVERRIDE ---
                 chunkMaterial.onBeforeCompile = (shader) => {
                     // Add our varying
@@ -4527,6 +4627,211 @@
                 setSlotIcon("#slot-7", 9); // Sand (Tile 9)
                 setSlotIcon("#slot-8", 10); // Water (Tile 10)
                 setSlotIcon("#slot-9", 11); // Torch (Tile 11)
+            }
+
+            function applyZombieUVs(geometry, layout) {
+                const uv = geometry.attributes.uv;
+                const faces = [layout.right, layout.left, layout.top, layout.bottom, layout.front, layout.back];
+                for (let i = 0; i < faces.length; i++) {
+                    const tile = faces[i];
+                    const uMin = tile / ZOMBIE_TILE_COUNT;
+                    const uMax = (tile + 1) / ZOMBIE_TILE_COUNT;
+                    const vMin = 0;
+                    const vMax = 1;
+                    const offset = i * 8;
+                    uv.array[offset + 0] = uMax;
+                    uv.array[offset + 1] = vMax;
+                    uv.array[offset + 2] = uMin;
+                    uv.array[offset + 3] = vMax;
+                    uv.array[offset + 4] = uMax;
+                    uv.array[offset + 5] = vMin;
+                    uv.array[offset + 6] = uMin;
+                    uv.array[offset + 7] = vMin;
+                }
+                uv.needsUpdate = true;
+            }
+
+            function createZombieMesh() {
+                if (!zombieMaterial) return null;
+                const root = new THREE.Group();
+                const legHeight = 0.9;
+                const bodyHeight = 1.2;
+                const armHeight = 1.1;
+
+                const headGeo = new THREE.BoxGeometry(0.9, 0.9, 0.9);
+                applyZombieUVs(headGeo, { right: 1, left: 1, top: 2, bottom: 2, front: 0, back: 1 });
+                const head = new THREE.Mesh(headGeo, zombieMaterial);
+                head.position.set(0, legHeight + bodyHeight + 0.45, 0);
+
+                const bodyGeo = new THREE.BoxGeometry(0.9, bodyHeight, 0.45);
+                applyZombieUVs(bodyGeo, { right: 4, left: 4, top: 5, bottom: 5, front: 3, back: 4 });
+                const body = new THREE.Mesh(bodyGeo, zombieMaterial);
+                body.position.set(0, legHeight + bodyHeight * 0.5, 0);
+
+                const armGeo = new THREE.BoxGeometry(0.45, armHeight, 0.45);
+                applyZombieUVs(armGeo, { right: 7, left: 7, top: 6, bottom: 6, front: 6, back: 7 });
+                const leftArm = new THREE.Mesh(armGeo, zombieMaterial);
+                const rightArm = new THREE.Mesh(armGeo, zombieMaterial);
+                leftArm.position.set(-0.65, legHeight + bodyHeight - 0.1, 0);
+                rightArm.position.set(0.65, legHeight + bodyHeight - 0.1, 0);
+
+                const legGeo = new THREE.BoxGeometry(0.45, legHeight, 0.45);
+                applyZombieUVs(legGeo, { right: 7, left: 7, top: 6, bottom: 6, front: 6, back: 7 });
+                const leftLeg = new THREE.Mesh(legGeo, zombieMaterial);
+                const rightLeg = new THREE.Mesh(legGeo, zombieMaterial);
+                leftLeg.position.set(-0.22, legHeight * 0.5, 0);
+                rightLeg.position.set(0.22, legHeight * 0.5, 0);
+
+                root.add(head, body, leftArm, rightArm, leftLeg, rightLeg);
+                root.traverse((child) => {
+                    if (child.isMesh) {
+                        child.castShadow = true;
+                        child.receiveShadow = true;
+                    }
+                });
+
+                return {
+                    group: root,
+                    head,
+                    body,
+                    leftArm,
+                    rightArm,
+                    leftLeg,
+                    rightLeg,
+                    baseOffsets: {
+                        headY: head.position.y,
+                        bodyY: body.position.y,
+                        armY: leftArm.position.y,
+                        legY: leftLeg.position.y,
+                    },
+                    velocity: new THREE.Vector3(),
+                    heading: new THREE.Vector3(1, 0, 0),
+                    wanderTimer: 0,
+                    walkPhase: 0,
+                };
+            }
+
+            function getZombieFromPool() {
+                const pooled = zombiePool.pop();
+                if (pooled) return pooled;
+                return createZombieMesh();
+            }
+
+            function releaseZombie(z) {
+                scene.remove(z.group);
+                z.velocity.set(0, 0, 0);
+                z.walkPhase = 0;
+                z.wanderTimer = 0;
+                z.heading.set(1, 0, 0);
+                z.leftArm.rotation.set(0, 0, 0);
+                z.rightArm.rotation.set(0, 0, 0);
+                z.leftLeg.rotation.set(0, 0, 0);
+                z.rightLeg.rotation.set(0, 0, 0);
+                z.head.position.y = z.baseOffsets.headY;
+                z.body.position.y = z.baseOffsets.bodyY;
+                zombiePool.push(z);
+            }
+
+            function findSurfaceHeight(x, z) {
+                ensureChunk(x, z);
+                for (let y = WORLD_DIMS.chunkHeight - 2; y >= 0; y--) {
+                    const b = getBlock(x, y, z);
+                    if (b !== AIR && b !== LEAVES && b !== WATER) return y + 1;
+                }
+                return null;
+            }
+
+            function spawnZombieNearPlayer() {
+                if (!zombieMaterial) return false;
+                const playerPos = controls.getObject().position;
+                for (let i = 0; i < 6; i++) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const radius = ZOMBIE_CONFIG.spawnRadius * (0.5 + Math.random() * 0.5);
+                    const gx = Math.floor(playerPos.x + Math.cos(angle) * radius);
+                    const gz = Math.floor(playerPos.z + Math.sin(angle) * radius);
+                    const gy = findSurfaceHeight(gx, gz);
+                    if (gy !== null) {
+                        const zombie = getZombieFromPool();
+                        if (!zombie) return false;
+                        zombie.group.position.set(gx + 0.5, gy, gz + 0.5);
+                        zombie.velocity.set(0, 0, 0);
+                        zombie.wanderTimer = 0.5 + Math.random() * 1.5;
+                        zombie.heading.set(1, 0, 0).applyAxisAngle(zombieUp, angle);
+                        zombies.push(zombie);
+                        scene.add(zombie.group);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            function updateZombies(dt) {
+                if (!controls || !controls.isLocked) return;
+                zombieSpawnTimer -= dt;
+                if (zombieSpawnTimer <= 0 && zombies.length < ZOMBIE_CONFIG.maxCount && dayNightTime > 0.45) {
+                    const spawned = spawnZombieNearPlayer();
+                    zombieSpawnTimer = spawned ? ZOMBIE_CONFIG.spawnCooldown : 2;
+                }
+
+                const playerPos = controls.getObject().position;
+                for (let i = zombies.length - 1; i >= 0; i--) {
+                    const z = zombies[i];
+                    const pos = z.group.position;
+                    const dist = zombieTempVec.set(pos.x - playerPos.x, 0, pos.z - playerPos.z).length();
+                    if (dist > ZOMBIE_CONFIG.despawnRadius) {
+                        zombies.splice(i, 1);
+                        releaseZombie(z);
+                        continue;
+                    }
+
+                    const targetVec = zombieTempVec.set(playerPos.x - pos.x, 0, playerPos.z - pos.z);
+                    const isChasing = targetVec.length() < ZOMBIE_CONFIG.chaseDistance;
+                    if (isChasing) {
+                        targetVec.normalize();
+                        z.heading.lerp(targetVec, 0.18);
+                    } else {
+                        z.wanderTimer -= dt;
+                        if (z.wanderTimer <= 0) {
+                            z.heading.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+                            z.wanderTimer = 1.5 + Math.random() * 2.5;
+                        }
+                    }
+
+                    const moveSpeed = ZOMBIE_CONFIG.walkSpeed * (isChasing ? 1.1 : 0.55);
+                    const stepX = z.heading.x * moveSpeed * dt;
+                    const stepZ = z.heading.z * moveSpeed * dt;
+                    pos.x += stepX;
+                    pos.z += stepZ;
+                    const feetY = Math.floor(pos.y - 1.2);
+                    if (isSolidBlock(Math.floor(pos.x), feetY, Math.floor(pos.z))) {
+                        pos.x -= stepX;
+                        pos.z -= stepZ;
+                        z.wanderTimer = 0.1;
+                    }
+
+                    // Gravity and ground stickiness
+                    z.velocity.y -= SETTINGS.gravity * dt * 0.35;
+                    pos.y += z.velocity.y * dt;
+                    const groundY = Math.floor(pos.y - 1.35);
+                    if (isSolidBlock(Math.floor(pos.x), groundY, Math.floor(pos.z))) {
+                        pos.y = groundY + 1.35;
+                        z.velocity.y = 0;
+                    }
+
+                    // Simple animation
+                    z.walkPhase += dt * moveSpeed * 1.2;
+                    const swing = Math.sin(z.walkPhase) * 0.4;
+                    z.leftArm.rotation.x = swing;
+                    z.rightArm.rotation.x = -swing;
+                    z.leftLeg.rotation.x = -swing * 0.6;
+                    z.rightLeg.rotation.x = swing * 0.6;
+                    const bob = Math.abs(Math.sin(z.walkPhase * 0.5)) * 0.05;
+                    z.head.position.y = z.baseOffsets.headY + bob;
+                    z.body.position.y = z.baseOffsets.bodyY + bob * 0.5;
+
+                    // Face movement direction
+                    z.group.rotation.y = Math.atan2(z.heading.x, z.heading.z);
+                }
             }
 
             function rebuildBiomeTable() {
@@ -6814,6 +7119,8 @@
                             }
                         }
                     }
+
+                    updateZombies(clampedDt);
 
                     flushMaterialUpdates();
                     const renderStart = perfMonitor.start("rendering");
