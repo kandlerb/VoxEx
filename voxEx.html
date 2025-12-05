@@ -2683,12 +2683,20 @@
             ambLight = new THREE.AmbientLight(0xffffff, SETTINGS.ambientIntensity); // Very dark for underground atmosphere
             scene.add(ambLight);
 
-            // Shadow map sizes optimized per-light importance
-            const sunShadowMapSize = 4096;    // Highest quality for main light
-            const moonShadowMapSize = 2048;   // Medium quality for nighttime
-            const torchShadowMapSize = 1024;  // Lower quality for local light
+            // Shadow configuration for pixel-perfect texel alignment
+            // Shadows snap to the same grid as block textures (PIXELS_PER_TILE = 16)
+            const PIXELS_PER_TILE = SETTINGS.textureResolution; // 16x16 texture pixels
+            const SHADOW_COVERAGE_RADIUS = 128; // blocks (covers max render distance)
 
-            const sunShadowViewSize = WORLD_PIXEL_SIZE * sunShadowMapSize;
+            // Calculate shadow map size so each texel = 1 texture pixel in world space
+            // Each texture pixel = 1/PIXELS_PER_TILE world units = 1/16
+            // Shadow map size = (coverage diameter) / (texel size) = (radius * 2) * PIXELS_PER_TILE
+            const sunShadowMapSize = SHADOW_COVERAGE_RADIUS * 2 * PIXELS_PER_TILE; // 4096
+            const moonShadowMapSize = Math.floor(sunShadowMapSize / 2);  // 2048 - half resolution for nighttime
+            const torchShadowMapSize = Math.floor(sunShadowMapSize / 4); // 1024 - quarter resolution for local light
+
+            // Shadow frustum size in world units
+            const sunShadowViewSize = SHADOW_COVERAGE_RADIUS * 2; // 256 world units diameter
 
             //Sun Lighting with pixel-perfect shadow configuration
             sun = new THREE.DirectionalLight(SETTINGS.sunColor, 1);
@@ -2698,7 +2706,8 @@
             sun.shadow.normalBias = 0;
             sun.shadow.radius = 0.1; // Soft shadows
 
-            // Configure sun shadow camera for pixel-locked shadows
+            // Configure sun shadow camera for texel-locked shadows
+            // Frustum size ensures: texelWorldSize = frustumWidth / mapWidth = 256 / 4096 = 1/16
             sun.shadow.camera.left = -sunShadowViewSize / 2;
             sun.shadow.camera.right = sunShadowViewSize / 2;
             sun.shadow.camera.top = sunShadowViewSize / 2;
@@ -2716,7 +2725,7 @@
             moon.shadow.normalBias = 0;
             moon.shadow.radius = 0.25;
 
-            // Moon uses same frustum as sun for consistent pixel-locking
+            // Moon uses same frustum as sun for consistent texel-locking
             moon.shadow.camera.left = -sunShadowViewSize / 2;
             moon.shadow.camera.right = sunShadowViewSize / 2;
             moon.shadow.camera.top = sunShadowViewSize / 2;
@@ -6501,11 +6510,13 @@
                 const diskX = Math.cos(diskAngle);
                 const sunOffset = 100;
 
-                // 4. Compute texel size from *configured* shadow camera
+                // 4. Compute texel size from configured shadow camera
+                // With current setup: frustumWidth=256, mapWidth=4096
+                // texelWorldSize = 256/4096 = 1/16 = WORLD_PIXEL_SIZE (matches texture pixels)
                 const shadowCam = sun.shadow.camera;
                 const mapWidth = sun.shadow.mapSize.x;
                 const frustumWidth = shadowCam.right - shadowCam.left;
-                const texelWorldSize = frustumWidth / mapWidth; // should be 1/16 after configureSunShadow()
+                const texelWorldSize = frustumWidth / mapWidth;
 
                 // Light direction (reuse vector to reduce GC)
                 shadowLightDir.set(diskX, diskH, 0).normalize();
@@ -6528,12 +6539,71 @@
 
                 shadowInPlane.add(shadowAlong); // snappedSunPos
 
-                // Apply to sun
+                // Apply to sun - but we need to ensure shadow camera frustum is grid-aligned
                 sun.target.position.copy(shadowTargetPos);
                 sun.position.copy(shadowInPlane);
                 sun.target.updateMatrixWorld();
+                sun.updateMatrixWorld();
 
-                // Moon opposite (no snapping if it doesn't cast shadows)
+                // CRITICAL: Snap shadow camera frustum to texel grid (Shadow Camera Space Snapping)
+                //
+                // Problem: Simply snapping sun position in world space doesn't guarantee shadow
+                // texels align with texture pixels when the shadow frustum is rotated.
+                //
+                // Solution: Snap in shadow camera's normalized device coordinates (NDC).
+                // This ensures that no matter the sun angle, shadow texels map exactly to
+                // texture pixel boundaries, preventing sub-pixel shadow shimmer.
+                //
+                // Algorithm:
+                // 1. Transform target to shadow camera NDC space [-1, 1]
+                // 2. Snap to texel boundaries in NDC space
+                // 3. Calculate snap delta in NDC
+                // 4. Transform delta back to world space
+                // 5. Offset shadow camera by delta
+                //
+                // Result: Shadow texels ALWAYS align with 1/16 texture pixel grid
+                sun.shadow.camera.updateMatrixWorld();
+                sun.shadow.camera.updateProjectionMatrix();
+
+                // Calculate the shadow camera's view-projection matrix
+                const shadowMatrix = new THREE.Matrix4();
+                shadowMatrix.multiplyMatrices(
+                    sun.shadow.camera.projectionMatrix,
+                    sun.shadow.camera.matrixWorldInverse
+                );
+
+                // Transform target position to shadow camera space
+                const shadowTargetInCamSpace = shadowTargetPos.clone().applyMatrix4(shadowMatrix);
+
+                // Snap to texel boundaries in normalized device coordinates [-1, 1]
+                // Each texel in NDC space = 2.0 / mapWidth
+                const texelSizeNDC = 2.0 / mapWidth;
+                shadowTargetInCamSpace.x = Math.round(shadowTargetInCamSpace.x / texelSizeNDC) * texelSizeNDC;
+                shadowTargetInCamSpace.y = Math.round(shadowTargetInCamSpace.y / texelSizeNDC) * texelSizeNDC;
+
+                // Calculate the snap delta in NDC space
+                const origTargetInCamSpace = shadowTargetPos.clone().applyMatrix4(shadowMatrix);
+                const deltaX = shadowTargetInCamSpace.x - origTargetInCamSpace.x;
+                const deltaY = shadowTargetInCamSpace.y - origTargetInCamSpace.y;
+
+                // Convert delta back to world space and apply to sun position
+                // Delta in world space = delta in NDC * (frustumWidth / 2)
+                const halfFrustumWidth = frustumWidth / 2;
+                const worldDelta = new THREE.Vector3();
+
+                // Get shadow camera's right and up vectors
+                const shadowCamMatrix = sun.shadow.camera.matrixWorld;
+                const right = new THREE.Vector3().setFromMatrixColumn(shadowCamMatrix, 0);
+                const up = new THREE.Vector3().setFromMatrixColumn(shadowCamMatrix, 1);
+
+                worldDelta.addScaledVector(right, deltaX * halfFrustumWidth);
+                worldDelta.addScaledVector(up, deltaY * halfFrustumWidth);
+
+                // Apply snap correction
+                sun.position.add(worldDelta);
+                sun.updateMatrixWorld();
+
+                // Moon opposite with same grid-snapping for stable shadows
                 moon.target.position.copy(shadowTargetPos);
                 moon.position.set(
                     snapTargetX - diskX * sunOffset,
@@ -6541,6 +6611,42 @@
                     snapTargetZ
                 );
                 moon.target.updateMatrixWorld();
+                moon.updateMatrixWorld();
+
+                // Apply same texel-grid snapping to moon shadows
+                moon.shadow.camera.updateMatrixWorld();
+                moon.shadow.camera.updateProjectionMatrix();
+
+                const moonShadowMatrix = new THREE.Matrix4();
+                moonShadowMatrix.multiplyMatrices(
+                    moon.shadow.camera.projectionMatrix,
+                    moon.shadow.camera.matrixWorldInverse
+                );
+
+                const moonTargetInCamSpace = shadowTargetPos.clone().applyMatrix4(moonShadowMatrix);
+                const moonOrigTargetInCamSpace = shadowTargetPos.clone().applyMatrix4(moonShadowMatrix);
+
+                const moonMapWidth = moon.shadow.mapSize.x;
+                const moonTexelSizeNDC = 2.0 / moonMapWidth;
+                moonTargetInCamSpace.x = Math.round(moonTargetInCamSpace.x / moonTexelSizeNDC) * moonTexelSizeNDC;
+                moonTargetInCamSpace.y = Math.round(moonTargetInCamSpace.y / moonTexelSizeNDC) * moonTexelSizeNDC;
+
+                const moonDeltaX = moonTargetInCamSpace.x - moonOrigTargetInCamSpace.x;
+                const moonDeltaY = moonTargetInCamSpace.y - moonOrigTargetInCamSpace.y;
+
+                const moonFrustumWidth = moon.shadow.camera.right - moon.shadow.camera.left;
+                const moonHalfFrustumWidth = moonFrustumWidth / 2;
+
+                const moonCamMatrix = moon.shadow.camera.matrixWorld;
+                const moonRight = new THREE.Vector3().setFromMatrixColumn(moonCamMatrix, 0);
+                const moonUp = new THREE.Vector3().setFromMatrixColumn(moonCamMatrix, 1);
+
+                const moonWorldDelta = new THREE.Vector3();
+                moonWorldDelta.addScaledVector(moonRight, moonDeltaX * moonHalfFrustumWidth);
+                moonWorldDelta.addScaledVector(moonUp, moonDeltaY * moonHalfFrustumWidth);
+
+                moon.position.add(moonWorldDelta);
+                moon.updateMatrixWorld();
             }
 
             // --- C. LIGHTING INTENSITY (smooth, unchanged) ---
