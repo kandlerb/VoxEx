@@ -1221,6 +1221,8 @@
             let scene;
             let renderer;
             let controls;
+            let controlsReadyResolve = null;
+            let controlsReadyPromise = null;
             let raycaster;
             let sun;
             let moon;
@@ -1801,6 +1803,11 @@
                     return { geo: _torchGeoCache, mat: _torchMatCache };
                 }
 
+                let controlsReadyResolve;
+                const controlsReady = new Promise((resolve) => {
+                    controlsReadyResolve = resolve;
+                });
+
                 let camera;
                 let scene;
                 let renderer;
@@ -1878,6 +1885,10 @@
                     updateBlockNameDisplay(1); // Initialize with first slot (Grass Block)
                 }
 
+                // Ensure controls are ready before creating the start screen/pointer lock handlers
+                await controlsReadyPromise;
+                await controlsReady;
+
                 // Create a temporary "Click to Start" overlay (DON'T replace instructions)
                 const blocker = document.getElementById("blocker");
                 const instructions = document.getElementById("instructions");
@@ -1919,8 +1930,6 @@
                     // Lock controls once they exist
                     if (controls) {
                         controls.lock();
-                    } else {
-                        logError("CONTROLS_INIT", "PointerLockControls not ready; skipping lock on start click");
                     }
 
                     // Clean up listeners
@@ -1928,11 +1937,7 @@
                     blocker.removeEventListener("click", startGame);
                 };
 
-                if (controls) {
-                    instructions.addEventListener("click", startGame);
-                } else {
-                    logError("CONTROLS_INIT", "PointerLockControls not ready; start screen click handler not attached");
-                }
+                instructions.addEventListener("click", startGame);
                 blocker.addEventListener("click", startGame);
 
                 document.getElementById("clear-cache-btn")?.addEventListener("click", async () => {
@@ -3012,6 +3017,10 @@
                 // 9. Controls & Pause Menu Logic
                 controls = new PointerLockControls(camera, document.body);
                 scene.add(controls.getObject());
+
+                if (controlsReadyResolve) {
+                    controlsReadyResolve(controls);
+                }
 
                 // UI Elements
                 const blocker = document.getElementById("blocker");
@@ -6129,7 +6138,7 @@
 
             const sharedCameraDir = new THREE.Vector3();
 
-            function isChunkInFrustum(chunkX, chunkZ, playerChunkX, playerChunkZ, playerPos, normCamX, normCamZ, threshold, cameraValid) {
+            function isChunkInFrustum(chunkX, chunkZ, playerChunkX, playerChunkZ, playerPos, normCamDirX, normCamDirZ, cosHalfFovWithMargin, hasHorizontalDir) {
                 // 1. ALWAYS load chunks within 6 chunk radius (inner ring - no culling)
                 const chunkDistSq = (chunkX - playerChunkX) ** 2 + (chunkZ - playerChunkZ) ** 2;
                 const INNER_RADIUS = 6;
@@ -6152,13 +6161,13 @@
                 const toChunkX = dx / dist;
                 const toChunkZ = dz / dist;
 
-                // 4. Skip culling if camera direction is invalid (pointing straight up/down)
-                if (!cameraValid) return true;
+                // 4. Skip culling if camera has no horizontal direction (e.g., looking straight up/down)
+                if (!hasHorizontalDir) return true;
 
-                // 5. Calculate dot product
-                const dotProduct = toChunkX * normCamX + toChunkZ * normCamZ;
+                // 5. Calculate dot product using pre-normalized camera direction and precomputed threshold
+                const dotProduct = toChunkX * normCamDirX + toChunkZ * normCamDirZ;
 
-                return dotProduct >= threshold;
+                return dotProduct >= cosHalfFovWithMargin;
             }
 
             async function updateChunks() {
@@ -6224,8 +6233,22 @@
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
                 controls.getDirection(sharedCameraDir);
                 const playerPos = controls.getObject().position;
-                const fov = camera.fov;
-                const aspectRatio = camera.aspect;
+
+                // Precompute camera direction normalization and frustum thresholds once per update
+                const camDirX = sharedCameraDir.x;
+                const camDirZ = sharedCameraDir.z;
+                const camDirLen = Math.sqrt(camDirX * camDirX + camDirZ * camDirZ);
+                const hasHorizontalDir = camDirLen >= 0.01;
+                const normCamDirX = hasHorizontalDir ? camDirX / camDirLen : 0;
+                const normCamDirZ = hasHorizontalDir ? camDirZ / camDirLen : 0;
+
+                const verticalFovRad = (camera.fov * Math.PI) / 180;
+                const horizontalFovRad = 2 * Math.atan(Math.tan(verticalFovRad / 2) * camera.aspect);
+
+                // Add 30 degrees margin for smooth transitions
+                const marginRad = (30 * Math.PI) / 180;
+                const halfFovWithMargin = horizontalFovRad / 2 + marginRad;
+                const cosHalfFovWithMargin = Math.cos(halfFovWithMargin);
 
                 // Precompute camera direction and FOV threshold once per update
                 const camDirX = sharedCameraDir.x;
@@ -6252,7 +6275,7 @@
                         const cz = chunkZ + dz;
 
                         // FRUSTUM CULLING with inner radius exception
-                        if (!isChunkInFrustum(cx, cz, chunkX, chunkZ, playerPos, normCamX, normCamZ, threshold, cameraValid)) {
+                        if (!isChunkInFrustum(cx, cz, chunkX, chunkZ, playerPos, normCamDirX, normCamDirZ, cosHalfFovWithMargin, hasHorizontalDir)) {
                             culled++;
                             continue;
                         }
