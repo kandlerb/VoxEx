@@ -1146,7 +1146,6 @@
             targetZ: -1
         };
 
-
         import * as THREE from "three";
         import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 
@@ -1154,6 +1153,13 @@
         let fogFar;
         const velocity = new THREE.Vector3();
         const direction = new THREE.Vector3();
+
+        // Reusable vectors for shadow calculations (reduce GC pressure)
+        const shadowLightDir = new THREE.Vector3();
+        const shadowTargetPos = new THREE.Vector3();
+        const shadowDesiredPos = new THREE.Vector3();
+        const shadowAlong = new THREE.Vector3();
+        const shadowInPlane = new THREE.Vector3();
 
         let isFlying = false;
         let flyUp = false;
@@ -2677,65 +2683,57 @@
             ambLight = new THREE.AmbientLight(0xffffff, SETTINGS.ambientIntensity); // Very dark for underground atmosphere
             scene.add(ambLight);
 
-            const shadowMapSize = 4096;
-            const shadowViewSize = WORLD_PIXEL_SIZE * shadowMapSize;
+            // Shadow map sizes optimized per-light importance
+            const sunShadowMapSize = 4096;    // Highest quality for main light
+            const moonShadowMapSize = 2048;   // Medium quality for nighttime
+            const torchShadowMapSize = 1024;  // Lower quality for local light
 
-            //Sun Lighting
+            const sunShadowViewSize = WORLD_PIXEL_SIZE * sunShadowMapSize;
+
+            //Sun Lighting with pixel-perfect shadow configuration
             sun = new THREE.DirectionalLight(SETTINGS.sunColor, 1);
             sun.castShadow = SETTINGS.shadows;
-            sun.shadow.mapSize.set(shadowMapSize, shadowMapSize);
+            sun.shadow.mapSize.set(sunShadowMapSize, sunShadowMapSize);
+            sun.shadow.bias = 0;
+            sun.shadow.normalBias = 0;
+            sun.shadow.radius = 0.5; // Soft shadows
+
+            // Configure sun shadow camera for pixel-locked shadows
+            sun.shadow.camera.left = -sunShadowViewSize / 2;
+            sun.shadow.camera.right = sunShadowViewSize / 2;
+            sun.shadow.camera.top = sunShadowViewSize / 2;
+            sun.shadow.camera.bottom = -sunShadowViewSize / 2;
             sun.shadow.camera.near = 0.001;
-            sun.shadow.camera.far = shadowViewSize;
-            sun.shadow.camera.left = -shadowViewSize;
-            sun.shadow.camera.right = shadowViewSize;
-            sun.shadow.camera.top = shadowViewSize;
-            sun.shadow.camera.bottom = -shadowViewSize;
-            sun.shadow.bias = 0; // Adjusted for better shadow quality
-            sun.shadow.normalBias = 0; // Reduced for tighter shadows
-            sun.shadow.radius = 0.5; // Increased for softer, more natural shadows
+            sun.shadow.camera.far = 200;
+            sun.shadow.camera.updateProjectionMatrix();
             scene.add(sun);
 
-            //Moon Lighting
+            //Moon Lighting (shares sun's shadow configuration for consistency)
             moon = new THREE.DirectionalLight(SETTINGS.moonColor, 0.2);
             moon.castShadow = SETTINGS.shadows;
-            moon.shadow.mapSize.set(shadowMapSize, shadowMapSize); // Moon doesn't need as high resolution
-            moon.shadow.camera.near = 0.001;
-            moon.shadow.camera.far = shadowViewSize;
-            moon.shadow.camera.left = -shadowViewSize;
-            moon.shadow.camera.right = shadowViewSize;
-            moon.shadow.camera.top = shadowViewSize;
-            moon.shadow.camera.bottom = -shadowViewSize;
+            moon.shadow.mapSize.set(moonShadowMapSize, moonShadowMapSize);
             moon.shadow.bias = 0;
             moon.shadow.normalBias = 0;
-            moon.shadow.radius = 0.5; // Softer moonlight shadows
+            moon.shadow.radius = 0.5;
+
+            // Moon uses same frustum as sun for consistent pixel-locking
+            moon.shadow.camera.left = -sunShadowViewSize / 2;
+            moon.shadow.camera.right = sunShadowViewSize / 2;
+            moon.shadow.camera.top = sunShadowViewSize / 2;
+            moon.shadow.camera.bottom = -sunShadowViewSize / 2;
+            moon.shadow.camera.near = 0.001;
+            moon.shadow.camera.far = 200;
+            moon.shadow.camera.updateProjectionMatrix();
             scene.add(moon);
 
-            // Configure sun shadow camera for pixel-perfect shadows
-
-            const shadowCam = sun.shadow.camera;
-
-            shadowCam.left = -shadowViewSize / 2;
-            shadowCam.right = shadowViewSize / 2;
-            shadowCam.top = shadowViewSize / 2;
-            shadowCam.bottom = -shadowViewSize / 2;
-            shadowCam.near = 0.001;
-            shadowCam.far = 200;
-
-            shadowCam.updateProjectionMatrix();
-            
-            // Torch Lighting (continue with torch code here)
+            // Torch Lighting (PointLight with optimized shadow settings)
             torchLight = new THREE.PointLight(SETTINGS.torchColor, 0, SETTINGS.torchRange, 0.8);
             torchLight.castShadow = SETTINGS.shadows;
-            torchLight.shadow.mapSize.set(shadowMapSize, shadowMapSize);
-            torchLight.shadow.camera.near = 0.001;
-            torchLight.shadow.camera.far = shadowViewSize;
-            torchLight.shadow.camera.left = -shadowViewSize;
-            torchLight.shadow.camera.right = shadowViewSize;
-            torchLight.shadow.camera.top = shadowViewSize;
-            torchLight.shadow.camera.bottom = -shadowViewSize;
-            torchLight.shadow.camera.far = 32;
+            torchLight.shadow.mapSize.set(torchShadowMapSize, torchShadowMapSize);
+            torchLight.shadow.camera.near = 0.1;
+            torchLight.shadow.camera.far = SETTINGS.torchRange;
             torchLight.shadow.bias = 0;
-            torchLight.shadow.noramlBias = 0;
+            torchLight.shadow.normalBias = 0;
 
             // Create 3D voxel torch model (view model style)
             const torchGroup = new THREE.Group();
@@ -6509,33 +6507,34 @@
                 const frustumWidth = shadowCam.right - shadowCam.left;
                 const texelWorldSize = frustumWidth / mapWidth; // should be 1/16 after configureSunShadow()
 
-                // Light direction
-                const lightDir = new THREE.Vector3(diskX, diskH, 0).normalize();
+                // Light direction (reuse vector to reduce GC)
+                shadowLightDir.set(diskX, diskH, 0).normalize();
 
-                // Target position snapped to world pixels
-                const targetPos = new THREE.Vector3(snapTargetX, snapTargetY, snapTargetZ);
+                // Target position snapped to world pixels (reuse vector)
+                shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
 
-                // Desired (unsnapped) sun position
-                const desiredSunPos = targetPos.clone().addScaledVector(lightDir, sunOffset);
+                // Desired (unsnapped) sun position (reuse vector)
+                shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, sunOffset);
 
-                // Stable shadow mapping: snap in plane perpendicular to lightDir
-                const along = lightDir.clone().multiplyScalar(desiredSunPos.dot(lightDir));
-                const inPlane = desiredSunPos.clone().sub(along);
+                // Stable shadow mapping: snap in plane perpendicular to lightDir (reuse vectors)
+                const dotProduct = shadowDesiredPos.dot(shadowLightDir);
+                shadowAlong.copy(shadowLightDir).multiplyScalar(dotProduct);
+                shadowInPlane.copy(shadowDesiredPos).sub(shadowAlong);
 
                 const snap = texelWorldSize;
-                inPlane.x = Math.round(inPlane.x / snap) * snap;
-                inPlane.y = Math.round(inPlane.y / snap) * snap;
-                inPlane.z = Math.round(inPlane.z / snap) * snap;
+                shadowInPlane.x = Math.round(shadowInPlane.x / snap) * snap;
+                shadowInPlane.y = Math.round(shadowInPlane.y / snap) * snap;
+                shadowInPlane.z = Math.round(shadowInPlane.z / snap) * snap;
 
-                const snappedSunPos = inPlane.add(along);
+                shadowInPlane.add(shadowAlong); // snappedSunPos
 
                 // Apply to sun
-                sun.target.position.copy(targetPos);
-                sun.position.copy(snappedSunPos);
+                sun.target.position.copy(shadowTargetPos);
+                sun.position.copy(shadowInPlane);
                 sun.target.updateMatrixWorld();
 
                 // Moon opposite (no snapping if it doesn't cast shadows)
-                moon.target.position.copy(targetPos);
+                moon.target.position.copy(shadowTargetPos);
                 moon.position.set(
                     snapTargetX - diskX * sunOffset,
                     snapTargetY - diskH * sunOffset,
