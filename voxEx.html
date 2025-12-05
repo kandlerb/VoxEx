@@ -1340,6 +1340,10 @@
 
             const chunks = new Map();
             const chunkMeshes = new Map();
+            let terrainMeshCount = 0;
+            let waterMeshCount = 0;
+            const reusableMeshKeys = [];
+            const reusableChunkDistances = [];
             const chunkTorches = new Map(); // Store torch 3D models per chunk
             const activeChunks = new Set();
             const globalPendingMods = new Map();
@@ -1538,21 +1542,11 @@
                         const [c, z] = k.split(",").map(Number);
 
                         // Remove BOTH terrain and water meshes if they exist
-                        if (chunkMeshes.has(k)) {
-                            const m = chunkMeshes.get(k);
-                            scene.remove(m);
-                            if (m.geometry) m.geometry.dispose();
-                            chunkMeshes.delete(k);
-                        }
+                        disposeChunkMesh(k);
 
                         // Also remove water mesh
                         const waterKey = k + "_WATER";
-                        if (chunkMeshes.has(waterKey)) {
-                            const waterMesh = chunkMeshes.get(waterKey);
-                            scene.remove(waterMesh);
-                            if (waterMesh.geometry) waterMesh.geometry.dispose();
-                            chunkMeshes.delete(waterKey);
-                        }
+                        disposeChunkMesh(waterKey);
 
                         // Add to the async build queue instead of rebuilding immediately
                         if (!queuedChunkKeys.has(k)) {
@@ -1563,6 +1557,48 @@
                     pendingChunkUpdates.clear();
                     updateTimeout = null;
                 }, 50);
+            }
+
+            const isWaterKey = (key) => key.endsWith("_WATER");
+
+            const incrementMeshCount = (key) => {
+                if (isWaterKey(key)) {
+                    waterMeshCount++;
+                } else {
+                    terrainMeshCount++;
+                }
+            };
+
+            const decrementMeshCount = (key) => {
+                if (isWaterKey(key)) {
+                    waterMeshCount = Math.max(0, waterMeshCount - 1);
+                } else {
+                    terrainMeshCount = Math.max(0, terrainMeshCount - 1);
+                }
+            };
+
+            function storeChunkMesh(key, mesh) {
+                if (!chunkMeshes.has(key)) {
+                    incrementMeshCount(key);
+                }
+                chunkMeshes.set(key, mesh);
+            }
+
+            function disposeChunkMesh(key) {
+                const mesh = chunkMeshes.get(key);
+                if (!mesh) return null;
+
+                scene.remove(mesh);
+                if (mesh.geometry) mesh.geometry.dispose();
+                chunkMeshes.delete(key);
+                decrementMeshCount(key);
+                chunkRenderedFaces.delete(key);
+                return mesh;
+            }
+
+            function resetMeshCounters() {
+                terrainMeshCount = 0;
+                waterMeshCount = 0;
             }
 
             class SeededRandom {
@@ -2104,12 +2140,7 @@
                 const chunksToRebuild = [...activeChunks];
                 for (const key of chunksToRebuild) {
                     // Dispose and remove old mesh
-                    const oldMesh = chunkMeshes.get(key);
-                    if (oldMesh) {
-                        if (oldMesh.geometry) oldMesh.geometry.dispose();
-                        scene.remove(oldMesh);
-                        chunkMeshes.delete(key);
-                    }
+                    disposeChunkMesh(key);
                     // Add to build queue to be re-rendered with new settings
                     const [cx, cz] = key.split(",").map(Number);
                     if (!chunkBuildQueue.some((q) => q.key === key)) {
@@ -2292,11 +2323,15 @@
                     activeChunks.clear();
                     // modifiedChunks.clear(); // Uncomment if you have this variable
 
-                    for (const mesh of chunkMeshes.values()) {
-                        scene.remove(mesh);
-                        if (mesh.geometry) mesh.geometry.dispose();
+                    reusableMeshKeys.length = 0;
+                    for (const key of chunkMeshes.keys()) {
+                        reusableMeshKeys.push(key);
+                    }
+                    for (const key of reusableMeshKeys) {
+                        disposeChunkMesh(key);
                     }
                     chunkMeshes.clear();
+                    resetMeshCounters();
                     chunkRenderedFaces.clear();
                     lastChunkUpdate = -Infinity; // Force refresh
                 }
@@ -5223,12 +5258,7 @@
                             const idx = nLx + nLz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
                             if (idx >= 0 && idx < nData.length && (nData[idx] === AIR || nData[idx] === LEAVES)) {
                                 nData[idx] = id;
-                                if (chunkMeshes.has(nKey)) {
-                                    const oldMesh = chunkMeshes.get(nKey);
-                                    if (oldMesh && oldMesh.geometry) oldMesh.geometry.dispose();
-                                    scene.remove(oldMesh);
-                                    chunkMeshes.delete(nKey);
-                                }
+                                disposeChunkMesh(nKey);
                                 if (typeof chunkBuildQueue !== "undefined") {
                                     // ONLY queue the neighbor for a rebuild if it is ALREADY VISIBLE (has a mesh)
                                     // This prevents generating chunks infinitely into the distance just because a tree touched them.
@@ -6041,7 +6071,7 @@
                             terrainMesh.renderOrder = 0; // Render terrain first
 
                             scene.add(terrainMesh);
-                            chunkMeshes.set(cKey, terrainMesh);
+                            storeChunkMesh(cKey, terrainMesh);
                         }
 
                         // --- CREATE WATER MESH ---
@@ -6073,7 +6103,7 @@
                             waterMesh.renderOrder = 1; // Render water after terrain
 
                             scene.add(waterMesh);
-                            chunkMeshes.set(cKey + "_WATER", waterMesh);
+                            storeChunkMesh(cKey + "_WATER", waterMesh);
                         }
 
                         // --- CREATE TORCH MODELS ---
@@ -6278,11 +6308,10 @@
                 logDebug(`Frustum Culling: ${culled}/${totalChecked} chunks culled (${((culled / totalChecked) * 100).toFixed(1)}%)`);
 
                 // --- 6A. PROACTIVE MESH CLEANUP (NEW - ADD THIS BEFORE EXISTING CLEANUP) ---
-                const terrainMeshCount = Array.from(chunkMeshes.keys()).filter((k) => !k.includes("_WATER")).length;
                 const maxAllowedMeshes = Math.max(SETTINGS.maxCachedChunks, currentRenderRadius * currentRenderRadius * 2);
 
                 if (terrainMeshCount > maxAllowedMeshes) {
-                    const chunkDistances = [];
+                    reusableChunkDistances.length = 0;
                     const processedKeys = new Set();
 
                     for (const key of chunkMeshes.keys()) {
@@ -6291,51 +6320,35 @@
                             processedKeys.add(baseKey);
                             const [c, z] = baseKey.split(",").map(Number);
                             const dist = (c - chunkX) ** 2 + (z - chunkZ) ** 2;
-                            chunkDistances.push({ key: baseKey, dist });
+                            reusableChunkDistances.push({ key: baseKey, dist });
                         }
                     }
 
-                    chunkDistances.sort((a, b) => b.dist - a.dist);
+                    reusableChunkDistances.sort((a, b) => b.dist - a.dist);
                     const excess = terrainMeshCount - maxAllowedMeshes;
                     const toRemove = Math.ceil(excess * 0.3);
 
-                    for (let i = 0; i < toRemove && i < chunkDistances.length; i++) {
-                        const targetKey = chunkDistances[i].key;
+                    for (let i = 0; i < toRemove && i < reusableChunkDistances.length; i++) {
+                        const targetKey = reusableChunkDistances[i].key;
                         if (!neededKeys.has(targetKey)) {
-                            // Remove terrain mesh
-                            if (chunkMeshes.has(targetKey)) {
-                                const m = chunkMeshes.get(targetKey);
-                                scene.remove(m);
-                                if (m.geometry) m.geometry.dispose();
-                                chunkMeshes.delete(targetKey);
-                            }
-                            // Remove water mesh
-                            const waterKey = targetKey + "_WATER";
-                            if (chunkMeshes.has(waterKey)) {
-                                const wm = chunkMeshes.get(waterKey);
-                                scene.remove(wm);
-                                if (wm.geometry) wm.geometry.dispose();
-                                chunkMeshes.delete(waterKey);
-                            }
-                            chunkRenderedFaces.delete(targetKey);
+                            disposeChunkMesh(targetKey);
+                            disposeChunkMesh(targetKey + "_WATER");
                         }
                     }
                 }
 
                 // --- 6B. Cleanup Old Chunks ---
-                // Iterate over KEYS to avoid iterator invalidation issues during delete
-                const meshKeys = Array.from(chunkMeshes.keys());
-                for (const key of meshKeys) {
+                reusableMeshKeys.length = 0;
+                for (const key of chunkMeshes.keys()) {
+                    reusableMeshKeys.push(key);
+                }
+                for (const key of reusableMeshKeys) {
                     // Strip _WATER suffix to check if the base chunk is needed
                     const baseKey = key.replace("_WATER", "");
 
                     // If it's not in our "Needed" list, KILL IT IMMEDIATELY
                     if (!neededKeys.has(baseKey)) {
-                        const mesh = chunkMeshes.get(key);
-                        scene.remove(mesh);
-                        if (mesh.geometry) mesh.geometry.dispose();
-                        chunkMeshes.delete(key);
-                        chunkRenderedFaces.delete(key);
+                        disposeChunkMesh(key);
                     }
                 }
 
@@ -6434,19 +6447,9 @@
                         chunkNeighborUpdateQueue.delete(key);
 
                         // Remove old meshes
-                        if (chunkMeshes.has(key)) {
-                            const m = chunkMeshes.get(key);
-                            scene.remove(m);
-                            if (m.geometry) m.geometry.dispose();
-                            chunkMeshes.delete(key);
-                        }
+                        disposeChunkMesh(key);
                         const waterKey = key + "_WATER";
-                        if (chunkMeshes.has(waterKey)) {
-                            const wm = chunkMeshes.get(waterKey);
-                            scene.remove(wm);
-                            if (wm.geometry) wm.geometry.dispose();
-                            chunkMeshes.delete(waterKey);
-                        }
+                        disposeChunkMesh(waterKey);
 
                         // Rebuild chunk
                         const [cx, cz] = key.split(",").map(Number);
