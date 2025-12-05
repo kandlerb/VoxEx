@@ -1782,6 +1782,80 @@
             // Hide seed menu FIRST before any generation
             document.getElementById("seed-menu").style.display = "none";
 
+            // --- OPTIMIZATION: Cached torch geometries and materials ---
+            // Prevents shader recompilation by reusing materials across all torch instances
+            let _torchGeoCache = null;
+            let _torchMatCache = null;
+
+            function getTorchResources() {
+                if (!_torchGeoCache) {
+                    _torchGeoCache = {
+                        stick: new THREE.BoxGeometry(0.08, 0.5, 0.08),
+                        flame: new THREE.BoxGeometry(0.08, 0.04, 0.08),
+                        glow: new THREE.BoxGeometry(0.08, 0.08, 0.08)
+                    };
+                }
+                if (!_torchMatCache) {
+                    _torchMatCache = {
+                        stick: new THREE.MeshLambertMaterial({ color: 0x4a2511 }),
+                        flame: new THREE.MeshLambertMaterial({
+                            color: 0xffaa33,
+                            emissive: 0xffaa33,
+                            emissiveIntensity: 0.5,
+                        }),
+                        glow: new THREE.MeshLambertMaterial({
+                            color: 0xffff66,
+                            emissive: 0xffff66,
+                            emissiveIntensity: 1.0,
+                        })
+                    };
+                }
+                return { geo: _torchGeoCache, mat: _torchMatCache };
+            }
+
+            let camera;
+            let scene;
+            let renderer;
+            let controls;
+            let raycaster;
+            let sun;
+            let moon;
+            let skybox;
+            let skyMaterial;
+            let sunSprite;
+            let moonSprite;
+            let ambLight;
+            let dayNightTime = 0.25;
+            let moveForward = false;
+            let moveBackward = false;
+            let moveLeft = false;
+            let moveRight = false;
+            let canJump = false;
+            let isSprinting = false;
+            let isCrouching = false;
+            let isChatOpen = false;
+            let isDebug = false;
+
+            // Error throttling system to prevent console spam and browser slowdown
+            const errorThrottle = new Map(); // Track last error time by error type
+            const ERROR_THROTTLE_MS = 5000; // Only same error once per 5 seconds
+
+            function logError(errorType, message, error = null) {
+                const now = Date.now();
+                const lastLogged = errorThrottle.get(errorType) || 0;
+
+                // Always errors, but throttle duplicates
+                if (now - lastLogged > ERROR_THROTTLE_MS) {
+                    errorThrottle.set(errorType, now);
+                    if (error) {
+                        console.error(`[VoxEx Error - ${errorType}]:`, message, error);
+                    } else {
+                        console.error(`[VoxEx Error - ${errorType}]:`, message);
+                    }
+                    return true; // Error was logged
+                }
+                return false; // Error was throttled
+            }
             // If we didn't just load a save, set up the RNG now
             if (!loadedPlayerState) {
                 rng = new SeededRandom(seedStr);
@@ -2299,6 +2373,86 @@
         async function saveChunkToCache(chunkKey, chunkData) {
             if (!db) return;
 
+            function getBlock(x, y, z) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                // FIX: Use Math.floor for correct handling of negative coordinates
+                // The bitwise approach was broken for x/z in range [-16, -2], [-32, -18], etc.
+                const cx = Math.floor(x / 16);
+                const cz = Math.floor(z / 16);
+                const key = getChunkKey(cx, cz);
+                // OPTIMIZATION: Cache last accessed chunk to avoid repeated Map lookups
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
+                if (!chunk) return undefined;
+                _lastChunkKey = key;
+                _lastChunk = chunk;
+                // OPTIMIZATION: Use bitwise AND for modulo 16 (works correctly for negative numbers)
+                const lx = x & 15;
+                const lz = z & 15;
+                const idx = lx + (lz << 4) + (ly << 8);
+                return chunk.blocks ? chunk.blocks[idx] : chunk[idx]; // Support both old and new format
+            }
+
+            function getSkyLight(x, y, z) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0) return 1; // Below world: minimum light
+                if (ly >= WORLD_DIMS.chunkHeight) return 15; // Above world: full sky light
+                // FIX: Use Math.floor for correct handling of negative coordinates
+                const cx = Math.floor(x / 16);
+                const cz = Math.floor(z / 16);
+                const key = getChunkKey(cx, cz);
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
+                if (!chunk || !chunk.skyLight) return 15; // Default full bright for unloaded chunks
+                const lx = x & 15;
+                const lz = z & 15;
+                return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
+            }
+
+            function getBlockLight(x, y, z) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                // FIX: Use Math.floor for correct handling of negative coordinates
+                const cx = Math.floor(x / 16);
+                const cz = Math.floor(z / 16);
+                const key = getChunkKey(cx, cz);
+                const chunk = (key === _lastChunkKey) ? _lastChunk : chunks.get(key);
+                if (!chunk || !chunk.blockLight) return 0;
+                const lx = x & 15;
+                const lz = z & 15;
+                return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
+            }
+
+            function setSkyLight(x, y, z, level) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                // FIX: Use Math.floor for correct handling of negative coordinates
+                const cx = Math.floor(x / 16);
+                const cz = Math.floor(z / 16);
+                const key = getChunkKey(cx, cz);
+                const chunk = chunks.get(key);
+                if (!chunk || !chunk.skyLight) return;
+                const lx = x & 15;
+                const lz = z & 15;
+                // OPTIMIZATION: Inline clamp instead of Math.max/Math.min
+                const clamped = level < 1 ? 1 : (level > 15 ? 15 : level);
+                chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
+            }
+
+            function setBlockLight(x, y, z, level) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                // FIX: Use Math.floor for correct handling of negative coordinates
+                const cx = Math.floor(x / 16);
+                const cz = Math.floor(z / 16);
+                const key = getChunkKey(cx, cz);
+                const chunk = chunks.get(key);
+                if (!chunk || !chunk.blockLight) return;
+                const lx = x & 15;
+                const lz = z & 15;
+                // OPTIMIZATION: Inline clamp instead of Math.max/Math.min
+                const clamped = level < 0 ? 0 : (level > 15 ? 15 : level);
+                chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
+            }
             return new Promise((resolve, reject) => {
                 const transaction = db.transaction([STORE_NAME], "readwrite");
                 const store = transaction.objectStore(STORE_NAME);
@@ -5360,6 +5514,97 @@
                     }
                 }
 
+                // Get light level at this block (1-15) and convert to 0-1 range
+                // Use square root curve for better visibility in dark areas while preserving brightness gradient
+                // sqrt(1/15) = 0.258 (26% vs 7% linear), sqrt(15/15) = 1.0 (100% same)
+                const rawLight = lightGetter ? lightGetter(lx, ly, lz) / 15.0 : 1.0;
+                const lightLevel = Math.sqrt(rawLight);
+
+                // Apply both AO and light level to vertex colors
+                const c1 = ao1 * lightLevel;
+                const c2 = ao2 * lightLevel;
+                const c3 = ao3 * lightLevel;
+                const c4 = ao4 * lightLevel;
+
+                col[cIdx + 0] = c1;
+                col[cIdx + 1] = c1;
+                col[cIdx + 2] = c1;
+                col[cIdx + 3] = c2;
+                col[cIdx + 4] = c2;
+                col[cIdx + 5] = c2;
+                col[cIdx + 6] = c4;
+                col[cIdx + 7] = c4;
+                col[cIdx + 8] = c4;
+
+                col[cIdx + 9] = c2;
+                col[cIdx + 10] = c2;
+                col[cIdx + 11] = c2;
+                col[cIdx + 12] = c3;
+                col[cIdx + 13] = c3;
+                col[cIdx + 14] = c3;
+                col[cIdx + 15] = c4;
+                col[cIdx + 16] = c4;
+                col[cIdx + 17] = c4;
+
+                // Push UVs (Preserved)
+                const p = 0.05; // padding to prevent bleeding (increased from 0.0001)
+                const tileW = 1 / NUM_TILES;
+
+                const u0 = uv[0] + p;
+                const u1 = uv[0] + tileW - p;
+                const v0 = uv[1] + p;
+                const v1c = uv[1] + 1.0 - p; // Assuming v height is 1.0 (stacked vertically?)
+
+                uvs[uvIdx + 0] = u0;
+                uvs[uvIdx + 1] = v0;
+                uvs[uvIdx + 2] = u1;
+                uvs[uvIdx + 3] = v0;
+                uvs[uvIdx + 4] = u0;
+                uvs[uvIdx + 5] = v1c;
+
+                uvs[uvIdx + 6] = u1;
+                uvs[uvIdx + 7] = v0;
+                uvs[uvIdx + 8] = u1;
+                uvs[uvIdx + 9] = v1c;
+                uvs[uvIdx + 10] = u0;
+                uvs[uvIdx + 11] = v1c;
+            }
+
+            // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
+            // OPTIMIZATION: Uses cached geometries and materials to prevent shader recompilation
+            function createWorldTorch(x, y, z) {
+                const { geo, mat } = getTorchResources();
+                const torchGroup = new THREE.Group();
+
+                // Torch stick (reuse cached geometry and material)
+                const stick = new THREE.Mesh(geo.stick, mat.stick);
+                stick.position.set(0, 0, 0);
+                stick.castShadow = false; // OPTIMIZATION: Disable shadows on small torch objects
+                stick.receiveShadow = false;
+                torchGroup.add(stick);
+
+                // Torch flame (reuse cached geometry and material)
+                const flame = new THREE.Mesh(geo.flame, mat.flame);
+                flame.position.set(0, 0.27, 0);
+                flame.castShadow = false;
+                torchGroup.add(flame);
+
+                // Torch glow (reuse cached geometry and material)
+                const glow = new THREE.Mesh(geo.glow, mat.glow);
+                glow.position.set(0, 0.33, 0);
+                glow.castShadow = false;
+                torchGroup.add(glow);
+
+                // Add PointLight for actual light emission
+                // OPTIMIZATION: Disable shadow casting on torch lights (major performance improvement)
+                // Shadow mapping is expensive - use only the main sun/moon lights for shadows
+                const light = new THREE.PointLight(SETTINGS.torchColor, SETTINGS.torchIntensity * 2, SETTINGS.torchRange, 0.8);
+                light.position.set(0, 0.33, 0);
+                light.castShadow = false; // CRITICAL OPTIMIZATION: Torch shadows were causing major performance issues
+                torchGroup.add(light);
+
+                // Position at block location (centered, on ground)
+                torchGroup.position.set(x + 0.5, y, z + 0.5);
                 // Create chunk with light data
                 const size = chunkSize * chunkSize * chunkHeight;
                 const chunk = {
@@ -5705,6 +5950,24 @@
                         return getLightFromChunk(centerData, idx);
                     }
 
+                    // --- CREATE TORCH MODELS ---
+                    // Clean up old torches first (properly dispose to prevent memory leaks)
+                    const oldTorches = chunkTorches.get(cKey);
+                    if (oldTorches) {
+                        for (const torch of oldTorches) {
+                            scene.remove(torch);
+                            // Dispose children (meshes and lights) but NOT shared geometries/materials
+                            torch.traverse((child) => {
+                                if (child.isLight) {
+                                    // Dispose light shadow map if it exists
+                                    if (child.shadow && child.shadow.map) {
+                                        child.shadow.map.dispose();
+                                    }
+                                }
+                                // Note: We don't dispose geometry/material since they're cached and shared
+                            });
+                        }
+                        chunkTorches.delete(cKey);
                     // 2. Orthogonal Neighbors
                     if (lz < 0 && lx >= 0 && lx < 16) {
                         const idx = lx + 15 * 16 + ly * 256;
