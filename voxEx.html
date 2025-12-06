@@ -2282,7 +2282,9 @@
                 const chunkVolume = chunkSize * chunkSize * chunkHeight;
                 const currentLight = getSkyLight(x, y, z);
                 const becameOpaque = !IS_TRANSPARENT[newId];
-                const HARD_CAP_CELLS = chunkVolume * 3; // allow a few chunks worth of work before bailing
+                const HARD_CAP_BASE_CHUNKS = 3; // base allowance in chunks for hard cap
+                const HARD_CAP_MAX_CHUNKS = 12; // prevent runaway growth when many chunks are touched
+                const HARD_CAP_GROWTH_RATIO = 0.5; // +1 chunk per two additional touched chunks
                 const SOFT_CAP_BASE = chunkVolume * 2; // baseline soft cap, scaled by affected chunks
 
                 const task = {
@@ -2301,13 +2303,18 @@
                     chunkSize,
                     chunkHeight,
                     chunkVolume,
-                    HARD_CAP_CELLS,
+                    HARD_CAP_BASE_CHUNKS,
+                    HARD_CAP_MAX_CHUNKS,
+                    HARD_CAP_GROWTH_RATIO,
                     SOFT_CAP_BASE,
                     bailedOut: false,
                     done: false,
                     totalEnqueued: 0,
                     softWarned: false,
                     enqueueBlocked: false,
+                    blockedAddBuffer: [],
+                    blockedRemoveBuffer: [],
+                    peakEntries: 0,
                 };
 
                 task.touchedChunks.add(getChunkKey(Math.floor(x / chunkSize), Math.floor(z / chunkSize)));
@@ -2376,14 +2383,61 @@
                     return true;
                 };
 
+                task.flushBlocked = () => {
+                    if (!task.blockedAddBuffer.length && !task.blockedRemoveBuffer.length) return;
+                    if (task.blockedRemoveBuffer.length) {
+                        for (let i = 0; i < task.blockedRemoveBuffer.length; i++) {
+                            task.removeQueue.push(task.blockedRemoveBuffer[i]);
+                        }
+                        task.blockedRemoveBuffer.length = 0;
+                    }
+                    if (task.blockedAddBuffer.length) {
+                        for (let i = 0; i < task.blockedAddBuffer.length; i++) {
+                            task.addQueue.push(task.blockedAddBuffer[i]);
+                        }
+                        task.blockedAddBuffer.length = 0;
+                    }
+                };
+
+                task.getDynamicHardCap = () => {
+                    const touched = Math.max(1, task.touchedChunks.size);
+                    const extraChunks = Math.max(0, touched - task.HARD_CAP_BASE_CHUNKS);
+                    const allowedChunks = Math.min(
+                        task.HARD_CAP_MAX_CHUNKS,
+                        task.HARD_CAP_BASE_CHUNKS + Math.floor(extraChunks * task.HARD_CAP_GROWTH_RATIO)
+                    );
+                    return allowedChunks * task.chunkVolume;
+                };
+
                 task.checkPressure = () => {
                     if (task.bailedOut) return true;
+                    const dynamicHardCap = task.getDynamicHardCap();
                     const addEntries = task.addQueue.length >> 2;
                     const removeEntries = task.removeQueue.length >> 2;
-                    const maxEntries = Math.max(addEntries, removeEntries, task.totalEnqueued);
+                    const bufferedEntries = (task.blockedAddBuffer.length + task.blockedRemoveBuffer.length) >> 2;
+                    const currentEntries = Math.max(addEntries, removeEntries);
+                    const maxEntries = Math.max(currentEntries, bufferedEntries);
+                    task.peakEntries = Math.max(task.peakEntries, maxEntries);
                     const dynamicSoftCap = task.SOFT_CAP_BASE * Math.max(1, task.touchedChunks.size / 4);
+                    const throttleLimit = dynamicHardCap * 0.8;
+                    const unblockThreshold = dynamicHardCap * 0.6;
 
-                    if (maxEntries > task.HARD_CAP_CELLS) {
+                    if (maxEntries > throttleLimit && !task.enqueueBlocked) {
+                        task.enqueueBlocked = true;
+                        return false;
+                    }
+
+                    if (task.enqueueBlocked) {
+                        if (maxEntries <= unblockThreshold) {
+                            task.enqueueBlocked = false;
+                            task.flushBlocked();
+                        } else if (maxEntries > dynamicHardCap) {
+                            return task.bailoutToFullRecalc('hard cap');
+                        }
+                        return false;
+                    }
+
+                    if (maxEntries > dynamicHardCap) {
                         return task.bailoutToFullRecalc('hard cap');
                     }
 
@@ -2398,16 +2452,24 @@
                 };
 
                 task.enqueueRemove = (qx, qy, qz, level) => {
-                    if (task.bailedOut || task.enqueueBlocked) return;
+                    if (task.bailedOut) return;
                     if (task.resolveVisit(task.removeVisited, qx, qy, qz) === null) return;
+                    if (task.enqueueBlocked) {
+                        task.blockedRemoveBuffer.push(qx, qy, qz, level);
+                        return;
+                    }
                     task.removeQueue.push(qx, qy, qz, level);
                     task.totalEnqueued++;
                     task.checkPressure();
                 };
 
                 task.enqueueAdd = (qx, qy, qz, level) => {
-                    if (task.bailedOut || task.enqueueBlocked) return;
+                    if (task.bailedOut) return;
                     if (task.resolveVisit(task.addVisited, qx, qy, qz) === null) return;
+                    if (task.enqueueBlocked) {
+                        task.blockedAddBuffer.push(qx, qy, qz, level);
+                        return;
+                    }
                     task.addQueue.push(qx, qy, qz, level);
                     task.totalEnqueued++;
                     task.checkPressure();
