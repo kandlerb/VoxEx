@@ -1434,6 +1434,16 @@
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
             const chunkTorches = new Map(); // Store torch 3D models per chunk
+            const meshLifecycleStats = {
+                acquired: { terrain: 0, water: 0 },
+                released: { terrain: 0, water: 0 },
+                attached: new Map(),
+                detached: new Map(),
+                mark(event, payload = {}) {
+                    if (!isDebug) return;
+                    logDebug(`[MeshLifecycle] ${event}`, payload);
+                },
+            };
             const activeChunks = new Set();
             const globalPendingMods = new Map();
             const chunkBuildQueue = [];
@@ -8185,22 +8195,48 @@
             function acquireChunkMesh(type) {
                 const pool = type === "water" ? waterMeshPool : terrainMeshPool;
                 const mesh = pool.pop() || new THREE.Mesh(undefined, type === "water" ? waterMaterial : chunkMaterial);
+                // Ensure no stale geometry is kept between uses
+                if (mesh.geometry) {
+                    mesh.geometry.dispose();
+                    mesh.geometry = null;
+                }
                 mesh.matrixAutoUpdate = false;
                 mesh.material = type === "water" ? waterMaterial : chunkMaterial;
                 mesh.frustumCulled = type === "water" ? false : SETTINGS.enableFrustumCulling;
                 mesh.castShadow = type === "water" ? false : SETTINGS.shadows;
                 mesh.receiveShadow = type === "water" ? false : SETTINGS.shadows;
                 mesh.renderOrder = type === "water" ? 1 : 0;
+                mesh.userData.chunkType = type;
+                mesh.userData.chunkKey = null;
+                meshLifecycleStats.acquired[type]++;
+                meshLifecycleStats.mark("acquire", {
+                    type,
+                    poolSize: pool.length,
+                    terrainMeshCount,
+                    waterMeshCount,
+                });
                 return mesh;
             }
 
             function releaseChunkMesh(mesh, type) {
                 if (!mesh) return;
-                scene.remove(mesh);
+                if (mesh.parent) mesh.parent.remove(mesh);
                 if (mesh.geometry) mesh.geometry.dispose();
                 mesh.geometry = null;
+                mesh.userData.chunkKey = null;
+                mesh.userData.chunkType = type;
+                mesh.frustumCulled = type === "water" ? false : SETTINGS.enableFrustumCulling;
+                mesh.castShadow = type === "water" ? false : SETTINGS.shadows;
+                mesh.receiveShadow = type === "water" ? false : SETTINGS.shadows;
                 const pool = type === "water" ? waterMeshPool : terrainMeshPool;
                 pool.push(mesh);
+                meshLifecycleStats.released[type]++;
+                meshLifecycleStats.mark("release", {
+                    type,
+                    poolSize: pool.length,
+                    terrainMeshCount,
+                    waterMeshCount,
+                });
             }
 
             function releaseChunkTorches(baseKey) {
@@ -8208,7 +8244,7 @@
                 if (!torches) return;
 
                 for (const torch of torches) {
-                    scene.remove(torch);
+                    if (torch.parent) torch.parent.remove(torch);
                     torch.traverse((node) => {
                         if (node.isMesh) {
                             if (node.geometry) node.geometry.dispose();
@@ -8220,6 +8256,8 @@
                             } else if (mat && typeof mat.dispose === "function") {
                                 mat.dispose();
                             }
+                        } else if (node.isLight && typeof node.dispose === "function") {
+                            node.dispose();
                         }
                     });
                 }
@@ -8234,14 +8272,26 @@
 
                 const mesh = chunkMeshes.get(key);
                 if (!mesh) return;
+                meshLifecycleStats.mark("detach", { key, isWater });
                 releaseChunkMesh(mesh, isWater ? "water" : "terrain");
                 chunkMeshes.delete(key);
                 if (isWater) {
-                    if (waterMeshCount > 0) waterMeshCount--;
+                    if (waterMeshCount > 0) {
+                        waterMeshCount--;
+                    } else {
+                        meshLifecycleStats.mark("waterCountUnderflow", { key });
+                    }
                 } else {
-                    if (terrainMeshCount > 0) terrainMeshCount--;
+                    if (terrainMeshCount > 0) {
+                        terrainMeshCount--;
+                    } else {
+                        meshLifecycleStats.mark("terrainCountUnderflow", { key });
+                    }
                     chunkRenderedFaces.delete(key);
                 }
+                const now = performance.now();
+                meshLifecycleStats.detached.set(baseKey, now);
+                meshLifecycleStats.detached.set(key, now);
             }
 
             // OPTIMIZATION: Hoist light lookup helper outside of renderChunk to avoid creating closures
@@ -8497,11 +8547,24 @@
                         terrainMesh.frustumCulled = SETTINGS.enableFrustumCulling;
                         terrainMesh.castShadow = SETTINGS.shadows;
                         terrainMesh.receiveShadow = SETTINGS.shadows;
+                        terrainMesh.userData.chunkKey = cKey;
                         terrainMesh.updateMatrix();
 
                         scene.add(terrainMesh);
                         if (!chunkMeshes.has(cKey)) terrainMeshCount++;
                         chunkMeshes.set(cKey, terrainMesh);
+                        meshLifecycleStats.mark("attach", {
+                            key: cKey,
+                            type: "terrain",
+                            faces: tFaceCount,
+                            poolRemaining: terrainMeshPool.length,
+                        });
+                        meshLifecycleStats.attached.set(cKey, performance.now());
+                        if (meshLifecycleStats.detached.has(cKey)) {
+                            const downtime = performance.now() - meshLifecycleStats.detached.get(cKey);
+                            meshLifecycleStats.mark("reattach", { key: cKey, type: "terrain", downtime: downtime.toFixed(1) });
+                            meshLifecycleStats.detached.delete(cKey);
+                        }
                     }
 
                     // --- CREATE WATER MESH ---
@@ -8528,12 +8591,27 @@
                         waterMesh.frustumCulled = false; // Water doesn't use frustum culling
                         waterMesh.castShadow = false; // Water doesn't cast shadows
                         waterMesh.receiveShadow = false;
+                        waterMesh.userData.chunkKey = cKey;
                         waterMesh.updateMatrix();
 
                         scene.add(waterMesh);
                         const waterKey = cKey + "_WATER";
                         if (!chunkMeshes.has(waterKey)) waterMeshCount++;
                         chunkMeshes.set(waterKey, waterMesh);
+                        meshLifecycleStats.mark("attach", {
+                            key: waterKey,
+                            type: "water",
+                            faces: wFaceCount,
+                            poolRemaining: waterMeshPool.length,
+                        });
+                        meshLifecycleStats.attached.set(waterKey, performance.now());
+                        if (meshLifecycleStats.detached.has(waterKey) || meshLifecycleStats.detached.has(cKey)) {
+                            const refKey = meshLifecycleStats.detached.has(waterKey) ? waterKey : cKey;
+                            const downtime = performance.now() - meshLifecycleStats.detached.get(refKey);
+                            meshLifecycleStats.mark("reattach", { key: waterKey, type: "water", downtime: downtime.toFixed(1) });
+                            meshLifecycleStats.detached.delete(waterKey);
+                            meshLifecycleStats.detached.delete(cKey);
+                        }
                     }
 
                     // --- CREATE TORCH MODELS ---
@@ -8986,6 +9064,14 @@
                         dirtyChunks.delete(job.key);
                     }
                     renderChunk(jobCx, jobCz);
+                    if (isDirty) {
+                        const terrainOK = chunkMeshes.has(job.key);
+                        meshLifecycleStats.mark("dirtyRebuild", {
+                            key: job.key,
+                            terrainAttached: terrainOK,
+                            waterAttached: chunkMeshes.has(job.key + "_WATER"),
+                        });
+                    }
                     builds++;
                 }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
