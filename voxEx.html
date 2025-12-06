@@ -1262,6 +1262,28 @@
             let nightFogColorObj, dayFogColorObj;
             let colorsInitialized = false;
 
+            // Track pixel-art textures that should share anisotropy + mipmap settings
+            const pixelTexturesNeedingAniso = new Set();
+            let MAX_TEXTURE_ANISOTROPY = 1;
+
+            function registerPixelTexture(tex) {
+                tex.magFilter = THREE.NearestFilter;
+                tex.minFilter = THREE.NearestMipMapNearestFilter;
+                tex.generateMipmaps = true;
+                tex.needsUpdate = true;
+                tex.anisotropy = MAX_TEXTURE_ANISOTROPY;
+                pixelTexturesNeedingAniso.add(tex);
+            }
+
+            function refreshPixelTextureAnisotropy() {
+                if (renderer && renderer.capabilities) {
+                    MAX_TEXTURE_ANISOTROPY = renderer.capabilities.getMaxAnisotropy();
+                    pixelTexturesNeedingAniso.forEach((tex) => {
+                        tex.anisotropy = MAX_TEXTURE_ANISOTROPY;
+                    });
+                }
+            }
+
             // --- OPTIMIZATION: Pre-computed AO power curve lookup table ---
             // Math.pow((3 - occlusionCount) / 3, 0.6) for occlusion counts 0-3
             // Avoids expensive Math.pow calls in tight rendering loop
@@ -3255,6 +3277,7 @@
                 if (SETTINGS.shadows) {
                     renderer.shadowMap.type = THREE.PCFShadowMap;
                 }
+                refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
 
                 // 9. Controls & Pause Menu Logic
@@ -5118,6 +5141,86 @@
                 return tex;
             }
 
+            const FACE_VALIDATION_RESOLUTIONS = new Set([16, 32, 64]);
+            const zombieFaceValidations = new Set();
+
+            function quantizeUVToPixel(u, v, resolution) {
+                const clamp01 = (value) => Math.min(1, Math.max(0, value));
+                const resIndex = resolution - 1;
+                return {
+                    x: Math.round(clamp01(u) * resIndex),
+                    y: Math.round(clamp01(v) * resIndex),
+                };
+            }
+
+            function fillRoundedPixel(ctx, step, x, y, color) {
+                const startX = Math.round(x * step);
+                const startY = Math.round(y * step);
+                const endX = Math.round((x + 1) * step);
+                const endY = Math.round((y + 1) * step);
+                ctx.fillStyle = color;
+                ctx.fillRect(startX, startY, Math.max(1, endX - startX), Math.max(1, endY - startY));
+            }
+
+            function applyPixelDither(ctx, resolution, step, strength = 0.08) {
+                const ditherCount = Math.max(resolution * resolution * 0.25, resolution * 2);
+                const alpha = strength / Math.max(12, resolution);
+                for (let i = 0; i < ditherCount; i++) {
+                    const { x, y } = quantizeUVToPixel(Math.random(), Math.random(), resolution);
+                    ctx.fillStyle = Math.random() > 0.5 ? `rgba(255,255,255,${alpha})` : `rgba(0,0,0,${alpha})`;
+                    const startX = Math.round(x * step);
+                    const startY = Math.round(y * step);
+                    const endX = Math.round((x + 1) * step);
+                    const endY = Math.round((y + 1) * step);
+                    ctx.fillRect(startX, startY, Math.max(1, endX - startX), Math.max(1, endY - startY));
+                }
+            }
+
+            function hexToRgbArray(hex) {
+                const normalized = hex.toString().startsWith("#") ? hex.substring(1) : hex.toString(16).padStart(6, "0");
+                const intVal = parseInt(normalized, 16);
+                return [
+                    (intVal >> 16) & 0xff,
+                    (intVal >> 8) & 0xff,
+                    intVal & 0xff,
+                ];
+            }
+
+            function colorMatches(sampled, targetHex, tolerance = 6) {
+                const [tr, tg, tb] = hexToRgbArray(targetHex);
+                return (
+                    Math.abs(sampled[0] - tr) <= tolerance &&
+                    Math.abs(sampled[1] - tg) <= tolerance &&
+                    Math.abs(sampled[2] - tb) <= tolerance
+                );
+            }
+
+            function validateFaceFeatures(cvs, resolution, uvMap, featureColors) {
+                if (!FACE_VALIDATION_RESOLUTIONS.has(resolution) || zombieFaceValidations.has(resolution)) return;
+                zombieFaceValidations.add(resolution);
+                const ctx = cvs.getContext("2d");
+                const step = cvs.width / resolution;
+                const sample = (u, v) => {
+                    const { x, y } = quantizeUVToPixel(u, v, resolution);
+                    const sx = Math.min(cvs.width - 1, Math.round((x + 0.5) * step));
+                    const sy = Math.min(cvs.height - 1, Math.round((y + 0.5) * step));
+                    return ctx.getImageData(sx, sy, 1, 1).data;
+                };
+
+                const samples = [
+                    { label: "left eye", data: sample(uvMap.eyeLeft, uvMap.eyeY), color: featureColors.eye },
+                    { label: "right eye", data: sample(uvMap.eyeRight, uvMap.eyeY), color: featureColors.eye },
+                    { label: "pupil", data: sample(uvMap.eyeLeft, uvMap.eyeY + uvMap.pupilVOffset), color: featureColors.pupil },
+                    { label: "mouth", data: sample(uvMap.mouthLeft, uvMap.mouthY), color: featureColors.mouth },
+                ];
+
+                samples.forEach((entry) => {
+                    if (!colorMatches(entry.data, entry.color)) {
+                        console.warn(`Zombie face ${entry.label} failed color validation at ${resolution}x texture resolution.`);
+                    }
+                });
+            }
+
             // Zombie appearance variation system - stores different skin colors and features
             const ZOMBIE_SKIN_COLORS = [
                 { base: ["#3a5a35", "#2f4a2b", "#263c22"], dark: ["#1a2818", "#243520", "#2b3f26"] }, // Green zombie
@@ -5146,6 +5249,18 @@
             function generateZombieHeadTexture(skinColorIndex, eyeTypeIndex, mouthTypeIndex) {
                 const PIXELS_PER_TILE = SETTINGS.textureResolution;
                 const TILE_SIZE = PIXELS_PER_TILE * 4;
+                const pixelStepUV = 1 / PIXELS_PER_TILE;
+                const uvFeatureMap = {
+                    eyeLeft: 0.3,
+                    eyeRight: 0.7,
+                    eyeY: 0.4,
+                    noseU: 0.5,
+                    noseV: 0.55,
+                    mouthLeft: 0.35,
+                    mouthRight: 0.65,
+                    mouthY: 0.65,
+                    pupilVOffset: pixelStepUV,
+                };
 
                 // Create 6 canvases for cube faces (right, left, top, bottom, front, back)
                 const canvases = [];
@@ -5159,11 +5274,7 @@
                     cvs.height = TILE_SIZE;
                     const ctx = cvs.getContext("2d");
                     const STEP = TILE_SIZE / PIXELS_PER_TILE;
-
-                    function fillPixel(x, y, color) {
-                        ctx.fillStyle = color;
-                        ctx.fillRect(x * STEP, y * STEP, STEP, STEP);
-                    }
+                    const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
 
                     // Base skin texture (all faces)
                     for (let y = 0; y < PIXELS_PER_TILE; y++) {
@@ -5174,11 +5285,12 @@
                         }
                     }
 
+                    applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.22);
+
                     // Add mottling (all faces)
                     const mottles = PIXELS_PER_TILE * 2;
                     for (let i = 0; i < mottles; i++) {
-                        const x = Math.floor(Math.random() * PIXELS_PER_TILE);
-                        const y = Math.floor(Math.random() * PIXELS_PER_TILE);
+                        const { x, y } = quantizeUVToPixel(Math.random(), Math.random(), PIXELS_PER_TILE);
                         const r = Math.random();
                         fillPixel(x, y, r > 0.5 ? skinColors.dark[0] : skinColors.dark[1]);
                     }
@@ -5186,84 +5298,105 @@
                     // FRONT FACE ONLY (index 4) - add facial features
                     if (faceIdx === 4) {
                         // Eyes
-                        const eyeY = Math.floor(PIXELS_PER_TILE * 0.4);
-                        const eyeLeft = Math.floor(PIXELS_PER_TILE * 0.3);
-                        const eyeRight = Math.floor(PIXELS_PER_TILE * 0.7);
+                        const eyeLeftPx = quantizeUVToPixel(uvFeatureMap.eyeLeft, uvFeatureMap.eyeY, PIXELS_PER_TILE);
+                        const eyeRightPx = quantizeUVToPixel(uvFeatureMap.eyeRight, uvFeatureMap.eyeY, PIXELS_PER_TILE);
+                        const glowOffsetU = pixelStepUV;
+                        const browOffsetV = -pixelStepUV;
+                        const underEyeOffsetV = pixelStepUV * 2;
 
                         // Base glow + iris
-                        fillPixel(eyeLeft, eyeY, eyeType.color);
-                        fillPixel(eyeRight, eyeY, eyeType.color);
-                        fillPixel(eyeLeft - 1, eyeY, eyeType.glow);
-                        fillPixel(eyeLeft + 1, eyeY, eyeType.glow);
-                        fillPixel(eyeRight - 1, eyeY, eyeType.glow);
-                        fillPixel(eyeRight + 1, eyeY, eyeType.glow);
+                        fillPixel(eyeLeftPx.x, eyeLeftPx.y, eyeType.color);
+                        fillPixel(eyeRightPx.x, eyeRightPx.y, eyeType.color);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeLeft - glowOffsetU, uvFeatureMap.eyeY, PIXELS_PER_TILE).x, eyeLeftPx.y, eyeType.glow);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeLeft + glowOffsetU, uvFeatureMap.eyeY, PIXELS_PER_TILE).x, eyeLeftPx.y, eyeType.glow);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeRight - glowOffsetU, uvFeatureMap.eyeY, PIXELS_PER_TILE).x, eyeRightPx.y, eyeType.glow);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeRight + glowOffsetU, uvFeatureMap.eyeY, PIXELS_PER_TILE).x, eyeRightPx.y, eyeType.glow);
 
                         // Pupils with subtle asymmetry
                         const pupilColor = "#0b0b0b";
-                        fillPixel(eyeLeft, eyeY + 1, pupilColor);
-                        fillPixel(eyeRight + (Math.random() > 0.5 ? 0 : -1), eyeY + 1, pupilColor);
+                        const leftPupil = quantizeUVToPixel(uvFeatureMap.eyeLeft, uvFeatureMap.eyeY + uvFeatureMap.pupilVOffset, PIXELS_PER_TILE);
+                        const rightPupilOffsetU = Math.random() > 0.5 ? 0 : -pixelStepUV;
+                        const rightPupil = quantizeUVToPixel(uvFeatureMap.eyeRight + rightPupilOffsetU, uvFeatureMap.eyeY + uvFeatureMap.pupilVOffset, PIXELS_PER_TILE);
+                        fillPixel(leftPupil.x, leftPupil.y, pupilColor);
+                        fillPixel(rightPupil.x, rightPupil.y, pupilColor);
 
                         // Brows / sunken eye shadow
-                        fillPixel(eyeLeft, eyeY - 1, skinColors.dark[0]);
-                        fillPixel(eyeRight, eyeY - 1, skinColors.dark[0]);
-                        fillPixel(eyeLeft - 1, eyeY - 1, skinColors.dark[1]);
-                        fillPixel(eyeRight + 1, eyeY - 1, skinColors.dark[1]);
+                        const leftBrow = quantizeUVToPixel(uvFeatureMap.eyeLeft, uvFeatureMap.eyeY + browOffsetV, PIXELS_PER_TILE);
+                        const rightBrow = quantizeUVToPixel(uvFeatureMap.eyeRight, uvFeatureMap.eyeY + browOffsetV, PIXELS_PER_TILE);
+                        fillPixel(leftBrow.x, leftBrow.y, skinColors.dark[0]);
+                        fillPixel(rightBrow.x, rightBrow.y, skinColors.dark[0]);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeLeft - glowOffsetU, uvFeatureMap.eyeY + browOffsetV, PIXELS_PER_TILE).x, leftBrow.y, skinColors.dark[1]);
+                        fillPixel(quantizeUVToPixel(uvFeatureMap.eyeRight + glowOffsetU, uvFeatureMap.eyeY + browOffsetV, PIXELS_PER_TILE).x, rightBrow.y, skinColors.dark[1]);
 
                         // Under-eye bruising
                         if (Math.random() > 0.4) {
-                            fillPixel(eyeLeft, eyeY + 2, skinColors.dark[2]);
-                            fillPixel(eyeRight, eyeY + 2, skinColors.dark[2]);
+                            const leftUnder = quantizeUVToPixel(uvFeatureMap.eyeLeft, uvFeatureMap.eyeY + underEyeOffsetV, PIXELS_PER_TILE);
+                            const rightUnder = quantizeUVToPixel(uvFeatureMap.eyeRight, uvFeatureMap.eyeY + underEyeOffsetV, PIXELS_PER_TILE);
+                            fillPixel(leftUnder.x, leftUnder.y, skinColors.dark[2]);
+                            fillPixel(rightUnder.x, rightUnder.y, skinColors.dark[2]);
                         }
 
                         // Nose shadow
-                        const noseX = Math.floor(PIXELS_PER_TILE * 0.5);
-                        const noseY = Math.floor(PIXELS_PER_TILE * 0.55);
-                        fillPixel(noseX, noseY, skinColors.dark[1]);
-                        fillPixel(noseX, noseY + 1, skinColors.dark[2]);
+                        const nosePos = quantizeUVToPixel(uvFeatureMap.noseU, uvFeatureMap.noseV, PIXELS_PER_TILE);
+                        fillPixel(nosePos.x, nosePos.y, skinColors.dark[1]);
+                        const lowerNose = quantizeUVToPixel(uvFeatureMap.noseU, uvFeatureMap.noseV + pixelStepUV, PIXELS_PER_TILE);
+                        fillPixel(lowerNose.x, lowerNose.y, skinColors.dark[2]);
 
                         // Mouth variations
-                        const mouthY = Math.floor(PIXELS_PER_TILE * 0.65);
-                        const mouthLeft = Math.floor(PIXELS_PER_TILE * 0.35);
-                        const mouthRight = Math.floor(PIXELS_PER_TILE * 0.65);
+                        const mouthStartX = quantizeUVToPixel(uvFeatureMap.mouthLeft, uvFeatureMap.mouthY, PIXELS_PER_TILE).x;
+                        const mouthEndX = quantizeUVToPixel(uvFeatureMap.mouthRight, uvFeatureMap.mouthY, PIXELS_PER_TILE).x;
+                        const mouthY = quantizeUVToPixel(uvFeatureMap.mouthLeft, uvFeatureMap.mouthY, PIXELS_PER_TILE).y;
 
                         if (mouthType === "line") {
-                            for (let x = mouthLeft; x < mouthRight; x++) {
+                            for (let x = mouthStartX; x <= mouthEndX; x++) {
                                 fillPixel(x, mouthY, "#000000");
                             }
                         } else if (mouthType === "frown") {
-                            for (let x = mouthLeft; x < mouthRight; x++) {
-                                const offset = Math.abs(x - (mouthLeft + mouthRight) / 2) < 2 ? 1 : 0;
+                            const mid = (mouthStartX + mouthEndX) / 2;
+                            for (let x = mouthStartX; x <= mouthEndX; x++) {
+                                const offset = Math.abs(x - mid) < 2 ? 1 : 0;
                                 fillPixel(x, mouthY + offset, "#000000");
                             }
                         } else if (mouthType === "open") {
-                            for (let x = mouthLeft; x < mouthRight; x++) {
+                            for (let x = mouthStartX; x <= mouthEndX; x++) {
                                 fillPixel(x, mouthY, "#000000");
-                                fillPixel(x, mouthY + 1, "#000000");
-                                // Teeth glint
-                                if (x % 2 === 0) fillPixel(x, mouthY + 1, "#cfcfcf");
+                                const lowerLip = quantizeUVToPixel(uvFeatureMap.mouthLeft + (x - mouthStartX) * pixelStepUV, uvFeatureMap.mouthY + pixelStepUV, PIXELS_PER_TILE).y;
+                                fillPixel(x, lowerLip, "#000000");
+                                if (x % 2 === 0) fillPixel(x, lowerLip, "#cfcfcf");
                             }
                         } else if (mouthType === "crooked") {
-                            for (let x = mouthLeft; x < mouthRight; x++) {
-                                const offset = x < (mouthLeft + mouthRight) / 2 ? 0 : 1;
+                            const mid = (mouthStartX + mouthEndX) / 2;
+                            for (let x = mouthStartX; x <= mouthEndX; x++) {
+                                const offset = x < mid ? 0 : 1;
                                 fillPixel(x, mouthY + offset, "#000000");
                             }
                         } else if (mouthType === "wide") {
-                            for (let x = Math.floor(PIXELS_PER_TILE * 0.25); x < Math.floor(PIXELS_PER_TILE * 0.75); x++) {
+                            const wideStart = quantizeUVToPixel(0.25, uvFeatureMap.mouthY, PIXELS_PER_TILE).x;
+                            const wideEnd = quantizeUVToPixel(0.75, uvFeatureMap.mouthY, PIXELS_PER_TILE).x;
+                            const lowerLip = quantizeUVToPixel(0.25, uvFeatureMap.mouthY + pixelStepUV, PIXELS_PER_TILE).y;
+                            for (let x = wideStart; x <= wideEnd; x++) {
                                 fillPixel(x, mouthY, "#000000");
-                                if (x % 3 === 0) fillPixel(x, mouthY + 1, "#cfcfcf");
+                                if (x % 3 === 0) fillPixel(x, lowerLip, "#cfcfcf");
                             }
                         }
 
                         // Scars and cracks for variety
                         const scarCount = 1 + Math.floor(Math.random() * 3);
                         for (let s = 0; s < scarCount; s++) {
-                            const sx = Math.floor(Math.random() * PIXELS_PER_TILE);
-                            const sy = Math.floor(Math.random() * PIXELS_PER_TILE * 0.6 + PIXELS_PER_TILE * 0.2);
+                            const sx = Math.random();
+                            const sy = 0.2 + Math.random() * 0.6;
                             const length = 2 + Math.floor(Math.random() * 3);
                             for (let l = 0; l < length; l++) {
-                                fillPixel(sx + l, sy + (l % 2 === 0 ? 0 : -1), skinColors.dark[(s + l) % skinColors.dark.length]);
+                                const scarPos = quantizeUVToPixel(sx + l * pixelStepUV, sy + (l % 2 === 0 ? 0 : -pixelStepUV), PIXELS_PER_TILE);
+                                fillPixel(scarPos.x, scarPos.y, skinColors.dark[(s + l) % skinColors.dark.length]);
                             }
                         }
+
+                        validateFaceFeatures(cvs, PIXELS_PER_TILE, uvFeatureMap, {
+                            eye: eyeType.color,
+                            pupil: pupilColor,
+                            mouth: "#000000",
+                        });
                     }
 
                     canvases.push(cvs);
@@ -5271,10 +5404,9 @@
 
                 // Create materials array for cube faces
                 // Order: right, left, top, bottom, front, back
-                const materials = canvases.map(cvs => {
+                const materials = canvases.map((cvs) => {
                     const tex = new THREE.CanvasTexture(cvs);
-                    tex.magFilter = THREE.NearestFilter;
-                    tex.minFilter = THREE.NearestFilter;
+                    registerPixelTexture(tex);
                     return new THREE.MeshLambertMaterial({ map: tex, transparent: false });
                 });
 
@@ -5290,10 +5422,7 @@
                 const ctx = cvs.getContext("2d");
                 const STEP = TILE_SIZE / PIXELS_PER_TILE;
 
-                function fillPixel(x, y, color) {
-                    ctx.fillStyle = color;
-                    ctx.fillRect(x * STEP, y * STEP, STEP, STEP);
-                }
+                const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
 
                 // Base skin texture
                 for (let y = 0; y < PIXELS_PER_TILE; y++) {
@@ -5304,20 +5433,23 @@
                     }
                 }
 
+                applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.16);
+
                 // Add mottling
                 const mottles = PIXELS_PER_TILE * 3;
                 for (let i = 0; i < mottles; i++) {
-                    const x = Math.floor(Math.random() * PIXELS_PER_TILE);
-                    const y = Math.floor(Math.random() * PIXELS_PER_TILE);
+                    const { x, y } = quantizeUVToPixel(Math.random(), Math.random(), PIXELS_PER_TILE);
                     const r = Math.random();
                     const color = r > 0.7 ? skinColors.dark[0] : r > 0.4 ? skinColors.dark[1] : skinColors.dark[2];
                     fillPixel(x, y, color);
                 }
 
                 // Torn/dirty shirt (darker teal/gray)
-                const shirtStart = Math.floor(PIXELS_PER_TILE * 0.4);
-                const shirtHeight = Math.floor(PIXELS_PER_TILE * 0.25);
-                for (let y = shirtStart; y < shirtStart + shirtHeight; y++) {
+                const shirtStartV = 0.4;
+                const shirtEndV = 0.65;
+                const shirtStart = quantizeUVToPixel(0, shirtStartV, PIXELS_PER_TILE).y;
+                const shirtEnd = quantizeUVToPixel(0, shirtEndV, PIXELS_PER_TILE).y;
+                for (let y = shirtStart; y <= shirtEnd; y++) {
                     for (let x = 0; x < PIXELS_PER_TILE; x++) {
                         const r = Math.random();
                         const shade = r > 0.5 ? "#1f5a65" : "#1a4d57";
@@ -5327,7 +5459,8 @@
                 }
 
                 // Tattered pants (darker blue/gray)
-                const pantStart = Math.floor(PIXELS_PER_TILE * 0.7);
+                const pantStartV = 0.7;
+                const pantStart = quantizeUVToPixel(0, pantStartV, PIXELS_PER_TILE).y;
                 for (let y = pantStart; y < PIXELS_PER_TILE; y++) {
                     for (let x = 0; x < PIXELS_PER_TILE; x++) {
                         const r = Math.random();
@@ -5338,8 +5471,7 @@
                 }
 
                 const tex = new THREE.CanvasTexture(cvs);
-                tex.magFilter = THREE.NearestFilter;
-                tex.minFilter = THREE.NearestFilter;
+                registerPixelTexture(tex);
                 return new THREE.MeshLambertMaterial({ map: tex, transparent: false });
             }
 
