@@ -1448,6 +1448,7 @@
             const globalPendingMods = new Map();
             const chunkBuildQueue = [];
             const chunkRenderedFaces = new Map();
+            const chunkRenderDiagnostics = new Map();
             const lightUpdateQueue = [];
             const queuedLightUpdates = new Set();
             const MAX_LIGHT_UPDATES_PER_FRAME = 4;
@@ -3190,6 +3191,7 @@
                         releaseMeshForKey(key);
                     }
                     chunkRenderedFaces.clear();
+                    chunkRenderDiagnostics.clear();
                     lastChunkUpdate = -Infinity; // Force refresh
                 }
 
@@ -8288,6 +8290,7 @@
                         meshLifecycleStats.mark("terrainCountUnderflow", { key });
                     }
                     chunkRenderedFaces.delete(key);
+                    chunkRenderDiagnostics.delete(key);
                 }
                 const now = performance.now();
                 meshLifecycleStats.detached.set(baseKey, now);
@@ -8327,10 +8330,35 @@
                     const nSW = chunks.get(`${cxM1},${czP1}`);
                     const nSE = chunks.get(`${cxP1},${czP1}`);
 
+                    const trackRenderDebug = isDebug;
+                    const debugCounters = trackRenderDebug
+                        ? {
+                              heightOutOfRange: 0,
+                              missingNeighborSamples: 0,
+                              diagMissingSamples: 0,
+                              lightFallbacks: 0,
+                              facesDrawn: 0,
+                              occludedFaces: 0,
+                              blocksWithoutFaces: 0,
+                          }
+                        : null;
+
+                    const sampleNeighborBlock = (chunk, idx, isDiagonal = false) => {
+                        if (chunk) return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+                        if (debugCounters) {
+                            debugCounters.missingNeighborSamples++;
+                            if (isDiagonal) debugCounters.diagMissingSamples++;
+                        }
+                        return AIR;
+                    };
+
                     // OPTIMIZED getLocal: No internal functions, fast center path
                     const getLocal = (lx, ly, lz) => {
                         // 1. Height check (Fastest fail)
-                        if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                        if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) {
+                            if (debugCounters) debugCounters.heightOutOfRange++;
+                            return AIR;
+                        }
 
                         // 2. Center Chunk (Most common case - ~90% of lookups)
                         if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
@@ -8341,46 +8369,50 @@
                         // 3. Orthogonal Neighbors
                         if (lz < 0 && lx >= 0 && lx < 16) {
                             const idx = lx + 15 * 16 + ly * 256;
-                            return nN ? (nN.blocks ? nN.blocks[idx] : nN[idx]) : 0;
+                            return sampleNeighborBlock(nN, idx);
                         }
                         if (lz > 15 && lx >= 0 && lx < 16) {
                             const idx = lx + 0 * 16 + ly * 256;
-                            return nS ? (nS.blocks ? nS.blocks[idx] : nS[idx]) : 0;
+                            return sampleNeighborBlock(nS, idx);
                         }
                         if (lx > 15 && lz >= 0 && lz < 16) {
                             const idx = 0 + lz * 16 + ly * 256;
-                            return nE ? (nE.blocks ? nE.blocks[idx] : nE[idx]) : 0;
+                            return sampleNeighborBlock(nE, idx);
                         }
                         if (lx < 0 && lz >= 0 && lz < 16) {
                             const idx = 15 + lz * 16 + ly * 256;
-                            return nW ? (nW.blocks ? nW.blocks[idx] : nW[idx]) : 0;
+                            return sampleNeighborBlock(nW, idx);
                         }
 
                         // 4. Diagonal Neighbors (Rare - corners only)
                         if (lz < 0 && lx < 0) {
                             const idx = 15 + 15 * 16 + ly * 256;
-                            return nNW ? (nNW.blocks ? nNW.blocks[idx] : nNW[idx]) : 0;
+                            return sampleNeighborBlock(nNW, idx, true);
                         }
                         if (lz < 0 && lx > 15) {
                             const idx = 0 + 15 * 16 + ly * 256;
-                            return nNE ? (nNE.blocks ? nNE.blocks[idx] : nNE[idx]) : 0;
+                            return sampleNeighborBlock(nNE, idx, true);
                         }
                         if (lz > 15 && lx < 0) {
                             const idx = 15 + 0 * 16 + ly * 256;
-                            return nSW ? (nSW.blocks ? nSW.blocks[idx] : nSW[idx]) : 0;
+                            return sampleNeighborBlock(nSW, idx, true);
                         }
                         if (lz > 15 && lx > 15) {
                             const idx = 0 + 0 * 16 + ly * 256;
-                            return nSE ? (nSE.blocks ? nSE.blocks[idx] : nSE[idx]) : 0;
+                            return sampleNeighborBlock(nSE, idx, true);
                         }
 
-                        return 0;
+                        if (debugCounters) debugCounters.missingNeighborSamples++;
+                        return AIR;
                     };
 
                     // OPTIMIZED getLocalLight: Full neighbor support for seamless lighting
                     // Now uses hoisted extractLightFromChunk helper to avoid closure creation
                     const getLocalLight = (lx, ly, lz) => {
-                        if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15;
+                        if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) {
+                            if (debugCounters) debugCounters.lightFallbacks++;
+                            return 15;
+                        }
 
                         // 1. Center Chunk (most common case - ~85% of lookups)
                         if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
@@ -8391,38 +8423,55 @@
                         // 2. Orthogonal Neighbors
                         if (lz < 0 && lx >= 0 && lx < 16) {
                             const idx = lx + 15 * 16 + ly * 256;
-                            return extractLightFromChunk(nN, idx);
+                            const val = extractLightFromChunk(nN, idx);
+                            if (debugCounters && !nN) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lz > 15 && lx >= 0 && lx < 16) {
                             const idx = lx + 0 * 16 + ly * 256;
-                            return extractLightFromChunk(nS, idx);
+                            const val = extractLightFromChunk(nS, idx);
+                            if (debugCounters && !nS) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lx > 15 && lz >= 0 && lz < 16) {
                             const idx = 0 + lz * 16 + ly * 256;
-                            return extractLightFromChunk(nE, idx);
+                            const val = extractLightFromChunk(nE, idx);
+                            if (debugCounters && !nE) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lx < 0 && lz >= 0 && lz < 16) {
                             const idx = 15 + lz * 16 + ly * 256;
-                            return extractLightFromChunk(nW, idx);
+                            const val = extractLightFromChunk(nW, idx);
+                            if (debugCounters && !nW) debugCounters.lightFallbacks++;
+                            return val;
                         }
 
                         // 3. Diagonal Neighbors
                         if (lz < 0 && lx < 0) {
                             const idx = 15 + 15 * 16 + ly * 256;
-                            return extractLightFromChunk(nNW, idx);
+                            const val = extractLightFromChunk(nNW, idx);
+                            if (debugCounters && !nNW) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lz < 0 && lx > 15) {
                             const idx = 0 + 15 * 16 + ly * 256;
-                            return extractLightFromChunk(nNE, idx);
+                            const val = extractLightFromChunk(nNE, idx);
+                            if (debugCounters && !nNE) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lz > 15 && lx < 0) {
                             const idx = 15 + 0 * 16 + ly * 256;
-                            return extractLightFromChunk(nSW, idx);
+                            const val = extractLightFromChunk(nSW, idx);
+                            if (debugCounters && !nSW) debugCounters.lightFallbacks++;
+                            return val;
                         }
                         if (lz > 15 && lx > 15) {
                             const idx = 0 + 0 * 16 + ly * 256;
-                            return extractLightFromChunk(nSE, idx);
+                            const val = extractLightFromChunk(nSE, idx);
+                            if (debugCounters && !nSE) debugCounters.lightFallbacks++;
+                            return val;
                         }
+                        if (debugCounters) debugCounters.lightFallbacks++;
                         return 15;
                     };
                     const maxFaces = 30000;
@@ -8487,6 +8536,8 @@
                                 // UV lookup: index 0=top, 1=bottom, 2-5=side
                                 const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
 
+                                let blockHasFace = false;
+
                                 for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                     const face = FACE_DIRECTIONS[faceIdx];
                                     const lx = x + face[0];
@@ -8506,6 +8557,8 @@
                                         vIdx += 18;
                                         uvIdx += 12;
                                         cIdx += 18;
+                                        blockHasFace = true;
+                                        if (debugCounters) debugCounters.facesDrawn++;
                                         if (isWater) {
                                             wVIdx = vIdx;
                                             wUvIdx = uvIdx;
@@ -8517,7 +8570,13 @@
                                             tCIdx = cIdx;
                                             tFaceCount++;
                                         }
+                                    } else if (debugCounters) {
+                                        debugCounters.occludedFaces++;
                                     }
+                                }
+
+                                if (debugCounters && !blockHasFace) {
+                                    debugCounters.blocksWithoutFaces++;
                                 }
                             }
                         }
@@ -8652,6 +8711,20 @@
                     colPool.release(waterCols);
 
                     chunkRenderedFaces.set(cKey, tFaceCount + wFaceCount);
+
+                    if (debugCounters) {
+                        chunkRenderDiagnostics.set(cKey, {
+                            facesDrawn: tFaceCount + wFaceCount,
+                            occludedFaces: debugCounters.occludedFaces,
+                            blocksWithoutFaces: debugCounters.blocksWithoutFaces,
+                            heightClamps: debugCounters.heightOutOfRange,
+                            missingNeighbors: debugCounters.missingNeighborSamples,
+                            diagonalFallbacks: debugCounters.diagMissingSamples,
+                            lightFallbacks: debugCounters.lightFallbacks,
+                        });
+                    } else {
+                        chunkRenderDiagnostics.delete(cKey);
+                    }
 
                     // --- NEIGHBOR UPDATE SYSTEM ---
                     // If this chunk has water or transparent blocks, mark neighbors for update
