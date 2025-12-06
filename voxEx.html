@@ -1436,6 +1436,14 @@
                 attackDamage: 2,
                 jumpForce: 4.25,
                 cliffCheckDistance: 2.5,
+                memoryDuration: 6,
+                targetLostWanderDelay: 1.25,
+                stuckMoveEpsilon: 0.01,
+                stuckTimeout: 1.2,
+                detourProbeStep: 0.8,
+                detourProbeDepth: 2,
+                detourSideBias: 0.65,
+                sidestepSpeed: 3.2,
             };
             const ZOMBIE_PROPORTIONS = {
                 hipY: 0.9,
@@ -1447,6 +1455,8 @@
             };
             const mobTmpA = new THREE.Vector3();
             const mobTmpB = new THREE.Vector3();
+            const mobTmpC = new THREE.Vector3();
+            const mobTmpD = new THREE.Vector3();
 
             // Track material changes so we only set needsUpdate when values actually change
             const materialUpdateState = {
@@ -5473,6 +5483,11 @@
                 group.userData.idleTimer = Math.random() * Math.PI * 2;
                 group.userData.attackCooldown = 0;
                 group.userData.pose = null;
+                group.userData.lastSeenPos = group.userData.lastSeenPos || new THREE.Vector3();
+                group.userData.lastSeenAge = ZOMBIE_CONFIG.memoryDuration + 1;
+                group.userData.lastObstacleNormal = group.userData.lastObstacleNormal || new THREE.Vector3();
+                group.userData.stuckTimer = 0;
+                group.userData.lastStablePos = group.userData.lastStablePos || new THREE.Vector3();
                 return group;
             }
 
@@ -5545,6 +5560,7 @@
                     mesh.position.set(gx + 0.5, gy, gz + 0.5);
                     mesh.userData.velocity.set(0, 0, 0);
                     mesh.userData.walkPhase = Math.random() * Math.PI * 2;
+                    mesh.userData.lastStablePos.copy(mesh.position);
                     mobs.push(mesh);
                     scene.add(mesh);
                     return true;
@@ -5633,6 +5649,44 @@
             function updateZombies(dt) {
                 if (!controls) return;
 
+                // Shared helpers reuse the scratch vectors above to avoid allocations
+                function probeDirectionForZombie(pos, dir) {
+                    const footY = Math.floor(pos.y + 0.2);
+                    let score = 0;
+                    for (let step = 1; step <= ZOMBIE_CONFIG.detourProbeDepth; step++) {
+                        const dist = ZOMBIE_CONFIG.detourProbeStep * step;
+                        const gx = Math.floor(pos.x + dir.x * dist);
+                        const gz = Math.floor(pos.z + dir.z * dist);
+                        if (isSolidBlock(gx, footY, gz) || isSolidBlock(gx, footY + 1, gz)) {
+                            return Infinity; // immediate wall in the way
+                        }
+                        // Prefer tiles that have ground beneath to avoid stepping into holes
+                        if (!isSolidBlock(gx, footY - 1, gz)) score += 0.35;
+                    }
+                    return score;
+                }
+
+                function pickZombieMoveDirection(pos, forwardDir, sideDir) {
+                    let bestScore = probeDirectionForZombie(pos, forwardDir);
+                    let bestX = forwardDir.x;
+                    let bestZ = forwardDir.z;
+
+                    for (let side = -1; side <= 1; side += 2) {
+                        mobTmpC.copy(forwardDir).addScaledVector(sideDir, side * ZOMBIE_CONFIG.detourSideBias).normalize();
+                        const score = probeDirectionForZombie(pos, mobTmpC);
+                        if (score < bestScore) {
+                            bestScore = score;
+                            bestX = mobTmpC.x;
+                            bestZ = mobTmpC.z;
+                        }
+                    }
+
+                    mobTmpD.set(bestX, 0, bestZ);
+                    mobTmpD.normalize();
+                    mobTmpD.score = bestScore;
+                    return mobTmpD;
+                }
+
                 // Night-only spawning to mimic Minecraft behavior
                 zombieSpawnTimer += dt;
                 const nightCycle = dayNightTime > 0.55 || dayNightTime < 0.2;
@@ -5666,12 +5720,25 @@
                     if (mob.userData.attackCooldown > 0) {
                         mob.userData.attackCooldown -= dt;
                     }
+                    // Fade obstacle memory slowly
+                    mob.userData.lastObstacleNormal.multiplyScalar(0.9);
 
                     // Determine AI state - use squared distances
                     const canDetect = nightCycle && distanceSq < detectionRadiusSq;
-                    const inAttackRange = distanceSq < attackRangeSq;
+                    const inAttackRange = canDetect && distanceSq < attackRangeSq;
 
-                    if (canDetect && inAttackRange) {
+                    // Update memory of the last known player position
+                    if (canDetect) {
+                        mob.userData.lastSeenPos.copy(playerPos);
+                        mob.userData.lastSeenAge = 0;
+                    } else {
+                        mob.userData.lastSeenAge += dt;
+                    }
+
+                    const hasMemoryTarget = mob.userData.lastSeenAge < ZOMBIE_CONFIG.memoryDuration;
+                    let stateHandled = false;
+
+                    if (inAttackRange) {
                         // Attack state
                         mob.userData.state = "attack";
                         vel.x *= 0.5;
@@ -5685,44 +5752,60 @@
                         if (mob.userData.attackCooldown <= 0) {
                             mob.userData.attackCooldown = ZOMBIE_CONFIG.attackCooldown;
                         }
-                    } else if (canDetect) {
-                        // Chase state - mobTmpA already calculated, just normalize
+                        stateHandled = true;
+                    } else if (canDetect || hasMemoryTarget) {
+                        // Pursue either the visible player or the remembered position
+                        const targetPos = canDetect ? playerPos : mob.userData.lastSeenPos;
+                        mobTmpA.subVectors(targetPos, pos);
                         mobTmpA.y = 0;
-                        mobTmpA.normalize();
+                        const targetDistSq = mobTmpA.lengthSq();
 
-                        // Check for cliff ahead (only when chasing to save performance)
-                        const checkX = Math.floor(pos.x + mobTmpA.x * ZOMBIE_CONFIG.cliffCheckDistance);
-                        const checkZ = Math.floor(pos.z + mobTmpA.z * ZOMBIE_CONFIG.cliffCheckDistance);
-                        const checkY = Math.floor(pos.y - 3);
+                        if (targetDistSq > 0.04) {
+                            mobTmpA.multiplyScalar(1 / Math.sqrt(targetDistSq));
+                            const sideDir = mobTmpB.set(-mobTmpA.z, 0, mobTmpA.x);
+                            const moveDir = pickZombieMoveDirection(pos, mobTmpA, sideDir);
 
-                        let hasGround = false;
-                        for (let dy = 0; dy < 5; dy++) {
-                            if (isSolidBlock(checkX, checkY + dy, checkZ)) {
-                                hasGround = true;
-                                break;
+                            if (moveDir.score !== Infinity) {
+                                const chaseSpeed = canDetect ? ZOMBIE_CONFIG.chaseSpeed : ZOMBIE_CONFIG.walkSpeed * 0.9;
+                                vel.x += moveDir.x * chaseSpeed * dt;
+                                vel.z += moveDir.z * chaseSpeed * dt;
+
+                                // Lightly sidestep when recently stuck or facing a wall
+                                if (mob.userData.stuckTimer > ZOMBIE_CONFIG.stuckTimeout * 0.5 || moveDir.score > 0.6) {
+                                    mobTmpC.copy(sideDir);
+                                    if (mob.userData.lastObstacleNormal.lengthSq() > 0.0001) {
+                                        mobTmpC.set(-mob.userData.lastObstacleNormal.z, 0, mob.userData.lastObstacleNormal.x);
+                                    }
+                                    mobTmpC.normalize();
+                                    vel.x += mobTmpC.x * ZOMBIE_CONFIG.sidestepSpeed * dt;
+                                    vel.z += mobTmpC.z * ZOMBIE_CONFIG.sidestepSpeed * dt;
+                                }
+
+                                // Check for obstacle and jump if needed
+                                const obstacleX = Math.floor(pos.x + moveDir.x * 0.7);
+                                const obstacleZ = Math.floor(pos.z + moveDir.z * 0.7);
+                                const obstacleY = Math.floor(pos.y + 0.5);
+
+                                if (
+                                    Math.abs(vel.y) < 0.1 &&
+                                    isSolidBlock(obstacleX, obstacleY, obstacleZ) &&
+                                    !isSolidBlock(obstacleX, obstacleY + 1, obstacleZ)
+                                ) {
+                                    vel.y = ZOMBIE_CONFIG.jumpForce;
+                                    mob.userData.lastObstacleNormal.set(-moveDir.x, 0, -moveDir.z);
+                                }
+
+                                mob.userData.state = canDetect ? "chase" : "wander";
+                                stateHandled = true;
                             }
                         }
 
-                        // Path around cliff or chase directly
-                        if (!hasGround) {
-                            vel.x += -mobTmpA.z * ZOMBIE_CONFIG.walkSpeed * dt;
-                            vel.z += mobTmpA.x * ZOMBIE_CONFIG.walkSpeed * dt;
-                        } else {
-                            vel.x += mobTmpA.x * ZOMBIE_CONFIG.chaseSpeed * dt;
-                            vel.z += mobTmpA.z * ZOMBIE_CONFIG.chaseSpeed * dt;
+                        if (!stateHandled && mob.userData.lastSeenAge > ZOMBIE_CONFIG.targetLostWanderDelay) {
+                            mob.userData.lastSeenAge = ZOMBIE_CONFIG.memoryDuration + 1; // Force wander fallback
                         }
+                    }
 
-                        // Check for obstacle and jump if needed
-                        const obstacleX = Math.floor(pos.x + mobTmpA.x * 0.7);
-                        const obstacleZ = Math.floor(pos.z + mobTmpA.z * 0.7);
-                        const obstacleY = Math.floor(pos.y + 0.5);
-
-                        if (Math.abs(vel.y) < 0.1 && isSolidBlock(obstacleX, obstacleY, obstacleZ) && !isSolidBlock(obstacleX, obstacleY + 1, obstacleZ)) {
-                            vel.y = ZOMBIE_CONFIG.jumpForce;
-                        }
-
-                        mob.userData.state = "chase";
-                    } else {
+                    if (!stateHandled) {
                         // Wander state
                         if (!mob.userData.wanderDir || mob.userData.wanderTimer <= 0) {
                             mob.userData.wanderDir = mob.userData.wanderDir || new THREE.Vector3();
@@ -5749,20 +5832,47 @@
                         pos.x += vel.x * stepDt;
                         if (zombieCollides(pos) || checkZombieCollision(pos, mob)) {
                             pos.x -= vel.x * stepDt;
+                            mob.userData.lastObstacleNormal.set(Math.sign(-vel.x) || 0, 0, 0);
                             vel.x *= 0.5; // Reduce velocity on collision
                         }
 
                         pos.z += vel.z * stepDt;
                         if (zombieCollides(pos) || checkZombieCollision(pos, mob)) {
                             pos.z -= vel.z * stepDt;
+                            mob.userData.lastObstacleNormal.set(0, 0, Math.sign(-vel.z) || 0);
                             vel.z *= 0.5; // Reduce velocity on collision
                         }
 
                         pos.y += vel.y * stepDt;
                         if (zombieCollides(pos)) {
                             pos.y -= vel.y * stepDt;
+                            mob.userData.lastObstacleNormal.set(0, Math.sign(-vel.y) || 0, 0);
                             vel.y = 0;
                         }
+                    }
+
+                    // Stuck detection and corrective sidestep
+                    const dx = pos.x - mob.userData.lastStablePos.x;
+                    const dz = pos.z - mob.userData.lastStablePos.z;
+                    const movedSq = dx * dx + dz * dz;
+                    if (movedSq < ZOMBIE_CONFIG.stuckMoveEpsilon) {
+                        mob.userData.stuckTimer += dt;
+                    } else {
+                        mob.userData.stuckTimer = 0;
+                        mob.userData.lastStablePos.copy(pos);
+                    }
+
+                    if (mob.userData.stuckTimer > ZOMBIE_CONFIG.stuckTimeout) {
+                        mobTmpC.set(
+                            -mob.userData.lastObstacleNormal.z || Math.random() - 0.5,
+                            0,
+                            mob.userData.lastObstacleNormal.x || Math.random() - 0.5
+                        );
+                        if (mobTmpC.lengthSq() < 0.001) mobTmpC.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+                        mobTmpC.normalize();
+                        vel.x += mobTmpC.x * ZOMBIE_CONFIG.sidestepSpeed * dt;
+                        vel.z += mobTmpC.z * ZOMBIE_CONFIG.sidestepSpeed * dt;
+                        mob.userData.stuckTimer = 0.4; // Small cooldown before checking again
                     }
 
                     // Face movement direction (except when attacking)
