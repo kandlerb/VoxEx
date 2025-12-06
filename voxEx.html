@@ -2276,7 +2276,17 @@
                 const key = `${x},${y},${z}`;
                 if (queuedLightUpdates.has(key)) return;
                 queuedLightUpdates.add(key);
-                lightUpdateQueue.push({ x, y, z, oldId: neighborId, newId: neighborId, key });
+                const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
+                lightUpdateQueue.push({
+                    x,
+                    y,
+                    z,
+                    oldId: neighborId,
+                    newId: neighborId,
+                    key,
+                    primeColumn: !!IS_TRANSPARENT[neighborId],
+                    pendingLightChunks: new Set([chunkKey]),
+                });
             }
 
             function enqueueLightUpdate(x, y, z, oldId, newId) {
@@ -2376,7 +2386,7 @@
                 const prevId = oldId ?? existingId ?? AIR;
                 const nextId = newId ?? existingId ?? AIR;
 
-                const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker);
+                const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker, job.primeColumn);
                 updateBlockLightAt(x, y, z, prevId, nextId, tracker);
 
                 if (!sunTask || sunTask.done || sunTask.bailedOut) {
@@ -2386,12 +2396,53 @@
                 }
             }
 
-            function updateSunlightAt(x, y, z, oldId, newId, tracker) {
+            function primeSunlightColumn(task, x, z, tracker) {
+                const minY = -WORLD_DIMS.yOffset;
+                const maxY = WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset - 1;
+                let currentLight = 15;
+                let anyChange = false;
+
+                for (let cy = maxY; cy >= minY; cy--) {
+                    const blockId = getBlock(x, cy, z);
+                    if (blockId === undefined) continue; // Skip unloaded chunks
+
+                    const target = currentLight > 1 ? currentLight : 1;
+                    const prev = getSkyLight(x, cy, z);
+
+                    if (target !== prev) {
+                        setSkyLight(x, cy, z, target);
+                        anyChange = true;
+                        if (task) {
+                            if (target > prev) {
+                                task.enqueueAdd(x, cy, z, target);
+                            } else {
+                                task.enqueueRemove(x, cy, z, prev);
+                            }
+                        }
+                    }
+
+                    if (blockId !== AIR) {
+                        currentLight = currentLight > 2 ? currentLight - 1 : 1;
+                    }
+                }
+
+                if (anyChange) {
+                    const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
+                    tracker?.mark(chunkKey);
+                    task?.ensureQueued();
+                }
+
+                return anyChange;
+            }
+
+            function updateSunlightAt(x, y, z, oldId, newId, tracker, primeColumn = false) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
                 const chunkVolume = chunkSize * chunkSize * chunkHeight;
                 const currentLight = getSkyLight(x, y, z);
                 const becameOpaque = !IS_TRANSPARENT[newId];
+                const becameTransparent = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
+                const shouldPrimeColumn = primeColumn || becameTransparent;
                 const HARD_CAP_BASE_CHUNKS = 3; // base allowance in chunks for hard cap
                 const HARD_CAP_MAX_CHUNKS = 12; // prevent runaway growth when many chunks are touched
                 const HARD_CAP_GROWTH_RATIO = 0.5; // +1 chunk per two additional touched chunks
@@ -2607,6 +2658,10 @@
                     task.totalEnqueued++;
                     task.checkPressure();
                 };
+
+                if (shouldPrimeColumn) {
+                    primeSunlightColumn(task, x, z, tracker);
+                }
 
                 if (becameOpaque) {
                     if (currentLight > 1) {
