@@ -1557,6 +1557,8 @@
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
             const pendingChunkUpdates = new Set(); // Debounced Chunk Update System
             const dirtyChunks = new Set(); // Tracks chunks that need a rebuild while keeping their current mesh visible
+            const deferredChunkUpdates = new Set(); // Chunk updates blocked while lighting is pending
+            const pendingLightChunks = new Map(); // key -> { count }
             let updateTimeout = null; // Debounced Chunk Update System
             const DIR_EPSILON = 1e-4; // Threshold for camera dir delta before re-running frustum pass
 
@@ -1580,6 +1582,51 @@
 
             function invalidateFrustumCache() {
                 frustumCacheState.dirty = true;
+            }
+
+            function markPendingLight(chunkKey) {
+                if (!chunkKey) return;
+                const entry = pendingLightChunks.get(chunkKey) || { count: 0 };
+                entry.count++;
+                pendingLightChunks.set(chunkKey, entry);
+            }
+
+            function clearPendingLight(chunkKey) {
+                const entry = pendingLightChunks.get(chunkKey);
+                if (!entry) return;
+                entry.count = Math.max(0, entry.count - 1);
+                if (entry.count === 0) {
+                    pendingLightChunks.delete(chunkKey);
+                    flushDeferredChunkUpdatesAround(chunkKey);
+                }
+            }
+
+            function chunkOrNeighborsPending(cx, cz) {
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        const key = getChunkKey(cx + dx, cz + dz);
+                        if (pendingLightChunks.has(key)) return true;
+                    }
+                }
+                return false;
+            }
+
+            function flushDeferredChunkUpdatesAround(chunkKey) {
+                const toCheck = [];
+                const [baseCx, baseCz] = chunkKey.split(",").map(Number);
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        toCheck.push(getChunkKey(baseCx + dx, baseCz + dz));
+                    }
+                }
+
+                for (const key of toCheck) {
+                    if (!deferredChunkUpdates.has(key)) continue;
+                    const [cx, cz] = key.split(",").map(Number);
+                    if (chunkOrNeighborsPending(cx, cz)) continue;
+                    deferredChunkUpdates.delete(key);
+                    scheduleChunkUpdate(cx, cz, true);
+                }
             }
 
             // --- RENDERING RESOURCE POOLS ---
@@ -1753,8 +1800,14 @@
                 return verts;
             }
 
-            function scheduleChunkUpdate(cx, cz) {
+            function scheduleChunkUpdate(cx, cz, force = false) {
                 const key = `${cx},${cz}`;
+
+                if (!force && chunkOrNeighborsPending(cx, cz)) {
+                    deferredChunkUpdates.add(key);
+                    return;
+                }
+
                 pendingChunkUpdates.add(key);
                 dirtyChunks.add(key);
 
@@ -2230,9 +2283,13 @@
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
                 const key = `${x},${y},${z}`;
+                const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
+
                 if (!queuedLightUpdates.has(key)) {
                     queuedLightUpdates.add(key);
-                    lightUpdateQueue.push({ x, y, z, oldId, newId, key });
+                    const pendingChunksForJob = new Set([chunkKey]);
+                    markPendingLight(chunkKey);
+                    lightUpdateQueue.push({ x, y, z, oldId, newId, key, pendingLightChunks: pendingChunksForJob });
                 }
 
                 // If the edit is on a boundary, ensure neighbors get a quick relight probe
@@ -2246,10 +2303,30 @@
 
             const sunlightWorkQueue = [];
 
+            function isCriticalLightJob(job) {
+                if (!job || !controls || !controls.getObject) return false;
+                const player = controls.getObject();
+                if (!player || !player.position) return false;
+                const p = player.position;
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const playerChunkX = Math.floor(p.x / chunkSize);
+                const playerChunkZ = Math.floor(p.z / chunkSize);
+                const jobChunkX = Math.floor(job.x / chunkSize);
+                const jobChunkZ = Math.floor(job.z / chunkSize);
+
+                if (playerChunkX === jobChunkX && playerChunkZ === jobChunkZ) return true;
+
+                return Math.floor(job.x) === Math.floor(p.x) && Math.floor(job.z) === Math.floor(p.z);
+            }
+
             function processLightQueue(limit = MAX_LIGHT_UPDATES_PER_FRAME, sunlightBudget = SUNLIGHT_STEPS_PER_FRAME) {
                 let processed = 0;
-                while (lightUpdateQueue.length > 0 && processed < limit) {
-                    const job = lightUpdateQueue.shift();
+                while (lightUpdateQueue.length > 0) {
+                    const job = lightUpdateQueue[0];
+                    const critical = isCriticalLightJob(job);
+                    if (!critical && processed >= limit) break;
+
+                    lightUpdateQueue.shift();
                     queuedLightUpdates.delete(job.key);
                     applyLocalizedRelight(job);
                     processed++;
@@ -2261,22 +2338,55 @@
                 }
             }
 
+            function createLightTaskTracker(initialChunks = []) {
+                const tracked = new Set(initialChunks);
+                return {
+                    tracked,
+                    mark: (chunkKey) => {
+                        if (!chunkKey || tracked.has(chunkKey)) return;
+                        tracked.add(chunkKey);
+                        markPendingLight(chunkKey);
+                    },
+                    finalize: () => {
+                        tracked.forEach((chunkKey) => clearPendingLight(chunkKey));
+                        tracked.clear();
+                    },
+                };
+            }
+
+            function finalizeLightTracker(tracker) {
+                if (!tracker || tracker.done) return;
+                tracker.done = true;
+                tracker.finalize();
+            }
+
             function applyLocalizedRelight(job) {
                 const { x, y, z, oldId, newId } = job;
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
-                if (!chunks.has(key)) return;
+                const tracker = createLightTaskTracker(job.pendingLightChunks || [key]);
+
+                if (!chunks.has(key)) {
+                    finalizeLightTracker(tracker);
+                    return;
+                }
 
                 const existingId = getBlock(x, y, z);
                 const prevId = oldId ?? existingId ?? AIR;
                 const nextId = newId ?? existingId ?? AIR;
 
-                updateSunlightAt(x, y, z, prevId, nextId);
-                updateBlockLightAt(x, y, z, prevId, nextId);
+                const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker);
+                updateBlockLightAt(x, y, z, prevId, nextId, tracker);
+
+                if (!sunTask || sunTask.done || sunTask.bailedOut) {
+                    finalizeLightTracker(tracker);
+                } else {
+                    sunTask.onComplete = () => finalizeLightTracker(tracker);
+                }
             }
 
-            function updateSunlightAt(x, y, z, oldId, newId) {
+            function updateSunlightAt(x, y, z, oldId, newId, tracker) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
                 const chunkVolume = chunkSize * chunkSize * chunkHeight;
@@ -2286,6 +2396,9 @@
                 const HARD_CAP_MAX_CHUNKS = 12; // prevent runaway growth when many chunks are touched
                 const HARD_CAP_GROWTH_RATIO = 0.5; // +1 chunk per two additional touched chunks
                 const SOFT_CAP_BASE = chunkVolume * 2; // baseline soft cap, scaled by affected chunks
+
+                const baseChunkKey = getChunkKey(Math.floor(x / chunkSize), Math.floor(z / chunkSize));
+                tracker?.mark(baseChunkKey);
 
                 const task = {
                     x,
@@ -2318,7 +2431,7 @@
                     inQueue: false,
                 };
 
-                task.touchedChunks.add(getChunkKey(Math.floor(x / chunkSize), Math.floor(z / chunkSize)));
+                task.touchedChunks.add(baseChunkKey);
 
                 task.ensureQueued = () => {
                     if (task.inQueue || task.done || task.bailedOut) return;
@@ -2336,16 +2449,17 @@
                     const lz = ((qz % chunkSize) + chunkSize) % chunkSize;
                     const chunkKey = getChunkKey(cx, cz);
                     task.touchedChunks.add(chunkKey);
+                    tracker?.mark(chunkKey);
 
-                    let tracker = map.get(chunkKey);
-                    if (!tracker) {
-                        tracker = new Uint8Array(chunkVolume);
-                        map.set(chunkKey, tracker);
+                    let visitTracker = map.get(chunkKey);
+                    if (!visitTracker) {
+                        visitTracker = new Uint8Array(chunkVolume);
+                        map.set(chunkKey, visitTracker);
                     }
 
                     const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
-                    if (tracker[idx]) return null;
-                    tracker[idx] = 1;
+                    if (visitTracker[idx]) return null;
+                    visitTracker[idx] = 1;
                     return chunkKey;
                 };
 
@@ -2397,6 +2511,7 @@
                         scheduleChunkUpdate(cx, cz);
                     }
 
+                    finalizeSunlightTask(task);
                     return true;
                 };
 
@@ -2517,6 +2632,8 @@
                         task.checkPressure();
                     }
                 }
+
+                return task;
             }
 
             function stepSunlightTask(task, budget = SUNLIGHT_STEPS_PER_FRAME) {
@@ -2606,6 +2723,14 @@
                 return steps;
             }
 
+            function finalizeSunlightTask(task) {
+                if (!task || task._finalized) return;
+                task._finalized = true;
+                if (typeof task.onComplete === "function") {
+                    task.onComplete(task);
+                }
+            }
+
             function processSunlightQueue(stepBudget = SUNLIGHT_STEPS_PER_FRAME) {
                 let remaining = stepBudget;
                 for (let i = 0; i < sunlightWorkQueue.length && remaining > 0; ) {
@@ -2614,6 +2739,7 @@
                     remaining -= used;
 
                     if (task.done || task.bailedOut) {
+                        finalizeSunlightTask(task);
                         task.inQueue = false;
                         sunlightWorkQueue.splice(i, 1);
                     } else {
@@ -2622,7 +2748,7 @@
                 }
             }
 
-            function updateBlockLightAt(x, y, z, oldId, newId) {
+            function updateBlockLightAt(x, y, z, oldId, newId, tracker) {
                 const wasSource = oldId === TORCH;
                 const isSource = newId === TORCH;
                 const currentLight = getBlockLight(x, y, z);
@@ -2630,6 +2756,15 @@
                 const removeQueue = [];
                 const baseLevel = isSource ? 15 : 0;
                 const transparent = IS_TRANSPARENT[newId];
+                const chunkSize = WORLD_DIMS.chunkSize;
+
+                const markBlockLightChunk = (qx, qz) => {
+                    if (!tracker) return;
+                    const chunkKey = getChunkKey(Math.floor(qx / chunkSize), Math.floor(qz / chunkSize));
+                    tracker.mark(chunkKey);
+                };
+
+                markBlockLightChunk(x, z);
 
                 if (!transparent) {
                     if (currentLight !== baseLevel) {
@@ -2663,6 +2798,7 @@
                         const nx = lx + o[0];
                         const ny = ly + o[1];
                         const nz = lz + o[2];
+                        markBlockLightChunk(nx, nz);
                         const nId = getBlock(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
                         const nLight = getBlockLight(nx, ny, nz);
@@ -2694,6 +2830,7 @@
                         const nx = lx + o[0];
                         const ny = ly + o[1];
                         const nz = lz + o[2];
+                        markBlockLightChunk(nx, nz);
                         const nId = getBlock(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
                         const nLight = getBlockLight(nx, ny, nz);
@@ -8717,10 +8854,28 @@
             async function processChunkQueue() {
                 let builds = 0;
                 const processed = new Set();
-                while (builds < SETTINGS.buildQueueLimit && chunkBuildQueue.length > 0) {
+                const initialQueueLength = chunkBuildQueue.length;
+                let inspected = 0;
+                while (
+                    builds < SETTINGS.buildQueueLimit &&
+                    chunkBuildQueue.length > 0 &&
+                    inspected < initialQueueLength + chunkBuildQueue.length
+                ) {
+                    inspected++;
                     const job = chunkBuildQueue.shift();
                     if (!job) continue;
                     if (!job.key) job.key = getChunkKey(job.cx, job.cz);
+                    if (typeof job.cx !== "number" || typeof job.cz !== "number") {
+                        const [jcX, jcZ] = job.key.split(",").map(Number);
+                        job.cx = jcX;
+                        job.cz = jcZ;
+                    }
+                    const jobCx = job.cx;
+                    const jobCz = job.cz;
+                    if (chunkOrNeighborsPending(jobCx, jobCz)) {
+                        chunkBuildQueue.push(job);
+                        continue;
+                    }
                     if (processed.has(job.key)) continue;
                     const isDirty = dirtyChunks.has(job.key);
                     if (!isDirty && chunkMeshes.has(job.key)) continue;
@@ -8729,7 +8884,7 @@
 
                     // Make chunk generation await if data doesn't exist
                     if (!chunks.has(job.key)) {
-                        await generateChunkData(job.cx, job.cz);
+                        await generateChunkData(jobCx, jobCz);
                     }
 
                     // Release old meshes only when the chunk was explicitly marked dirty
@@ -8738,7 +8893,7 @@
                         releaseMeshForKey(job.key + "_WATER");
                         dirtyChunks.delete(job.key);
                     }
-                    renderChunk(job.cx, job.cz);
+                    renderChunk(jobCx, jobCz);
                     builds++;
                 }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
@@ -8749,12 +8904,17 @@
                             for (const key of toUpdate) {
                                 chunkNeighborUpdateQueue.delete(key);
 
+                                const [cx, cz] = key.split(",").map(Number);
+                                if (chunkOrNeighborsPending(cx, cz)) {
+                                    chunkNeighborUpdateQueue.add(key);
+                                    continue;
+                                }
+
                                 // Remove old meshes
                                 releaseMeshForKey(key);
                                 releaseMeshForKey(key + "_WATER");
 
                                 // Rebuild chunk
-                                const [cx, cz] = key.split(",").map(Number);
                                 renderChunk(cx, cz);
                             }
                 }
