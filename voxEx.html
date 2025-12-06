@@ -2216,30 +2216,55 @@
                 const currentLight = getSkyLight(x, y, z);
                 const addQueue = [];
                 const removeQueue = [];
+                const addVisited = new Set();
+                const removeVisited = new Set();
                 const becameOpaque = !IS_TRANSPARENT[newId];
+
+                const enqueueRemove = (qx, qy, qz, level) => {
+                    const key = `${qx},${qy},${qz}`;
+                    if (removeVisited.has(key)) return;
+                    removeVisited.add(key);
+                    removeQueue.push(qx, qy, qz, level);
+                };
+
+                const enqueueAdd = (qx, qy, qz, level) => {
+                    const key = `${qx},${qy},${qz}`;
+                    if (addVisited.has(key)) return;
+                    addVisited.add(key);
+                    addQueue.push(qx, qy, qz, level);
+                };
+
+                const warnOnGrowth = (queue, cap, label) => {
+                    if (queue.length > cap && !queue.warned) {
+                        console.warn(`[Lighting] ${label} queue exceeded soft cap`, queue.length / 4, 'entries');
+                        queue.warned = true;
+                    }
+                };
+
+                const SOFT_CAP = 200000; // soft cap on entries (divided by 4 for coordinates)
 
                 if (becameOpaque) {
                     if (currentLight > 1) {
                         setSkyLight(x, y, z, 1);
-                        removeQueue.push(x, y, z, currentLight);
+                        enqueueRemove(x, y, z, currentLight);
                     }
                 } else {
                     const desired = computeNeighborSunlight(x, y, z);
                     if (desired > currentLight) {
                         setSkyLight(x, y, z, desired);
-                        addQueue.push(x, y, z, desired);
+                        enqueueAdd(x, y, z, desired);
                     } else if (desired < currentLight) {
                         setSkyLight(x, y, z, desired);
-                        removeQueue.push(x, y, z, currentLight);
+                        enqueueRemove(x, y, z, currentLight);
                     }
                 }
 
                 // Darken areas that depended on removed light
-                for (let i = 0; i < removeQueue.length; ) {
-                    const lx = removeQueue[i++];
-                    const ly = removeQueue[i++];
-                    const lz = removeQueue[i++];
-                    const level = removeQueue[i++];
+                for (let removeIndex = 0; removeIndex < removeQueue.length; ) {
+                    const lx = removeQueue[removeIndex++];
+                    const ly = removeQueue[removeIndex++];
+                    const lz = removeQueue[removeIndex++];
+                    const level = removeQueue[removeIndex++];
 
                     for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
                         const o = NEIGHBOR_OFFSETS[n];
@@ -2249,29 +2274,34 @@
                         const nId = getBlock(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
                         const nLight = getSkyLight(nx, ny, nz);
-                        if (nLight === 0) continue;
+                        // Skip if neighbor is already at baseline darkness; this prevents
+                        // removal waves from flooding through fully dark regions and
+                        // ballooning the queue for no-ops.
+                        if (nLight <= 1) continue;
 
                         if (nLight < level) {
                             setSkyLight(nx, ny, nz, 1);
-                            removeQueue.push(nx, ny, nz, nLight);
+                            enqueueRemove(nx, ny, nz, nLight);
                         } else {
                             const desiredNeighbor = computeNeighborSunlight(nx, ny, nz);
                             if (desiredNeighbor < nLight) {
                                 setSkyLight(nx, ny, nz, desiredNeighbor);
-                                removeQueue.push(nx, ny, nz, nLight);
+                                enqueueRemove(nx, ny, nz, nLight);
                             } else if (desiredNeighbor > nLight) {
-                                addQueue.push(nx, ny, nz, desiredNeighbor);
+                                enqueueAdd(nx, ny, nz, desiredNeighbor);
                             }
                         }
                     }
+
+                    warnOnGrowth(removeQueue, SOFT_CAP, 'remove');
                 }
 
                 // Brighten areas by spreading from updated cells
-                for (let i = 0; i < addQueue.length; ) {
-                    const lx = addQueue[i++];
-                    const ly = addQueue[i++];
-                    const lz = addQueue[i++];
-                    const level = addQueue[i++];
+                for (let addIndex = 0; addIndex < addQueue.length; ) {
+                    const lx = addQueue[addIndex++];
+                    const ly = addQueue[addIndex++];
+                    const lz = addQueue[addIndex++];
+                    const level = addQueue[addIndex++];
 
                     for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
                         const o = NEIGHBOR_OFFSETS[n];
@@ -2284,9 +2314,11 @@
                         const propagated = level > 1 ? level - 1 : 1;
                         if (propagated > nLight) {
                             setSkyLight(nx, ny, nz, propagated);
-                            addQueue.push(nx, ny, nz, propagated);
+                            enqueueAdd(nx, ny, nz, propagated);
                         }
                     }
+
+                    warnOnGrowth(addQueue, SOFT_CAP, 'add');
                 }
             }
 
