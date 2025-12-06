@@ -1558,6 +1558,29 @@
             const pendingChunkUpdates = new Set(); // Debounced Chunk Update System
             const dirtyChunks = new Set(); // Tracks chunks that need a rebuild while keeping their current mesh visible
             let updateTimeout = null; // Debounced Chunk Update System
+            const DIR_EPSILON = 1e-4; // Threshold for camera dir delta before re-running frustum pass
+
+            // Cache last frustum computation to avoid re-running the heavy chunk-visibility sweep when stationary
+            const frustumCacheState = {
+                chunkX: null,
+                chunkZ: null,
+                renderRadius: null,
+                normCamX: 0,
+                normCamZ: 0,
+                hasHorizontalCameraDir: false,
+                neededKeys: new Set(),
+                neededList: [],
+                culled: 0,
+                totalChecked: 0,
+                frustumEnabled: null,
+                cameraFov: null,
+                cameraAspect: null,
+                dirty: true,
+            };
+
+            function invalidateFrustumCache() {
+                frustumCacheState.dirty = true;
+            }
 
             // --- RENDERING RESOURCE POOLS ---
             const terrainMeshPool = [];
@@ -3909,6 +3932,7 @@
                 frustumToggle?.addEventListener("change", () => {
                     SETTINGS.enableFrustumCulling = frustumToggle.checked;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    invalidateFrustumCache();
                 });
                 lowerFpsSlider?.addEventListener("input", () => {
                     SETTINGS.lowerBoundFPS = parseInt(lowerFpsSlider.value);
@@ -7906,6 +7930,11 @@
                     cosThresholdSq,
                     hasHorizontalCameraDir
                 ) {
+                    // Global frustum toggle: when disabled, always treat as visible
+                    if (!SETTINGS.enableFrustumCulling) {
+                        return true;
+                    }
+
                     // 1. ALWAYS load chunks within 6 chunk radius (inner ring - no culling)
                     if (!hasHorizontalCameraDir || chunkDistSq <= innerRadiusSq) {
                         return true;
@@ -7931,8 +7960,9 @@
                 // --- 5. Chunk Loading Loop ---
                 const maxR = currentRenderRadius;
                 const maxRSq = maxR * maxR;
-                const neededKeys = new Set();
-                const needed = [];
+                let neededKeys;
+                let needed;
+                let recomputedFrustum = false;
 
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
                 controls.getDirection(cameraDirTmp);
@@ -7962,50 +7992,95 @@
                     normCamZ = camDirZ * invCamDirLen;
                 }
 
-                culled = 0; // Reset counter each frame
-                totalChecked = 0;
+                const frustumUnchanged =
+                    !frustumCacheState.dirty &&
+                    frustumCacheState.chunkX === chunkX &&
+                    frustumCacheState.chunkZ === chunkZ &&
+                    frustumCacheState.renderRadius === currentRenderRadius &&
+                    frustumCacheState.frustumEnabled === SETTINGS.enableFrustumCulling &&
+                    frustumCacheState.cameraFov === camera.fov &&
+                    frustumCacheState.cameraAspect === camera.aspect &&
+                    frustumCacheState.hasHorizontalCameraDir === hasHorizontalCameraDir &&
+                    (!hasHorizontalCameraDir ||
+                        (Math.abs(frustumCacheState.normCamX - normCamX) < DIR_EPSILON &&
+                            Math.abs(frustumCacheState.normCamZ - normCamZ) < DIR_EPSILON));
 
-                for (let dx = -maxR; dx <= maxR; dx++) {
-                    for (let dz = -maxR; dz <= maxR; dz++) {
-                        const distSq = dx * dx + dz * dz;
-                        if (distSq > maxRSq) continue;
+                if (frustumUnchanged) {
+                    // Reuse previous visibility results to skip heavy per-chunk iteration
+                    neededKeys = frustumCacheState.neededKeys;
+                    needed = frustumCacheState.neededList;
+                    culled = frustumCacheState.culled;
+                    totalChecked = frustumCacheState.totalChecked;
+                } else {
+                    neededKeys = new Set();
+                    needed = [];
+                    culled = 0; // Reset counter only when recomputing
+                    totalChecked = 0;
 
-                        const cx = chunkX + dx;
-                        const cz = chunkZ + dz;
+                    for (let dx = -maxR; dx <= maxR; dx++) {
+                        for (let dz = -maxR; dz <= maxR; dz++) {
+                            const distSq = dx * dx + dz * dz;
+                            if (distSq > maxRSq) continue;
 
-                        // FRUSTUM CULLING with inner radius exception
-                        totalChecked++;
+                            const cx = chunkX + dx;
+                            const cz = chunkZ + dz;
 
-                        if (
-                            !isChunkInFrustum(
-                                cx,
-                                cz,
-                                playerPos,
-                                normCamX,
-                                normCamZ,
-                                distSq,
-                                innerRadiusSq,
-                                cosThresholdSq,
-                                hasHorizontalCameraDir
-                            )
-                        ) {
-                            culled++;
-                            continue;
-                        }
+                            // FRUSTUM CULLING with inner radius exception
+                            totalChecked++;
 
-                        const key = getChunkKey(cx, cz);
-                        neededKeys.add(key);
+                            if (
+                                !isChunkInFrustum(
+                                    cx,
+                                    cz,
+                                    playerPos,
+                                    normCamX,
+                                    normCamZ,
+                                    distSq,
+                                    innerRadiusSq,
+                                    cosThresholdSq,
+                                    hasHorizontalCameraDir
+                                )
+                            ) {
+                                culled++;
+                                continue;
+                            }
 
-                        if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) {
-                            needed.push({ key, cx, cz, dist: distSq });
+                            const key = getChunkKey(cx, cz);
+                            neededKeys.add(key);
+
+                            if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) {
+                                needed.push({ key, cx, cz, dist: distSq });
+                            }
                         }
                     }
+
+                    // Refresh cache snapshot when recomputed
+                    frustumCacheState.chunkX = chunkX;
+                    frustumCacheState.chunkZ = chunkZ;
+                    frustumCacheState.renderRadius = currentRenderRadius;
+                    frustumCacheState.normCamX = normCamX;
+                    frustumCacheState.normCamZ = normCamZ;
+                    frustumCacheState.hasHorizontalCameraDir = hasHorizontalCameraDir;
+                    frustumCacheState.neededKeys = neededKeys;
+                    frustumCacheState.neededList = needed;
+                    frustumCacheState.culled = culled;
+                    frustumCacheState.totalChecked = totalChecked;
+                    frustumCacheState.frustumEnabled = SETTINGS.enableFrustumCulling;
+                    frustumCacheState.cameraFov = camera.fov;
+                    frustumCacheState.cameraAspect = camera.aspect;
+                    frustumCacheState.dirty = false;
+                    recomputedFrustum = true;
                 }
 
-                logDebug(`Frustum Culling: ${culled}/${totalChecked} chunks culled (${((culled / totalChecked) * 100).toFixed(1)}%)`);
+                if (recomputedFrustum) {
+                    logDebug(
+                        `Frustum Culling: ${culled}/${totalChecked} chunks culled (${((culled / totalChecked) * 100).toFixed(1)}%)`
+                    );
+                }
 
                 // --- 6A. PROACTIVE MESH CLEANUP (NEW - ADD THIS BEFORE EXISTING CLEANUP) ---
                 const maxAllowedMeshes = Math.max(SETTINGS.maxCachedChunks, currentRenderRadius * currentRenderRadius * 2);
+                let meshPrunedDuringUpdate = false;
 
                 if (terrainMeshCount > maxAllowedMeshes) {
                     const chunkDistances = [];
@@ -8034,6 +8109,7 @@
                                 const waterKey = targetKey + "_WATER";
                                 releaseMeshForKey(waterKey);
                                 chunkRenderedFaces.delete(targetKey);
+                                meshPrunedDuringUpdate = true;
                             }
                         }
                 }
@@ -8048,12 +8124,19 @@
                     // If it's not in our "Needed" list, KILL IT IMMEDIATELY
                     if (!neededKeys.has(baseKey)) {
                         releaseMeshForKey(key);
+                        meshPrunedDuringUpdate = true;
                     }
+                }
+
+                if (meshPrunedDuringUpdate) {
+                    invalidateFrustumCache();
                 }
 
                 // --- 7. Smart Queueing ---
                 // Sort by distance (closest first)
-                needed.sort((a, b) => a.dist - b.dist);
+                if (recomputedFrustum) {
+                    needed.sort((a, b) => a.dist - b.dist);
+                }
 
                 // Double check using the fast Set lookup
                 for (const job of needed) {
