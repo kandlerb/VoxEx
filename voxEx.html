@@ -2249,23 +2249,21 @@
                 const currentLight = getSkyLight(x, y, z);
                 const addQueue = [];
                 const removeQueue = [];
-                const addVisited = new Set();
-                const removeVisited = new Set();
+                const addVisited = new Map();
+                const removeVisited = new Map();
+                const touchedChunks = new Set();
                 const becameOpaque = !IS_TRANSPARENT[newId];
 
-                const enqueueRemove = (qx, qy, qz, level) => {
-                    const key = `${qx},${qy},${qz}`;
-                    if (removeVisited.has(key)) return;
-                    removeVisited.add(key);
-                    removeQueue.push(qx, qy, qz, level);
-                };
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                const chunkVolume = chunkSize * chunkSize * chunkHeight;
+                const HARD_CAP_CELLS = chunkVolume * 3; // allow a few chunks worth of work before bailing
+                const SOFT_CAP = 200000; // soft cap on entries (divided by 4 for coordinates)
 
-                const enqueueAdd = (qx, qy, qz, level) => {
-                    const key = `${qx},${qy},${qz}`;
-                    if (addVisited.has(key)) return;
-                    addVisited.add(key);
-                    addQueue.push(qx, qy, qz, level);
-                };
+                let bailedOut = false;
+
+                const baseChunkKey = getChunkKey(Math.floor(x / chunkSize), Math.floor(z / chunkSize));
+                touchedChunks.add(baseChunkKey);
 
                 const warnOnGrowth = (queue, cap, label) => {
                     if (queue.length > cap && !queue.warned) {
@@ -2274,7 +2272,90 @@
                     }
                 };
 
-                const SOFT_CAP = 200000; // soft cap on entries (divided by 4 for coordinates)
+                const resolveVisit = (map, qx, qy, qz) => {
+                    const ly = qy + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= chunkHeight) return null;
+
+                    const cx = Math.floor(qx / chunkSize);
+                    const cz = Math.floor(qz / chunkSize);
+                    const lx = ((qx % chunkSize) + chunkSize) % chunkSize;
+                    const lz = ((qz % chunkSize) + chunkSize) % chunkSize;
+                    const chunkKey = getChunkKey(cx, cz);
+                    touchedChunks.add(chunkKey);
+
+                    let tracker = map.get(chunkKey);
+                    if (!tracker) {
+                        tracker = new Uint8Array(chunkVolume);
+                        map.set(chunkKey, tracker);
+                    }
+
+                    const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                    if (tracker[idx]) return null;
+                    tracker[idx] = 1;
+                    return chunkKey;
+                };
+
+                const bailoutToFullRecalc = () => {
+                    if (bailedOut) return true;
+                    bailedOut = true;
+                    addQueue.length = 0;
+                    removeQueue.length = 0;
+
+                    const targets = new Set();
+                    touchedChunks.forEach((chunkKey) => {
+                        const [cxStr, czStr] = chunkKey.split(',');
+                        const cx = Number(cxStr);
+                        const cz = Number(czStr);
+                        for (let dx = -1; dx <= 1; dx++) {
+                            for (let dz = -1; dz <= 1; dz++) {
+                                targets.add(getChunkKey(cx + dx, cz + dz));
+                            }
+                        }
+                    });
+
+                    targets.forEach((key) => {
+                        const chunk = chunks.get(key);
+                        if (!chunk) return;
+                        calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                        calculateBlockLight(chunk, chunkSize, chunkHeight);
+                    });
+
+                    if (lightUpdateQueue.length) {
+                        for (let i = lightUpdateQueue.length - 1; i >= 0; i--) {
+                            const job = lightUpdateQueue[i];
+                            const jobKey = getChunkKey(Math.floor(job.x / chunkSize), Math.floor(job.z / chunkSize));
+                            if (!targets.has(jobKey)) continue;
+                            if (job.key) queuedLightUpdates.delete(job.key);
+                            lightUpdateQueue.splice(i, 1);
+                        }
+                    }
+
+                    return true;
+                };
+
+                const checkHardCap = () => {
+                    if (bailedOut) return true;
+                    const addEntries = addQueue.length >> 2;
+                    const removeEntries = removeQueue.length >> 2;
+                    if (addEntries > HARD_CAP_CELLS || removeEntries > HARD_CAP_CELLS) {
+                        return bailoutToFullRecalc();
+                    }
+                    return false;
+                };
+
+                const enqueueRemove = (qx, qy, qz, level) => {
+                    if (bailedOut) return;
+                    if (resolveVisit(removeVisited, qx, qy, qz) === null) return;
+                    removeQueue.push(qx, qy, qz, level);
+                    checkHardCap();
+                };
+
+                const enqueueAdd = (qx, qy, qz, level) => {
+                    if (bailedOut) return;
+                    if (resolveVisit(addVisited, qx, qy, qz) === null) return;
+                    addQueue.push(qx, qy, qz, level);
+                    checkHardCap();
+                };
 
                 if (becameOpaque) {
                     if (currentLight > 1) {
@@ -2292,8 +2373,10 @@
                     }
                 }
 
+                if (bailedOut) return;
+
                 // Darken areas that depended on removed light
-                for (let removeIndex = 0; removeIndex < removeQueue.length; ) {
+                for (let removeIndex = 0; removeIndex < removeQueue.length && !bailedOut; ) {
                     const lx = removeQueue[removeIndex++];
                     const ly = removeQueue[removeIndex++];
                     const lz = removeQueue[removeIndex++];
@@ -2324,13 +2407,17 @@
                                 enqueueAdd(nx, ny, nz, desiredNeighbor);
                             }
                         }
+
+                        if (bailedOut) break;
                     }
 
                     warnOnGrowth(removeQueue, SOFT_CAP, 'remove');
                 }
 
+                if (bailedOut) return;
+
                 // Brighten areas by spreading from updated cells
-                for (let addIndex = 0; addIndex < addQueue.length; ) {
+                for (let addIndex = 0; addIndex < addQueue.length && !bailedOut; ) {
                     const lx = addQueue[addIndex++];
                     const ly = addQueue[addIndex++];
                     const lz = addQueue[addIndex++];
@@ -2349,6 +2436,8 @@
                             setSkyLight(nx, ny, nz, propagated);
                             enqueueAdd(nx, ny, nz, propagated);
                         }
+
+                        if (bailedOut) break;
                     }
 
                     warnOnGrowth(addQueue, SOFT_CAP, 'add');
