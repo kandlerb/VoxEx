@@ -5824,49 +5824,119 @@
                 return materials;
             }
 
+            function generateZombieBodyMaterial(skinColors) {
+                const PIXELS_PER_TILE = SETTINGS.textureResolution;
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+                const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                // Segment UV layout (0-1 in texture space) used to remap torso faces
+                const waistEnd = THREE.MathUtils.lerp(0.26, 0.38, Math.random());
+                const torsoEnd = THREE.MathUtils.lerp(waistEnd + 0.28, 0.88, Math.random());
+
+                const shirtPalette = ["#1f5a65", "#1a4d57", "#234b55", "#1c414b"];
+                const pantsPalette = ["#1a2d55", "#15243f", "#0f1f35", "#0b1728"];
+                const grimePalette = ["#0f1a1f", "#141f26", "#1a252d", "#0a0f13"];
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    const v = y / PIXELS_PER_TILE;
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        let chosen;
+                        if (v < waistEnd) {
+                            // Lower torso: pants/grime blend with occasional skin tears
+                            const r = Math.random();
+                            if (r > 0.8) {
+                                chosen = skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)];
+                            } else if (r > 0.55) {
+                                chosen = grimePalette[Math.floor(Math.random() * grimePalette.length)];
+                            } else {
+                                chosen = pantsPalette[Math.floor(Math.random() * pantsPalette.length)];
+                            }
+                        } else if (v < torsoEnd) {
+                            // Mid torso: shirt fabric with tears exposing skin underneath
+                            const r = Math.random();
+                            if (r > 0.82) {
+                                chosen = skinColors.base[Math.floor(Math.random() * skinColors.base.length)];
+                            } else if (r > 0.6) {
+                                chosen = grimePalette[Math.floor(Math.random() * grimePalette.length)];
+                            } else {
+                                chosen = shirtPalette[Math.floor(Math.random() * shirtPalette.length)];
+                            }
+                        } else {
+                            // Neck/upper chest: primarily skin with subtle shading
+                            const r = Math.random();
+                            chosen = r > 0.35
+                                ? skinColors.base[Math.floor(Math.random() * skinColors.base.length)]
+                                : skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)];
+                        }
+                        fillPixel(x, y, chosen);
+                    }
+                }
+
+                // Weathering passes
+                applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.12);
+                const scarCount = Math.floor(PIXELS_PER_TILE * 1.2);
+                for (let i = 0; i < scarCount; i++) {
+                    const { x, y } = quantizeUVToPixel(Math.random(), Math.random(), PIXELS_PER_TILE);
+                    const scarTone = skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)];
+                    fillPixel(x, y, scarTone);
+                }
+
+                const tex = new THREE.CanvasTexture(cvs);
+                registerPixelTexture(tex);
+
+                return {
+                    material: new THREE.MeshLambertMaterial({ map: tex, transparent: false }),
+                    layout: { waistEnd, torsoEnd },
+                };
+            }
+
             function applyTorsoSegmentUVs(geometry, layout) {
                 if (!geometry || !geometry.attributes.uv) return;
                 const uvAttr = geometry.attributes.uv;
                 const { waistEnd, torsoEnd } = layout;
 
-                const setFaceUV = (faceIndex, corners) => {
-                    const base = faceIndex * 4;
-                    uvAttr.setXY(base + 0, corners[0].u, corners[0].v);
-                    uvAttr.setXY(base + 1, corners[1].u, corners[1].v);
-                    uvAttr.setXY(base + 2, corners[2].u, corners[2].v);
-                    uvAttr.setXY(base + 3, corners[3].u, corners[3].v);
+                // Preserve each face's original winding but remap vertical bands so waist/torso/neck stay aligned.
+                const remapSideV = (v) => {
+                    if (v <= 0.333) {
+                        return THREE.MathUtils.lerp(0, waistEnd, v / 0.333);
+                    } else if (v <= 0.666) {
+                        return THREE.MathUtils.lerp(waistEnd, torsoEnd, (v - 0.333) / 0.333);
+                    }
+                    return THREE.MathUtils.lerp(torsoEnd, 1, (v - 0.666) / 0.334);
                 };
 
-                // Standard side mapping keeps vertical 0-1 range so the procedural bands show crisp segmentation.
-                const sideUVs = [
-                    { u: 1, v: 1 },
-                    { u: 0, v: 1 },
-                    { u: 0, v: 0 },
-                    { u: 1, v: 0 },
-                ];
+                // Compact neck/waist spans to avoid collapsing faces into a single UV line (causes texture twisting).
+                const neckStart = THREE.MathUtils.clamp(torsoEnd + (1 - torsoEnd) * 0.35, torsoEnd, 0.94);
+                const neckEnd = Math.min(1, neckStart + Math.max(0.06, (1 - neckStart) * 0.6));
+                const waistStart = Math.max(0, waistEnd * 0.18);
+                const waistEndBand = Math.min(waistEnd * 0.95, waistStart + Math.max(0.08, waistEnd * 0.55));
 
-                setFaceUV(0, sideUVs); // right
-                setFaceUV(1, sideUVs); // left
-                setFaceUV(4, sideUVs); // front
-                setFaceUV(5, sideUVs); // back
+                const remapFaceRange = (faceIndex, uRange, vRange, vMapper = null) => {
+                    const base = faceIndex * 4;
+                    for (let i = 0; i < 4; i++) {
+                        const u = uvAttr.getX(base + i);
+                        const v = uvAttr.getY(base + i);
+                        const mappedU = THREE.MathUtils.lerp(uRange[0], uRange[1], u);
+                        const sourceV = vMapper ? vMapper(v) : v;
+                        const mappedV = THREE.MathUtils.lerp(vRange[0], vRange[1], sourceV);
+                        uvAttr.setXY(base + i, mappedU, mappedV);
+                    }
+                };
 
-                // Top samples from neck region, bottom samples waist/pants for clarity.
-                const neckV = THREE.MathUtils.lerp(torsoEnd, 1, 0.6);
-                const waistV = waistEnd * 0.35;
+                // Sides keep their U orientation but get segmented V bands.
+                remapFaceRange(0, [0, 1], [0, 1], remapSideV); // right
+                remapFaceRange(1, [0, 1], [0, 1], remapSideV); // left
+                remapFaceRange(4, [0, 1], [0, 1], remapSideV); // front
+                remapFaceRange(5, [0, 1], [0, 1], remapSideV); // back
 
-                setFaceUV(2, [
-                    { u: 1, v: neckV },
-                    { u: 0, v: neckV },
-                    { u: 0, v: neckV },
-                    { u: 1, v: neckV },
-                ]);
-
-                setFaceUV(3, [
-                    { u: 1, v: waistV },
-                    { u: 0, v: waistV },
-                    { u: 0, v: waistV },
-                    { u: 1, v: waistV },
-                ]);
+                // Top pulls from neck, bottom from waist/pants. Keep a small V span to avoid smearing.
+                remapFaceRange(2, [0, 1], [neckStart, neckEnd]);
+                remapFaceRange(3, [0, 1], [waistStart, waistEndBand]);
 
                 uvAttr.needsUpdate = true;
             }
@@ -6142,15 +6212,17 @@
                 parts.body.material = bodyMaterial;
                 leftArmMesh.material = armMaterials;
                 rightArmMesh.material = armMaterials;
-                leftLegMesh.material = bodyMaterial;
-                rightLegMesh.material = bodyMaterial;
+                leftLegMesh.material = legMaterials;
+                rightLegMesh.material = legMaterials;
 
                 // Re-apply torso UV layout so each zombie keeps its unique waist/torso/neck proportions
                 applyTorsoSegmentUVs(parts.body.geometry, bodyUVLayout);
 
-                // Ensure arm geometry keeps banded material indices
+                // Ensure limb geometry keeps banded material indices
                 leftArmMesh.geometry = armGeometry;
                 rightArmMesh.geometry = armGeometry;
+                leftLegMesh.geometry = legGeometry;
+                rightLegMesh.geometry = legGeometry;
 
                 group.visible = true;
                 group.castShadow = true;
