@@ -38,6 +38,13 @@ Data Structure:
 UI Overlay:
 1. Add a new `<div id="inventory-screen">` in the HTML, styled with CSS grid (9x4 slots).
 2. Bind the E key to toggle this screen (unlocking pointer controls similar to the Pause menu).
-**Logic:**
+Logic:
 1. Implement drag-and-drop or "click-to-swap" logic in JavaScript.
 2. Update the `setSlotIcon` function to read from your dynamic hotbar array instead of hardcoded IDs.
+**Mechanics:**
+1. Jousting
+
+# Mobs
+Owls: 
+1. use my voice for 'hoo'
+2. can fly

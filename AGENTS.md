@@ -89,3 +89,4 @@ If tests or simple debug toggles exist, ExecPlans should specify how to run/enab
 - This is a single-file project; never create or split code into multiple files.
 - Make all changes inside the one main source file, using clear function/class boundaries and well-labeled regions.
 - For complex refactors (e.g., chunk building and caching), use ExecPlans as defined in `.agent/PLANS.md`, but always describe work in terms of edits to this single file.
+- Always give explanation for how to test and subsequently, the coding agent must run a test.
