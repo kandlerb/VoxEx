@@ -1402,6 +1402,9 @@
             const globalPendingMods = new Map();
             const chunkBuildQueue = [];
             const chunkRenderedFaces = new Map();
+            const lightUpdateQueue = [];
+            const queuedLightUpdates = new Set();
+            const MAX_LIGHT_UPDATES_PER_FRAME = 4;
             let lastChunkUpdate = 0;
             let selectedBlockId = GRASS;
             let currentHotbarSlot = 1; // Track current hotbar position (1-8)
@@ -1536,6 +1539,18 @@
                     return false;
                 }
                 return true;
+            }
+
+            function purgeChunkData(key) {
+                // Dispose meshes first to avoid dangling references
+                releaseMeshForKey(key);
+                releaseMeshForKey(`${key}_WATER`);
+
+                // Remove chunk data and bookkeeping entries
+                chunks.delete(key);
+                pristineChunks.delete(key);
+                modifiedChunks.delete(key);
+                activeChunks.delete(key);
             }
 
             const worldConfig = {
@@ -2108,6 +2123,254 @@
                 chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
             }
 
+            function computeNeighborSunlight(x, y, z) {
+                let maxLight = 1;
+                for (let i = 0; i < NEIGHBOR_OFFSETS.length; i++) {
+                    const o = NEIGHBOR_OFFSETS[i];
+                    const nx = x + o[0];
+                    const ny = y + o[1];
+                    const nz = z + o[2];
+                    const neighborId = getBlock(nx, ny, nz);
+                    if (neighborId === undefined || !IS_TRANSPARENT[neighborId]) continue;
+                    const nLight = getSkyLight(nx, ny, nz);
+                    const propagated = nLight > 1 ? nLight - 1 : 1;
+                    if (propagated > maxLight) maxLight = propagated;
+                }
+                return maxLight;
+            }
+
+            function computeNeighborBlockLight(x, y, z) {
+                let maxLight = 0;
+                for (let i = 0; i < NEIGHBOR_OFFSETS.length; i++) {
+                    const o = NEIGHBOR_OFFSETS[i];
+                    const nx = x + o[0];
+                    const ny = y + o[1];
+                    const nz = z + o[2];
+                    const neighborId = getBlock(nx, ny, nz);
+                    if (neighborId === undefined || !IS_TRANSPARENT[neighborId]) continue;
+                    const nLight = getBlockLight(nx, ny, nz);
+                    const propagated = nLight > 0 ? nLight - 1 : 0;
+                    if (propagated > maxLight) maxLight = propagated;
+                }
+                return maxLight;
+            }
+
+            function enqueueBoundaryRelight(x, y, z) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                const neighborId = getBlock(x, y, z);
+                if (neighborId === undefined) return;
+                const key = `${x},${y},${z}`;
+                if (queuedLightUpdates.has(key)) return;
+                queuedLightUpdates.add(key);
+                lightUpdateQueue.push({ x, y, z, oldId: neighborId, newId: neighborId, key });
+            }
+
+            function enqueueLightUpdate(x, y, z, oldId, newId) {
+                const ly = y + WORLD_DIMS.yOffset;
+                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                const key = `${x},${y},${z}`;
+                if (!queuedLightUpdates.has(key)) {
+                    queuedLightUpdates.add(key);
+                    lightUpdateQueue.push({ x, y, z, oldId, newId, key });
+                }
+
+                // If the edit is on a boundary, ensure neighbors get a quick relight probe
+                const lx = ((x % 16) + 16) % 16;
+                const lz = ((z % 16) + 16) % 16;
+                if (lx === 0) enqueueBoundaryRelight(x - 1, y, z);
+                if (lx === 15) enqueueBoundaryRelight(x + 1, y, z);
+                if (lz === 0) enqueueBoundaryRelight(x, y, z - 1);
+                if (lz === 15) enqueueBoundaryRelight(x, y, z + 1);
+            }
+
+            function processLightQueue(limit = MAX_LIGHT_UPDATES_PER_FRAME) {
+                let processed = 0;
+                while (lightUpdateQueue.length > 0 && processed < limit) {
+                    const job = lightUpdateQueue.shift();
+                    queuedLightUpdates.delete(job.key);
+                    applyLocalizedRelight(job);
+                    processed++;
+                }
+            }
+
+            function applyLocalizedRelight(job) {
+                const { x, y, z, oldId, newId } = job;
+                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                const key = getChunkKey(cx, cz);
+                if (!chunks.has(key)) return;
+
+                const existingId = getBlock(x, y, z);
+                const prevId = oldId ?? existingId ?? AIR;
+                const nextId = newId ?? existingId ?? AIR;
+
+                updateSunlightAt(x, y, z, prevId, nextId);
+                updateBlockLightAt(x, y, z, prevId, nextId);
+            }
+
+            function updateSunlightAt(x, y, z, oldId, newId) {
+                const currentLight = getSkyLight(x, y, z);
+                const addQueue = [];
+                const removeQueue = [];
+                const becameOpaque = !IS_TRANSPARENT[newId];
+
+                if (becameOpaque) {
+                    if (currentLight > 1) {
+                        setSkyLight(x, y, z, 1);
+                        removeQueue.push(x, y, z, currentLight);
+                    }
+                } else {
+                    const desired = computeNeighborSunlight(x, y, z);
+                    if (desired > currentLight) {
+                        setSkyLight(x, y, z, desired);
+                        addQueue.push(x, y, z, desired);
+                    } else if (desired < currentLight) {
+                        setSkyLight(x, y, z, desired);
+                        removeQueue.push(x, y, z, currentLight);
+                    }
+                }
+
+                // Darken areas that depended on removed light
+                for (let i = 0; i < removeQueue.length; ) {
+                    const lx = removeQueue[i++];
+                    const ly = removeQueue[i++];
+                    const lz = removeQueue[i++];
+                    const level = removeQueue[i++];
+
+                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                        const o = NEIGHBOR_OFFSETS[n];
+                        const nx = lx + o[0];
+                        const ny = ly + o[1];
+                        const nz = lz + o[2];
+                        const nId = getBlock(nx, ny, nz);
+                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                        const nLight = getSkyLight(nx, ny, nz);
+                        if (nLight === 0) continue;
+
+                        if (nLight < level) {
+                            setSkyLight(nx, ny, nz, 1);
+                            removeQueue.push(nx, ny, nz, nLight);
+                        } else {
+                            const desiredNeighbor = computeNeighborSunlight(nx, ny, nz);
+                            if (desiredNeighbor < nLight) {
+                                setSkyLight(nx, ny, nz, desiredNeighbor);
+                                removeQueue.push(nx, ny, nz, nLight);
+                            } else if (desiredNeighbor > nLight) {
+                                addQueue.push(nx, ny, nz, desiredNeighbor);
+                            }
+                        }
+                    }
+                }
+
+                // Brighten areas by spreading from updated cells
+                for (let i = 0; i < addQueue.length; ) {
+                    const lx = addQueue[i++];
+                    const ly = addQueue[i++];
+                    const lz = addQueue[i++];
+                    const level = addQueue[i++];
+
+                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                        const o = NEIGHBOR_OFFSETS[n];
+                        const nx = lx + o[0];
+                        const ny = ly + o[1];
+                        const nz = lz + o[2];
+                        const nId = getBlock(nx, ny, nz);
+                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                        const nLight = getSkyLight(nx, ny, nz);
+                        const propagated = level > 1 ? level - 1 : 1;
+                        if (propagated > nLight) {
+                            setSkyLight(nx, ny, nz, propagated);
+                            addQueue.push(nx, ny, nz, propagated);
+                        }
+                    }
+                }
+            }
+
+            function updateBlockLightAt(x, y, z, oldId, newId) {
+                const wasSource = oldId === TORCH;
+                const isSource = newId === TORCH;
+                const currentLight = getBlockLight(x, y, z);
+                const addQueue = [];
+                const removeQueue = [];
+                const baseLevel = isSource ? 15 : 0;
+                const transparent = IS_TRANSPARENT[newId];
+
+                if (!transparent) {
+                    if (currentLight !== baseLevel) {
+                        setBlockLight(x, y, z, baseLevel);
+                        if (currentLight > baseLevel) removeQueue.push(x, y, z, currentLight);
+                        else if (baseLevel > currentLight) addQueue.push(x, y, z, baseLevel);
+                    }
+                } else {
+                    const desired = Math.max(baseLevel, computeNeighborBlockLight(x, y, z));
+                    if (desired > currentLight) {
+                        setBlockLight(x, y, z, desired);
+                        addQueue.push(x, y, z, desired);
+                    } else if (desired < currentLight) {
+                        setBlockLight(x, y, z, desired);
+                        removeQueue.push(x, y, z, currentLight);
+                    }
+                }
+
+                if (wasSource && !isSource && currentLight > baseLevel) {
+                    removeQueue.push(x, y, z, currentLight);
+                }
+
+                for (let i = 0; i < removeQueue.length; ) {
+                    const lx = removeQueue[i++];
+                    const ly = removeQueue[i++];
+                    const lz = removeQueue[i++];
+                    const level = removeQueue[i++];
+
+                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                        const o = NEIGHBOR_OFFSETS[n];
+                        const nx = lx + o[0];
+                        const ny = ly + o[1];
+                        const nz = lz + o[2];
+                        const nId = getBlock(nx, ny, nz);
+                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                        const nLight = getBlockLight(nx, ny, nz);
+                        if (nLight === 0) continue;
+
+                        if (nLight < level) {
+                            setBlockLight(nx, ny, nz, 0);
+                            removeQueue.push(nx, ny, nz, nLight);
+                        } else {
+                            const desiredNeighbor = Math.max(computeNeighborBlockLight(nx, ny, nz), nId === TORCH ? 15 : 0);
+                            if (desiredNeighbor < nLight) {
+                                setBlockLight(nx, ny, nz, desiredNeighbor);
+                                removeQueue.push(nx, ny, nz, nLight);
+                            } else if (desiredNeighbor > nLight) {
+                                addQueue.push(nx, ny, nz, desiredNeighbor);
+                            }
+                        }
+                    }
+                }
+
+                for (let i = 0; i < addQueue.length; ) {
+                    const lx = addQueue[i++];
+                    const ly = addQueue[i++];
+                    const lz = addQueue[i++];
+                    const level = addQueue[i++];
+
+                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                        const o = NEIGHBOR_OFFSETS[n];
+                        const nx = lx + o[0];
+                        const ny = ly + o[1];
+                        const nz = lz + o[2];
+                        const nId = getBlock(nx, ny, nz);
+                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                        const nLight = getBlockLight(nx, ny, nz);
+                        const propagated = level > 0 ? level - 1 : 0;
+                        if (propagated > nLight) {
+                            setBlockLight(nx, ny, nz, propagated);
+                            addQueue.push(nx, ny, nz, propagated);
+                        }
+                    }
+                }
+            }
+
             function setBlock(x, y, z, id) {
                 const ly = y + WORLD_DIMS.yOffset;
                 if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
@@ -2127,41 +2390,40 @@
                     };
                     chunks.set(key, chunk);
                     activeChunks.add(key);
+                } else if (!chunk.blocks) {
+                    // Upgrade legacy chunk format to include lighting buffers
+                    const legacy = chunk;
+                    const legacySize = legacy.length || WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                    chunk = {
+                        blocks: legacy,
+                        skyLight: new Uint8Array(legacySize).fill(15),
+                        blockLight: new Uint8Array(legacySize).fill(1),
+                    };
+                    chunks.set(key, chunk);
+                } else {
+                    if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
+                    if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
                 }
                 const lx = ((x % 16) + 16) % 16;
                 const lz = ((z % 16) + 16) % 16;
                 const idx = lx + lz * 16 + ly * 256;
 
+                const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+                if (oldId === id) return;
+
                 // Handle both old and new format
                 if (chunk.blocks) {
                     chunk.blocks[idx] = id;
-
-                    // Recalculate lighting for the chunk since block changed
-                    calculateChunkSunlight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
-                    calculateBlockLight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
-
-                    // Also recalculate neighbor chunks to fix boundary light propagation
-                    const neighbors = [
-                        [cx - 1, cz],
-                        [cx + 1, cz],
-                        [cx, cz - 1],
-                        [cx, cz + 1],
-                    ];
-                    for (const [ncx, ncz] of neighbors) {
-                        const nKey = getChunkKey(ncx, ncz);
-                        const nChunk = chunks.get(nKey);
-                        if (nChunk && nChunk.blocks) {
-                            calculateChunkSunlight(nChunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
-                            calculateBlockLight(nChunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
-                        }
-                    }
                 } else {
                     chunk[idx] = id;
                 }
 
+                enqueueLightUpdate(x, y, z, oldId, id);
+
                 // Mark chunk as modified by player (for smart memory management)
                 modifiedChunks.add(key);
                 pristineChunks.delete(key);
+                activeChunks.add(key);
             }
             function rebuildAllVisibleChunks() {
                 logDebug("Rebuilding all visible chunks for settings change...");
@@ -7285,8 +7547,7 @@
                 if (pristineChunks.size > 0) {
                     for (const key of pristineChunks) {
                         if (!neededKeys.has(key) && canEvictChunk(key)) {
-                            chunks.delete(key);
-                            pristineChunks.delete(key);
+                            purgeChunkData(key);
                         }
                     }
                 }
@@ -7307,8 +7568,7 @@
                         if (neededKeys.has(targetKey)) continue;
                         if (!canEvictChunk(targetKey, { persistModified: true })) continue;
 
-                        chunks.delete(targetKey);
-                        pristineChunks.delete(targetKey);
+                        purgeChunkData(targetKey);
                         removed++;
                     }
                 }
@@ -7681,6 +7941,9 @@
                             breakProgress = 0;
                         }
                     }
+
+                    // Process a few pending light updates each frame to avoid large spikes
+                    processLightQueue();
 
                     // 1. Throttle Heavy Tasks (Mesh Building)
                     // OPTIMIZATION: Only process chunks if frame time is under budget (32ms = ~30fps minimum)
