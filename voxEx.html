@@ -5748,23 +5748,96 @@
                 return new THREE.MeshLambertMaterial({ map: tex, transparent: false });
             }
 
+            function generateZombieArmSegmentTexture(skinColors, segment) {
+                const PIXELS_PER_TILE = SETTINGS.textureResolution;
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+                const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                const skinPalette = segment === "hand" ? skinColors.dark.concat(skinColors.base) : skinColors.base.concat(skinColors.dark);
+                const shoulderAccent = ["#1f5a65", "#1a4d57", "#234b55", "#1c414b"]; // Matches shirt band hues
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        let chosen;
+                        if (segment === "shoulder") {
+                            // Mostly fabric, occasional skin tear-throughs
+                            const r = Math.random();
+                            chosen = r > 0.12 ? shoulderAccent[Math.floor(Math.random() * shoulderAccent.length)] : skinPalette[Math.floor(Math.random() * skinPalette.length)];
+                        } else if (segment === "hand") {
+                            const r = Math.random();
+                            chosen = r > 0.7 ? skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)] : skinColors.base[Math.floor(Math.random() * skinColors.base.length)];
+                        } else {
+                            const r = Math.random();
+                            chosen = r > 0.65 ? skinColors.base[Math.floor(Math.random() * skinColors.base.length)] : skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)];
+                        }
+                        fillPixel(x, y, chosen);
+                    }
+                }
+
+                // Add subtle weathering/dither and scars to break up repetition
+                applyPixelDither(ctx, PIXELS_PER_TILE, STEP, segment === "hand" ? 0.09 : 0.12);
+                const scratchCount = Math.floor(PIXELS_PER_TILE * (segment === "shoulder" ? 0.8 : 0.6));
+                for (let i = 0; i < scratchCount; i++) {
+                    const { x, y } = quantizeUVToPixel(Math.random(), Math.random(), PIXELS_PER_TILE);
+                    const tone = segment === "shoulder" ? "#0f1f27" : skinColors.dark[Math.floor(Math.random() * skinColors.dark.length)];
+                    fillPixel(x, y, tone);
+                }
+
+                const tex = new THREE.CanvasTexture(cvs);
+                registerPixelTexture(tex);
+                return tex;
+            }
+
+            function generateZombieArmMaterials(skinColors) {
+                const shoulderTex = generateZombieArmSegmentTexture(skinColors, "shoulder");
+                const armTex = generateZombieArmSegmentTexture(skinColors, "arm");
+                const handTex = generateZombieArmSegmentTexture(skinColors, "hand");
+
+                return [
+                    new THREE.MeshLambertMaterial({ map: shoulderTex, transparent: false }),
+                    new THREE.MeshLambertMaterial({ map: armTex, transparent: false }),
+                    new THREE.MeshLambertMaterial({ map: handTex, transparent: false }),
+                ];
+            }
+
+            function applyArmMaterialBands(geometry) {
+                // BoxGeometry group order: right, left, top, bottom, front, back
+                if (!geometry.groups || geometry.groups.length < 6) return;
+                geometry.groups[0].materialIndex = 1; // right - mid arm
+                geometry.groups[1].materialIndex = 1; // left - mid arm
+                geometry.groups[2].materialIndex = 0; // top - shoulder band
+                geometry.groups[3].materialIndex = 2; // bottom - hand
+                geometry.groups[4].materialIndex = 1; // front - mid arm
+                geometry.groups[5].materialIndex = 1; // back - mid arm
+            }
+
             function buildZombieMesh() {
                 const group = mobPool.pop() || new THREE.Group();
-                if (!group.userData.parts) {
-                    const { head, body, leg, shoulderY, hipY, arm } = ZOMBIE_PROPORTIONS;
+                const { head, body, leg, shoulderY, hipY, arm } = ZOMBIE_PROPORTIONS;
 
-                    // VARIATION: Generate unique appearance for each zombie
-                    const skinColorIndex = pickZombieSkinIndex();
-                    const eyeTypeIndex = Math.floor(Math.random() * ZOMBIE_EYE_TYPES.length);
-                    const mouthTypeIndex = Math.floor(Math.random() * ZOMBIE_MOUTH_TYPES.length);
+                // VARIATION: Generate unique appearance for each zombie
+                const skinColorIndex = pickZombieSkinIndex();
+                const eyeTypeIndex = Math.floor(Math.random() * ZOMBIE_EYE_TYPES.length);
+                const mouthTypeIndex = Math.floor(Math.random() * ZOMBIE_MOUTH_TYPES.length);
 
-                    // Generate unique head materials for this zombie
-                    const headMaterials = generateZombieHeadTexture(skinColorIndex, eyeTypeIndex, mouthTypeIndex);
+                // Generate unique head/body/arm materials for this zombie
+                const headMaterials = generateZombieHeadTexture(skinColorIndex, eyeTypeIndex, mouthTypeIndex);
+                const bodySkinColor = ZOMBIE_SKIN_COLORS[skinColorIndex];
+                const bodyMaterial = generateZombieBodyMaterial(bodySkinColor);
+                const armMaterials = generateZombieArmMaterials(bodySkinColor);
 
-                    // Generate matching body material with same skin color
-                    const bodySkinColor = ZOMBIE_SKIN_COLORS[skinColorIndex];
-                    const bodyMaterial = generateZombieBodyMaterial(bodySkinColor);
+                const armGeometry = new THREE.BoxGeometry(arm.thickness, arm.height, arm.thickness);
+                applyArmMaterialBands(armGeometry);
 
+                let parts = group.userData.parts;
+                let leftArmMesh, rightArmMesh, leftLegMesh, rightLegMesh;
+
+                if (!parts) {
                     // Create body parts with unique materials
                     const headMesh = new THREE.Mesh(new THREE.BoxGeometry(head.size, head.height, head.size), headMaterials);
                     const bodyMesh = new THREE.Mesh(new THREE.BoxGeometry(body.width, body.height, body.depth), bodyMaterial);
@@ -5778,7 +5851,7 @@
 
                     // Left Arm - pivot at shoulder
                     const leftArmPivot = new THREE.Group();
-                    const leftArmMesh = new THREE.Mesh(new THREE.BoxGeometry(arm.thickness, arm.height, arm.thickness), bodyMaterial);
+                    leftArmMesh = new THREE.Mesh(armGeometry, armMaterials);
                     leftArmMesh.castShadow = true;
                     leftArmMesh.receiveShadow = true;
                     // Position mesh DOWN from pivot so it rotates from shoulder
@@ -5788,7 +5861,7 @@
 
                     // Right Arm - pivot at shoulder
                     const rightArmPivot = new THREE.Group();
-                    const rightArmMesh = new THREE.Mesh(new THREE.BoxGeometry(arm.thickness, arm.height, arm.thickness), bodyMaterial);
+                    rightArmMesh = new THREE.Mesh(armGeometry, armMaterials);
                     rightArmMesh.castShadow = true;
                     rightArmMesh.receiveShadow = true;
                     rightArmMesh.position.y = -arm.height * 0.5;
@@ -5797,7 +5870,7 @@
 
                     // Left Leg - pivot at hip
                     const leftLegPivot = new THREE.Group();
-                    const leftLegMesh = new THREE.Mesh(new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness), bodyMaterial);
+                    leftLegMesh = new THREE.Mesh(new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness), bodyMaterial);
                     leftLegMesh.castShadow = true;
                     leftLegMesh.receiveShadow = true;
                     // Position mesh DOWN from pivot so it rotates from hip
@@ -5807,7 +5880,7 @@
 
                     // Right Leg - pivot at hip
                     const rightLegPivot = new THREE.Group();
-                    const rightLegMesh = new THREE.Mesh(new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness), bodyMaterial);
+                    rightLegMesh = new THREE.Mesh(new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness), bodyMaterial);
                     rightLegMesh.castShadow = true;
                     rightLegMesh.receiveShadow = true;
                     rightLegMesh.position.y = -leg.height * 0.5;
@@ -5819,13 +5892,17 @@
                     bodyMesh.position.set(0, hipY + body.height * 0.5, 0);
 
                     // Store references to pivot groups for animation
-                    const parts = {
+                    parts = {
                         head: headMesh,
                         body: bodyMesh,
                         leftArm: leftArmPivot,
                         rightArm: rightArmPivot,
                         leftLeg: leftLegPivot,
-                        rightLeg: rightLegPivot
+                        rightLeg: rightLegPivot,
+                        leftArmMesh,
+                        rightArmMesh,
+                        leftLegMesh,
+                        rightLegMesh,
                     };
 
                     // Add all parts to the group
@@ -5842,7 +5919,24 @@
                     group.add(rightLegPivot);
 
                     group.userData.parts = parts;
+                } else {
+                    leftArmMesh = parts.leftArmMesh || parts.leftArm.children[0];
+                    rightArmMesh = parts.rightArmMesh || parts.rightArm.children[0];
+                    leftLegMesh = parts.leftLegMesh || parts.leftLeg.children[0];
+                    rightLegMesh = parts.rightLegMesh || parts.rightLeg.children[0];
                 }
+
+                // Refresh materials for pooled zombies so each spawn stays unique
+                parts.head.material = headMaterials;
+                parts.body.material = bodyMaterial;
+                leftArmMesh.material = armMaterials;
+                rightArmMesh.material = armMaterials;
+                leftLegMesh.material = bodyMaterial;
+                rightLegMesh.material = bodyMaterial;
+
+                // Ensure arm geometry keeps banded material indices
+                leftArmMesh.geometry = armGeometry;
+                rightArmMesh.geometry = armGeometry;
 
                 group.visible = true;
                 group.castShadow = true;
