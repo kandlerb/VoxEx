@@ -1583,6 +1583,17 @@
             const pendingChunkUpdates = new Set(); // Debounced Chunk Update System
             const dirtyChunks = new Set(); // Tracks chunks that need a rebuild while keeping their current mesh visible
             const deferredChunkUpdates = new Set(); // Chunk updates blocked while lighting is pending
+            const chunkUpdateDiagnostics = {
+                pending: new Map(),
+                lastDispatchKeys: [],
+                debounceResets: 0,
+                lastDispatchReason: "",
+                lastDispatchTime: 0,
+                lastHeartbeat: 0,
+                deferredFlushes: 0,
+                neighborStats: { processed: 0, requeued: 0, lastRun: 0 },
+            };
+            const renderChunkTrace = new Map();
             const pendingLightChunks = new Map(); // key -> { count }
             let updateTimeout = null; // Debounced Chunk Update System
             const DIR_EPSILON = 1e-4; // Threshold for camera dir delta before re-running frustum pass
@@ -1634,12 +1645,14 @@
                 for (const key of deferredChunkUpdates) {
                     deferredChunkUpdates.delete(key);
                     const [cx, cz] = key.split(",").map(Number);
-                    scheduleChunkUpdate(cx, cz, true);
+                    recordChunkUpdateState(key, reason, "deferred-flush");
+                    scheduleChunkUpdate(cx, cz, true, `${reason}-flush`);
                     flushed++;
                 }
 
                 // Lightweight diagnostic to help track stuck chunk rebuilds without spamming logs
                 if (flushed > 0) {
+                    chunkUpdateDiagnostics.deferredFlushes += flushed;
                     console.debug(`Flushed ${flushed} deferred chunk updates after ${reason}`);
                 }
             }
@@ -1668,7 +1681,76 @@
                     const [cx, cz] = key.split(",").map(Number);
                     if (chunkOrNeighborsPending(cx, cz)) continue;
                     deferredChunkUpdates.delete(key);
-                    scheduleChunkUpdate(cx, cz, true);
+                    scheduleChunkUpdate(cx, cz, true, "light-unblocked");
+                }
+            }
+
+            function recordChunkUpdateState(key, source, state) {
+                const now = performance.now();
+                const entry = chunkUpdateDiagnostics.pending.get(key) || { first: now, sources: new Set() };
+                entry.last = now;
+                entry.state = state;
+                if (source) entry.sources.add(source);
+                chunkUpdateDiagnostics.pending.set(key, entry);
+
+                if (chunkUpdateDiagnostics.pending.size > 4096) {
+                    const oldestKey = chunkUpdateDiagnostics.pending.keys().next().value;
+                    if (oldestKey) chunkUpdateDiagnostics.pending.delete(oldestKey);
+                }
+            }
+
+            function dispatchPendingChunkUpdates(reason = "debounce") {
+                const keys = Array.from(pendingChunkUpdates);
+                chunkUpdateDiagnostics.lastDispatchKeys = keys;
+                chunkUpdateDiagnostics.lastDispatchReason = reason;
+                chunkUpdateDiagnostics.lastDispatchTime = performance.now();
+
+                if (keys.length === 0) {
+                    if (isDebug) logDebug(`[ChunkUpdate] Dispatch '${reason}' ran with no pending keys.`);
+                    return;
+                }
+
+                for (const k of keys) {
+                    const [c, z] = k.split(",").map(Number);
+                    if (!queuedChunkKeys.has(k)) {
+                        chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0 }); // Use unshift for priority
+                        queuedChunkKeys.add(k);
+                    }
+                    recordChunkUpdateState(k, reason, "queued");
+                }
+
+                pendingChunkUpdates.clear();
+            }
+
+            function heartbeatChunkUpdates(now = performance.now()) {
+                if (now - chunkUpdateDiagnostics.lastHeartbeat < 200) return;
+                chunkUpdateDiagnostics.lastHeartbeat = now;
+
+                if (!updateTimeout && pendingChunkUpdates.size > 0) {
+                    dispatchPendingChunkUpdates("heartbeat");
+                }
+
+                if (pendingLightChunks.size === 0 && deferredChunkUpdates.size > 0) {
+                    flushAllDeferredChunkUpdates("heartbeat");
+                }
+
+                if (isDebug && chunkUpdateDiagnostics.pending.size > 0) {
+                    for (const [key, entry] of chunkUpdateDiagnostics.pending) {
+                        const stale = now - entry.last > 2000;
+                        const notQueued =
+                            !pendingChunkUpdates.has(key) &&
+                            !deferredChunkUpdates.has(key) &&
+                            !queuedChunkKeys.has(key) &&
+                            !chunkBuildQueue.some((job) => job.key === key);
+                        if (stale && notQueued) {
+                            logDebug(`[ChunkUpdate] Stale pending trace for ${key}`, {
+                                state: entry.state,
+                                age: Math.round(now - entry.last),
+                                sources: entry.sources ? Array.from(entry.sources) : [],
+                            });
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -1843,33 +1925,28 @@
                 return verts;
             }
 
-            function scheduleChunkUpdate(cx, cz, force = false) {
+            function scheduleChunkUpdate(cx, cz, force = false, source = "generic") {
                 const key = `${cx},${cz}`;
+                recordChunkUpdateState(key, source, "scheduled");
 
                 if (!force && chunkOrNeighborsPending(cx, cz)) {
                     deferredChunkUpdates.add(key);
                     dirtyChunks.add(key); // Keep the dirty flag so the rebuild releases old meshes when it runs
+                    recordChunkUpdateState(key, source, "waiting-light");
                     return;
                 }
 
                 pendingChunkUpdates.add(key);
                 dirtyChunks.add(key);
 
-                if (updateTimeout) clearTimeout(updateTimeout);
+                if (updateTimeout) {
+                    clearTimeout(updateTimeout);
+                    chunkUpdateDiagnostics.debounceResets++;
+                }
 
                 // Debounce: Wait 50ms after the last block change
                 updateTimeout = setTimeout(() => {
-                    // Instead of rebuilding synchronously, add to the normal queue
-                    for (const k of pendingChunkUpdates) {
-                        const [c, z] = k.split(",").map(Number);
-
-                        // Add to the async build queue instead of rebuilding immediately
-                        if (!queuedChunkKeys.has(k)) {
-                            chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0 }); // Use unshift for priority
-                            queuedChunkKeys.add(k);
-                        }
-                    }
-                    pendingChunkUpdates.clear();
+                    dispatchPendingChunkUpdates("debounce");
                     updateTimeout = null;
                 }, 50);
             }
@@ -2608,7 +2685,7 @@
                         const [cxStr, czStr] = rebuildTargets[i].split(',');
                         const cx = Number(cxStr);
                         const cz = Number(czStr);
-                        scheduleChunkUpdate(cx, cz);
+                        scheduleChunkUpdate(cx, cz, false, "sunlight-task");
                     }
 
                     finalizeSunlightTask(task);
@@ -8345,9 +8422,22 @@
             function renderChunk(cx, cz) {
                 try {
                     const cKey = getChunkKey(cx, cz);
+                    const trace = {
+                        key: cKey,
+                        start: performance.now(),
+                        status: "start",
+                        pendingLight: pendingLightChunks.has(cKey),
+                    };
+                    renderChunkTrace.set(cKey, trace);
                     const centerData = chunks.get(cKey);
 
                     if (!centerData) {
+                        trace.status = "missing-center-data";
+                        trace.missingData = true;
+                        renderChunkTrace.set(cKey, trace);
+                        if (isDebug) {
+                            logDebug(`[RenderChunk] Skipping ${cKey} (no center data, pendingLight=${trace.pendingLight}).`);
+                        }
                         return;
                     }
 
@@ -8379,7 +8469,9 @@
                           }
                         : null;
 
+                    let lastSampleMissing = false;
                     const sampleNeighborBlock = (chunk, idx, isDiagonal = false) => {
+                        lastSampleMissing = !chunk;
                         if (chunk) return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
                         if (debugCounters) {
                             debugCounters.missingNeighborSamples++;
@@ -8513,6 +8605,12 @@
                     const maxFaces = 30000;
 
                     // --- SEPARATE POOLS FOR TERRAIN AND WATER ---
+                    trace.poolBefore = {
+                        pos: posPool.pool.length,
+                        norm: normPool.pool.length,
+                        uv: uvPool.pool.length,
+                        col: colPool.pool.length,
+                    };
                     const terrainPos = posPool.acquire(maxFaces * 18);
                     const terrainNorm = normPool.acquire(maxFaces * 18);
                     const terrainUvs = uvPool.acquire(maxFaces * 12);
@@ -8531,6 +8629,9 @@
                         wUvIdx = 0,
                         wCIdx = 0,
                         wFaceCount = 0; // Water
+                    let solidBlocks = 0;
+                    let boundaryTransparentFace = false;
+                    let missingNeighborDuringRender = false;
 
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
@@ -8549,6 +8650,8 @@
                                 const idx = x + zOffset + yOffset;
                                 const id = blockData[idx];
                                 if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
+
+                                solidBlocks++;
 
                                 const wx = startX + x;
                                 const wy = y - WORLD_DIMS.yOffset;
@@ -8585,7 +8688,9 @@
                                     // OPTIMIZATION: Use pre-computed UV values instead of array lookup
                                     const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
 
+                                    lastSampleMissing = false;
                                     const nid = getLocal(lx, ly, lz);
+                                    const neighborMissing = lastSampleMissing;
                                     // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
                                     const draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
                                     if (draw) {
@@ -8595,6 +8700,18 @@
                                         cIdx += 18;
                                         blockHasFace = true;
                                         if (debugCounters) debugCounters.facesDrawn++;
+                                        const boundaryFace =
+                                            (x === 0 && nx === -1) ||
+                                            (x === 15 && nx === 1) ||
+                                            (z === 0 && nz === -1) ||
+                                            (z === 15 && nz === 1);
+                                        if (
+                                            boundaryFace &&
+                                            (isWater || IS_TRANSPARENT[id] || IS_TRANSPARENT[nid] || neighborMissing)
+                                        ) {
+                                            boundaryTransparentFace = true;
+                                        }
+                                        if (neighborMissing) missingNeighborDuringRender = true;
                                         if (isWater) {
                                             wVIdx = vIdx;
                                             wUvIdx = uvIdx;
@@ -8762,9 +8879,14 @@
                         chunkRenderDiagnostics.delete(cKey);
                     }
 
+                    if (solidBlocks > 0 && tFaceCount + wFaceCount === 0 && isDebug) {
+                        logDebug(`[RenderChunk] ${cKey} had ${solidBlocks} solid blocks but produced no faces.`);
+                    }
+
                     // --- NEIGHBOR UPDATE SYSTEM ---
-                    // If this chunk has water or transparent blocks, mark neighbors for update
-                    if (wFaceCount > 0) {
+                    // Mark neighbors for refresh when water or transparent boundaries appear or when missing data was sampled
+                    const needsNeighborRefresh = wFaceCount > 0 || boundaryTransparentFace || missingNeighborDuringRender;
+                    if (needsNeighborRefresh) {
                         const neighbors = [getChunkKey(cx, cz - 1), getChunkKey(cx, cz + 1), getChunkKey(cx + 1, cz), getChunkKey(cx - 1, cz)];
                         // Only queue if neighbor exists and is already rendered
                         for (const nKey of neighbors) {
@@ -8773,8 +8895,26 @@
                             }
                         }
                     }
+
+                    trace.status = "rendered";
+                    trace.faces = tFaceCount + wFaceCount;
+                    trace.solids = solidBlocks;
+                    trace.boundaryRefresh = needsNeighborRefresh;
+                    trace.poolAfter = {
+                        pos: posPool.pool.length,
+                        norm: normPool.pool.length,
+                        uv: uvPool.pool.length,
+                        col: colPool.pool.length,
+                    };
+                    trace.duration = performance.now() - trace.start;
+                    renderChunkTrace.set(cKey, trace);
                 } catch (error) {
                     logError("RENDER_CHUNK", `Error rendering chunk (${cx}, ${cz})`, error);
+                    const trace = renderChunkTrace.get(getChunkKey(cx, cz)) || { key: getChunkKey(cx, cz) };
+                    trace.status = "error";
+                    trace.error = `${error}`;
+                    trace.duration = performance.now() - (trace.start || performance.now());
+                    renderChunkTrace.set(trace.key, trace);
                 }
             }
 
@@ -9135,6 +9275,8 @@
                 const processed = new Set();
                 const initialQueueLength = chunkBuildQueue.length;
                 let inspected = 0;
+
+                heartbeatChunkUpdates();
                 while (
                     builds < SETTINGS.buildQueueLimit &&
                     chunkBuildQueue.length > 0 &&
@@ -9153,6 +9295,9 @@
                     const jobCz = job.cz;
                     if (chunkOrNeighborsPending(jobCx, jobCz)) {
                         chunkBuildQueue.push(job);
+                        if (isDebug && dirtyChunks.has(job.key)) {
+                            logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`);
+                        }
                         continue;
                     }
                     if (processed.has(job.key)) continue;
@@ -9173,6 +9318,8 @@
                         dirtyChunks.delete(job.key);
                     }
                     renderChunk(jobCx, jobCz);
+                    recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
+                    chunkUpdateDiagnostics.pending.delete(job.key);
                     if (isDirty) {
                         const terrainOK = chunkMeshes.has(job.key);
                         meshLifecycleStats.mark("dirtyRebuild", {
@@ -9184,26 +9331,31 @@
                     builds++;
                 }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
-                        if (chunkNeighborUpdateQueue.size > 0 && builds < SETTINGS.buildQueueLimit) {
-                            const updateLimit = Math.min(2, SETTINGS.buildQueueLimit - builds);
-                            const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
+                if (chunkNeighborUpdateQueue.size > 0 && builds < SETTINGS.buildQueueLimit) {
+                    const updateLimit = Math.min(2, SETTINGS.buildQueueLimit - builds);
+                    const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
 
-                            for (const key of toUpdate) {
-                                chunkNeighborUpdateQueue.delete(key);
+                    for (const key of toUpdate) {
+                        chunkNeighborUpdateQueue.delete(key);
 
-                                const [cx, cz] = key.split(",").map(Number);
-                                if (chunkOrNeighborsPending(cx, cz)) {
-                                    chunkNeighborUpdateQueue.add(key);
-                                    continue;
-                                }
+                        const [cx, cz] = key.split(",").map(Number);
+                        if (chunkOrNeighborsPending(cx, cz)) {
+                            chunkNeighborUpdateQueue.add(key);
+                            chunkUpdateDiagnostics.neighborStats.requeued++;
+                            continue;
+                        }
 
-                                // Remove old meshes
-                                releaseMeshForKey(key);
-                                releaseMeshForKey(key + "_WATER");
+                        chunkUpdateDiagnostics.neighborStats.processed++;
+                        chunkUpdateDiagnostics.neighborStats.lastRun = performance.now();
 
-                                // Rebuild chunk
-                                renderChunk(cx, cz);
-                            }
+                        // Remove old meshes
+                        releaseMeshForKey(key);
+                        releaseMeshForKey(key + "_WATER");
+
+                        // Rebuild chunk
+                        renderChunk(cx, cz);
+                        recordChunkUpdateState(key, "neighbor-refresh", "rendered");
+                    }
                 }
                 // const loaderEl = document.getElementById('chunk-loader');
                 // const countEl = document.getElementById('chunk-count');
@@ -9219,22 +9371,22 @@
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
 
                 // Always update the chunk the block is in
-                scheduleChunkUpdate(cx, cz);
+                scheduleChunkUpdate(cx, cz, false, "edit-center");
 
                 // Check boundaries and update neighbors if necessary
                 const lx = ((x % 16) + 16) % 16;
                 const lz = ((z % 16) + 16) % 16;
 
-                if (lx === 0) scheduleChunkUpdate(cx - 1, cz);
-                if (lx === 15) scheduleChunkUpdate(cx + 1, cz);
-                if (lz === 0) scheduleChunkUpdate(cx, cz - 1);
-                if (lz === 15) scheduleChunkUpdate(cx, cz + 1);
+                if (lx === 0) scheduleChunkUpdate(cx - 1, cz, false, "edit-west-edge");
+                if (lx === 15) scheduleChunkUpdate(cx + 1, cz, false, "edit-east-edge");
+                if (lz === 0) scheduleChunkUpdate(cx, cz - 1, false, "edit-north-edge");
+                if (lz === 15) scheduleChunkUpdate(cx, cz + 1, false, "edit-south-edge");
 
                 // ALSO update diagonal neighbors if on a corner
-                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1);
-                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1);
-                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1);
-                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1);
+                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1, false, "edit-nw-corner");
+                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1, false, "edit-sw-corner");
+                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, false, "edit-ne-corner");
+                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, false, "edit-se-corner");
             }
 
             function pickVoxel(origin, dir, range) {
@@ -9500,6 +9652,9 @@
                         physicsAccumulator + clampedDt,
                         FIXED_TIME_STEP * MAX_PHYSICS_STEPS
                     );
+
+                    // Heartbeat to flush deferred or stuck chunk updates between rapid edits
+                    heartbeatChunkUpdates(time);
 
                     // --- Block breaking logic ---
                     if (breakingBlock && controls.isLocked) {
