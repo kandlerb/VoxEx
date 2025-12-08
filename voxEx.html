@@ -1302,6 +1302,30 @@
                 pointLights: Array.from({ length: MAX_VOLUMETRIC_POINT_LIGHTS }, () => new THREE.Vector4()),
                 pointLightColors: Array.from({ length: MAX_VOLUMETRIC_POINT_LIGHTS }, () => new THREE.Color()),
             };
+            // Shared uniforms used to re-scale skylight per-frame without rebuilding meshes
+            const chunkLightUniforms = {
+                skyLightScale: { value: 1.0 },
+                moonLightFloor: { value: 0.1 },
+            };
+            function injectChunkLightShader(material) {
+                if (!material) return;
+                material.onBeforeCompile = (shader) => {
+                    shader.uniforms.skyLightScale = chunkLightUniforms.skyLightScale;
+                    shader.uniforms.moonLightFloor = chunkLightUniforms.moonLightFloor;
+                    shader.fragmentShader = shader.fragmentShader.replace(
+                        "#include <color_fragment>",
+                        `// Custom skylight/blocklight blending\n`
+                            + `vec3 packedLight = vColor.rgb;\n`
+                            + `float skyTerm = packedLight.r * skyLightScale;\n`
+                            + `float blockTerm = packedLight.g;\n`
+                            + `float aoTerm = packedLight.b;\n`
+                            + `float moonTerm = aoTerm * moonLightFloor;\n`
+                            + `float lightMix = max(blockTerm, max(skyTerm, moonTerm));\n`
+                            + `diffuseColor.rgb *= lightMix;`
+                    );
+                };
+                material.needsUpdate = true;
+            }
             function resetVolumetricPointLights() {
                 volumetricLightBlock.pointLightCount = 0;
                 for (let i = 0; i < volumetricLightBlock.pointLights.length; i++) {
@@ -4991,6 +5015,8 @@
                 // Allow built-in fog to run with camera depth for both terrain and water
                 chunkMaterial.fog = true;
                 waterMaterial.fog = true;
+                injectChunkLightShader(chunkMaterial);
+                injectChunkLightShader(waterMaterial);
                 // --- HOTBAR ICONS ---
                 const atlasURL = cvs.toDataURL();
                 function setSlotIcon(slotId, tileIndex) {
@@ -7353,34 +7379,38 @@
                     // Front
                     } else { ao1 = getAO(1, 0, -1, 0, -1, -1, 1, -1, -1); ao2 = getAO(-1, 0, -1, 0, -1, -1, -1, -1, -1); ao3 = getAO(-1, 0, -1, 0, 1, -1, -1, 1, -1); ao4 = getAO(1, 0, -1, 0, 1, -1, 1, 1, -1); }
                 }
-                // Get light level at this block (1-15) and convert to 0-1 range
-                // Use square root curve for better visibility in dark areas while preserving brightness gradient
-                // sqrt(1/15) = 0.258 (26% vs 7% linear), sqrt(15/15) = 1.0 (100% same)
-                const rawLight = lightGetter ? lightGetter(lx, ly, lz) / 15.0 : 1.0;
-                const lightLevel = Math.sqrt(rawLight);
-                // Apply both AO and light level to vertex colors
-                const c1 = ao1 * lightLevel;
-                const c2 = ao2 * lightLevel;
-                const c3 = ao3 * lightLevel;
-                const c4 = ao4 * lightLevel;
-                col[cIdx + 0] = c1;
-                col[cIdx + 1] = c1;
-                col[cIdx + 2] = c1;
-                col[cIdx + 3] = c2;
-                col[cIdx + 4] = c2;
-                col[cIdx + 5] = c2;
-                col[cIdx + 6] = c4;
-                col[cIdx + 7] = c4;
-                col[cIdx + 8] = c4;
-                col[cIdx + 9] = c2;
-                col[cIdx + 10] = c2;
-                col[cIdx + 11] = c2;
-                col[cIdx + 12] = c3;
-                col[cIdx + 13] = c3;
-                col[cIdx + 14] = c3;
-                col[cIdx + 15] = c4;
-                col[cIdx + 16] = c4;
-                col[cIdx + 17] = c4;
+                // Get packed skylight/blocklight for this block and convert to 0-1 ranges (sqrt curve for better dark detail)
+                const packedLight = lightGetter ? lightGetter(lx, ly, lz) : DEFAULT_LIGHT_PACKED;
+                const skyRaw = (packedLight >> 8) & 0xff;
+                const blockRaw = packedLight & 0xff;
+                const skyLightLevel = Math.sqrt(Math.min(skyRaw, 15) / 15.0);
+                const blockLightLevel = Math.sqrt(Math.min(blockRaw, 15) / 15.0);
+                const c1Sky = ao1 * skyLightLevel;
+                const c2Sky = ao2 * skyLightLevel;
+                const c3Sky = ao3 * skyLightLevel;
+                const c4Sky = ao4 * skyLightLevel;
+                const c1Block = ao1 * blockLightLevel;
+                const c2Block = ao2 * blockLightLevel;
+                const c3Block = ao3 * blockLightLevel;
+                const c4Block = ao4 * blockLightLevel;
+                col[cIdx + 0] = c1Sky; // R: skylight term (scaled in shader)
+                col[cIdx + 1] = c1Block; // G: blocklight (torch/etc)
+                col[cIdx + 2] = ao1; // B: raw AO for moon baseline
+                col[cIdx + 3] = c2Sky;
+                col[cIdx + 4] = c2Block;
+                col[cIdx + 5] = ao2;
+                col[cIdx + 6] = c4Sky;
+                col[cIdx + 7] = c4Block;
+                col[cIdx + 8] = ao4;
+                col[cIdx + 9] = c2Sky;
+                col[cIdx + 10] = c2Block;
+                col[cIdx + 11] = ao2;
+                col[cIdx + 12] = c3Sky;
+                col[cIdx + 13] = c3Block;
+                col[cIdx + 14] = ao3;
+                col[cIdx + 15] = c4Sky;
+                col[cIdx + 16] = c4Block;
+                col[cIdx + 17] = ao4;
                 // Push UVs (Preserved)
                 const p = 0; // was 0.0001
                 const tileW = 1 / NUM_TILES;
@@ -7519,12 +7549,13 @@
                 meshLifecycleStats.detached.set(key, now);
             }
             // OPTIMIZATION: Hoist light lookup helper outside of renderChunk to avoid creating closures
-            // This function is called thousands of times per chunk, so avoiding closure creation saves significant GC pressure
+            // Pack skylight (high byte) and block light (low byte) so shaders can scale skylight per-frame via uniform
+            const DEFAULT_LIGHT_PACKED = 15 << 8; // skylight 15, blocklight 0
             function extractLightFromChunk(chunk, idx) {
-                if (!chunk || !chunk.skyLight) return 15;
-                const sky = chunk.skyLight[idx] || 1;
+                if (!chunk || !chunk.skyLight) return DEFAULT_LIGHT_PACKED;
+                const sky = chunk.skyLight[idx] || 0;
                 const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
-                return sky > block ? sky : block;
+                return (sky << 8) | block;
             }
             function renderChunk(cx, cz) {
                 try {
@@ -7565,7 +7596,7 @@
                     };
                     // OPTIMIZED getLocalLight: Full neighbor support for seamless lighting
                     // Now uses hoisted extractLightFromChunk helper to avoid closure creation
-                    const getLocalLight = (lx, ly, lz) => {     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15;
+                    const getLocalLight = (lx, ly, lz) => {     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return DEFAULT_LIGHT_PACKED;
                         // 1. Center Chunk (most common case - ~85% of lookups)
                         if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) { const idx = lx + lz * 16 + ly * 256; return extractLightFromChunk(centerData, idx); }
                         // 2. Orthogonal Neighbors
@@ -8233,6 +8264,13 @@
                 ambLight.intensity = THREE.MathUtils.lerp(surfaceAmbient, caveAmbient, depthFactor);
                 const baseMoonIntensity = Math.max(0, -smoothH) * SETTINGS.moonIntensity;
                 moon.intensity = baseMoonIntensity * surfaceFactor;
+                // Normalize sun/moon intensities into a skylight multiplier so we avoid recomputing light flood fills per frame
+                const normalizedSun = SETTINGS.sunIntensity > 0 ? baseSunIntensity / SETTINGS.sunIntensity : 0;
+                const normalizedMoon = SETTINGS.moonIntensity > 0 ? baseMoonIntensity / SETTINGS.moonIntensity : 0;
+                const sunCurve = Math.pow(THREE.MathUtils.clamp(normalizedSun, 0, 1), 0.35);
+                const moonFloor = 0.05 + Math.pow(THREE.MathUtils.clamp(normalizedMoon, 0, 1), 0.5) * 0.25;
+                chunkLightUniforms.skyLightScale.value = THREE.MathUtils.clamp(moonFloor + sunCurve * 0.95, moonFloor, 1.0);
+                chunkLightUniforms.moonLightFloor.value = moonFloor;
                 postSunDir.copy(sun.target.position).sub(sun.position).normalize();
                 postMoonDir.copy(moon.target.position).sub(moon.position).normalize();
                 volumetricLightBlock.sunDir.copy(postSunDir);
