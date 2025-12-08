@@ -5333,6 +5333,13 @@
             const ZOMBIE_EYE_TYPES = [
                 { color: "#d9c002", glow: "#5e3f01" }, // Orange eyes
             ];
+            const ZOMBIE_EYE_LIGHT = {
+                intensity: 1.1,
+                distance: 6,
+                decay: 1.8,
+                volumetricRange: 28,
+                maxVolumetricLights: 4,
+            };
             const ZOMBIE_MOUTH_TYPES = [
                 "line", // Simple line mouth
                 "frown", // Downturned mouth
@@ -5966,12 +5973,37 @@
                 geometry.groups[4].materialIndex = 1; // front - shaft
                 geometry.groups[5].materialIndex = 1; // back - shaft
             }
+            function ensureZombieEyeLight(mob, headMesh, eyeType) {
+                if (!headMesh) return;
+                const colorHex = eyeType?.glow || eyeType?.color || "#ffaa33";
+                let light = mob.userData.eyeLight;
+                if (!light) {
+                    light = new THREE.PointLight(
+                        colorHex,
+                        ZOMBIE_EYE_LIGHT.intensity,
+                        ZOMBIE_EYE_LIGHT.distance,
+                        ZOMBIE_EYE_LIGHT.decay
+                    );
+                    light.castShadow = false;
+                    light.layers.set(0); // Share world layer with terrain and volumetrics
+                    mob.userData.eyeLight = light;
+                } else {
+                    light.color.set(colorHex);
+                    light.intensity = ZOMBIE_EYE_LIGHT.intensity;
+                    light.distance = ZOMBIE_EYE_LIGHT.distance;
+                    light.decay = ZOMBIE_EYE_LIGHT.decay;
+                    light.visible = true;
+                }
+                light.position.set(0, 0, ZOMBIE_PROPORTIONS.head.size * 0.26);
+                if (light.parent !== headMesh) headMesh.add(light);
+            }
             function buildZombieMesh() {
                 const group = mobPool.pop() || new THREE.Group();
                 const { head, body, leg, shoulderY, hipY, arm } = ZOMBIE_PROPORTIONS;
                 // VARIATION: Generate unique appearance for each zombie
                 const skinColorIndex = pickZombieSkinIndex();
                 const eyeTypeIndex = Math.floor(Math.random() * ZOMBIE_EYE_TYPES.length);
+                const eyeType = ZOMBIE_EYE_TYPES[eyeTypeIndex % ZOMBIE_EYE_TYPES.length];
                 const mouthTypeIndex = Math.floor(Math.random() * ZOMBIE_MOUTH_TYPES.length);
                 // Generate unique head/body/arm materials for this zombie
                 const headMaterials = generateZombieHeadTexture(skinColorIndex, eyeTypeIndex, mouthTypeIndex);
@@ -6097,6 +6129,7 @@
                 rightArmMesh.geometry = armGeometry;
                 leftLegMesh.geometry = legGeometry;
                 rightLegMesh.geometry = legGeometry;
+                ensureZombieEyeLight(group, parts.head, eyeType);
                 group.visible = true;
                 group.castShadow = true;
                 group.receiveShadow = true;
@@ -8078,19 +8111,38 @@
                 return false;
             }
             function updateVolumetricPointLights(camPos) {
-                const maxRangeSq = SETTINGS.torchRange * SETTINGS.torchRange;
                 resetVolumetricPointLights();
+                const torchRangeSq = SETTINGS.torchRange * SETTINGS.torchRange;
+                const eyeRangeSq = ZOMBIE_EYE_LIGHT.volumetricRange * ZOMBIE_EYE_LIGHT.volumetricRange;
+                const candidates = [];
+                const addCandidate = (light, maxRangeSq, source = "generic") => {
+                    if (!light || light.intensity <= 0) return;
+                    light.getWorldPosition(postTempVec);
+                    const distSq = camPos ? camPos.distanceToSquared(postTempVec) : 0;
+                    if (distSq > maxRangeSq) return;
+                    candidates.push({ light, distSq, rangeSq: maxRangeSq, source });
+                };
                 if (torchActive && torchLight && torchLight.intensity > 0) {
-                    pushVolumetricPointLight(torchLight, camPos, maxRangeSq);
+                    addCandidate(torchLight, torchRangeSq, "torch");
                 }
                 for (const torchArray of chunkTorches.values()) {
                     for (let i = 0; i < torchArray.length; i++) {
-                        if (volumetricLightBlock.pointLightCount >= MAX_VOLUMETRIC_POINT_LIGHTS) return;
                         const light = torchArray[i].userData?.pointLight;
-                        if (!light || light.intensity <= 0) continue;
-                        pushVolumetricPointLight(light, camPos, maxRangeSq);
+                        addCandidate(light, torchRangeSq, "torch");
                     }
-                    if (volumetricLightBlock.pointLightCount >= MAX_VOLUMETRIC_POINT_LIGHTS) return;
+                }
+                for (let i = 0; i < mobs.length; i++) {
+                    const eyeLight = mobs[i].userData?.eyeLight;
+                    addCandidate(eyeLight, eyeRangeSq, "mob");
+                }
+                candidates.sort((a, b) => a.distSq - b.distSq);
+                let mobUsed = 0;
+                for (let i = 0; i < candidates.length; i++) {
+                    if (volumetricLightBlock.pointLightCount >= MAX_VOLUMETRIC_POINT_LIGHTS) break;
+                    const candidate = candidates[i];
+                    if (candidate.source === "mob" && mobUsed >= ZOMBIE_EYE_LIGHT.maxVolumetricLights) continue;
+                    pushVolumetricPointLight(candidate.light, camPos, candidate.rangeSq);
+                    if (candidate.source === "mob") mobUsed++;
                 }
             }
             function updateDayNight(dt) {
