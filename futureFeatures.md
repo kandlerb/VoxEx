@@ -44,7 +44,39 @@ Logic:
 **Mechanics:**
 1. Jousting
 
+# Sounds
+### Zombie
+1. groans
+2. foot steps
+3. foot step with drag(for potential leg drag) 
+4. attack
+5. take damage
+
+### Player
+1. Foot steps (at least 3 variations of each)  
+   a. on stone  
+   b. on grass  
+   c. on sand  
+   d. on wood planks  
+   e. on leaves  
+   f. on bedrock  
+2. knees creak when crouch
+3. jump
+4. sprint (soft wind)
+5. Flying (louder wind)
+6. jumping in water (velocity based) 
+7. step into water (velocity based) 
+8. take damage
+9. falling
+
+### Environmental
+1. button click sound for menu
+2. leaves rustling sound
+3. block break
+4. block place
+5. eerie drone for in dark
+6. eerie drone for when a zombie is pursuing you
+7. eerie drone for if 5 or more zombies are pursuing you
+
 # Mobs
-Owls: 
-1. use my voice for 'hoo'
-2. can fly
+
