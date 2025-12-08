@@ -1360,7 +1360,9 @@
                 neighborStats: { processed: 0, requeued: 0, lastRun: 0 },
             };
             const renderChunkTrace = new Map();
-            const pendingLightChunks = new Map(); // key -> { count }
+            const pendingLightChunks = new Map(); // key -> { count, firstSeen, lastSeen, lastForced }
+            const forceLightingBypassKeys = new Set();
+            const LIGHT_PENDING_GRACE_MS = 3000; // Allow lighting a few seconds to finish before forcing rebuilds
             let updateTimeout = null; // Debounced Chunk Update System
             const DIR_EPSILON = 1e-4; // Threshold for camera dir delta before re-running frustum pass
             const frustumCacheState = { // Cache last frustum computation to avoid re-running the heavy chunk-visibility sweep when stationary
@@ -1380,10 +1382,19 @@
                 dirty: true,
             };
             function invalidateFrustumCache() { frustumCacheState.dirty = true; }
-            function markPendingLight(chunkKey) { if (!chunkKey) return; const entry = pendingLightChunks.get(chunkKey) || { count: 0 }; entry.count++; pendingLightChunks.set(chunkKey, entry); }
+            function markPendingLight(chunkKey) {
+                if (!chunkKey) return;
+                const now = performance.now();
+                const entry = pendingLightChunks.get(chunkKey) || { count: 0, firstSeen: now, lastSeen: now, lastForced: 0 };
+                entry.count++;
+                entry.lastSeen = now;
+                if (!entry.firstSeen) entry.firstSeen = now;
+                pendingLightChunks.set(chunkKey, entry);
+            }
             function clearPendingLight(chunkKey) {
                 const entry = pendingLightChunks.get(chunkKey);
                 if (!entry) return;
+                entry.lastSeen = performance.now();
                 entry.count = Math.max(0, entry.count - 1);
                 if (entry.count === 0) {
                     pendingLightChunks.delete(chunkKey);
@@ -1404,6 +1415,19 @@
                 // Lightweight diagnostic to help track stuck chunk rebuilds without spamming logs
                 if (flushed > 0) { chunkUpdateDiagnostics.deferredFlushes += flushed; console.debug(`Flushed ${flushed} deferred chunk updates after ${reason}`); }
             }
+            function forceDrainDeferredChunkUpdates(reason = "watchdog") {
+                if (deferredChunkUpdates.size === 0) return 0;
+                let flushed = 0;
+                for (const key of deferredChunkUpdates) {
+                    deferredChunkUpdates.delete(key);
+                    const [cx, cz] = key.split(",").map(Number);
+                    recordChunkUpdateState(key, reason, "watchdog-flush");
+                    scheduleChunkUpdate(cx, cz, true, `${reason}-force`, { bypassLighting: true });
+                    flushed++;
+                }
+                if (flushed > 0) { chunkUpdateDiagnostics.deferredFlushes += flushed; console.debug(`Force-drained ${flushed} deferred chunk updates after ${reason}`); }
+                return flushed;
+            }
             function chunkOrNeighborsPending(cx, cz) { for (let dx = -1; dx <= 1; dx++) { for (let dz = -1; dz <= 1; dz++) { const key = getChunkKey(cx + dx, cz + dz); if (pendingLightChunks.has(key)) return true; }} return false; }
             function flushDeferredChunkUpdatesAround(chunkKey) {
                 const toCheck = [];
@@ -1415,6 +1439,28 @@
                     if (chunkOrNeighborsPending(cx, cz)) continue;
                     deferredChunkUpdates.delete(key);
                     scheduleChunkUpdate(cx, cz, true, "light-unblocked");
+                }
+            }
+            function watchdogPendingLightChunks(now = performance.now()) {
+                if (pendingLightChunks.size === 0) return;
+                let forced = 0;
+                for (const [key, entry] of pendingLightChunks) {
+                    const firstSeen = entry.firstSeen ?? entry.lastSeen ?? now;
+                    const lastSeen = entry.lastSeen ?? firstSeen;
+                    const age = now - firstSeen;
+                    const idle = now - lastSeen;
+                    if (age < LIGHT_PENDING_GRACE_MS) continue; // Still within grace window
+                    if (idle < 250) continue; // Recently updated, likely still progressing
+                    if (entry.lastForced && now - entry.lastForced < LIGHT_PENDING_GRACE_MS * 0.5) continue; // Avoid spamming the same chunk
+                    const [cx, cz] = key.split(",").map(Number);
+                    scheduleChunkUpdate(cx, cz, true, "light-watchdog", { bypassLighting: true });
+                    entry.lastForced = now;
+                    pendingLightChunks.set(key, entry);
+                    forced++;
+                }
+                if (forced > 0) {
+                    const drained = forceDrainDeferredChunkUpdates("light-watchdog");
+                    if (isDebug) { logDebug(`[ChunkUpdate] Watchdog forced ${forced} rebuild(s) while lighting pending. Drained ${drained} deferred updates.`); }
                 }
             }
             function recordChunkUpdateState(key, source, state) {
@@ -1433,7 +1479,7 @@
                 chunkUpdateDiagnostics.lastDispatchTime = performance.now();
                 if (keys.length === 0) { if (isDebug) logDebug(`[ChunkUpdate] Dispatch '${reason}' ran with no pending keys.`); return; }
                 // Use unshift for priority
-                for (const k of keys) { const [c, z] = k.split(",").map(Number); if (!queuedChunkKeys.has(k)) { chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0 }); queuedChunkKeys.add(k); }}
+                for (const k of keys) { const [c, z] = k.split(",").map(Number); if (!queuedChunkKeys.has(k)) { const allowLightingBypass = forceLightingBypassKeys.has(k); chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0, allowLightingBypass }); queuedChunkKeys.add(k); }}
                 pendingChunkUpdates.clear();
             }
             function heartbeatChunkUpdates(now = performance.now()) {
@@ -1441,6 +1487,7 @@
                 chunkUpdateDiagnostics.lastHeartbeat = now;
                 if (!updateTimeout && pendingChunkUpdates.size > 0) { dispatchPendingChunkUpdates("heartbeat"); }
                 if (pendingLightChunks.size === 0 && deferredChunkUpdates.size > 0) { flushAllDeferredChunkUpdates("heartbeat"); }
+                else { watchdogPendingLightChunks(now); }
                 if (isDebug && chunkUpdateDiagnostics.pending.size > 0) {
                     for (const [key, entry] of chunkUpdateDiagnostics.pending) {
                         const stale = now - entry.last > 2000;
@@ -1514,8 +1561,9 @@
                 faceVertexCache.set(key, verts);
                 return verts;
             }
-            function scheduleChunkUpdate(cx, cz, force = false, source = "generic") {
+            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false } = {}) {
                 const key = `${cx},${cz}`;
+                if (bypassLighting) { forceLightingBypassKeys.add(key); }
                 recordChunkUpdateState(key, source, "scheduled");
                 if (!force && chunkOrNeighborsPending(cx, cz)) {
                     deferredChunkUpdates.add(key);
@@ -6884,11 +6932,13 @@
                     if (typeof job.cx !== "number" || typeof job.cz !== "number") { const [jcX, jcZ] = job.key.split(",").map(Number); job.cx = jcX; job.cz = jcZ; }
                     const jobCx = job.cx;
                     const jobCz = job.cz;
-                    if (chunkOrNeighborsPending(jobCx, jobCz)) { chunkBuildQueue.push(job); if (isDebug && dirtyChunks.has(job.key)) { logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`); } continue; }
+                    const allowLightingBypass = job.allowLightingBypass || forceLightingBypassKeys.has(job.key);
+                    if (chunkOrNeighborsPending(jobCx, jobCz) && !allowLightingBypass) { chunkBuildQueue.push(job); if (isDebug && dirtyChunks.has(job.key)) { logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`); } continue; }
                     if (processed.has(job.key)) continue;
                     const isDirty = dirtyChunks.has(job.key);
                     if (!isDirty && chunkMeshes.has(job.key)) continue;
                     processed.add(job.key);
+                    forceLightingBypassKeys.delete(job.key);
                     queuedChunkKeys.delete(job.key); // Allow re-queueing later if needed
                     // Make chunk generation await if data doesn't exist
                     if (!chunks.has(job.key)) { await generateChunkData(jobCx, jobCz); }
