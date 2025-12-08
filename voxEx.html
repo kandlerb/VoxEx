@@ -1970,161 +1970,283 @@
                 if (anyChange) { const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize)); tracker?.mark(chunkKey); task?.ensureQueued(); }
                 return anyChange;
             }
-            function updateSunlightAt(x, y, z, oldId, newId, tracker, primeColumn = false) {
-                const chunkSize = WORLD_DIMS.chunkSize;
-                const chunkHeight = WORLD_DIMS.chunkHeight;
-                const chunkVolume = chunkSize * chunkSize * chunkHeight;
-                const currentLight = getSkyLight(x, y, z);
-                const becameOpaque = !IS_TRANSPARENT[newId];
-                const becameTransparent = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
-                const shouldPrimeColumn = primeColumn || becameTransparent;
-                const HARD_CAP_BASE_CHUNKS = 3; // base allowance in chunks for hard cap
-                const HARD_CAP_MAX_CHUNKS = 12; // prevent runaway growth when many chunks are touched
-                const HARD_CAP_GROWTH_RATIO = 0.5; // +1 chunk per two additional touched chunks
-                const SOFT_CAP_BASE = chunkVolume * 2; // baseline soft cap, scaled by affected chunks
-                const baseChunkKey = getChunkKey(Math.floor(x / chunkSize), Math.floor(z / chunkSize));
-                tracker?.mark(baseChunkKey);
-                const task = {
-                    x,
-                    y,
-                    z,
-                    oldId,
-                    newId,
-                    addQueue: [],
-                    removeQueue: [],
-                    addVisited: new Map(),
-                    removeVisited: new Map(),
-                    touchedChunks: new Set(),
-                    addIndex: 0,
-                    removeIndex: 0,
-                    chunkSize,
-                    chunkHeight,
-                    chunkVolume,
-                    HARD_CAP_BASE_CHUNKS,
-                    HARD_CAP_MAX_CHUNKS,
-                    HARD_CAP_GROWTH_RATIO,
-                    SOFT_CAP_BASE,
-                    bailedOut: false,
-                    done: false,
-                    totalEnqueued: 0,
-                    softWarned: false,
-                    enqueueBlocked: false,
-                    blockedAddBuffer: [],
-                    blockedRemoveBuffer: [],
-                    peakEntries: 0,
-                    inQueue: false,
-                };
-                task.touchedChunks.add(baseChunkKey);
-                task.ensureQueued = () => { if (task.inQueue || task.done || task.bailedOut) return; sunlightWorkQueue.push(task); task.inQueue = true; };
-                task.resolveVisit = (map, qx, qy, qz) => { const ly = qy + WORLD_DIMS.yOffset;
-                    if (ly < 0 || ly >= chunkHeight) return null;
-                    const cx = Math.floor(qx / chunkSize);
-                    const cz = Math.floor(qz / chunkSize);
-                    const lx = ((qx % chunkSize) + chunkSize) % chunkSize;
-                    const lz = ((qz % chunkSize) + chunkSize) % chunkSize;
+            // SunlightTask class - Encapsulates sunlight update state and operations
+            // Extracted from updateSunlightAt for clarity and maintainability
+            class SunlightTask {
+                constructor(x, y, z, oldId, newId, tracker) {
+                    // Position and block info
+                    this.x = x;
+                    this.y = y;
+                    this.z = z;
+                    this.oldId = oldId;
+                    this.newId = newId;
+                    // World dimensions
+                    this.chunkSize = WORLD_DIMS.chunkSize;
+                    this.chunkHeight = WORLD_DIMS.chunkHeight;
+                    this.chunkVolume = this.chunkSize * this.chunkSize * this.chunkHeight;
+                    // Queues for light propagation
+                    this.addQueue = [];
+                    this.removeQueue = [];
+                    this.addVisited = new Map();
+                    this.removeVisited = new Map();
+                    this.addIndex = 0;
+                    this.removeIndex = 0;
+                    // Pressure management
+                    this.blockedAddBuffer = [];
+                    this.blockedRemoveBuffer = [];
+                    this.enqueueBlocked = false;
+                    // Chunk tracking
+                    this.touchedChunks = new Set();
+                    const baseChunkKey = getChunkKey(Math.floor(x / this.chunkSize), Math.floor(z / this.chunkSize));
+                    this.touchedChunks.add(baseChunkKey);
+                    tracker?.mark(baseChunkKey);
+                    // Capacity limits
+                    this.HARD_CAP_BASE_CHUNKS = 3;
+                    this.HARD_CAP_MAX_CHUNKS = 12;
+                    this.HARD_CAP_GROWTH_RATIO = 0.5;
+                    this.SOFT_CAP_BASE = this.chunkVolume * 2;
+                    // State flags
+                    this.bailedOut = false;
+                    this.done = false;
+                    this.inQueue = false;
+                    this.softWarned = false;
+                    // Statistics
+                    this.totalEnqueued = 0;
+                    this.peakEntries = 0;
+                    // Keep tracker reference for later use
+                    this.tracker = tracker;
+                }
+                // Add task to work queue if not already queued
+                ensureQueued() {
+                    if (this.inQueue || this.done || this.bailedOut) return;
+                    sunlightWorkQueue.push(this);
+                    this.inQueue = true;
+                }
+                // Resolve world coordinates to chunk/local coords and track visits
+                resolveVisit(visitMap, qx, qy, qz) {
+                    const ly = qy + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= this.chunkHeight) return null;
+                    const cx = Math.floor(qx / this.chunkSize);
+                    const cz = Math.floor(qz / this.chunkSize);
+                    const lx = ((qx % this.chunkSize) + this.chunkSize) % this.chunkSize;
+                    const lz = ((qz % this.chunkSize) + this.chunkSize) % this.chunkSize;
                     const chunkKey = getChunkKey(cx, cz);
-                    task.touchedChunks.add(chunkKey);
-                    tracker?.mark(chunkKey);
-                    let visitTracker = map.get(chunkKey);
-                    if (!visitTracker) { visitTracker = new Uint8Array(chunkVolume); map.set(chunkKey, visitTracker);}
-                    const idx = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                    this.touchedChunks.add(chunkKey);
+                    this.tracker?.mark(chunkKey);
+                    let visitTracker = visitMap.get(chunkKey);
+                    if (!visitTracker) {
+                        visitTracker = new Uint8Array(this.chunkVolume);
+                        visitMap.set(chunkKey, visitTracker);
+                    }
+                    const idx = lx + lz * this.chunkSize + ly * this.chunkSize * this.chunkSize;
                     if (visitTracker[idx]) return null;
                     visitTracker[idx] = 1;
                     return chunkKey;
-                };
-                task.bailoutToFullRecalc = (reason = "cap exceeded") => { if (task.bailedOut) return true;
-                    task.bailedOut = true;
-                    task.done = true;
-                    task.addQueue.length = 0;
-                    task.removeQueue.length = 0;
+                }
+                // Calculate dynamic hard cap based on touched chunks
+                getDynamicHardCap() {
+                    const touched = Math.max(1, this.touchedChunks.size);
+                    const extraChunks = Math.max(0, touched - this.HARD_CAP_BASE_CHUNKS);
+                    const allowedChunks = Math.min(
+                        this.HARD_CAP_MAX_CHUNKS,
+                        this.HARD_CAP_BASE_CHUNKS + Math.floor(extraChunks * this.HARD_CAP_GROWTH_RATIO)
+                    );
+                    return allowedChunks * this.chunkVolume;
+                }
+                // Flush blocked buffers to main queues
+                flushBlocked() {
+                    if (!this.blockedAddBuffer.length && !this.blockedRemoveBuffer.length) return;
+                    if (this.blockedRemoveBuffer.length) {
+                        for (let i = 0; i < this.blockedRemoveBuffer.length; i++) {
+                            this.removeQueue.push(this.blockedRemoveBuffer[i]);
+                        }
+                        this.blockedRemoveBuffer.length = 0;
+                    }
+                    if (this.blockedAddBuffer.length) {
+                        for (let i = 0; i < this.blockedAddBuffer.length; i++) {
+                            this.addQueue.push(this.blockedAddBuffer[i]);
+                        }
+                        this.blockedAddBuffer.length = 0;
+                    }
+                }
+                // Check queue pressure and trigger bailout if needed
+                checkPressure() {
+                    if (this.bailedOut) return true;
+                    const dynamicHardCap = this.getDynamicHardCap();
+                    const dynamicSoftCap = this.SOFT_CAP_BASE * Math.max(1, this.touchedChunks.size / 4);
+                    const throttleLimit = dynamicHardCap * 0.8;
+                    const unblockThreshold = dynamicHardCap * 0.6;
+                    // Calculate current queue sizes
+                    const addEntries = this.addQueue.length >> 2;
+                    const removeEntries = this.removeQueue.length >> 2;
+                    const bufferedEntries = (this.blockedAddBuffer.length + this.blockedRemoveBuffer.length) >> 2;
+                    const currentEntries = Math.max(addEntries, removeEntries);
+                    const maxEntries = Math.max(currentEntries, bufferedEntries);
+                    this.peakEntries = Math.max(this.peakEntries, maxEntries);
+                    // Throttle enqueueing if approaching hard cap
+                    if (maxEntries > throttleLimit && !this.enqueueBlocked) {
+                        this.enqueueBlocked = true;
+                        return false;
+                    }
+                    // Handle blocked state
+                    if (this.enqueueBlocked) {
+                        if (maxEntries <= unblockThreshold) {
+                            this.enqueueBlocked = false;
+                            this.flushBlocked();
+                            this.ensureQueued();
+                        } else if (maxEntries > dynamicHardCap) {
+                            return this.bailoutToFullRecalc("hard cap");
+                        }
+                        return false;
+                    }
+                    // Check caps
+                    if (maxEntries > dynamicHardCap) {
+                        return this.bailoutToFullRecalc("hard cap");
+                    }
+                    if (maxEntries > dynamicSoftCap) {
+                        if (!this.softWarned) {
+                            this.softWarned = true;
+                            console.warn(
+                                `[Lighting] Soft cap reached (${maxEntries} entries across ${this.touchedChunks.size} chunks, cap ${Math.floor(dynamicSoftCap)}); falling back.`
+                            );
+                        }
+                        return this.bailoutToFullRecalc("soft cap");
+                    }
+                    return false;
+                }
+                // Bailout to full chunk recalculation
+                bailoutToFullRecalc(reason = "cap exceeded") {
+                    if (this.bailedOut) return true;
+                    this.bailedOut = true;
+                    this.done = true;
+                    this.addQueue.length = 0;
+                    this.removeQueue.length = 0;
+                    // Collect affected chunks and their neighbors
+                    const targets = this.collectAffectedChunks();
+                    console.warn(`[Lighting] Sunlight fallback triggered (${reason}); scheduling chunk-level recalcs.`);
+                    // Recalculate lighting for all affected chunks
+                    const rebuildTargets = this.recalculateAffectedChunks(targets);
+                    // Clean up pending light updates for affected chunks
+                    this.cleanupPendingUpdates(targets);
+                    // Schedule chunk mesh rebuilds
+                    this.scheduleChunkRebuilds(rebuildTargets);
+                    finalizeSunlightTask(this);
+                    return true;
+                }
+                // Collect affected chunks and their neighbors
+                collectAffectedChunks() {
                     const targets = new Set();
-                    task.touchedChunks.forEach((chunkKey) => {     const [cxStr, czStr] = chunkKey.split(",");
+                    this.touchedChunks.forEach((chunkKey) => {
+                        const [cxStr, czStr] = chunkKey.split(",");
                         const cx = Number(cxStr);
                         const cz = Number(czStr);
-                        for (let dx = -1; dx <= 1; dx++) { for (let dz = -1; dz <= 1; dz++) { targets.add(getChunkKey(cx + dx, cz + dz)); }}
+                        for (let dx = -1; dx <= 1; dx++) {
+                            for (let dz = -1; dz <= 1; dz++) {
+                                targets.add(getChunkKey(cx + dx, cz + dz));
+                            }
+                        }
                     });
-                    console.warn(`[Lighting] Sunlight fallback triggered (${reason}); scheduling chunk-level recalcs.`);
+                    return targets;
+                }
+                // Recalculate lighting for affected chunks
+                recalculateAffectedChunks(targets) {
                     const rebuildTargets = [];
-                    targets.forEach((key) => {     const chunk = chunks.get(key);
+                    targets.forEach((key) => {
+                        const chunk = chunks.get(key);
                         if (!chunk) return;
-                        calculateChunkSunlight(chunk, chunkSize, chunkHeight);
-                        calculateBlockLight(chunk, chunkSize, chunkHeight);
+                        calculateChunkSunlight(chunk, this.chunkSize, this.chunkHeight);
+                        calculateBlockLight(chunk, this.chunkSize, this.chunkHeight);
                         rebuildTargets.push(key);
                     });
-                    if (lightUpdateQueue.length) {
-                        for (let i = lightUpdateQueue.length - 1; i >= 0; i--) {
-                            const job = lightUpdateQueue[i];
-                            const jobKey = getChunkKey(Math.floor(job.x / chunkSize), Math.floor(job.z / chunkSize));
-                            if (!targets.has(jobKey)) continue;
-                            if (job.key) queuedLightUpdates.delete(job.key);
-                            lightUpdateQueue.splice(i, 1);
-                        }
+                    return rebuildTargets;
+                }
+                // Clean up pending light updates for affected chunks
+                cleanupPendingUpdates(targets) {
+                    if (!lightUpdateQueue.length) return;
+                    for (let i = lightUpdateQueue.length - 1; i >= 0; i--) {
+                        const job = lightUpdateQueue[i];
+                        const jobKey = getChunkKey(
+                            Math.floor(job.x / this.chunkSize),
+                            Math.floor(job.z / this.chunkSize)
+                        );
+                        if (!targets.has(jobKey)) continue;
+                        if (job.key) queuedLightUpdates.delete(job.key);
+                        lightUpdateQueue.splice(i, 1);
                     }
+                }
+                // Schedule chunk mesh rebuilds
+                scheduleChunkRebuilds(rebuildTargets) {
                     for (let i = 0; i < rebuildTargets.length; i++) {
                         const [cxStr, czStr] = rebuildTargets[i].split(",");
                         const cx = Number(cxStr);
                         const cz = Number(czStr);
                         scheduleChunkUpdate(cx, cz, false, "sunlight-task");
                     }
-                    finalizeSunlightTask(task);
-                    return true;
-                };
-                task.flushBlocked = () => { if (!task.blockedAddBuffer.length && !task.blockedRemoveBuffer.length) return;
-                    if (task.blockedRemoveBuffer.length) { for (let i = 0; i < task.blockedRemoveBuffer.length; i++) { task.removeQueue.push(task.blockedRemoveBuffer[i]); } task.blockedRemoveBuffer.length = 0; }
-                    if (task.blockedAddBuffer.length) { for (let i = 0; i < task.blockedAddBuffer.length; i++) { task.addQueue.push(task.blockedAddBuffer[i]); } task.blockedAddBuffer.length = 0; }
-                };
-                task.getDynamicHardCap = () => { const touched = Math.max(1, task.touchedChunks.size);
-                    const extraChunks = Math.max(0, touched - task.HARD_CAP_BASE_CHUNKS);
-                    const allowedChunks = Math.min(task.HARD_CAP_MAX_CHUNKS, task.HARD_CAP_BASE_CHUNKS + Math.floor(extraChunks * task.HARD_CAP_GROWTH_RATIO));
-                    return allowedChunks * task.chunkVolume;
-                };
-                task.checkPressure = () => { if (task.bailedOut) return true;
-                    const dynamicHardCap = task.getDynamicHardCap();
-                    const addEntries = task.addQueue.length >> 2;
-                    const removeEntries = task.removeQueue.length >> 2;
-                    const bufferedEntries = (task.blockedAddBuffer.length + task.blockedRemoveBuffer.length) >> 2;
-                    const currentEntries = Math.max(addEntries, removeEntries);
-                    const maxEntries = Math.max(currentEntries, bufferedEntries);
-                    task.peakEntries = Math.max(task.peakEntries, maxEntries);
-                    const dynamicSoftCap = task.SOFT_CAP_BASE * Math.max(1, task.touchedChunks.size / 4);
-                    const throttleLimit = dynamicHardCap * 0.8;
-                    const unblockThreshold = dynamicHardCap * 0.6;
-                    if (maxEntries > throttleLimit && !task.enqueueBlocked) { task.enqueueBlocked = true; return false; }
-                    if (task.enqueueBlocked) {
-                        if (maxEntries <= unblockThreshold) { task.enqueueBlocked = false; task.flushBlocked(); task.ensureQueued();
-                        } else if (maxEntries > dynamicHardCap) { return task.bailoutToFullRecalc("hard cap");}
-                        return false;
-                    }
-                    if (maxEntries > dynamicHardCap) { return task.bailoutToFullRecalc("hard cap"); }
-                    if (maxEntries > dynamicSoftCap) {
-                        if (!task.softWarned) { task.softWarned = true; console.warn( `[Lighting] Soft cap reached (${maxEntries} entries across ${task.touchedChunks.size} chunks, cap ${Math.floor(dynamicSoftCap)}); falling back.`, ); }
-                        return task.bailoutToFullRecalc("soft cap");
-                    }
-                    return false;
-                };
-                task.enqueueRemove = (qx, qy, qz, level) => { if (task.bailedOut) return;
-                    if (task.resolveVisit(task.removeVisited, qx, qy, qz) === null) return;
-                    if (task.enqueueBlocked) { task.blockedRemoveBuffer.push(qx, qy, qz, level); return; }
-                    task.removeQueue.push(qx, qy, qz, level);
-                    task.totalEnqueued++;
-                    task.checkPressure();
-                };
-                task.enqueueAdd = (qx, qy, qz, level) => { if (task.bailedOut) return;
-                    if (task.resolveVisit(task.addVisited, qx, qy, qz) === null) return;
-                    if (task.enqueueBlocked) { task.blockedAddBuffer.push(qx, qy, qz, level); return; }
-                    task.addQueue.push(qx, qy, qz, level);
-                    task.totalEnqueued++;
-                    task.checkPressure();
-                };
-                if (shouldPrimeColumn) { primeSunlightColumn(task, x, z, tracker); }
-                if (becameOpaque) { if (currentLight > 1) { setSkyLight(x, y, z, 1); task.enqueueRemove(x, y, z, currentLight); }
-                } else {
-                    const desired = computeNeighborSunlight(x, y, z);
-                    if (desired > currentLight) { setSkyLight(x, y, z, desired); task.enqueueAdd(x, y, z, desired);
-                    } else if (desired < currentLight) { setSkyLight(x, y, z, desired); task.enqueueRemove(x, y, z, currentLight); }
                 }
-                // Re-check pressure in case the initial step spanned many chunks
-                if (!task.bailedOut) { const used = stepSunlightTask(task, Math.floor(SUNLIGHT_STEPS_PER_FRAME * 0.5)); if (!task.done && !task.bailedOut) { task.ensureQueued(); task.checkPressure(); }}
+                // Enqueue a light removal operation
+                enqueueRemove(qx, qy, qz, level) {
+                    if (this.bailedOut) return;
+                    if (this.resolveVisit(this.removeVisited, qx, qy, qz) === null) return;
+                    if (this.enqueueBlocked) {
+                        this.blockedRemoveBuffer.push(qx, qy, qz, level);
+                        return;
+                    }
+                    this.removeQueue.push(qx, qy, qz, level);
+                    this.totalEnqueued++;
+                    this.checkPressure();
+                }
+                // Enqueue a light addition operation
+                enqueueAdd(qx, qy, qz, level) {
+                    if (this.bailedOut) return;
+                    if (this.resolveVisit(this.addVisited, qx, qy, qz) === null) return;
+                    if (this.enqueueBlocked) {
+                        this.blockedAddBuffer.push(qx, qy, qz, level);
+                        return;
+                    }
+                    this.addQueue.push(qx, qy, qz, level);
+                    this.totalEnqueued++;
+                    this.checkPressure();
+                }
+            }
+            // Update sunlight at a specific position (simplified orchestrator)
+            function updateSunlightAt(x, y, z, oldId, newId, tracker, primeColumn = false) {
+                // Determine block transparency changes
+                const currentLight = getSkyLight(x, y, z);
+                const becameOpaque = !IS_TRANSPARENT[newId];
+                const becameTransparent = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
+                const shouldPrimeColumn = primeColumn || becameTransparent;
+                // Create task to manage the update
+                const task = new SunlightTask(x, y, z, oldId, newId, tracker);
+                // Prime the sunlight column if needed (when block becomes transparent)
+                if (shouldPrimeColumn) {
+                    primeSunlightColumn(task, x, z, tracker);
+                }
+                // Handle light updates based on block change
+                if (becameOpaque) {
+                    // Block became opaque - remove light
+                    if (currentLight > 1) {
+                        setSkyLight(x, y, z, 1);
+                        task.enqueueRemove(x, y, z, currentLight);
+                    }
+                } else {
+                    // Block is transparent - propagate light from neighbors
+                    const desired = computeNeighborSunlight(x, y, z);
+                    if (desired > currentLight) {
+                        setSkyLight(x, y, z, desired);
+                        task.enqueueAdd(x, y, z, desired);
+                    } else if (desired < currentLight) {
+                        setSkyLight(x, y, z, desired);
+                        task.enqueueRemove(x, y, z, currentLight);
+                    }
+                }
+                // Process initial steps and re-check pressure
+                if (!task.bailedOut) {
+                    const used = stepSunlightTask(task, Math.floor(SUNLIGHT_STEPS_PER_FRAME * 0.5));
+                    if (!task.done && !task.bailedOut) {
+                        task.ensureQueued();
+                        task.checkPressure();
+                    }
+                }
                 return task;
             }
             function stepSunlightTask(task, budget = SUNLIGHT_STEPS_PER_FRAME) {
