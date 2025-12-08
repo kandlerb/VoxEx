@@ -7373,159 +7373,247 @@
                 const baseMoonIntensity = Math.max(0, -smoothH) * SETTINGS.moonIntensity;
                 moon.intensity = baseMoonIntensity * surfaceFactor;
             }
+            // Update chunk system (mesh building, updates, reconciliation)
+            function updateChunkSystem(time, prevTime) {
+                heartbeatChunkUpdates(time);
+                processLightQueue();
+                // Throttle mesh building - prioritize edits even when FPS dips
+                const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
+                if (chunkBuildQueue.length > 0 && (time - prevTime < 32 || hasEditWork)) {
+                    const chunkBuildStart = perfMonitor.start("chunkBuild");
+                    processChunkQueue();
+                    perfMonitor.end("chunkBuild", chunkBuildStart);
+                }
+                // Run chunk updates every 200ms
+                if (time - lastChunkUpdate > 200) {
+                    const chunkUpdateStart = perfMonitor.start("chunkUpdate");
+                    updateChunks();
+                    perfMonitor.end("chunkUpdate", chunkUpdateStart);
+                    lastChunkUpdate = time;
+                }
+                runNeighborReconciliationSweep(time);
+            }
+            // Update FPS tracking and statistics
+            function updateFPSTracking(time, rawDt, clampedDt) {
+                if (clampedDt <= 0) return;
+                fpsInstant = 1 / rawDt;
+                fpsSamples.push({ t: time, fps: fpsInstant });
+                // Remove old samples efficiently
+                const cutoff = time - 10000;
+                let firstValid = 0;
+                while (firstValid < fpsSamples.length && fpsSamples[firstValid].t < cutoff) {
+                    firstValid++;
+                }
+                if (firstValid > 0) {
+                    fpsSamples = fpsSamples.slice(firstValid);
+                }
+                // Calculate average using single loop
+                let fpsSum = 0;
+                for (let i = 0; i < fpsSamples.length; i++) {
+                    fpsSum += fpsSamples[i].fps;
+                }
+                fpsAvg = fpsSum / (fpsSamples.length || 1);
+            }
+            // Apply player velocity based on input
+            function applyPlayerVelocity(dt) {
+                const inputSpeed = SETTINGS.playerSpeed * (
+                    isFlying ? SETTINGS.flySpeedMultiplier :
+                    isCrouching ? SETTINGS.crouchMultiplier :
+                    isSprinting ? SETTINGS.sprintMultiplier : 1.0
+                );
+                // Update direction from input
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveLeft) - Number(moveRight);
+                direction.normalize();
+                // Apply input to velocity
+                if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
+                if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
+                // Apply damping
+                const dampingFactor = Math.pow(0.00001, dt);
+                velocity.x *= dampingFactor;
+                velocity.z *= dampingFactor;
+                if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
+                if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
+                // Apply gravity or flying
+                if (isFlying) {
+                    velocity.y = 0;
+                    if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25;
+                    if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25;
+                } else {
+                    velocity.y -= SETTINGS.gravity * dt;
+                }
+            }
+            // Apply a single collision step (axis-sweep collision resolution)
+            function applyCollisionStep(obj, stepDt) {
+                // Get movement directions
+                controls.getDirection(_physFwd);
+                _physFwd.y = 0;
+                _physFwd.normalize();
+                _physRight.crossVectors(_physFwd, _physUp);
+                // Calculate deltas
+                const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
+                const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
+                const dY = velocity.y * stepDt;
+                // Apply movement with collision detection (axis-sweep)
+                obj.position.x += dX;
+                if (collide(obj.position)) obj.position.x -= dX;
+                obj.position.z += dZ;
+                if (collide(obj.position)) obj.position.z -= dZ;
+                obj.position.y += dY;
+                if (collide(obj.position)) {
+                    obj.position.y -= dY;
+                    velocity.y = 0;
+                }
+                // Ground detection and jumping
+                if (!isFlying) {
+                    if (velocity.y <= 0 && checkGround(obj.position)) {
+                        canJump = true;
+                        velocity.y = 0;
+                        // Snap to ground
+                        const currentFeet = obj.position.y - playerEyeHeight;
+                        const groundBlockY = Math.floor(currentFeet - 0.001);
+                        if (Math.abs(currentFeet - (groundBlockY + 1)) < 0.25) {
+                            obj.position.y = groundBlockY + 1 + playerEyeHeight;
+                        }
+                        // Handle jump
+                        if (spacePressed) {
+                            velocity.y = SETTINGS.jumpForce;
+                            canJump = false;
+                            obj.position.y += 0.02;
+                        }
+                    } else {
+                        canJump = false;
+                    }
+                }
+            }
+            // Update physics and movement (fixed timestep with collision substeps)
+            function updatePhysicsAndMovement() {
+                const physicsStart = perfMonitor.start("physics");
+                let physicsSteps = 0;
+                // Fixed timestep physics loop
+                while (physicsAccumulator >= FIXED_TIME_STEP && physicsSteps < MAX_PHYSICS_STEPS) {
+                    physicsAccumulator -= FIXED_TIME_STEP;
+                    physicsSteps++;
+                    const dt = FIXED_TIME_STEP;
+                    // Apply velocity from player input
+                    applyPlayerVelocity(dt);
+                    // Calculate collision substeps for fast movement
+                    const inputSpeed = SETTINGS.playerSpeed * (
+                        isFlying ? SETTINGS.flySpeedMultiplier :
+                        isCrouching ? SETTINGS.crouchMultiplier :
+                        isSprinting ? SETTINGS.sprintMultiplier : 1.0
+                    );
+                    const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
+                    const stepDt = dt / collisionSteps;
+                    const obj = controls.getObject();
+                    // Smooth crouch transition
+                    playerEyeHeight = THREE.MathUtils.lerp(
+                        playerEyeHeight,
+                        isCrouching ? 1.4 : 1.8,
+                        0.2
+                    );
+                    // Apply collision substeps
+                    for (let s = 0; s < collisionSteps; s++) {
+                        applyCollisionStep(obj, stepDt);
+                    }
+                }
+                updateHighlight();
+                perfMonitor.end("physics", physicsStart);
+            }
+            // Update visual effects (torch, FOV, camera)
+            function updateVisualEffects(time) {
+                // FOV changes for sprint
+                const targetFOV = isSprinting && !isFlying && controls.isLocked ?
+                    SETTINGS.sprintFOV : SETTINGS.normalFOV;
+                camera.fov += (targetFOV - camera.fov) * 0.1;
+                camera.updateProjectionMatrix();
+                controls.getObject().updateMatrixWorld();
+                // Torch flicker effect
+                if (torchActive && torchLight) {
+                    torchLight.intensity = SETTINGS.torchIntensity + Math.sin(time * 0.003) * 0.5;
+                    // Animate 3D torch flame
+                    if (window.torchModel) {
+                        const flame = window.torchModel.children[1];
+                        const glow = window.torchModel.children[2];
+                        if (flame && glow) {
+                            const flameScale = 1.0 + Math.sin(time * 0.001) * 0.03 + Math.sin(time * 0.0023) * 0.01;
+                            flame.scale.set(flameScale, flameScale, flameScale);
+                            const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
+                            glow.scale.set(glowScale, glowScale, glowScale);
+                        }
+                    }
+                }
+            }
+            // Render the frame (single-pass or two-pass for viewmodel)
+            function renderFrame() {
+                const renderStart = perfMonitor.start("rendering");
+                // Two-pass rendering for torch viewmodel
+                if (torchActive && window.torchModel) {
+                    // Pass 1: Render world (Layer 0)
+                    camera.layers.set(0);
+                    renderer.render(scene, camera);
+                    // Pass 2: Render viewmodel (Layer 1) on top
+                    camera.layers.set(1);
+                    renderer.autoClear = false;
+                    renderer.clearDepth();
+                    renderer.render(scene, camera);
+                    renderer.autoClear = true;
+                    // Re-enable both layers
+                    camera.layers.enable(0);
+                    camera.layers.enable(1);
+                } else {
+                    // Single-pass rendering (50% faster)
+                    camera.layers.enableAll();
+                    renderer.render(scene, camera);
+                }
+                perfMonitor.end("rendering", renderStart);
+            }
+            // Main animation loop (simplified orchestrator)
             async function animate() {
                 const frameStart = perfMonitor.start("animate");
                 try {
                     const time = performance.now();
-                    const rawDt = (time - prevTime) / 1000; // Calculate delta time early
+                    const rawDt = (time - prevTime) / 1000;
                     const clampedDt = Math.min(rawDt, 0.1);
                     physicsAccumulator = Math.min(physicsAccumulator + clampedDt, FIXED_TIME_STEP * MAX_PHYSICS_STEPS);
-                    // Heartbeat to flush deferred or stuck chunk updates between rapid edits
-                    heartbeatChunkUpdates(time);
-                    // --- Block breaking logic ---
+                    // Update chunk system
+                    updateChunkSystem(time, prevTime);
+                    // Block breaking logic
                     if (breakingBlock && controls.isLocked) {
                         breakProgress += clampedDt / BREAK_TIME;
-                        if (breakProgress >= 1.0) { setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR); updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z); breakingBlock = null; breakProgress = 0; }}
-                    // Process a few pending light updates each frame to avoid large spikes
-                    processLightQueue();
-                    // 1. Throttle Heavy Tasks (Mesh Building)
-                    // OPTIMIZATION: Prioritize edits even when FPS dips by allowing chunk rebuilds whenever
-                    // dirty work is pending, while still respecting the build queue limit inside processChunkQueue.
-                    const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
-                    if (chunkBuildQueue.length > 0 && (time - prevTime < 32 || hasEditWork)) {
-                        const chunkBuildStart = perfMonitor.start("chunkBuild");
-                        // OPTIMIZATION: Call processChunkQueue once - it already has its own limiter (buildQueueLimit)
-                        // The old while loop with performance.now() checks was adding unnecessary overhead
-                        processChunkQueue();
-                        perfMonitor.end("chunkBuild", chunkBuildStart);
+                        if (breakProgress >= 1.0) {
+                            setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR);
+                            updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z);
+                            breakingBlock = null;
+                            breakProgress = 0;
+                        }
                     }
-                    // 2. CRITICAL FIX: Run Update/Cleanup independently of FPS
-                    // We throttle this to run every 200ms using a timer, but we DO NOT
-                    // restrict it based on frame rendering time.
-                    if (time - lastChunkUpdate > 200) { const chunkUpdateStart = perfMonitor.start("chunkUpdate"); updateChunks(); perfMonitor.end("chunkUpdate", chunkUpdateStart); lastChunkUpdate = time; }
-                    runNeighborReconciliationSweep(time);
                     frameCount++;
+                    // Game active updates
                     if (controls.isLocked) {
                         updateDayNight(clampedDt);
-                        if (clampedDt > 0) {
-                            fpsInstant = 1 / rawDt;
-                            fpsSamples.push({ t: time, fps: fpsInstant });
-                            // OPTIMIZATION: Remove old samples more efficiently - find first valid index instead of shift() loop
-                            const cutoff = time - 10000;
-                            let firstValid = 0;
-                            while (firstValid < fpsSamples.length && fpsSamples[firstValid].t < cutoff) { firstValid++; }
-                            if (firstValid > 0) { fpsSamples = fpsSamples.slice(firstValid); }
-                            // OPTIMIZATION: Calculate average using single loop instead of reduce
-                            let fpsSum = 0;
-                            for (let i = 0; i < fpsSamples.length; i++) { fpsSum += fpsSamples[i].fps; }
-                            fpsAvg = fpsSum / (fpsSamples.length || 1);
-                        }
-                        // --- PHYSICS & MOVEMENT UPDATE ---
-                        const physicsStart = perfMonitor.start("physics");
-                        let physicsSteps = 0;
-                        while (physicsAccumulator >= FIXED_TIME_STEP && physicsSteps < MAX_PHYSICS_STEPS) {
-                            physicsAccumulator -= FIXED_TIME_STEP;
-                            physicsSteps++;
-                            const dt = FIXED_TIME_STEP;
-                            const inputSpeed = SETTINGS.playerSpeed * (isFlying ? SETTINGS.flySpeedMultiplier : isCrouching ? SETTINGS.crouchMultiplier : isSprinting ? SETTINGS.sprintMultiplier : 1.0);
-                            direction.z = Number(moveForward) - Number(moveBackward);
-                            direction.x = Number(moveLeft) - Number(moveRight);
-                            direction.normalize();
-                            if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
-                            if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
-                            // OPTIMIZATION: Cache Math.pow result instead of calling twice
-                            const dampingFactor = Math.pow(0.00001, dt);
-                            velocity.x *= dampingFactor;
-                            velocity.z *= dampingFactor;
-                            if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
-                            if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
-                            if (isFlying) { velocity.y = 0; if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25; if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25; } else { velocity.y -= SETTINGS.gravity * dt; }
-                            const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
-                            const stepDt = dt / collisionSteps;
-                            const obj = controls.getObject();
-                            playerEyeHeight = THREE.MathUtils.lerp(playerEyeHeight, isCrouching ? 1.4 : 1.8, 0.2);
-                            for (let s = 0; s < collisionSteps; s++) {
-                                // OPTIMIZATION: Use pre-allocated Vector3 objects instead of creating new ones
-                                controls.getDirection(_physFwd);
-                                _physFwd.y = 0;
-                                _physFwd.normalize();
-                                _physRight.crossVectors(_physFwd, _physUp);
-                                const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
-                                const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
-                                const dY = velocity.y * stepDt;
-                                obj.position.x += dX;
-                                if (collide(obj.position)) obj.position.x -= dX;
-                                obj.position.z += dZ;
-                                if (collide(obj.position)) obj.position.z -= dZ;
-                                obj.position.y += dY;
-                                if (collide(obj.position)) { obj.position.y -= dY; velocity.y = 0; }
-                                if (!isFlying) {
-                                    if (velocity.y <= 0 && checkGround(obj.position)) {
-                                        canJump = true;
-                                        velocity.y = 0;
-                                        const currentFeet = obj.position.y - playerEyeHeight;
-                                        const groundBlockY = Math.floor(currentFeet - 0.001);
-                                        if (Math.abs(currentFeet - (groundBlockY + 1)) < 0.25) { obj.position.y = groundBlockY + 1 + playerEyeHeight; }
-                                        if (spacePressed) { velocity.y = SETTINGS.jumpForce; canJump = false; obj.position.y += 0.02; }
-                                    } else { canJump = false; }
-                                }
-                            }
-                        }
-                        updateHighlight();
-                        perfMonitor.end("physics", physicsStart);
-                    } else { prevTime = performance.now(); physicsAccumulator = 0; }
-                    prevTime = time;
-                    if (isDebug) updateDebugInfo(fpsInstant, fpsAvg);
-                    // Update movement state indicators
-                    updateMovementIndicators();
-                    // FOV changes for sprint
-                    const targetFOV = isSprinting && !isFlying && controls.isLocked ? SETTINGS.sprintFOV : SETTINGS.normalFOV;
-                    camera.fov += (targetFOV - camera.fov) * 0.1;
-                    camera.updateProjectionMatrix();
-                    controls.getObject().updateMatrixWorld();
-                    // Torch flicker effect - light intensity and flame animation
-                    if (torchActive && torchLight) {
-                        // OPTIMIZATION: Use time (performance.now) instead of Date.now() - it's already calculated
-                        // Use deterministic sin waves instead of Math.random() for better performance
-                        torchLight.intensity = SETTINGS.torchIntensity + Math.sin(time * 0.003) * 0.5;
-                        // Animate the 3D torch flame (very subtle)
-                        if (window.torchModel) {
-                            const flame = window.torchModel.children[1]; // Second child is flame
-                            const glow = window.torchModel.children[2]; // Third child is glow
-                            if (flame && glow) {
-                                // Very subtle scale pulsing for flame (much slower)
-                                // OPTIMIZATION: Remove Math.random() - use secondary sin wave instead
-                                const flameScale = 1.0 + Math.sin(time * 0.001) * 0.03 + Math.sin(time * 0.0023) * 0.01;
-                                flame.scale.set(flameScale, flameScale, flameScale);
-                                // Glow flickers very subtly
-                                const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
-                                glow.scale.set(glowScale, glowScale, glowScale);
-                            }
-                        }
+                        updateFPSTracking(time, rawDt, clampedDt);
+                        updatePhysicsAndMovement();
+                    } else {
+                        prevTime = performance.now();
+                        physicsAccumulator = 0;
                     }
+                    prevTime = time;
+                    // UI and visual updates
+                    if (isDebug) updateDebugInfo(fpsInstant, fpsAvg);
+                    updateMovementIndicators();
+                    updateVisualEffects(time);
+                    // Entity and material updates
                     updateZombies(clampedDt);
                     flushMaterialUpdates();
-                    const renderStart = perfMonitor.start("rendering");
-                    // OPTIMIZATION: Only do two-pass rendering when torch viewmodel is active
-                    if (torchActive && window.torchModel) {
-                        // Two-pass rendering for proper viewmodel layering
-                        // Pass 1: Render world (Layer 0)
-                        camera.layers.set(0);
-                        renderer.render(scene, camera);
-                        // Pass 2: Render viewmodel/torch (Layer 1) on top without clearing color buffer
-                        camera.layers.set(1);
-                        renderer.autoClear = false; // Don't auto-clear
-                        renderer.clearDepth(); // Clear only depth buffer, keep color buffer
-                        renderer.render(scene, camera);
-                        renderer.autoClear = true; // Restore auto-clear for next frame
-                        // Re-enable both layers for camera (needed for other code that might check layers)
-                        camera.layers.enable(0);
-                        camera.layers.enable(1);
-                    // Single-pass rendering when no viewmodel needed (50% faster)
-                    } else { camera.layers.enableAll(); renderer.render(scene, camera); }
-                    perfMonitor.end("rendering", renderStart);
-                } catch (error) { logError("ANIMATE", "Error in animation loop", error);
-                } finally { perfMonitor.end("animate", frameStart); requestAnimationFrame(animate); }
+                    // Render
+                    renderFrame();
+                } catch (error) {
+                    logError("ANIMATE", "Error in animation loop", error);
+                } finally {
+                    perfMonitor.end("animate", frameStart);
+                    requestAnimationFrame(animate);
+                }
             }
             const onKeyDown = function (event) {
                 // 1. Global Keys (Works in Menu & Game)
