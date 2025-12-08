@@ -2738,7 +2738,7 @@
                     targets.forEach((key) => {     const chunk = chunks.get(key);
                         if (!chunk) return;
                         calculateChunkSunlight(chunk, chunkSize, chunkHeight);
-                        calculateBlockLight(chunk, chunkSize, chunkHeight);
+                        calculateBlockLight(chunk, chunkSize, chunkHeight, cx, cz, key);
                         rebuildTargets.push(key);
                     });
                     if (lightUpdateQueue.length) {
@@ -6956,15 +6956,31 @@
                 }
             }
             // Calculate block light for a chunk - light emitted by torches and other light sources
+            // Now propagates across chunk boundaries so adjacent chunk faces receive correct lighting
             // OPTIMIZATION: Uses BFS queue with early termination instead of fixed 15 passes
-            function calculateBlockLight(chunk, chunkSize, chunkHeight) {
-                const blocks = chunk.blocks || chunk;
-                const blockLight = chunk.blockLight || (chunk.blockLight = new Uint8Array(blocks.length).fill(0));
+            function calculateBlockLight(chunk, chunkSize, chunkHeight, cx = null, cz = null, chunkKey = null) {
+                const resolveArrays = (c) => {
+                    const cBlocks = c.blocks || c;
+                    if (!c.blockLight || c.blockLight.length !== cBlocks.length) {
+                        c.blockLight = new Uint8Array(cBlocks.length);
+                    }
+                    return { cBlocks, cLight: c.blockLight };
+                };
+                const { cBlocks: blocks, cLight: blockLight } = resolveArrays(chunk);
                 blockLight.fill(0);
                 const cs = chunkSize; // 16
-                // BFS queue - stores [x, y, z, light] as flat array for performance
+                const primaryKey = chunkKey || (cx !== null && cz !== null ? getChunkKey(cx, cz) : null);
+                const baseCoordX = cx ?? Number.NaN;
+                const baseCoordZ = cz ?? Number.NaN;
+                // BFS queue - stores [chunkRef, chunkKey, cx, cz, x, y, z, light] flat for performance
                 const queue = [];
-                // Step 1: Find all light sources and seed the queue
+                const touchedChunks = new Set();
+                if (primaryKey) touchedChunks.add(primaryKey);
+                const pushEntry = (chunkRef, cKey, cCx, cCz, lx, ly, lz, light) => {
+                    if (light <= 0) return;
+                    queue.push(chunkRef, cKey, cCx, cCz, lx, ly, lz, light);
+                };
+                // Step 1: Find all light sources in this chunk and seed the queue
                 for (let ly = 0; ly < chunkHeight; ly++) {
                     const yOffset = ly << 8;
                     for (let lz = 0; lz < cs; lz++) {
@@ -6973,44 +6989,128 @@
                             const idx = lx + zOffset + yOffset;
                             const blockId = blocks[idx];
                             if (blockId === TORCH) {
-                                blockLight[idx] = 15; // Max brightness
-                                queue.push(lx, ly, lz, 15);
+                                pushEntry(chunk, primaryKey, baseCoordX, baseCoordZ, lx, ly, lz, 15);
                             }
                         }
                     }
                 }
-                // Step 2: BFS propagation with early termination
+                // Step 1b: Seed the queue with neighbor boundary light so recalculations keep cross-chunk torches
+                if (cx !== null && cz !== null) {
+                    const neighborConfigs = [
+                        { dx: -1, dz: 0, lx: cs - 1, lzStart: 0, lzEnd: cs - 1 },
+                        { dx: 1, dz: 0, lx: 0, lzStart: 0, lzEnd: cs - 1 },
+                        { dx: 0, dz: -1, lxStart: 0, lxEnd: cs - 1, lz: cs - 1 },
+                        { dx: 0, dz: 1, lxStart: 0, lxEnd: cs - 1, lz: 0 },
+                    ];
+                    for (const config of neighborConfigs) {
+                        const nCx = cx + config.dx;
+                        const nCz = cz + config.dz;
+                        const nKey = getChunkKey(nCx, nCz);
+                        const neighbor = chunks.get(nKey);
+                        if (!neighbor) continue;
+                        const { cBlocks: nBlocks, cLight: nLight } = resolveArrays(neighbor);
+                        if (config.dx !== 0) {
+                            const lx = config.lx;
+                            for (let lz = config.lzStart; lz <= config.lzEnd; lz++) {
+                                const zOffset = lz << 4;
+                                for (let ly = 0; ly < chunkHeight; ly++) {
+                                    const idx = lx + zOffset + (ly << 8);
+                                    const seedLight = nLight[idx] || (nBlocks[idx] === TORCH ? 15 : 0);
+                                    if (seedLight > 0) {
+                                        const targetLx = config.dx === -1 ? 0 : cs - 1;
+                                        const targetIdx = targetLx + zOffset + (ly << 8);
+                                        const targetBlockId = blocks[targetIdx];
+                                        if (targetBlockId === AIR || targetBlockId === WATER || targetBlockId === LEAVES || targetBlockId === TORCH) {
+                                            const propagatedSeed = seedLight > 1 ? seedLight - 1 : seedLight;
+                                            pushEntry(chunk, primaryKey, baseCoordX, baseCoordZ, targetLx, ly, lz, propagatedSeed);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            const lz = config.lz;
+                            const zOffset = lz << 4;
+                            for (let lx = config.lxStart; lx <= config.lxEnd; lx++) {
+                                for (let ly = 0; ly < chunkHeight; ly++) {
+                                    const idx = lx + zOffset + (ly << 8);
+                                    const seedLight = nLight[idx] || (nBlocks[idx] === TORCH ? 15 : 0);
+                                    if (seedLight > 0) {
+                                        const targetLz = config.dz === -1 ? 0 : cs - 1;
+                                        const targetIdx = lx + (targetLz << 4) + (ly << 8);
+                                        const targetBlockId = blocks[targetIdx];
+                                        if (targetBlockId === AIR || targetBlockId === WATER || targetBlockId === LEAVES || targetBlockId === TORCH) {
+                                            const propagatedSeed = seedLight > 1 ? seedLight - 1 : seedLight;
+                                            pushEntry(chunk, primaryKey, baseCoordX, baseCoordZ, lx, ly, targetLz, propagatedSeed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Step 2: BFS propagation with early termination (cross-chunk aware)
                 let qIdx = 0;
                 while (qIdx < queue.length) {
+                    const chunkRef = queue[qIdx++];
+                    const cKey = queue[qIdx++];
+                    const baseCx = queue[qIdx++];
+                    const baseCz = queue[qIdx++];
                     const lx = queue[qIdx++];
                     const ly = queue[qIdx++];
                     const lz = queue[qIdx++];
                     const currentLight = queue[qIdx++];
+                    const { cBlocks, cLight } = resolveArrays(chunkRef);
+                    const idx = lx + (lz << 4) + (ly << 8);
+                    if (currentLight <= cLight[idx]) continue; // Skip stale entries
+                    cLight[idx] = currentLight;
+                    if (cKey) touchedChunks.add(cKey);
                     // OPTIMIZATION: Use pre-computed NEIGHBOR_OFFSETS constant
                     for (let i = 0; i < 6; i++) {
                         const offset = NEIGHBOR_OFFSETS[i];
-                        const nx = lx + offset[0];
+                        let nx = lx + offset[0];
                         const ny = ly + offset[1];
-                        const nz = lz + offset[2];
-                        // Bounds check
-                        if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
+                        let nz = lz + offset[2];
+                        if (ny < 0 || ny >= chunkHeight) continue;
+                        let targetChunk = chunkRef;
+                        let targetKey = cKey;
+                        let targetCx = baseCx;
+                        let targetCz = baseCz;
+                        // Cross-chunk traversal on X/Z boundaries
+                        if (nx < 0 || nx >= cs || nz < 0 || nz >= cs) {
+                            if (!Number.isFinite(baseCx) || !Number.isFinite(baseCz)) continue; // No position context; skip cross-chunk propagation
+                            targetCx = baseCx + (nx < 0 ? -1 : nx >= cs ? 1 : 0);
+                            targetCz = baseCz + (nz < 0 ? -1 : nz >= cs ? 1 : 0);
+                            targetKey = getChunkKey(targetCx, targetCz);
+                            targetChunk = chunks.get(targetKey);
+                            if (!targetChunk) continue;
+                            nx = (nx + cs) & 15;
+                            nz = (nz + cs) & 15;
+                        }
+                        const { cBlocks: nBlocks, cLight: nLight } = resolveArrays(targetChunk);
                         const nIdx = nx + (nz << 4) + (ny << 8);
-                        const nBlockId = blocks[nIdx];
+                        const nBlockId = nBlocks[nIdx];
                         // Only spread to transparent blocks (air=0, leaves=6, water=8, torch=10)
                         if (nBlockId !== AIR && nBlockId !== WATER && nBlockId !== LEAVES && nBlockId !== TORCH) continue;
                         // Calculate propagated light (minimum 0)
-                        // OPTIMIZATION: Inline ternary instead of Math.max
                         const propagatedLight = currentLight > 1 ? currentLight - 1 : 0;
                         // Only update if we can improve the neighbor's light
-                        if (propagatedLight > blockLight[nIdx]) {
-                            blockLight[nIdx] = propagatedLight;
+                        if (propagatedLight > nLight[nIdx]) {
+                            nLight[nIdx] = propagatedLight;
                             // Only continue propagating if light > 0
                             if (propagatedLight > 0) {
-                                queue.push(nx, ny, nz, propagatedLight);
+                                pushEntry(targetChunk, targetKey, targetCx, targetCz, nx, ny, nz, propagatedLight);
                             }
                         }
                     }
                 }
+                // Notify adjacent chunks that received boundary light so their meshes can rebuild with updated lighting
+                touchedChunks.forEach((key) => {
+                    if (!key) return;
+                    const [tx, tz] = key.split(",").map(Number);
+                    if (chunkMeshes.has(key)) {
+                        scheduleChunkUpdate(tx, tz, false, "blocklight-propagation");
+                    }
+                });
             }
             async function generateChunkData(cx, cz) {
                 try {
@@ -7289,7 +7389,7 @@
                     const chunk = { blocks: data, skyLight: new Uint8Array(size), blockLight: new Uint8Array(size), };
                     // Calculate initial sunlight for this chunk
                     calculateChunkSunlight(chunk, chunkSize, chunkHeight);
-                    calculateBlockLight(chunk, chunkSize, chunkHeight);
+                    calculateBlockLight(chunk, chunkSize, chunkHeight, cx, cz, key);
                     chunks.set(key, chunk);
                     // Mark as pristine (unmodified generated chunk)
                     pristineChunks.add(key);
