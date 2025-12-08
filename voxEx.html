@@ -1327,6 +1327,9 @@
             let breakingBlock = null;
             const BREAK_TIME = 0; // seconds
             const chunkNeighborUpdateQueue = new Set();
+            const NEIGHBOR_RECONCILE_INTERVAL_MS = 500;
+            const NEIGHBOR_RECONCILE_BUDGET = 6;
+            let lastNeighborReconcile = 0;
             const meshedChunkKeys = new Set(); // Tracks which chunk keys have been meshed at least once
             let culled = 0;
             let totalChecked = 0;
@@ -1500,6 +1503,36 @@
                             });
                             break;
                         }
+                    }
+                }
+            }
+            function runNeighborReconciliationSweep(now = performance.now()) {
+                if (now - lastNeighborReconcile < NEIGHBOR_RECONCILE_INTERVAL_MS) return; // Throttle to avoid heavy scans
+                if (chunkBuildQueue.length > SETTINGS.buildQueueLimit * 2 || pendingChunkUpdates.size > 0) return; // Skip when core builds are busy
+                lastNeighborReconcile = now;
+                const visibleKeys = frustumCacheState.neededKeys && frustumCacheState.neededKeys.size > 0 ? frustumCacheState.neededKeys : null;
+                const candidateKeys = visibleKeys || new Set(Array.from(chunkMeshes.keys()).filter((k) => !k.includes("_WATER")));
+                let budget = NEIGHBOR_RECONCILE_BUDGET;
+                for (const key of candidateKeys) {
+                    if (!chunkMeshes.has(key) || chunkNeighborUpdateQueue.has(key) || dirtyChunks.has(key) || queuedChunkKeys.has(key)) continue;
+                    const diag = chunkRenderDiagnostics.get(key);
+                    if (!diag) continue;
+                    if (diag.lastNeighborCheck && now - diag.lastNeighborCheck < NEIGHBOR_RECONCILE_INTERVAL_MS * 0.5) continue;
+                    const [cx, cz] = key.split(",").map(Number);
+                    const neighbors = [getChunkKey(cx + 1, cz), getChunkKey(cx - 1, cz), getChunkKey(cx, cz + 1), getChunkKey(cx, cz - 1)];
+                    let needsRefresh = false;
+                    for (const nKey of neighbors) {
+                        const neighborDiag = chunkRenderDiagnostics.get(nKey);
+                        const neighborMeshExists = chunkMeshes.has(nKey);
+                        if (!neighborMeshExists || (neighborDiag && neighborDiag.lastRender > diag.lastRender)) { needsRefresh = true; break; }
+                    }
+                    diag.lastNeighborCheck = now;
+                    chunkRenderDiagnostics.set(key, diag);
+                    if (needsRefresh) {
+                        chunkNeighborUpdateQueue.add(key);
+                        recordChunkUpdateState(key, "neighbor-reconcile", "queued");
+                        budget--;
+                        if (budget <= 0) break;
                     }
                 }
             }
@@ -6688,6 +6721,14 @@
                     colPool.release(waterCols);
                     meshedChunkKeys.add(cKey);
                     chunkRenderedFaces.set(cKey, tFaceCount + wFaceCount);
+                    const renderTimestamp = performance.now();
+                    const prevDiag = chunkRenderDiagnostics.get(cKey);
+                    chunkRenderDiagnostics.set(cKey, {
+                        lastRender: renderTimestamp,
+                        totalFaces: tFaceCount + wFaceCount,
+                        waterFaces: wFaceCount,
+                        lastNeighborCheck: prevDiag ? prevDiag.lastNeighborCheck : 0,
+                    });
                     // --- NEIGHBOR UPDATE SYSTEM ---
                     // If this chunk is new, had missing neighbors, or contains water, mark neighbors for update
                     const neighbors = [getChunkKey(cx, cz - 1), getChunkKey(cx, cz + 1), getChunkKey(cx + 1, cz), getChunkKey(cx - 1, cz)];
@@ -7185,6 +7226,7 @@
                     // We throttle this to run every 200ms using a timer, but we DO NOT
                     // restrict it based on frame rendering time.
                     if (time - lastChunkUpdate > 200) { const chunkUpdateStart = perfMonitor.start("chunkUpdate"); updateChunks(); perfMonitor.end("chunkUpdate", chunkUpdateStart); lastChunkUpdate = time; }
+                    runNeighborReconciliationSweep(time);
                     frameCount++;
                     if (controls.isLocked) {
                         updateDayNight(clampedDt);
