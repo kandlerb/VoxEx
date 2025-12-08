@@ -2136,10 +2136,9 @@
             }
             function installShaderDebugging(rendererInstance) {
                 if (!rendererInstance?.debug) return;
-                rendererInstance.debug.checkShaderErrors = isDebug;
-                if (!isDebug) { rendererInstance.debug.onShaderError = null; return; }
+                rendererInstance.debug.checkShaderErrors = true; // Always catch shader failures so we can recover gracefully
                 const gl = rendererInstance.getContext();
-                const debugShadersExt = gl?.getExtension?.("WEBGL_debug_shaders");
+                const debugShadersExt = isDebug ? gl?.getExtension?.("WEBGL_debug_shaders") : null;
                 const formatSource = (source) =>
                     typeof source === "string" && source.length > 0
                         ? source
@@ -2151,51 +2150,73 @@
                     try {
                         const ctx = glContext?.getShaderInfoLog ? glContext : gl;
                         const targetMaterial = material?.isMaterial ? material : null;
-                        const vertexLog = glVertexShader && ctx?.getShaderInfoLog ? ctx.getShaderInfoLog(glVertexShader) : "";
-                        const fragmentLog = glFragmentShader && ctx?.getShaderInfoLog ? ctx.getShaderInfoLog(glFragmentShader) : "";
-                        const rawVertexSrc =
-                            typeof glVertexShader === "string"
-                                ? glVertexShader
-                                : glVertexShader && ctx?.getShaderSource
-                                  ? ctx.getShaderSource(glVertexShader)
-                                  : "";
-                        const rawFragmentSrc =
-                            typeof glFragmentShader === "string"
-                                ? glFragmentShader
-                                : glFragmentShader && ctx?.getShaderSource
-                                  ? ctx.getShaderSource(glFragmentShader)
-                                  : "";
-                        const translatedVertex = debugShadersExt && glVertexShader
-                            ? debugShadersExt.getTranslatedShaderSource(glVertexShader)
-                            : rawVertexSrc;
-                        const translatedFragment = debugShadersExt && glFragmentShader
-                            ? debugShadersExt.getTranslatedShaderSource(glFragmentShader)
-                            : rawFragmentSrc;
-                        const activeDefines = targetMaterial?.defines && Object.keys(targetMaterial.defines).length > 0
-                            ? { ...targetMaterial.defines }
-                            : "<none>";
-                        const uniformKeys = targetMaterial?.uniforms ? Object.keys(targetMaterial.uniforms) : [];
-                        const activeUniforms = uniformKeys.length > 0 ? uniformKeys : "<none>";
+                        const materialLabel = targetMaterial
+                            ? `${targetMaterial.type}${targetMaterial.name ? ` (${targetMaterial.name})` : ""}`
+                            : "<unknown material>";
                         const linkedProgramLog = programLog || ctx?.getProgramInfoLog?.(program) || "<no program log>";
-                        console.error("[VoxEx ShaderError] Program failed to compile", {
-                            material: targetMaterial ? `${targetMaterial.type}${targetMaterial.name ? ` (${targetMaterial.name})` : ""}` : "<unknown material>",
-                            programLog: linkedProgramLog,
-                            vertexLog,
-                            fragmentLog,
-                            defines: activeDefines,
-                            uniforms: activeUniforms,
-                            translatedVertex: formatSource(translatedVertex || rawVertexSrc),
-                            translatedFragment: formatSource(translatedFragment || rawFragmentSrc),
-                        });
+
+                        if (isDebug) {
+                            const vertexLog = glVertexShader && ctx?.getShaderInfoLog ? ctx.getShaderInfoLog(glVertexShader) : "";
+                            const fragmentLog = glFragmentShader && ctx?.getShaderInfoLog ? ctx.getShaderInfoLog(glFragmentShader) : "";
+                            const rawVertexSrc =
+                                typeof glVertexShader === "string"
+                                    ? glVertexShader
+                                    : glVertexShader && ctx?.getShaderSource
+                                      ? ctx.getShaderSource(glVertexShader)
+                                      : "";
+                            const rawFragmentSrc =
+                                typeof glFragmentShader === "string"
+                                    ? glFragmentShader
+                                    : glFragmentShader && ctx?.getShaderSource
+                                      ? ctx.getShaderSource(glFragmentShader)
+                                      : "";
+                            const translatedVertex = debugShadersExt && glVertexShader
+                                ? debugShadersExt.getTranslatedShaderSource(glVertexShader)
+                                : rawVertexSrc;
+                            const translatedFragment = debugShadersExt && glFragmentShader
+                                ? debugShadersExt.getTranslatedShaderSource(glFragmentShader)
+                                : rawFragmentSrc;
+                            const activeDefines = targetMaterial?.defines && Object.keys(targetMaterial.defines).length > 0
+                                ? { ...targetMaterial.defines }
+                                : "<none>";
+                            const uniformKeys = targetMaterial?.uniforms ? Object.keys(targetMaterial.uniforms) : [];
+                            const activeUniforms = uniformKeys.length > 0 ? uniformKeys : "<none>";
+                            console.error("[VoxEx ShaderError] Program failed to compile", {
+                                material: materialLabel,
+                                programLog: linkedProgramLog,
+                                vertexLog,
+                                fragmentLog,
+                                defines: activeDefines,
+                                uniforms: activeUniforms,
+                                translatedVertex: formatSource(translatedVertex || rawVertexSrc),
+                                translatedFragment: formatSource(translatedFragment || rawFragmentSrc),
+                            });
+                        } else {
+                            console.error(`[VoxEx ShaderError]: ${materialLabel} failed to compile.`, linkedProgramLog);
+                        }
+
                         const isChunkMaterial = targetMaterial === chunkMaterial;
                         const isWaterMaterial = targetMaterial === waterMaterial;
                         if (isChunkMaterial || isWaterMaterial) {
-                            const materialLabel = isChunkMaterial ? "chunk" : "water";
-                            const warningMessage = `Shader compile failed for ${materialLabel} material. Reverting to default shading until uniforms are fixed.`;
+                            const fallbackLabel = isChunkMaterial ? "chunk" : "water";
+                            const warningMessage = `Shader compile failed for ${fallbackLabel} material. Reverting to default shading until uniforms are fixed.`;
                             setDebugWarning(warningMessage);
                             disableChunkLightInjection(targetMaterial);
-                            requestShaderMaterialRecovery(materialLabel);
-                            queueMaterialUpdate(materialLabel);
+                            requestShaderMaterialRecovery(fallbackLabel);
+                            queueMaterialUpdate(fallbackLabel);
+                        }
+
+                        const isPostProcessMaterial =
+                            targetMaterial === postMaterial ||
+                            targetMaterial === postCopyMaterial ||
+                            targetMaterial === godrayMaterial ||
+                            targetMaterial === bloomExtractMaterial ||
+                            targetMaterial === bloomBlurMaterial ||
+                            targetMaterial === finalCompositeMaterial;
+                        if (isPostProcessMaterial) {
+                            const warningMessage =
+                                `Shader compile failed for post-processing material ${materialLabel}. Post effects disabled until shaders succeed.`;
+                            handlePostProcessInitFailure(warningMessage, new Error(linkedProgramLog || "Post-process shader compile error"));
                         }
                     } catch (err) { console.error("[VoxEx ShaderError] Failed to log shader failure", err); }
                 };
