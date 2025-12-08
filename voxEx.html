@@ -1361,6 +1361,10 @@
             };
             function injectChunkLightShader(material) {
                 if (!material) return;
+                material.userData = material.userData || {};
+                if (!material.userData.originalOnBeforeCompile) {
+                    material.userData.originalOnBeforeCompile = material.onBeforeCompile || null;
+                }
                 material.onBeforeCompile = (shader) => {
                     shader.uniforms.skyLightScale = chunkLightUniforms.skyLightScale;
                     shader.uniforms.moonLightFloor = chunkLightUniforms.moonLightFloor;
@@ -1382,6 +1386,7 @@
                             + `diffuseColor.rgb *= lightMix;`
                     );
                 };
+                material.userData.lightInjectionEnabled = true;
                 material.needsUpdate = true;
             }
             function resetVolumetricPointLights() {
@@ -2092,6 +2097,42 @@
             function logDebug(message, ...args) { if (isDebug) { console.log(`[VoxEx Debug]:`, message, ...args); }}
             function logWarn(message, ...args) { if (isDebug) { console.warn(`[VoxEx Warning]:`, message, ...args); }}
             function setDebugWarning(message) { debugWarningMessage = message || ""; }
+            const shaderRecoveryState = {
+                chunk: { fallbackActive: false, lastFailure: 0 },
+                water: { fallbackActive: false, lastFailure: 0 },
+                pendingRebuild: false,
+            };
+            const SHADER_RETRY_DELAY_MS = 4000;
+            function disableChunkLightInjection(material) {
+                if (!material) return;
+                material.userData = material.userData || {};
+                const originalHook = material.userData.originalOnBeforeCompile || null;
+                material.userData.lightInjectionEnabled = false;
+                material.onBeforeCompile = originalHook;
+                material.needsUpdate = true;
+            }
+            function requestShaderMaterialRecovery(type) {
+                const bucket = type === "water" ? shaderRecoveryState.water : shaderRecoveryState.chunk;
+                bucket.fallbackActive = true;
+                bucket.lastFailure = performance.now();
+                shaderRecoveryState.pendingRebuild = true;
+            }
+            function attemptShaderMaterialRecovery() {
+                if (!shaderRecoveryState.pendingRebuild) return;
+                const now = performance.now();
+                const tryRestore = (type, material) => {
+                    const bucket = type === "water" ? shaderRecoveryState.water : shaderRecoveryState.chunk;
+                    if (!bucket.fallbackActive || now - bucket.lastFailure < SHADER_RETRY_DELAY_MS) return false;
+                    injectChunkLightShader(material);
+                    bucket.fallbackActive = false;
+                    queueMaterialUpdate(type);
+                    return true;
+                };
+                const restoredChunk = tryRestore("chunk", chunkMaterial);
+                const restoredWater = tryRestore("water", waterMaterial);
+                shaderRecoveryState.pendingRebuild = shaderRecoveryState.chunk.fallbackActive || shaderRecoveryState.water.fallbackActive;
+                if ((restoredChunk || restoredWater) && !shaderRecoveryState.pendingRebuild) { setDebugWarning(""); }
+            }
             function installShaderDebugging(rendererInstance) {
                 if (!rendererInstance?.debug) return;
                 rendererInstance.debug.checkShaderErrors = isDebug;
@@ -2145,6 +2186,16 @@
                             translatedVertex: formatSource(translatedVertex || rawVertexSrc),
                             translatedFragment: formatSource(translatedFragment || rawFragmentSrc),
                         });
+                        const isChunkMaterial = targetMaterial === chunkMaterial;
+                        const isWaterMaterial = targetMaterial === waterMaterial;
+                        if (isChunkMaterial || isWaterMaterial) {
+                            const materialLabel = isChunkMaterial ? "chunk" : "water";
+                            const warningMessage = `Shader compile failed for ${materialLabel} material. Reverting to default shading until uniforms are fixed.`;
+                            setDebugWarning(warningMessage);
+                            disableChunkLightInjection(targetMaterial);
+                            requestShaderMaterialRecovery(materialLabel);
+                            queueMaterialUpdate(materialLabel);
+                        }
                     } catch (err) { console.error("[VoxEx ShaderError] Failed to log shader failure", err); }
                 };
             }
@@ -8788,6 +8839,7 @@
                         }
                     }
                     updateZombies(clampedDt);
+                    attemptShaderMaterialRecovery();
                     flushMaterialUpdates();
                     const renderStart = perfMonitor.start("rendering");
                     const postReady = ensurePostProcessingReady();
