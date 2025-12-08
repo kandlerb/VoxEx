@@ -1295,12 +1295,14 @@
                 high: { samples: 48, resolutionScale: 1.0 },
                 ultra: { samples: 64, resolutionScale: 1.0 },
             };
+            const MAX_SHADER_SAMPLES = 64;
+            const clampVolumetricSamples = (value) => Math.max(1, Math.min(Math.round(value) || 1, MAX_SHADER_SAMPLES));
             const postProcessState = (() => {
                 const preset = POSTPROCESS_QUALITY_PRESETS[SETTINGS.postProcessQuality] || POSTPROCESS_QUALITY_PRESETS.medium;
                 if (SETTINGS.volumetricSamples === undefined) SETTINGS.volumetricSamples = preset.samples;
                 if (SETTINGS.volumetricResolutionScale === undefined) SETTINGS.volumetricResolutionScale = preset.resolutionScale;
                 return {
-                    samples: SETTINGS.volumetricSamples,
+                    samples: clampVolumetricSamples(SETTINGS.volumetricSamples),
                     resolutionScale: SETTINGS.volumetricResolutionScale,
                 };
             })();
@@ -1338,6 +1340,20 @@
                 pointLights: Array.from({ length: MAX_VOLUMETRIC_POINT_LIGHTS }, () => new THREE.Vector4()),
                 pointLightColors: Array.from({ length: MAX_VOLUMETRIC_POINT_LIGHTS }, () => new THREE.Color()),
             };
+            function updatePostMaterialDefines(force = false) {
+                if (!postMaterial) return;
+                const nextSamples = clampVolumetricSamples(postProcessState.samples);
+                const nextPointLights = Math.max(0, Math.min(volumetricLightBlock.pointLightCount, MAX_VOLUMETRIC_POINT_LIGHTS));
+                if (
+                    force ||
+                    postMaterial.defines.SAMPLES !== nextSamples ||
+                    postMaterial.defines.POINT_LIGHT_COUNT !== nextPointLights
+                ) {
+                    postMaterial.defines.SAMPLES = nextSamples;
+                    postMaterial.defines.POINT_LIGHT_COUNT = nextPointLights;
+                    postMaterial.needsUpdate = true;
+                }
+            }
             // Shared uniforms used to re-scale skylight per-frame without rebuilding meshes
             const chunkLightUniforms = {
                 skyLightScale: { value: 1.0 },
@@ -1385,6 +1401,7 @@
                 postMaterial.uniforms.moonIntensity.value = volumetricLightBlock.moonIntensity;
                 postMaterial.uniforms.pointLightCount.value = volumetricLightBlock.pointLightCount;
                 postMaterial.uniforms.torchRange.value = SETTINGS.torchRange;
+                updatePostMaterialDefines();
             }
             let isFlying = false;
             let flyUp = false;
@@ -1469,7 +1486,8 @@
                     SETTINGS.volumetricSamples = preset.samples;
                     SETTINGS.volumetricResolutionScale = preset.resolutionScale;
                 }
-                postProcessState.samples = Math.min(SETTINGS.volumetricSamples, 64);
+                postProcessState.samples = clampVolumetricSamples(SETTINGS.volumetricSamples);
+                SETTINGS.volumetricSamples = postProcessState.samples;
                 postProcessState.resolutionScale = SETTINGS.volumetricResolutionScale;
                 const sampleSlider = document.getElementById("volumetric-samples-slider");
                 const sampleVal = document.getElementById("volumetric-samples-val");
@@ -1477,7 +1495,7 @@
                 const resSlider = document.getElementById("volumetric-resolution-slider");
                 const resVal = document.getElementById("volumetric-resolution-val");
                 if (resSlider && resVal) { resSlider.value = postProcessState.resolutionScale; resVal.textContent = postProcessState.resolutionScale.toFixed(2); }
-                if (postMaterial) { postMaterial.uniforms.sampleCount.value = postProcessState.samples; }
+                if (postMaterial) { postMaterial.uniforms.sampleCount.value = postProcessState.samples; updatePostMaterialDefines(); }
                 resizeRenderTargets();
             }
             function applyLightingQualityPreset(presetName, options = {}) {
@@ -1497,12 +1515,14 @@
                 keys.forEach((key) => { if (preset[key] !== undefined) SETTINGS[key] = preset[key]; });
                 SETTINGS.atmosphereHaze = SETTINGS.skyHazeStrength;
                 SETTINGS.exposure = SETTINGS.toneMappingExposure;
-                postProcessState.samples = Math.min(SETTINGS.volumetricSamples, 64);
+                postProcessState.samples = clampVolumetricSamples(SETTINGS.volumetricSamples);
+                SETTINGS.volumetricSamples = postProcessState.samples;
                 postProcessState.resolutionScale = SETTINGS.volumetricResolutionScale;
                 applyPostProcessQuality(false);
                 if (postMaterial) {
                     postMaterial.uniforms.sampleCount.value = postProcessState.samples;
                     postMaterial.uniforms.jitter.value = SETTINGS.volumetricNoiseJitter ? postMaterial.uniforms.jitter.value : 0.0;
+                    updatePostMaterialDefines();
                 }
                 if (godrayMaterial) { godrayMaterial.uniforms.samples.value = SETTINGS.godraySteps; }
                 if (bloomExtractMaterial) { bloomExtractMaterial.uniforms.threshold.value = SETTINGS.bloomThreshold; }
@@ -1631,10 +1651,18 @@
             }
             function initPostProcessing() {
                 if (postScene) return; // Already initialized
+                const initialSamples = clampVolumetricSamples(postProcessState.samples);
+                postProcessState.samples = initialSamples;
+                const initialPointLights = Math.max(0, Math.min(volumetricLightBlock.pointLightCount, MAX_VOLUMETRIC_POINT_LIGHTS));
                 postScene = new THREE.Scene();
                 postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
                 postMaterial = new THREE.ShaderMaterial({
-                    defines: { MAX_SAMPLES: 64, MAX_POINT_LIGHTS: MAX_VOLUMETRIC_POINT_LIGHTS },
+                    defines: {
+                        MAX_SAMPLES: MAX_SHADER_SAMPLES,
+                        MAX_POINT_LIGHTS: MAX_VOLUMETRIC_POINT_LIGHTS,
+                        SAMPLES: initialSamples,
+                        POINT_LIGHT_COUNT: initialPointLights,
+                    },
                     uniforms: {
                         tColor: { value: null },
                         tDepth: { value: null },
@@ -1693,6 +1721,13 @@
                         uniform float stepLength;
                         uniform float enableVolumetrics;
 
+                        #ifndef SAMPLES
+                        #define SAMPLES MAX_SAMPLES
+                        #endif
+                        #ifndef POINT_LIGHT_COUNT
+                        #define POINT_LIGHT_COUNT 0
+                        #endif
+
                         vec3 reconstructWorldPosition(vec2 uv, float depth) {
                             float z = depth * 2.0 - 1.0;
                             vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
@@ -1715,7 +1750,7 @@
                                 gl_FragColor = baseColor;
                                 return;
                             }
-                            if (enableVolumetrics < 0.5 || scatterStrength <= 0.0 || sampleCount < 1.0) {
+                            if (enableVolumetrics < 0.5 || scatterStrength <= 0.0 || float(SAMPLES) < 1.0) {
                                 gl_FragColor = baseColor;
                                 return;
                             }
@@ -1725,10 +1760,10 @@
                             float travel = min(viewDistance, maxDistance);
                             float clampedG = clamp(anisotropy, -0.95, 0.95);
                             float clampedStep = max(stepLength, 0.01);
-                            float targetSamples = clamp(sampleCount, 1.0, float(MAX_SAMPLES));
+                            float targetSamples = clamp(sampleCount, 1.0, float(SAMPLES));
                             float maxSteps = max(1.0, min(targetSamples, travel / clampedStep));
-                            int samples = int(floor(maxSteps + 0.5));
-                            float invSamples = samples > 0 ? 1.0 / float(samples) : 1.0;
+                            float activeSamples = floor(maxSteps + 0.5);
+                            float invSamples = activeSamples > 0.0 ? 1.0 / activeSamples : 1.0;
 
                             vec3 lightDir = normalize(-sunDir);
                             vec3 moonDirN = normalize(-moonDir);
@@ -1742,27 +1777,28 @@
 
                             vec3 scatter = vec3(0.0);
                             float jitterOffset = fract(jitter);
-                            for (int i = 0; i < MAX_SAMPLES; i++) {
-                                if (i >= samples) break;
-                                float t = (float(i) + 0.5 + jitterOffset) * invSamples;
+                            for (int i = 0; i < SAMPLES; i++) {
+                                float fi = float(i);
+                                float active = step(fi, activeSamples - 1.0);
+                                float t = (fi + 0.5 + jitterOffset) * invSamples;
                                 float stepDist = t * travel;
                                 vec3 samplePos = cameraPos + viewDir * stepDist;
                                 float heightFactor = clamp((samplePos.y - 40.0) / 90.0, 0.0, 1.0);
                                 float localDensity = mix(0.035, 0.08, heightFactor) * scatterStrength;
                                 vec3 sampleScatter = directionalColor;
-                                for (int l = 0; l < MAX_POINT_LIGHTS; l++) {
-                                    if (l >= pointLightCount) break;
+                                for (int l = 0; l < POINT_LIGHT_COUNT; l++) {
+                                    float lightActive = pointLightCount > 0 ? step(float(l), float(pointLightCount) - 1.0) : 0.0;
                                     vec3 lp = pointLights[l].xyz;
                                     float range = min(pointLights[l].w, torchRange);
                                     vec3 toLight = lp - samplePos;
                                     float dist = length(toLight);
-                                    if (dist < range && range > 0.0) {
+                                    if (dist < range && range > 0.0 && lightActive > 0.0) {
                                         float atten = 1.0 - dist / range;
                                         float lightPhase = phaseHG(dot(normalize(toLight), -viewDir), clampedG);
                                         sampleScatter += pointLightColors[l] * (atten * atten) * lightPhase;
                                     }
                                 }
-                                scatter += sampleScatter * localDensity * invSamples;
+                                scatter += sampleScatter * localDensity * invSamples * active;
                             }
                             float scatterLuma = dot(scatter, vec3(0.3333));
                             float fogFactor = clamp(scatterLuma, 0.0, 1.0);
@@ -4254,11 +4290,11 @@
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                 });
                 volumetricSamplesSlider?.addEventListener("input", () => {
-                    const val = Math.min(64, parseInt(volumetricSamplesSlider.value, 10));
+                    const val = clampVolumetricSamples(parseInt(volumetricSamplesSlider.value, 10));
                     SETTINGS.volumetricSamples = val;
                     postProcessState.samples = val;
                     volumetricSamplesVal.textContent = val;
-                    if (postMaterial) postMaterial.uniforms.sampleCount.value = val;
+                    if (postMaterial) { postMaterial.uniforms.sampleCount.value = val; updatePostMaterialDefines(); }
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                 });
                 volumetricDensitySlider?.addEventListener("input", () => {
@@ -4422,7 +4458,8 @@
                         finalCompositeMaterial.uniforms.bloomEnabled.value = SETTINGS.bloomEnabled ? 1.0 : 0.0;
                         finalCompositeMaterial.uniforms.dirtEnabled.value = SETTINGS.lensDirtEnabled ? 1.0 : 0.0;
                     }
-                    postProcessState.samples = SETTINGS.volumetricSamples;
+                    postProcessState.samples = clampVolumetricSamples(SETTINGS.volumetricSamples);
+                    SETTINGS.volumetricSamples = postProcessState.samples;
                     postProcessState.resolutionScale = SETTINGS.volumetricResolutionScale;
                     if (postMaterial) {
                         postMaterial.uniforms.sampleCount.value = postProcessState.samples;
@@ -4431,6 +4468,7 @@
                         postMaterial.uniforms.stepLength.value = SETTINGS.volumetricStep;
                         postMaterial.uniforms.enableVolumetrics.value = SETTINGS.volumetricEnabled ? 1.0 : 0.0;
                         postMaterial.uniforms.maxDistance.value = SETTINGS.volumetricMaxDistance;
+                        updatePostMaterialDefines();
                     }
                     resizeRenderTargets();
                     applyWaterMaterialSettings();
