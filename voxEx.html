@@ -1131,6 +1131,8 @@
                           ? savedSettings.exposure
                           : 1.0,
                 exposure: savedSettings.exposure !== undefined ? savedSettings.exposure : undefined,
+                postProcessQueueEnabled:
+                    savedSettings.postProcessQueueEnabled !== undefined ? savedSettings.postProcessQueueEnabled : false,
                 volumetricEnabled: savedSettings.volumetricEnabled !== undefined ? savedSettings.volumetricEnabled : true,
                 volumetricSamples: savedSettings.volumetricSamples,
                 volumetricDensity: savedSettings.volumetricDensity !== undefined ? savedSettings.volumetricDensity : 0.35,
@@ -1227,6 +1229,7 @@
                 tonemapMode: "aces",
                 toneMappingExposure: 1.0,
                 exposure: 1.0,
+                postProcessQueueEnabled: false,
                 volumetricEnabled: true,
                 volumetricSamples: 32,
                 volumetricDensity: 0.35,
@@ -8306,33 +8309,11 @@
 
                     // Update post-process uniforms for this frame
                     const volumetricActive = postMaterial && SETTINGS.volumetricEnabled && mainRenderTarget.depthTexture;
-                    let currentTexture = postProcessTarget.texture;
-                    if (volumetricActive) {
-                        syncVolumetricLightingUniforms();
-                        postMaterial.uniforms.tColor.value = mainRenderTarget.texture;
-                        postMaterial.uniforms.tDepth.value = mainRenderTarget.depthTexture;
-                        postMaterial.uniforms.projectionInverse.value.copy(camera.projectionMatrixInverse);
-                        postMaterial.uniforms.cameraMatrixWorld.value.copy(camera.matrixWorld);
-                        postMaterial.uniforms.cameraPos.value.copy(camera.position);
-                        postMaterial.uniforms.sampleCount.value = postProcessState.samples;
-                        postMaterial.uniforms.scatterStrength.value = SETTINGS.volumetricDensity;
-                        postMaterial.uniforms.anisotropy.value = SETTINGS.volumetricAnisotropy;
-                        postMaterial.uniforms.stepLength.value = SETTINGS.volumetricStep;
-                        postMaterial.uniforms.enableVolumetrics.value = SETTINGS.volumetricEnabled ? 1.0 : 0.0;
-                        postProcessJitter = (postProcessJitter + 1.37) % 4096;
-                        postMaterial.uniforms.jitter.value = SETTINGS.volumetricNoiseJitter ? postProcessJitter * 0.000244140625 : 0.0; // 1/4096
+                    const godraysActive = SETTINGS.godraysEnabled && mainRenderTarget.depthTexture;
+                    const bloomActive = SETTINGS.bloomEnabled;
+                    const queuedPostEnabled = SETTINGS.postProcessQueueEnabled === true;
 
-                        renderer.setRenderTarget(postProcessTarget);
-                        renderer.clear();
-                        postQuad.material = postMaterial;
-                        renderer.render(postScene, postCamera);
-                    } else {
-                        renderer.setRenderTarget(postProcessTarget);
-                        renderer.clear();
-                        postCopyMaterial.map = mainRenderTarget.texture;
-                        postQuad.material = postCopyMaterial;
-                        renderer.render(postScene, postCamera);
-                    } else {
+                    if (queuedPostEnabled) {
                         const passQueue = [];
                         let currentTexture = mainRenderTarget.texture;
                         let bloomTexture = bloomTargets[0]?.texture || null;
@@ -8398,7 +8379,9 @@
                                     godrayMaterial.uniforms.decay.value = SETTINGS.godrayDecay;
                                     godrayMaterial.uniforms.exposure.value = SETTINGS.godrayIntensity;
                                     godrayMaterial.uniforms.samples.value = SETTINGS.godraySteps;
-                                    godrayMaterial.uniforms.lightColor.value.copy(volumetricLightBlock.sunColor).multiplyScalar(Math.max(0.0, volumetricLightBlock.sunIntensity));
+                                    godrayMaterial.uniforms.lightColor.value
+                                        .copy(volumetricLightBlock.sunColor)
+                                        .multiplyScalar(Math.max(0.0, volumetricLightBlock.sunIntensity));
                                 }
                             );
                         }
@@ -8458,69 +8441,98 @@
 
                         // Execute all queued passes in order
                         for (let i = 0; i < passQueue.length; i++) passQueue[i]();
+                    } else {
+                        let currentTexture = postProcessTarget.texture;
+
+                        if (volumetricActive) {
+                            syncVolumetricLightingUniforms();
+                            postMaterial.uniforms.tColor.value = mainRenderTarget.texture;
+                            postMaterial.uniforms.tDepth.value = mainRenderTarget.depthTexture;
+                            postMaterial.uniforms.projectionInverse.value.copy(camera.projectionMatrixInverse);
+                            postMaterial.uniforms.cameraMatrixWorld.value.copy(camera.matrixWorld);
+                            postMaterial.uniforms.cameraPos.value.copy(camera.position);
+                            postMaterial.uniforms.sampleCount.value = postProcessState.samples;
+                            postMaterial.uniforms.scatterStrength.value = SETTINGS.volumetricDensity;
+                            postMaterial.uniforms.anisotropy.value = SETTINGS.volumetricAnisotropy;
+                            postMaterial.uniforms.stepLength.value = SETTINGS.volumetricStep;
+                            postMaterial.uniforms.enableVolumetrics.value = SETTINGS.volumetricEnabled ? 1.0 : 0.0;
+                            postProcessJitter = (postProcessJitter + 1.37) % 4096;
+                            postMaterial.uniforms.jitter.value = SETTINGS.volumetricNoiseJitter ? postProcessJitter * 0.000244140625 : 0.0; // 1/4096
+
+                            renderer.setRenderTarget(postProcessTarget);
+                            renderer.clear();
+                            postQuad.material = postMaterial;
+                            renderer.render(postScene, postCamera);
+                        } else {
+                            renderer.setRenderTarget(postProcessTarget);
+                            renderer.clear();
+                            postCopyMaterial.map = mainRenderTarget.texture;
+                            postQuad.material = postCopyMaterial;
+                            renderer.render(postScene, postCamera);
+                        }
+
+                        if (godraysActive) {
+                            postTmpVec.copy(volumetricLightBlock.sunDir).normalize();
+                            postTmpVec4.set(postTmpVec.x, postTmpVec.y, postTmpVec.z, 0.0);
+                            postTmpVec4.applyMatrix4(camera.matrixWorldInverse);
+                            postTmpVec4.applyMatrix4(camera.projectionMatrix);
+                            const invW = postTmpVec4.w !== 0 ? 1.0 / postTmpVec4.w : 1.0;
+                            postSunScreenPos.set(0.5 + postTmpVec4.x * invW * 0.5, 0.5 + postTmpVec4.y * invW * 0.5);
+                            godrayMaterial.uniforms.sunPos.value.copy(postSunScreenPos);
+                            godrayMaterial.uniforms.tInput.value = currentTexture;
+                            godrayMaterial.uniforms.tDepth.value = mainRenderTarget.depthTexture;
+                            godrayMaterial.uniforms.density.value = SETTINGS.godrayDensity;
+                            godrayMaterial.uniforms.decay.value = SETTINGS.godrayDecay;
+                            godrayMaterial.uniforms.exposure.value = SETTINGS.godrayIntensity;
+                            godrayMaterial.uniforms.samples.value = SETTINGS.godraySteps;
+                            godrayMaterial.uniforms.lightColor.value.copy(volumetricLightBlock.sunColor);
+                            renderer.setRenderTarget(fxTarget);
+                            renderer.clear();
+                            postQuad.material = godrayMaterial;
+                            renderer.render(postScene, postCamera);
+                            currentTexture = fxTarget.texture;
+                        }
+
+                        let bloomTexture = bloomTargets[0]?.texture || null;
+                        if (bloomActive) {
+                            bloomExtractMaterial.uniforms.threshold.value = SETTINGS.bloomThreshold;
+                            bloomExtractMaterial.uniforms.tInput.value = currentTexture;
+                            renderer.setRenderTarget(bloomTargets[0]);
+                            renderer.clear();
+                            postQuad.material = bloomExtractMaterial;
+                            renderer.render(postScene, postCamera);
+
+                            const texelSize = bloomBlurMaterial.uniforms.texelSize.value;
+                            texelSize.set(1 / bloomTargets[0].width, 1 / bloomTargets[0].height);
+                            bloomBlurMaterial.uniforms.radius.value = SETTINGS.bloomRadius * 10.0;
+
+                            bloomBlurMaterial.uniforms.tInput.value = bloomTargets[0].texture;
+                            bloomBlurMaterial.uniforms.direction.value.set(1, 0);
+                            renderer.setRenderTarget(bloomTargets[1]);
+                            renderer.clear();
+                            postQuad.material = bloomBlurMaterial;
+                            renderer.render(postScene, postCamera);
+
+                            bloomBlurMaterial.uniforms.tInput.value = bloomTargets[1].texture;
+                            bloomBlurMaterial.uniforms.direction.value.set(0, 1);
+                            renderer.setRenderTarget(bloomTargets[0]);
+                            renderer.clear();
+                            postQuad.material = bloomBlurMaterial;
+                            renderer.render(postScene, postCamera);
+                            bloomTexture = bloomTargets[0].texture;
+                        }
+
+                        renderer.setRenderTarget(null);
+                        finalCompositeMaterial.uniforms.tBase.value = currentTexture;
+                        finalCompositeMaterial.uniforms.tBloom.value = bloomTexture;
+                        finalCompositeMaterial.uniforms.bloomIntensity.value = SETTINGS.bloomIntensity;
+                        finalCompositeMaterial.uniforms.bloomEnabled.value = bloomActive ? 1.0 : 0.0;
+                        finalCompositeMaterial.uniforms.dirtEnabled.value = SETTINGS.lensDirtEnabled ? 1.0 : 0.0;
+                        finalCompositeMaterial.uniforms.exposure.value = SETTINGS.toneMappingExposure;
+                        finalCompositeMaterial.uniforms.enableToneMapping.value = SETTINGS.toneMappingEnabled ? 1.0 : 0.0;
+                        postQuad.material = finalCompositeMaterial;
+                        renderer.render(postScene, postCamera);
                     }
-
-                    if (SETTINGS.godraysEnabled && mainRenderTarget.depthTexture) {
-                        postTmpVec.copy(volumetricLightBlock.sunDir).normalize();
-                        postTmpVec4.set(postTmpVec.x, postTmpVec.y, postTmpVec.z, 0.0);
-                        postTmpVec4.applyMatrix4(camera.matrixWorldInverse);
-                        postTmpVec4.applyMatrix4(camera.projectionMatrix);
-                        const invW = postTmpVec4.w !== 0 ? 1.0 / postTmpVec4.w : 1.0;
-                        postSunScreenPos.set(0.5 + postTmpVec4.x * invW * 0.5, 0.5 + postTmpVec4.y * invW * 0.5);
-                        godrayMaterial.uniforms.sunPos.value.copy(postSunScreenPos);
-                        godrayMaterial.uniforms.tInput.value = currentTexture;
-                        godrayMaterial.uniforms.tDepth.value = mainRenderTarget.depthTexture;
-                        godrayMaterial.uniforms.density.value = SETTINGS.godrayDensity;
-                        godrayMaterial.uniforms.decay.value = SETTINGS.godrayDecay;
-                        godrayMaterial.uniforms.exposure.value = SETTINGS.godrayIntensity;
-                        godrayMaterial.uniforms.samples.value = SETTINGS.godraySteps;
-                        godrayMaterial.uniforms.lightColor.value.copy(volumetricLightBlock.sunColor);
-                        renderer.setRenderTarget(fxTarget);
-                        renderer.clear();
-                        postQuad.material = godrayMaterial;
-                        renderer.render(postScene, postCamera);
-                        currentTexture = fxTarget.texture;
-                    }
-
-                    let bloomTexture = bloomTargets[0]?.texture || null;
-                    if (SETTINGS.bloomEnabled) {
-                        bloomExtractMaterial.uniforms.threshold.value = SETTINGS.bloomThreshold;
-                        bloomExtractMaterial.uniforms.tInput.value = currentTexture;
-                        renderer.setRenderTarget(bloomTargets[0]);
-                        renderer.clear();
-                        postQuad.material = bloomExtractMaterial;
-                        renderer.render(postScene, postCamera);
-
-                        const texelSize = bloomBlurMaterial.uniforms.texelSize.value;
-                        texelSize.set(1 / bloomTargets[0].width, 1 / bloomTargets[0].height);
-                        bloomBlurMaterial.uniforms.radius.value = SETTINGS.bloomRadius * 10.0;
-
-                        bloomBlurMaterial.uniforms.tInput.value = bloomTargets[0].texture;
-                        bloomBlurMaterial.uniforms.direction.value.set(1, 0);
-                        renderer.setRenderTarget(bloomTargets[1]);
-                        renderer.clear();
-                        postQuad.material = bloomBlurMaterial;
-                        renderer.render(postScene, postCamera);
-
-                        bloomBlurMaterial.uniforms.tInput.value = bloomTargets[1].texture;
-                        bloomBlurMaterial.uniforms.direction.value.set(0, 1);
-                        renderer.setRenderTarget(bloomTargets[0]);
-                        renderer.clear();
-                        postQuad.material = bloomBlurMaterial;
-                        renderer.render(postScene, postCamera);
-                        bloomTexture = bloomTargets[0].texture;
-                    }
-
-                    renderer.setRenderTarget(null);
-                    finalCompositeMaterial.uniforms.tBase.value = currentTexture;
-                    finalCompositeMaterial.uniforms.tBloom.value = bloomTexture;
-                    finalCompositeMaterial.uniforms.bloomIntensity.value = SETTINGS.bloomIntensity;
-                    finalCompositeMaterial.uniforms.bloomEnabled.value = SETTINGS.bloomEnabled ? 1.0 : 0.0;
-                    finalCompositeMaterial.uniforms.dirtEnabled.value = SETTINGS.lensDirtEnabled ? 1.0 : 0.0;
-                    finalCompositeMaterial.uniforms.exposure.value = SETTINGS.toneMappingExposure;
-                    finalCompositeMaterial.uniforms.enableToneMapping.value = SETTINGS.toneMappingEnabled ? 1.0 : 0.0;
-                    postQuad.material = finalCompositeMaterial;
-                    renderer.render(postScene, postCamera);
 
                     // Torch overlay rendered after volumetric pass to preserve layering
                     if (torchActive && window.torchModel) {
