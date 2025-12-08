@@ -799,6 +799,14 @@
                         <label for="pixel-ratio-slider">Pixel Ratio: <span id="pixel-ratio-val">1.0</span>x</label>
                         <input type="range" id="pixel-ratio-slider" min="0.5" max="2.0" step="0.1" value="1.0" />
                     </div>
+                    <div class="setting-item">
+                        <label for="post-quality-select">Volumetric Quality</label>
+                        <select id="post-quality-select">
+                            <option value="low">Low (half res, 16 samples)</option>
+                            <option value="medium">Medium (0.75x res, 32 samples)</option>
+                            <option value="high">High (full res, 64 samples)</option>
+                        </select>
+                    </div>
                     <p id="shader-reload-notice" style="color: #ffcc00; display: none; font-size: 12px">Some shader changes require a reload to apply.</p>
                     <button class="menu-btn" id="btn-reset-shader" style="margin-top: 20px; background: #884400; border-color: #aa5500">Reset to Default</button>
                     <button class="menu-btn" id="btn-back-from-shader">Back</button>
@@ -984,6 +992,7 @@
                 shadowRadius: savedSettings.shadowRadius !== undefined ? savedSettings.shadowRadius : 0,
                 antialiasing: savedSettings.antialiasing !== undefined ? savedSettings.antialiasing : true,
                 pixelRatio: savedSettings.pixelRatio !== undefined ? savedSettings.pixelRatio : 1.0,
+                postProcessQuality: savedSettings.postProcessQuality || "medium",
             };
             const DEFAULTS = {
                 // Performance
@@ -1037,6 +1046,7 @@
                 shadowRadius: 0,
                 antialiasing: true,
                 pixelRatio: 1.0,
+                postProcessQuality: "medium",
             };
             const WORLD_DIMS = {
                 chunkSize: 16,
@@ -1047,6 +1057,15 @@
             };
             const CHUNK_BOUNDING_RADIUS = Math.sqrt(8 * 8 + Math.pow(WORLD_DIMS.chunkHeight * 0.5, 2) + 8 * 8);
             const WORLD_PIXEL_SIZE = 1 / SETTINGS.textureResolution;
+            const POSTPROCESS_QUALITY_PRESETS = {
+                low: { samples: 16, resolutionScale: 0.5 },
+                medium: { samples: 32, resolutionScale: 0.75 },
+                high: { samples: 64, resolutionScale: 1.0 },
+            };
+            const postProcessState = {
+                samples: POSTPROCESS_QUALITY_PRESETS[SETTINGS.postProcessQuality]?.samples || 32,
+                resolutionScale: POSTPROCESS_QUALITY_PRESETS[SETTINGS.postProcessQuality]?.resolutionScale || 0.75,
+            };
             let lastShadowState = {
                 targetX: -1,
                 targetY: -1,
@@ -1066,6 +1085,9 @@
             const shadowDesiredPos = new THREE.Vector3();
             const shadowAlong = new THREE.Vector3();
             const shadowInPlane = new THREE.Vector3();
+            const postSunDir = new THREE.Vector3();
+            const postMoonDir = new THREE.Vector3();
+            const postTempVec = new THREE.Vector3();
             let isFlying = false;
             let flyUp = false;
             let flyDown = false;
@@ -1140,6 +1162,163 @@
                 queueMaterialUpdate("chunk");
                 queueMaterialUpdate("water");
             }
+            function getPostProcessPreset(quality) {
+                return POSTPROCESS_QUALITY_PRESETS[quality] || POSTPROCESS_QUALITY_PRESETS.medium;
+            }
+            function applyPostProcessQuality() {
+                const preset = getPostProcessPreset(SETTINGS.postProcessQuality);
+                postProcessState.samples = preset.samples;
+                postProcessState.resolutionScale = preset.resolutionScale;
+                if (postMaterial) {
+                    postMaterial.uniforms.sampleCount.value = postProcessState.samples;
+                }
+                resizeRenderTargets();
+            }
+            function createMainRenderTarget(width, height) {
+                if (mainRenderTarget) mainRenderTarget.dispose();
+                const depthTexture = new THREE.DepthTexture(width, height);
+                depthTexture.type = THREE.UnsignedShortType;
+                const target = new THREE.WebGLRenderTarget(width, height, {
+                    depthTexture,
+                    depthBuffer: true,
+                    stencilBuffer: false,
+                });
+                target.texture.name = "VoxExMainColor";
+                target.depthTexture.name = "VoxExMainDepth";
+                target.setSize(width, height);
+                return target;
+            }
+            function createPostProcessTarget(width, height) {
+                if (postProcessTarget) postProcessTarget.dispose();
+                const target = new THREE.WebGLRenderTarget(width, height, {
+                    depthBuffer: false,
+                    stencilBuffer: false,
+                    magFilter: THREE.LinearFilter,
+                    minFilter: THREE.LinearFilter,
+                });
+                target.texture.name = "VoxExPostColor";
+                target.setSize(width, height);
+                return target;
+            }
+            function resizeRenderTargets() {
+                if (!renderer) return;
+                const pixelRatio = renderer.getPixelRatio();
+                const baseWidth = Math.max(1, Math.floor(window.innerWidth * pixelRatio));
+                const baseHeight = Math.max(1, Math.floor(window.innerHeight * pixelRatio));
+                if (!mainRenderTarget || mainRenderTarget.width !== baseWidth || mainRenderTarget.height !== baseHeight) {
+                    mainRenderTarget = createMainRenderTarget(baseWidth, baseHeight);
+                }
+                const scaledWidth = Math.max(1, Math.floor(baseWidth * postProcessState.resolutionScale));
+                const scaledHeight = Math.max(1, Math.floor(baseHeight * postProcessState.resolutionScale));
+                if (!postProcessTarget || postProcessTarget.width !== scaledWidth || postProcessTarget.height !== scaledHeight) {
+                    postProcessTarget = createPostProcessTarget(scaledWidth, scaledHeight);
+                }
+                if (postMaterial) {
+                    postMaterial.uniforms.resolution.value.set(scaledWidth, scaledHeight);
+                }
+            }
+            function initPostProcessing() {
+                if (postScene) return; // Already initialized
+                postScene = new THREE.Scene();
+                postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+                postMaterial = new THREE.ShaderMaterial({
+                    defines: { MAX_SAMPLES: 64 },
+                    uniforms: {
+                        tColor: { value: null },
+                        tDepth: { value: null },
+                        resolution: { value: new THREE.Vector2(1, 1) },
+                        projectionInverse: { value: new THREE.Matrix4() },
+                        cameraMatrixWorld: { value: new THREE.Matrix4() },
+                        cameraPos: { value: new THREE.Vector3() },
+                        sunDir: { value: new THREE.Vector3(0, 1, 0) },
+                        moonDir: { value: new THREE.Vector3(0, -1, 0) },
+                        sunIntensity: { value: 0.0 },
+                        moonIntensity: { value: 0.0 },
+                        scatterStrength: { value: 0.35 },
+                        maxDistance: { value: 160.0 },
+                        sampleCount: { value: postProcessState.samples },
+                        jitter: { value: 0.0 },
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = vec4(position.xy, 0.0, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        varying vec2 vUv;
+                        uniform sampler2D tColor;
+                        uniform sampler2D tDepth;
+                        uniform vec2 resolution;
+                        uniform mat4 projectionInverse;
+                        uniform mat4 cameraMatrixWorld;
+                        uniform vec3 cameraPos;
+                        uniform vec3 sunDir;
+                        uniform vec3 moonDir;
+                        uniform float sunIntensity;
+                        uniform float moonIntensity;
+                        uniform float scatterStrength;
+                        uniform float maxDistance;
+                        uniform float sampleCount;
+                        uniform float jitter;
+
+                        vec3 reconstructWorldPosition(vec2 uv, float depth) {
+                            float z = depth * 2.0 - 1.0;
+                            vec4 clip = vec4(uv * 2.0 - 1.0, z, 1.0);
+                            vec4 view = projectionInverse * clip;
+                            view /= view.w;
+                            vec4 world = cameraMatrixWorld * view;
+                            return world.xyz;
+                        }
+
+                        void main() {
+                            vec4 baseColor = texture2D(tColor, vUv);
+                            float depth = texture2D(tDepth, vUv).x;
+                            if (depth >= 1.0) {
+                                gl_FragColor = baseColor;
+                                return;
+                            }
+                            vec3 worldPos = reconstructWorldPosition(vUv, depth);
+                            vec3 viewDir = normalize(worldPos - cameraPos);
+                            float viewDistance = length(worldPos - cameraPos);
+                            float travel = min(viewDistance, maxDistance);
+                            int samples = int(sampleCount + 0.5);
+                            float invSamples = samples > 0 ? 1.0 / float(samples) : 1.0;
+
+                            vec3 lightDir = normalize(-sunDir);
+                            vec3 moonDirN = normalize(-moonDir);
+                            float lightWeight = max(dot(viewDir, lightDir), 0.0) * sunIntensity;
+                            float moonWeight = max(dot(viewDir, moonDirN), 0.0) * moonIntensity;
+
+                            float scatter = 0.0;
+                            float jitterOffset = fract(jitter);
+                            for (int i = 0; i < MAX_SAMPLES; i++) {
+                                if (i >= samples) break;
+                                float t = (float(i) + 0.5 + jitterOffset) * invSamples;
+                                float stepDist = t * travel;
+                                vec3 samplePos = cameraPos + viewDir * stepDist;
+                                float heightFactor = clamp((samplePos.y - 40.0) / 90.0, 0.0, 1.0);
+                                float localDensity = mix(0.035, 0.08, heightFactor);
+                                scatter += (lightWeight + moonWeight * 0.6) * localDensity * invSamples;
+                            }
+                            float fogFactor = clamp(scatter * scatterStrength, 0.0, 1.0);
+                            vec3 haze = mix(baseColor.rgb, vec3(1.0), fogFactor * 0.2);
+                            vec3 finalColor = mix(baseColor.rgb, haze, fogFactor);
+                            gl_FragColor = vec4(finalColor, baseColor.a);
+                        }
+                    `,
+                    depthWrite: false,
+                    depthTest: false,
+                });
+                const quadGeo = new THREE.PlaneGeometry(2, 2);
+                postQuad = new THREE.Mesh(quadGeo, postMaterial);
+                postQuad.frustumCulled = false;
+                postScene.add(postQuad);
+                postCopyMaterial = new THREE.MeshBasicMaterial({ map: null });
+                applyPostProcessQuality();
+                resizeRenderTargets();
+            }
             // --- OPTIMIZATION: Pre-computed AO power curve lookup table ---
             // Math.pow((3 - occlusionCount) / 3, 0.6) for occlusion counts 0-3
             // Avoids expensive Math.pow calls in tight rendering loop
@@ -1150,6 +1329,8 @@
                 0.15, // 3 occlusions: Use 0.15 for deep shadows
             ];
             let camera, scene, renderer, controls, raycaster;
+            let mainRenderTarget, postProcessTarget, postScene, postCamera, postQuad, postMaterial, postCopyMaterial;
+            let postProcessJitter = 0;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
             let moveForward = false;
@@ -2841,6 +3022,7 @@
                 renderer.shadowMap.enabled = SETTINGS.shadows;
                 if (SETTINGS.shadows) { renderer.shadowMap.type = THREE.PCFShadowMap; }
                 refreshPixelTextureAnisotropy();
+                initPostProcessing();
                 document.body.appendChild(renderer.domElement);
                 // 9. Controls & Pause Menu Logic
                 controls = new PointerLockControls(camera, document.body);
@@ -3086,11 +3268,13 @@
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 const pixelRatioSlider = document.getElementById("pixel-ratio-slider");
                 const pixelRatioVal = document.getElementById("pixel-ratio-val");
+                const postQualitySelect = document.getElementById("post-quality-select");
                 if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowQuality;
                 if (shadowBiasSlider && shadowBiasVal) { shadowBiasSlider.value = SETTINGS.shadowBias; shadowBiasVal.textContent = SETTINGS.shadowBias.toFixed(5); }
                 if (shadowRadiusSlider && shadowRadiusVal) { shadowRadiusSlider.value = SETTINGS.shadowRadius; shadowRadiusVal.textContent = SETTINGS.shadowRadius.toFixed(1); }
                 if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
                 if (pixelRatioSlider && pixelRatioVal) { pixelRatioSlider.value = SETTINGS.pixelRatio; pixelRatioVal.textContent = SETTINGS.pixelRatio.toFixed(1); }
+                if (postQualitySelect) postQualitySelect.value = SETTINGS.postProcessQuality;
                 // EVENT HANDLERS - Performance
                 frustumToggle?.addEventListener("change", () => { SETTINGS.enableFrustumCulling = frustumToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); invalidateFrustumCache(); });
                 lowerFpsSlider?.addEventListener("input", () => { SETTINGS.lowerBoundFPS = parseInt(lowerFpsSlider.value); lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
@@ -3179,7 +3363,12 @@
                     pixelRatioVal.textContent = SETTINGS.pixelRatio.toFixed(1);
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     // Apply pixel ratio immediately
-                    if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); }
+                    if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); resizeRenderTargets(); }
+                });
+                postQualitySelect?.addEventListener("change", () => {
+                    SETTINGS.postProcessQuality = postQualitySelect.value;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    applyPostProcessQuality();
                 });
                 // RESET FUNCTIONALITY
                 function updateUIFromSettings() {
@@ -3233,6 +3422,7 @@
                     if (shadowRadiusSlider && shadowRadiusVal) { shadowRadiusSlider.value = SETTINGS.shadowRadius; shadowRadiusVal.textContent = SETTINGS.shadowRadius.toFixed(1); }
                     if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
                     if (pixelRatioSlider && pixelRatioVal) { pixelRatioSlider.value = SETTINGS.pixelRatio; pixelRatioVal.textContent = SETTINGS.pixelRatio.toFixed(1); }
+                    if (postQualitySelect) postQualitySelect.value = SETTINGS.postProcessQuality;
                     // Apply to game systems
                     if (sun) sun.color.setHex(SETTINGS.sunColor);
                     if (moon) moon.color.setHex(SETTINGS.moonColor);
@@ -3240,7 +3430,8 @@
                     // Apply shadow settings
                     if (sun && sun.shadow) { sun.shadow.bias = SETTINGS.shadowBias; sun.shadow.radius = SETTINGS.shadowRadius; }
                     if (moon && moon.shadow) { moon.shadow.bias = SETTINGS.shadowBias; moon.shadow.radius = SETTINGS.shadowRadius; }
-                    if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); }
+                    if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); resizeRenderTargets(); }
+                    applyPostProcessQuality();
                     applyWaterMaterialSettings();
                     refreshSkyFogColorsFromSettings();
                     camera.fov = isSprinting ? SETTINGS.sprintFOV : SETTINGS.normalFOV;
@@ -3307,6 +3498,7 @@
                     SETTINGS.shadowRadius = DEFAULTS.shadowRadius;
                     SETTINGS.antialiasing = DEFAULTS.antialiasing;
                     SETTINGS.pixelRatio = DEFAULTS.pixelRatio;
+                    SETTINGS.postProcessQuality = DEFAULTS.postProcessQuality;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                     // Apply shadow settings immediately
@@ -7237,23 +7429,55 @@
                     updateZombies(clampedDt);
                     flushMaterialUpdates();
                     const renderStart = perfMonitor.start("rendering");
-                    // OPTIMIZATION: Only do two-pass rendering when torch viewmodel is active
+                    // Render world into an offscreen target to preserve depth for post effects
+                    camera.layers.set(0);
+                    renderer.setRenderTarget(mainRenderTarget);
+                    renderer.clear();
+                    renderer.render(scene, camera);
+
+                    // Update post-process uniforms for this frame
+                    if (postMaterial) {
+                        if (sun) {
+                            postSunDir.copy(sun.target.position).sub(sun.position).normalize();
+                            postMaterial.uniforms.sunDir.value.copy(postSunDir);
+                            postMaterial.uniforms.sunIntensity.value = sun.intensity;
+                        }
+                        if (moon) {
+                            postMoonDir.copy(moon.target.position).sub(moon.position).normalize();
+                            postMaterial.uniforms.moonDir.value.copy(postMoonDir);
+                            postMaterial.uniforms.moonIntensity.value = moon.intensity;
+                        }
+                        postMaterial.uniforms.tColor.value = mainRenderTarget.texture;
+                        postMaterial.uniforms.tDepth.value = mainRenderTarget.depthTexture;
+                        postMaterial.uniforms.projectionInverse.value.copy(camera.projectionMatrixInverse);
+                        postMaterial.uniforms.cameraMatrixWorld.value.copy(camera.matrixWorld);
+                        postMaterial.uniforms.cameraPos.value.copy(camera.position);
+                        postProcessJitter = (postProcessJitter + 1.37) % 4096;
+                        postMaterial.uniforms.jitter.value = postProcessJitter * 0.000244140625; // 1/4096
+                    }
+
+                    // Volumetric/atmospheric pass at scaled resolution
+                    renderer.setRenderTarget(postProcessTarget);
+                    renderer.clear();
+                    postQuad.material = postMaterial;
+                    renderer.render(postScene, postCamera);
+
+                    // Blit post result to the backbuffer
+                    renderer.setRenderTarget(null);
+                    postCopyMaterial.map = postProcessTarget.texture;
+                    postQuad.material = postCopyMaterial;
+                    renderer.render(postScene, postCamera);
+
+                    // Torch overlay rendered after volumetric pass to preserve layering
                     if (torchActive && window.torchModel) {
-                        // Two-pass rendering for proper viewmodel layering
-                        // Pass 1: Render world (Layer 0)
-                        camera.layers.set(0);
-                        renderer.render(scene, camera);
-                        // Pass 2: Render viewmodel/torch (Layer 1) on top without clearing color buffer
                         camera.layers.set(1);
-                        renderer.autoClear = false; // Don't auto-clear
-                        renderer.clearDepth(); // Clear only depth buffer, keep color buffer
+                        renderer.autoClear = false;
+                        renderer.clearDepth();
                         renderer.render(scene, camera);
-                        renderer.autoClear = true; // Restore auto-clear for next frame
-                        // Re-enable both layers for camera (needed for other code that might check layers)
-                        camera.layers.enable(0);
-                        camera.layers.enable(1);
-                    // Single-pass rendering when no viewmodel needed (50% faster)
-                    } else { camera.layers.enableAll(); renderer.render(scene, camera); }
+                        renderer.autoClear = true;
+                    }
+                    camera.layers.enable(0);
+                    camera.layers.enable(1);
                     perfMonitor.end("rendering", renderStart);
                 } catch (error) { logError("ANIMATE", "Error in animation loop", error);
                 } finally { perfMonitor.end("animate", frameStart); requestAnimationFrame(animate); }
@@ -7385,7 +7609,12 @@
                 selectedBlockId = slotToBlock[currentHotbarSlot - 1];
                 highlightSlot(currentHotbarSlot);
             };
-            function onWindowResize() {  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); }
+            function onWindowResize() {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+                resizeRenderTargets();
+            }
         </script>
     </body>
 </html>
