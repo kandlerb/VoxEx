@@ -5991,31 +5991,262 @@
                     }
                 }
             }
+            // Helper: Trilinear interpolation for cave noise (OPTIMIZED)
+            // Extracted to module level for clarity
+            function interpolateCaveNoise(lx, ly, lz, cache, cxDim, cxzStride) {
+                // Find surrounding grid indices using bitwise shift (>> 2 = / 4)
+                const ix0 = lx >> 2; // Math.floor(lx / 4)
+                const iy0 = ly >> 2;
+                const iz0 = lz >> 2;
+                const ix1 = ix0 + 1;
+                const iy1 = iy0 + 1;
+                const iz1 = iz0 + 1;
+                // Fractional position within cell (& 3 = % 4)
+                const fx = (lx & 3) * 0.25; // (lx % 4) / 4
+                const fy = (ly & 3) * 0.25;
+                const fz = (lz & 3) * 0.25;
+                // Pre-compute base indices for each corner
+                const base00 = ix0 + iz0 * cxDim;
+                const base01 = ix0 + iz1 * cxDim;
+                const base10 = ix1 + iz0 * cxDim;
+                const base11 = ix1 + iz1 * cxDim;
+                const yOff0 = iy0 * cxzStride;
+                const yOff1 = iy1 * cxzStride;
+                // Get 8 corner values
+                const c000 = cache[base00 + yOff0];
+                const c001 = cache[base01 + yOff0];
+                const c010 = cache[base00 + yOff1];
+                const c011 = cache[base01 + yOff1];
+                const c100 = cache[base10 + yOff0];
+                const c101 = cache[base11 + yOff0];
+                const c110 = cache[base10 + yOff1];
+                const c111 = cache[base11 + yOff1];
+                // Trilinear interpolation
+                const ifx = 1 - fx;
+                const c00 = c000 * ifx + c100 * fx;
+                const c01 = c001 * ifx + c101 * fx;
+                const c10 = c010 * ifx + c110 * fx;
+                const c11 = c011 * ifx + c111 * fx;
+                const ify = 1 - fy;
+                const c0 = c00 * ify + c10 * fy;
+                const c1 = c01 * ify + c11 * fy;
+                return c0 * (1 - fz) + c1 * fz;
+            }
+            // Pre-calculate expensive lookups: heights, rivers, biomes, cave width noise
+            function precalculateTerrainCaches(chunkSize, startX, startZ, seed) {
+                const heightCache = new Int16Array(chunkSize * chunkSize);
+                const riverCache = new Float32Array(chunkSize * chunkSize);
+                const biomeCache = new Array(chunkSize * chunkSize);
+                const widthNoiseCache = new Float32Array(chunkSize * chunkSize);
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const idx = lx + lz * chunkSize;
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
+                        heightCache[idx] = blendedHeight(gx, gz, seed);
+                        riverCache[idx] = getRiverFactor(gx, gz, seed);
+                        biomeCache[idx] = getBiomeParams(gx, gz);
+                        widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
+                    }
+                }
+                return { heightCache, riverCache, biomeCache, widthNoiseCache };
+            }
+            // Pre-calculate cave noise samples for interpolation
+            function precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ) {
+                const CAVE_STEP = 4;
+                const cxDim = Math.ceil(chunkSize / CAVE_STEP) + 1;
+                const cyDim = Math.ceil(chunkHeight / CAVE_STEP) + 1;
+                const czDim = Math.ceil(chunkSize / CAVE_STEP) + 1;
+                const caveCache1 = new Float32Array(cxDim * cyDim * czDim);
+                const caveCache2 = new Float32Array(cxDim * cyDim * czDim);
+                for (let sx = 0; sx <= chunkSize; sx += CAVE_STEP) {
+                    for (let sz = 0; sz <= chunkSize; sz += CAVE_STEP) {
+                        for (let sy = 0; sy <= chunkHeight; sy += CAVE_STEP) {
+                            const gx = startX + sx;
+                            const gy = sy - WORLD_DIMS.yOffset;
+                            const gz = startZ + sz;
+                            const caveScale = 0.02;
+                            const caveYScale = 0.03;
+                            const cx = gx * caveScale;
+                            const cy = gy * caveYScale;
+                            const cz = gz * caveScale;
+                            const idx = sx / CAVE_STEP + (sz / CAVE_STEP) * cxDim + (sy / CAVE_STEP) * cxDim * czDim;
+                            caveCache1[idx] = noise3D(cx, cy, cz);
+                            caveCache2[idx] = noise3D(cx + 123.45, cy + 456.78, cz + 789.01);
+                        }
+                    }
+                }
+                const cxzStride = cxDim * czDim;
+                return { caveCache1, caveCache2, cxDim, cxzStride };
+            }
+            // Generate terrain and carve caves
+            function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set) {
+                const { heightCache, riverCache, widthNoiseCache } = caches;
+                const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const idx = lx + lz * chunkSize;
+                        const worldTopY = heightCache[idx];
+                        const riverFactor = riverCache[idx];
+                        const bedrockY = 0;
+                        for (let ly = 0; ly < chunkHeight; ly++) {
+                            const worldY = ly - WORLD_DIMS.yOffset;
+                            let id = AIR;
+                            // Bedrock and terrain generation
+                            if (worldY <= bedrockY) {
+                                id = BEDROCK;
+                            } else if (worldY <= worldTopY) {
+                                const depth = worldTopY - worldY;
+                                if (depth === 0) {
+                                    // Surface block logic
+                                    if (riverFactor < 0.8) {
+                                        id = SAND;
+                                    } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) {
+                                        id = SAND;
+                                    } else {
+                                        id = GRASS;
+                                    }
+                                } else if (depth < 4) {
+                                    id = DIRT;
+                                } else {
+                                    id = STONE;
+                                }
+                            }
+                            // Cave carving
+                            if (id !== AIR && id !== BEDROCK && id !== WATER) {
+                                const fadeStart = 30;
+                                const fadeEnd = 50;
+                                if (worldY < fadeEnd) {
+                                    const n1 = interpolateCaveNoise(lx, ly, lz, caveCache1, cxDim, cxzStride);
+                                    const n2 = interpolateCaveNoise(lx, ly, lz, caveCache2, cxDim, cxzStride);
+                                    const widthNoise = widthNoiseCache[idx];
+                                    let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
+                                    // Surface fading
+                                    if (worldY > fadeStart) {
+                                        const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart);
+                                        threshold *= fade;
+                                    }
+                                    // Carve using vector magnitude
+                                    if (n1 * n1 + n2 * n2 < threshold) {
+                                        id = AIR;
+                                    }
+                                }
+                            }
+                            set(lx, ly, lz, id);
+                        }
+                    }
+                }
+            }
+            // Fill water in areas below sea level
+            function fillWaterPass(data, chunkSize, chunkHeight, heightCache) {
+                for (let wx = 0; wx < chunkSize; wx++) {
+                    for (let wz = 0; wz < chunkSize; wz++) {
+                        const worldTopY = heightCache[wx + wz * chunkSize];
+                        if (worldTopY >= WORLD_DIMS.seaLevel) continue;
+                        const waterStart = worldTopY + 1 + WORLD_DIMS.yOffset;
+                        const waterEnd = Math.min(WORLD_DIMS.seaLevel + WORLD_DIMS.yOffset, chunkHeight - 1);
+                        for (let wy = waterStart; wy <= waterEnd; wy++) {
+                            const waterIdx = wx + wz * chunkSize + wy * chunkSize * chunkSize;
+                            if (data[waterIdx] === AIR) data[waterIdx] = WATER;
+                        }
+                    }
+                }
+            }
+            // Generate trees and decorations
+            function generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks) {
+                const { heightCache, riverCache, biomeCache } = caches;
+                // Setup biome decorators
+                for (const b of worldConfig.biomes) {
+                    if (b.name === "forests") b.decorateColumn = forestDecorateColumn;
+                    else b.decorateColumn = null;
+                }
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const idx = lx + lz * chunkSize;
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
+                        const biome = biomeCache[idx];
+                        const riverFactor = riverCache[idx];
+                        // Skip default tree logic if special decorator used
+                        if (biome.decorateColumn) {
+                            const localTopY = findSurfaceY(data, lx, lz);
+                            biome.decorateColumn(cx, cz, gx, gz, lx, lz, localTopY, setAcrossChunks, get, seed);
+                            continue;
+                        }
+                        // Default tree logic
+                        const density = getTreeDensityForBiome(biome.name);
+                        if (density <= 0) continue;
+                        if (!getTreeMaskValueGlobal(gx, gz, seed)) continue;
+                        const p = treePlacementValue(gx, gz, seed);
+                        if (p > density) continue;
+                        if (riverFactor < 0.8) continue;
+                        const centerY = findSurfaceY(data, lx, lz);
+                        if (centerY <= 0) continue;
+                        const worldY = centerY - WORLD_DIMS.yOffset;
+                        const groundId = get(lx, worldY, lz);
+                        if (groundId !== GRASS && groundId !== DIRT) continue;
+                        // Border check to avoid cut-off trees
+                        const minBorder = 2;
+                        if (lx < minBorder || lx >= chunkSize - minBorder || lz < minBorder || lz >= chunkSize - minBorder) continue;
+                        // Build tree
+                        const n = noise2D(gx * 0.01 + seed, gz * 0.01 - seed);
+                        const val01 = (n + 1) * 0.5;
+                        const heightRange = TREE_CONFIG.trunkHeightMax - TREE_CONFIG.trunkHeightMin;
+                        const trunkHeight = TREE_CONFIG.trunkHeightMin + Math.floor(val01 * heightRange);
+                        const trunkBaseY = worldY + 1;
+                        if (trunkBaseY + trunkHeight + 2 >= chunkHeight) continue;
+                        // Build trunk
+                        for (let i = 0; i < trunkHeight; i++) {
+                            set(lx, trunkBaseY + i, lz, LOG);
+                        }
+                        // Build canopy
+                        const leavesBottom = trunkBaseY + trunkHeight - 2;
+                        const leavesTop = trunkBaseY + trunkHeight + 1;
+                        const radius = 2;
+                        for (let y = leavesBottom; y <= leavesTop; y++) {
+                            for (let x = -radius; x <= radius; x++) {
+                                for (let z = -radius; z <= radius; z++) {
+                                    // Rounded corners
+                                    if (Math.abs(x) === radius && Math.abs(z) === radius && Math.random() > 0.5) continue;
+                                    // Don't overwrite trunk
+                                    if (x === 0 && z === 0 && y < trunkBaseY + trunkHeight) continue;
+                                    setAcrossChunks(lx + x, y, lz + z, LEAVES);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             async function generateChunkData(cx, cz) {
                 try {
                     const key = getChunkKey(cx, cz);
-                    // 1. Try to load from cache first
+                    // Try to load from cache first
                     const cachedData = await loadChunkFromCache(key);
-                    // Use cached data, skip generation
                     if (cachedData) {
                         chunks.set(key, cachedData);
                         return;
                     }
-                    // 2. Generate new chunk if not in cache
+                    // Initialize chunk data and parameters
                     const chunkSize = WORLD_DIMS.chunkSize;
                     const chunkHeight = WORLD_DIMS.chunkHeight;
                     const data = new Uint8Array(chunkSize * chunkSize * chunkHeight);
                     const startX = cx * chunkSize;
                     const startZ = cz * chunkSize;
                     const seed = worldConfig.seed;
-                    const set = (x, y, z, id) => {     if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
+                    // Helper: Set block in current chunk
+                    const set = (x, y, z, id) => {
+                        if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
                         const idx = x + z * chunkSize + y * chunkSize * chunkSize;
                         data[idx] = id;
                     };
-                    const get = (x, y, z) => {     if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
+                    // Helper: Get block from current chunk
+                    const get = (x, y, z) => {
+                        if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
                         return data[x + z * chunkSize + y * chunkSize * chunkSize];
                     };
-                    const setAcrossChunks = (lx, ly, lz, id) => {     if (lx >= 0 && lx < WORLD_DIMS.chunkSize && lz >= 0 && lz < WORLD_DIMS.chunkSize) {
+                    // Helper: Set block across chunk boundaries (for tree decorations)
+                    const setAcrossChunks = (lx, ly, lz, id) => {
+                        if (lx >= 0 && lx < WORLD_DIMS.chunkSize && lz >= 0 && lz < WORLD_DIMS.chunkSize) {
                             set(lx, ly, lz, id);
                             return;
                         }
@@ -6033,256 +6264,49 @@
                                     releaseMeshForKey(nKey);
                                     releaseMeshForKey(nKey + "_WATER");
                                 }
-                                if (typeof chunkBuildQueue !== "undefined") {
-                                    // ONLY queue the neighbor for a rebuild if it is ALREADY VISIBLE (has a mesh)
-                                    // This prevents generating chunks infinitely into the distance just because a tree touched them.
-                                    if (chunkMeshes.has(nKey)) {
-                                        const alreadyQueued = queuedChunkKeys.has(nKey);
-                                        if (!alreadyQueued) {
-                                            chunkBuildQueue.push({
-                                                key: nKey,
-                                                cx: neighborCx,
-                                                cz: neighborCz,
-                                                dist: 0,
-                                            });
-                                            queuedChunkKeys.add(nKey);
-                                        }
+                                if (typeof chunkBuildQueue !== "undefined" && chunkMeshes.has(nKey)) {
+                                    const alreadyQueued = queuedChunkKeys.has(nKey);
+                                    if (!alreadyQueued) {
+                                        chunkBuildQueue.push({ key: nKey, cx: neighborCx, cz: neighborCz, dist: 0 });
+                                        queuedChunkKeys.add(nKey);
                                     }
                                 }
                             }
                         }
                     };
-                    // Add at top of generateChunkData(), after creating chunk data
-                    const CAVE_STEP = 4; // Sample every 4 blocks
-                    const cxDim = Math.ceil(chunkSize / CAVE_STEP) + 1; // 5 samples across
-                    const cyDim = Math.ceil(chunkHeight / CAVE_STEP) + 1; // 97 samples tall
-                    const czDim = Math.ceil(chunkSize / CAVE_STEP) + 1; // 5 samples deep
-                    // Allocate cache: 5×97×5 = 2,425 values (vs 98,304 blocks)
-                    const caveCache1 = new Float32Array(cxDim * cyDim * czDim);
-                    const caveCache2 = new Float32Array(cxDim * cyDim * czDim);
-                    // Pre-calculate all cave noise samples
-                    for (let sx = 0; sx <= chunkSize; sx += CAVE_STEP) {
-                        for (let sz = 0; sz <= chunkSize; sz += CAVE_STEP) {
-                            for (let sy = 0; sy <= chunkHeight; sy += CAVE_STEP) {
-                                const gx = startX + sx;
-                                const gy = sy - WORLD_DIMS.yOffset;
-                                const gz = startZ + sz;
-                                const caveScale = 0.02;
-                                const caveYScale = 0.03;
-                                const cx = gx * caveScale;
-                                const cy = gy * caveYScale;
-                                const cz = gz * caveScale;
-                                const idx = sx / CAVE_STEP + (sz / CAVE_STEP) * cxDim + (sy / CAVE_STEP) * cxDim * czDim;
-                                caveCache1[idx] = noise3D(cx, cy, cz);
-                                caveCache2[idx] = noise3D(cx + 123.45, cy + 456.78, cz + 789.01);
-                            }
-                        }
-                    }
-                    // OPTIMIZATION: Pre-compute cache stride values
-                    const cxzStride = cxDim * czDim; // For y-axis indexing
-                    // Helper: Trilinear interpolation (OPTIMIZED)
-                    // - Removed inline function creation
-                    // - Use bitwise right-shift for division by 4 (CAVE_STEP = 4 = 2^2)
-                    // - Pre-computed strides
-                    function getCaveNoise(lx, ly, lz, cache) {
-                        // Find surrounding grid indices using bitwise shift (>> 2 = / 4)
-                        const ix0 = lx >> 2; // Math.floor(lx / 4)
-                        const iy0 = ly >> 2; // Math.floor(ly / 4)
-                        const iz0 = lz >> 2; // Math.floor(lz / 4)
-                        const ix1 = ix0 + 1;
-                        const iy1 = iy0 + 1;
-                        const iz1 = iz0 + 1;
-                        // Fractional position within cell (& 3 = % 4)
-                        const fx = (lx & 3) * 0.25; // (lx % 4) / 4
-                        const fy = (ly & 3) * 0.25;
-                        const fz = (lz & 3) * 0.25;
-                        // Pre-compute base indices for each corner
-                        const base00 = ix0 + iz0 * cxDim;
-                        const base01 = ix0 + iz1 * cxDim;
-                        const base10 = ix1 + iz0 * cxDim;
-                        const base11 = ix1 + iz1 * cxDim;
-                        const yOff0 = iy0 * cxzStride;
-                        const yOff1 = iy1 * cxzStride;
-                        // Get 8 corner values (inline index calculation)
-                        const c000 = cache[base00 + yOff0];
-                        const c001 = cache[base01 + yOff0];
-                        const c010 = cache[base00 + yOff1];
-                        const c011 = cache[base01 + yOff1];
-                        const c100 = cache[base10 + yOff0];
-                        const c101 = cache[base11 + yOff0];
-                        const c110 = cache[base10 + yOff1];
-                        const c111 = cache[base11 + yOff1];
-                        // Trilinear interpolation (unchanged, already optimal)
-                        const ifx = 1 - fx;
-                        const c00 = c000 * ifx + c100 * fx;
-                        const c01 = c001 * ifx + c101 * fx;
-                        const c10 = c010 * ifx + c110 * fx;
-                        const c11 = c011 * ifx + c111 * fx;
-                        const ify = 1 - fy;
-                        const c0 = c00 * ify + c10 * fy;
-                        const c1 = c01 * ify + c11 * fy;
-                        return c0 * (1 - fz) + c1 * fz;
-                    }
-                    // --- OPTIMIZATION: Pre-calculate and cache expensive lookups ---
-                    const heightCache = new Int16Array(chunkSize * chunkSize);
-                    const riverCache = new Float32Array(chunkSize * chunkSize); // Cache river factor per column
-                    const biomeCache = new Array(chunkSize * chunkSize); // Cache biome params per column
-                    const widthNoiseCache = new Float32Array(chunkSize * chunkSize); // OPTIMIZATION: Cache cave width noise per column
-                    // Pre-calculate all heights, rivers, biomes, and cave width noise (single pass)
-                    for (let lx = 0; lx < chunkSize; lx++) {
-                        for (let lz = 0; lz < chunkSize; lz++) {
-                            const idx = lx + lz * chunkSize;
-                            const gx = startX + lx;
-                            const gz = startZ + lz;
-                            heightCache[idx] = blendedHeight(gx, gz, seed);
-                            riverCache[idx] = getRiverFactor(gx, gz, seed);
-                            biomeCache[idx] = getBiomeParams(gx, gz);
-                            // OPTIMIZATION: Cache width noise per column (was computed 128x per column before!)
-                            widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
-                        }
-                    }
-                    // --- PASS 3: SOLIDS ---
-                    for (let lx = 0; lx < chunkSize; lx++) {
-                        for (let lz = 0; lz < chunkSize; lz++) {
-                            const idx = lx + lz * chunkSize;
-                            const gx = startX + lx;
-                            const gz = startZ + lz;
-                            const worldTopY = heightCache[idx];
-                            const riverFactor = riverCache[idx]; // Use cached river value
-                            const bedrockY = 0;
-                            for (let ly = 0; ly < chunkHeight; ly++) {
-                                const worldY = ly - WORLD_DIMS.yOffset;
-                                let id = AIR;
-                                if (worldY <= bedrockY) { id = BEDROCK;
-                                } else if (worldY <= worldTopY) {
-                                    const depth = worldTopY - worldY;
-                                    if (depth === 0) {
-                                        // Surface block logic - Check for river bed (use cached value)
-                                        if (riverFactor < 0.8) { id = SAND;
-                                        // Near sea level = Sand
-                                        } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) { id = SAND;
-                                        } else { id = GRASS; }
-                                    } else if (depth < 4) { id = DIRT;
-                                    } else { id = STONE; }
-                                }
-                                // --- OPTIMIZED CAVE GENERATION ---
-                                // Reduced from 3 noise3D calls to 2 + cached 2D width variation
-                                if (id !== AIR && id !== BEDROCK && id !== WATER) {
-                                    // Early exit for surface blocks (caves don't exist above y=50)
-                                    const fadeStart = 30;
-                                    const fadeEnd = 50;
-                                    if (worldY < fadeEnd) {
-                                        // Two cheap array lookups + interpolation
-                                        const n1 = getCaveNoise(lx, ly, lz, caveCache1);
-                                        const n2 = getCaveNoise(lx, ly, lz, caveCache2);
-                                        // OPTIMIZATION: Use cached width noise (was computed 128x per column before!)
-                                        const widthNoise = widthNoiseCache[idx];
-                                        let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
-                                        // Surface fading
-                                        if (worldY > fadeStart) { const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart); threshold *= fade; }
-                                        // Carve using vector magnitude
-                                        if (n1 * n1 + n2 * n2 < threshold) { id = AIR; }
-                                    }
-                                }
-                                set(lx, ly, lz, id);
-                            }
-                        }
-                    }
-                    // --- PASS 2: FILL WATER ---
-                    // CRITICAL FIX: This was incorrectly nested inside the solid block loop!
-                    // Moving it here fixes 8.3 million unnecessary iterations per chunk
-                    for (let wx = 0; wx < chunkSize; wx++) {
-                        for (let wz = 0; wz < chunkSize; wz++) {
-                            const worldTopY = heightCache[wx + wz * chunkSize];
-                            if (worldTopY >= WORLD_DIMS.seaLevel) continue;
-                            // Fill water from surface+1 up to sea level
-                            const waterStart = worldTopY + 1 + WORLD_DIMS.yOffset;
-                            const waterEnd = Math.min(WORLD_DIMS.seaLevel + WORLD_DIMS.yOffset, chunkHeight - 1);
-                            for (let wy = waterStart; wy <= waterEnd; wy++) {
-                                const waterIdx = wx + wz * chunkSize + wy * chunkSize * chunkSize;
-                                if (data[waterIdx] === AIR) data[waterIdx] = WATER;
-                            }
-                        }
-                    }
-                    // --- PASS 3: DECORATIONS ---
-                    for (const b of worldConfig.biomes) { if (b.name === "forests") b.decorateColumn = forestDecorateColumn; else b.decorateColumn = null; }
-                    for (let lx = 0; lx < chunkSize; lx++) {
-                        for (let lz = 0; lz < chunkSize; lz++) {
-                            const idx = lx + lz * chunkSize;
-                            const gx = startX + lx;
-                            const gz = startZ + lz;
-                            const biome = biomeCache[idx]; // Use cached biome
-                            const riverFactor = riverCache[idx]; // Use cached river factor
-                            // Skip default tree logic if special decorator used
-                            if (biome.decorateColumn) { const localTopY = findSurfaceY(data, lx, lz); biome.decorateColumn(cx, cz, gx, gz, lx, lz, localTopY, setAcrossChunks, get, seed); continue; }
-                            // --- DEFAULT TREE LOGIC (Restored) ---
-                            // This runs for biomes without a custom decorator (plains, hills, etc.)
-                            const density = getTreeDensityForBiome(biome.name);
-                            if (density <= 0) continue;
-                            // Use global tree mask to decide placement
-                            if (!getTreeMaskValueGlobal(gx, gz, seed)) continue;
-                            // Additional random check against density
-                            const p = treePlacementValue(gx, gz, seed);
-                            if (p > density) continue;
-                            // River Check (use cached value)
-                            if (riverFactor < 0.8) continue;
-                            const centerY = findSurfaceY(data, lx, lz);
-                            if (centerY <= 0) continue;
-                            const worldY = centerY - WORLD_DIMS.yOffset;
-                            const groundId = get(lx, worldY, lz);
-                            // Only plant on GRASS or DIRT
-                            if (groundId !== GRASS && groundId !== DIRT) continue;
-                            // Don't plant too close to chunk border to avoid cut-off trees (simple solution)
-                            // (Ideally setAcrossChunks handles this, but for default logic we keep it simple)
-                            const minBorder = 2;
-                            if (lx < minBorder || lx >= chunkSize - minBorder || lz < minBorder || lz >= chunkSize - minBorder) continue;
-                            // Tree Properties
-                            const n = noise2D(gx * 0.01 + seed, gz * 0.01 - seed);
-                            const val01 = (n + 1) * 0.5;
-                            const heightRange = TREE_CONFIG.trunkHeightMax - TREE_CONFIG.trunkHeightMin;
-                            const trunkHeight = TREE_CONFIG.trunkHeightMin + Math.floor(val01 * heightRange);
-                            const trunkBaseY = worldY + 1;
-                            if (trunkBaseY + trunkHeight + 2 >= chunkHeight) continue;
-                            // Build Trunk
-                            for (let i = 0; i < trunkHeight; i++) { set(lx, trunkBaseY + i, lz, LOG); }
-                            // Build Simple Canopy
-                            const leavesBottom = trunkBaseY + trunkHeight - 2;
-                            const leavesTop = trunkBaseY + trunkHeight + 1;
-                            const radius = 2;
-                            for (let y = leavesBottom; y <= leavesTop; y++) {
-                                for (let x = -radius; x <= radius; x++) {
-                                    for (let z = -radius; z <= radius; z++) {
-                                        // Rounded corners
-                                        if (Math.abs(x) === radius && Math.abs(z) === radius && Math.random() > 0.5) continue;
-                                        // Don't overwrite trunk
-                                        if (x === 0 && z === 0 && y < trunkBaseY + trunkHeight) continue;
-                                        // Use setAcrossChunks to handle leaves spilling over borders
-                                        setAcrossChunks(lx + x, y, lz + z, LEAVES);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Pre-calculate all caches
+                    const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seed);
+                    const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
+                    // Generate terrain with caves
+                    generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set);
+                    // Fill water
+                    fillWaterPass(data, chunkSize, chunkHeight, caches.heightCache);
+                    // Generate decorations (trees, etc.)
+                    generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks);
                     // Create chunk with light data
                     const size = chunkSize * chunkSize * chunkHeight;
-                    const chunk = { blocks: data, skyLight: new Uint8Array(size), blockLight: new Uint8Array(size), };
-                    // Calculate initial sunlight for this chunk
+                    const chunk = {
+                        blocks: data,
+                        skyLight: new Uint8Array(size),
+                        blockLight: new Uint8Array(size),
+                    };
+                    // Calculate lighting
                     calculateChunkSunlight(chunk, chunkSize, chunkHeight);
                     calculateBlockLight(chunk, chunkSize, chunkHeight);
                     chunks.set(key, chunk);
-                    // Mark as pristine (unmodified generated chunk)
                     pristineChunks.add(key);
-                    // Save to cache (can be skipped during batch operations)
-                    // Individual saves are still used during regular gameplay
                     await saveChunkToCache(key, chunk);
                     return chunk;
                 } catch (error) {
                     logError("GENERATE_CHUNK", `Error generating chunk data (${cx}, ${cz})`, error);
-                    // Return an empty chunk as fallback
                     const chunkSize = WORLD_DIMS.chunkSize;
                     const chunkHeight = WORLD_DIMS.chunkHeight;
                     const emptyData = new Uint8Array(chunkSize * chunkSize * chunkHeight);
-                    return { blocks: emptyData, skyLight: new Uint8Array(chunkSize * chunkSize * chunkHeight).fill(15), blockLight: new Uint8Array(chunkSize * chunkSize * chunkHeight), };
+                    return {
+                        blocks: emptyData,
+                        skyLight: new Uint8Array(chunkSize * chunkSize * chunkHeight).fill(15),
+                        blockLight: new Uint8Array(chunkSize * chunkSize * chunkHeight),
+                    };
                 }
             }
             function addFace(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, lx, ly, lz, blockId, vIdx, uvIdx, cIdx, lightGetter) {
