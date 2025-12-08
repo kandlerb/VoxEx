@@ -1322,7 +1322,9 @@
             let postProcessJitter = 0;
             let postProcessHealthy = false;
             let postProcessRetryPending = true;
+            let depthTextureSupported = true;
             let debugWarningMessage = "";
+            let persistentWarningMessage = "";
             const postTmpVec = new THREE.Vector3();
             const postTmpVec4 = new THREE.Vector4();
             const postSunScreenPos = new THREE.Vector2();
@@ -1557,7 +1559,8 @@
             }
             function createMainRenderTarget(width, height) {
                 if (mainRenderTarget) mainRenderTarget.dispose();
-                const depthTexture = SETTINGS.volumetricDepthTexture ? new THREE.DepthTexture(width, height) : null;
+                const wantsDepthTexture = depthTextureSupported && SETTINGS.volumetricDepthTexture;
+                const depthTexture = wantsDepthTexture ? new THREE.DepthTexture(width, height) : null;
                 if (depthTexture) depthTexture.type = THREE.UnsignedShortType;
                 const target = new THREE.WebGLRenderTarget(width, height, {
                     depthTexture: depthTexture || undefined,
@@ -1611,7 +1614,7 @@
                 const pixelRatio = renderer.getPixelRatio();
                 const baseWidth = Math.max(1, Math.floor(window.innerWidth * pixelRatio));
                 const baseHeight = Math.max(1, Math.floor(window.innerHeight * pixelRatio));
-                const wantsDepthTexture = SETTINGS.volumetricDepthTexture;
+                const wantsDepthTexture = depthTextureSupported && SETTINGS.volumetricDepthTexture;
                 const hasDepthTexture = mainRenderTarget && !!mainRenderTarget.depthTexture;
                 if (
                     !mainRenderTarget ||
@@ -1679,7 +1682,11 @@
             function markPostProcessHealthy() {
                 postProcessHealthy = true;
                 postProcessRetryPending = false;
-                setDebugWarning("");
+                if (persistentWarningMessage) {
+                    setDebugWarning(persistentWarningMessage);
+                } else {
+                    setDebugWarning("");
+                }
             }
             function requestPostProcessRetry() {
                 postProcessRetryPending = true;
@@ -1720,7 +1727,7 @@
                 const initialSamples = clampVolumetricSamples(postProcessState.samples);
                 postProcessState.samples = initialSamples;
                 const initialPointLights = Math.max(0, Math.min(volumetricLightBlock.pointLightCount, MAX_VOLUMETRIC_POINT_LIGHTS));
-                const useDepthTextures = SETTINGS.volumetricDepthTexture === true;
+                const useDepthTextures = depthTextureSupported && SETTINGS.volumetricDepthTexture === true;
                 postProcessState.usesDepthTexture = useDepthTextures;
                 try {
                     postScene = new THREE.Scene();
@@ -2070,7 +2077,7 @@
             }
             function ensurePostProcessingReady() {
                 if (!renderer) return false;
-                const wantsDepthVariant = SETTINGS.volumetricDepthTexture === true;
+                const wantsDepthVariant = depthTextureSupported && SETTINGS.volumetricDepthTexture === true;
                 const variantMismatch = postScene && postProcessState.usesDepthTexture !== wantsDepthVariant;
                 if (variantMismatch) {
                     disposePostProcessResources();
@@ -2117,7 +2124,35 @@
             }
             function logDebug(message, ...args) { if (isDebug) { console.log(`[VoxEx Debug]:`, message, ...args); }}
             function logWarn(message, ...args) { if (isDebug) { console.warn(`[VoxEx Warning]:`, message, ...args); }}
-            function setDebugWarning(message) { debugWarningMessage = message || ""; }
+            function setDebugWarning(message, options = {}) {
+                const { persistent = false } = options;
+                if (persistent) persistentWarningMessage = message || "";
+                if (!message && persistentWarningMessage) {
+                    debugWarningMessage = persistentWarningMessage;
+                } else {
+                    debugWarningMessage = message || "";
+                }
+            }
+            function applyDepthTextureSupportUIState() {
+                const volumetricDepthToggle = document.getElementById("volumetric-depth-toggle");
+                const toggleRow = volumetricDepthToggle?.closest(".setting-row") || volumetricDepthToggle?.parentElement;
+                if (!depthTextureSupported) {
+                    if (volumetricDepthToggle) {
+                        volumetricDepthToggle.checked = false;
+                        volumetricDepthToggle.disabled = true;
+                    }
+                    if (toggleRow) {
+                        toggleRow.style.opacity = "0.5";
+                        toggleRow.style.pointerEvents = "none";
+                    }
+                } else {
+                    if (volumetricDepthToggle) volumetricDepthToggle.disabled = false;
+                    if (toggleRow) {
+                        toggleRow.style.opacity = "";
+                        toggleRow.style.pointerEvents = "";
+                    }
+                }
+            }
             const shaderRecoveryState = {
                 chunk: { fallbackActive: false, lastFailure: 0 },
                 water: { fallbackActive: false, lastFailure: 0 },
@@ -3949,6 +3984,19 @@
                 renderer.shadowMap.enabled = SETTINGS.shadows;
                 if (SETTINGS.shadows) { renderer.shadowMap.type = THREE.PCFShadowMap; }
                 refreshPixelTextureAnisotropy();
+                const gl = renderer.getContext();
+                const isWebGL2 = typeof WebGL2RenderingContext !== "undefined" && gl instanceof WebGL2RenderingContext;
+                const depthTextureExtension = gl?.getExtension("WEBGL_depth_texture") || gl?.getExtension("WEBKIT_WEBGL_depth_texture");
+                depthTextureSupported = !!(isWebGL2 || depthTextureExtension);
+                if (!depthTextureSupported) {
+                    const warningMessage = "Depth textures are not supported in this browser; depth-based volumetrics disabled.";
+                    SETTINGS.volumetricDepthTexture = false;
+                    postProcessState.usesDepthTexture = false;
+                    setDebugWarning(warningMessage, { persistent: true });
+                    console.warn(warningMessage);
+                    applyDepthTextureSupportUIState();
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                }
                 initPostProcessing();
                 document.body.appendChild(renderer.domElement);
                 // 9. Controls & Pause Menu Logic
@@ -4274,6 +4322,7 @@
                 if (volumetricResolutionSlider && volumetricResolutionVal) { volumetricResolutionSlider.value = postProcessState.resolutionScale; volumetricResolutionVal.textContent = postProcessState.resolutionScale.toFixed(2); }
                 if (volumetricMaxDistanceSlider && volumetricMaxDistanceVal) { volumetricMaxDistanceSlider.value = SETTINGS.volumetricMaxDistance; volumetricMaxDistanceVal.textContent = SETTINGS.volumetricMaxDistance; }
                 if (volumetricDepthToggle) volumetricDepthToggle.checked = SETTINGS.volumetricDepthTexture;
+                applyDepthTextureSupportUIState();
                 // EVENT HANDLERS - Performance
                 frustumToggle?.addEventListener("change", () => { SETTINGS.enableFrustumCulling = frustumToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); invalidateFrustumCache(); });
                 lowerFpsSlider?.addEventListener("input", () => { SETTINGS.lowerBoundFPS = parseInt(lowerFpsSlider.value); lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
@@ -4497,6 +4546,10 @@
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                 });
                 volumetricDepthToggle?.addEventListener("change", () => {
+                    if (!depthTextureSupported) {
+                        volumetricDepthToggle.checked = false;
+                        return;
+                    }
                     SETTINGS.volumetricDepthTexture = volumetricDepthToggle.checked;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     const shaderReloadNotice = document.getElementById("shader-reload-notice");
@@ -4606,6 +4659,7 @@
                     if (volumetricResolutionSlider && volumetricResolutionVal) { volumetricResolutionSlider.value = SETTINGS.volumetricResolutionScale; volumetricResolutionVal.textContent = SETTINGS.volumetricResolutionScale.toFixed(2); }
                     if (volumetricMaxDistanceSlider && volumetricMaxDistanceVal) { volumetricMaxDistanceSlider.value = SETTINGS.volumetricMaxDistance; volumetricMaxDistanceVal.textContent = SETTINGS.volumetricMaxDistance; }
                     if (volumetricDepthToggle) volumetricDepthToggle.checked = SETTINGS.volumetricDepthTexture;
+                    applyDepthTextureSupportUIState();
                     // Apply to game systems
                     if (sun) sun.color.setHex(SETTINGS.sunColor);
                     if (moon) moon.color.setHex(SETTINGS.moonColor);
