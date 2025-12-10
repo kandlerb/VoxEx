@@ -1411,6 +1411,9 @@
             };
             const renderChunkTrace = new Map();
             const pendingLightChunks = new Map(); // key -> { count, firstSeen, lastSeen, lastForced }
+            const blockLightRecalcQueue = [];
+            const queuedBlockLightChunks = new Set();
+            const BLOCK_LIGHT_RECALC_BUDGET = 1;
             const forceLightingBypassKeys = new Set();
             const LIGHT_PENDING_GRACE_MS = 3000; // Allow lighting a few seconds to finish before forcing rebuilds
             let updateTimeout = null; // Debounced Chunk Update System
@@ -1450,6 +1453,43 @@
                     pendingLightChunks.delete(chunkKey);
                     flushDeferredChunkUpdatesAround(chunkKey);
                     flushAllDeferredChunkUpdates("light-cleared");
+                }
+            }
+            function ensureChunkMetadata(chunk, cx, cz) {
+                if (!chunk) return;
+                if (chunk.cx !== cx) chunk.cx = cx;
+                if (chunk.cz !== cz) chunk.cz = cz;
+                if (!Number.isInteger(chunk.startX)) chunk.startX = cx * WORLD_DIMS.chunkSize;
+                if (!Number.isInteger(chunk.startZ)) chunk.startZ = cz * WORLD_DIMS.chunkSize;
+            }
+            function enqueueBlockLightRecalc(cx, cz, reason = "edit") {
+                const key = getChunkKey(cx, cz);
+                if (queuedBlockLightChunks.has(key)) return;
+                const chunk = chunks.get(key);
+                if (!chunk || !chunk.blocks) return; // Only process loaded chunks with block data
+                ensureChunkMetadata(chunk, cx, cz);
+                queuedBlockLightChunks.add(key);
+                markPendingLight(key);
+                blockLightRecalcQueue.push({ key, cx, cz, reason });
+            }
+            function enqueueBlockLightNeighbors(cx, cz, reason = "edit") {
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        enqueueBlockLightRecalc(cx + dx, cz + dz, reason);
+                    }
+                }
+            }
+            function processBlockLightQueue(budget = BLOCK_LIGHT_RECALC_BUDGET) {
+                let processed = 0;
+                while (processed < budget && blockLightRecalcQueue.length > 0) {
+                    const job = blockLightRecalcQueue.shift();
+                    queuedBlockLightChunks.delete(job.key);
+                    const chunk = chunks.get(job.key);
+                    if (!chunk || !chunk.blocks) { clearPendingLight(job.key); continue; }
+                    ensureChunkMetadata(chunk, job.cx, job.cz);
+                    calculateBlockLight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                    clearPendingLight(job.key);
+                    processed++;
                 }
             }
             function flushAllDeferredChunkUpdates(reason = "idle") {
@@ -2756,6 +2796,7 @@
                     if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                     if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
                 }
+                ensureChunkMetadata(chunk, cx, cz);
                 const lx = ((x % 16) + 16) % 16;
                 const lz = ((z % 16) + 16) % 16;
                 const idx = lx + lz * 16 + ly * 256;
@@ -2772,6 +2813,11 @@
                 modifiedChunks.add(key);
                 pristineChunks.delete(key);
                 activeChunks.add(key);
+
+                const blockLightTracker = createLightTaskTracker([key]);
+                updateBlockLightAt(x, y, z, oldId, id, blockLightTracker);
+                finalizeLightTracker(blockLightTracker);
+                enqueueBlockLightNeighbors(cx, cz, "set-block");
             }
             function rebuildAllVisibleChunks() {
                 logDebug("Rebuilding all visible chunks for settings change...");
@@ -8005,6 +8051,7 @@
             // Update chunk system (mesh building, updates, reconciliation)
             function updateChunkSystem(time, prevTime) {
                 heartbeatChunkUpdates(time);
+                processBlockLightQueue();
                 processLightQueue();
                 // Throttle mesh building - prioritize edits even when FPS dips
                 const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
