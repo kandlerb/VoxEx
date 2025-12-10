@@ -2866,11 +2866,13 @@
                 }
             }
             function applyTorchSettingsToLights() {
+                // Unified torch intensity - both handheld and placed torches use the same brightness
+                const torchIntensityValue = SETTINGS.torchIntensity * 2;
                 // Update handheld torch light
                 if (torchLight) {
                     torchLight.color.setHex(SETTINGS.torchColor);
                     torchLight.distance = SETTINGS.torchRange;
-                    if (torchActive) torchLight.intensity = SETTINGS.torchIntensity;
+                    if (torchActive) torchLight.intensity = torchIntensityValue;
                 }
                 // Update all placed torch lights
                 chunkTorches.forEach((torches) => {
@@ -2878,7 +2880,7 @@
                         torch.traverse((node) => {
                             if (!node.isPointLight) return;
                             node.color.setHex(SETTINGS.torchColor);
-                            node.intensity = SETTINGS.torchIntensity * 2;
+                            node.intensity = torchIntensityValue;
                             node.distance = SETTINGS.torchRange;
                             node.castShadow = SETTINGS.shadows;
                             if (node.shadow) {
@@ -6867,36 +6869,94 @@
             }
             // Calculate block light for a chunk - light emitted by torches and other light sources
             // OPTIMIZATION: Uses BFS queue with early termination instead of fixed 15 passes
+            // Now supports cross-chunk propagation for seamless lighting across chunk boundaries
             function calculateBlockLight(chunk, chunkSize, chunkHeight) {
                 const blocks = chunk.blocks || chunk;
                 const blockLight = chunk.blockLight || (chunk.blockLight = new Uint8Array(blocks.length).fill(0));
                 blockLight.fill(0);
                 const cs = chunkSize; // 16
                 const torchLevel = getTorchBlockLightLevel();
+                // Get chunk world coordinates for cross-chunk propagation
+                const chunkCx = chunk.cx !== undefined ? chunk.cx : 0;
+                const chunkCz = chunk.cz !== undefined ? chunk.cz : 0;
+                const startX = chunkCx * cs;
+                const startZ = chunkCz * cs;
+                const yOffset_world = WORLD_DIMS.yOffset;
+                // Track neighbor chunks that received light (for scheduling rebuilds)
+                const affectedNeighborChunks = new Set();
                 // BFS queue - stores [x, y, z, light] as flat array for performance and is pooled to reduce GC
                 const queue = blockLightQueuePool.pop() || [];
                 queue.length = 0;
-                const maxQueueLength = Math.max(4, SETTINGS?.lighting?.blockQueueBudget ?? 98304);
-                const falloffMode = SETTINGS?.lighting?.blockFalloff || "linear";
-                const applyFalloff = falloffMode === "quadratic"
-                    ? (light, loss) => light - loss * loss
-                    : (light, loss) => light - loss;
-                // Slightly softer step losses so torches wrap and bleed around corners more naturally
-                const baseStepLoss = 0.75;
-                const diagonalPenalty = 1.25;
+                const maxQueueLength = Math.max(4, SETTINGS?.lighting?.blockQueueBudget ?? 131072);
+                // Smoother falloff for softer light diffusion (reduced from 0.75 for gentler shadows)
+                const baseStepLoss = 0.5;
+                const diagonalPenalty = 0.75;
                 const pushIfBudgetAllows = (x, y, z, light) => {
                     if (queue.length + 4 > maxQueueLength) return false;
                     queue.push(x, y, z, light);
                     return true;
                 };
-                // Step 1: Find all light sources and seed the queue
+                // Helper to get block ID at local or neighbor chunk coordinates
+                const getBlockAtLocal = (lx, ly, lz) => {
+                    if (ly < 0 || ly >= chunkHeight) return STONE; // Treat out-of-bounds Y as solid
+                    if (lx >= 0 && lx < cs && lz >= 0 && lz < cs) {
+                        return blocks[lx + (lz << 4) + (ly << 8)];
+                    }
+                    // Cross-chunk lookup using global coordinates
+                    const gx = startX + lx;
+                    const gz = startZ + lz;
+                    const gy = ly - yOffset_world;
+                    const blockId = getBlock(gx, gy, gz);
+                    return blockId !== undefined ? blockId : STONE;
+                };
+                // Helper to set block light at local or neighbor chunk coordinates
+                const setLightAtLocal = (lx, ly, lz, light) => {
+                    if (ly < 0 || ly >= chunkHeight) return false;
+                    if (lx >= 0 && lx < cs && lz >= 0 && lz < cs) {
+                        const idx = lx + (lz << 4) + (ly << 8);
+                        if (light > blockLight[idx]) {
+                            blockLight[idx] = light;
+                            return true;
+                        }
+                        return false;
+                    }
+                    // Cross-chunk: use global setBlockLight
+                    const gx = startX + lx;
+                    const gz = startZ + lz;
+                    const gy = ly - yOffset_world;
+                    const currentLight = getBlockLight(gx, gy, gz);
+                    if (light > currentLight) {
+                        setBlockLight(gx, gy, gz, light);
+                        // Track affected neighbor chunk
+                        const ncx = Math.floor(gx / cs);
+                        const ncz = Math.floor(gz / cs);
+                        if (ncx !== chunkCx || ncz !== chunkCz) {
+                            affectedNeighborChunks.add(getChunkKey(ncx, ncz));
+                        }
+                        return true;
+                    }
+                    return false;
+                };
+                // Helper to get current light at local or neighbor coordinates
+                const getLightAtLocal = (lx, ly, lz) => {
+                    if (ly < 0 || ly >= chunkHeight) return 0;
+                    if (lx >= 0 && lx < cs && lz >= 0 && lz < cs) {
+                        return blockLight[lx + (lz << 4) + (ly << 8)];
+                    }
+                    // Cross-chunk lookup
+                    const gx = startX + lx;
+                    const gz = startZ + lz;
+                    const gy = ly - yOffset_world;
+                    return getBlockLight(gx, gy, gz);
+                };
+                // Step 1: Find all light sources in this chunk and seed the queue
                 if (torchLevel > 0) {
                     for (let ly = 0; ly < chunkHeight; ly++) {
-                        const yOffset = ly << 8;
+                        const yOff = ly << 8;
                         for (let lz = 0; lz < cs; lz++) {
-                            const zOffset = lz << 4;
+                            const zOff = lz << 4;
                             for (let lx = 0; lx < cs; lx++) {
-                                const idx = lx + zOffset + yOffset;
+                                const idx = lx + zOff + yOff;
                                 if (blocks[idx] === TORCH) {
                                     blockLight[idx] = torchLevel;
                                     pushIfBudgetAllows(lx, ly, lz, torchLevel);
@@ -6905,55 +6965,117 @@
                         }
                     }
                 }
+                // Also seed from neighboring chunks' edge light (incoming light)
+                // This allows light from adjacent chunks to flow into this chunk
+                const neighborDirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+                for (const [dx, dz] of neighborDirs) {
+                    const ncx = chunkCx + dx;
+                    const ncz = chunkCz + dz;
+                    const nKey = getChunkKey(ncx, ncz);
+                    const neighborChunk = chunks.get(nKey);
+                    if (!neighborChunk || !neighborChunk.blockLight) continue;
+                    const nBlocks = neighborChunk.blocks || neighborChunk;
+                    const nBlockLight = neighborChunk.blockLight;
+                    // Determine which edge to sample from neighbor
+                    const edgeLx = dx === -1 ? 15 : dx === 1 ? 0 : -1;
+                    const edgeLz = dz === -1 ? 15 : dz === 1 ? 0 : -1;
+                    for (let ly = 0; ly < chunkHeight; ly++) {
+                        const yOff = ly << 8;
+                        if (edgeLx >= 0) {
+                            // Sample vertical edge (X boundary)
+                            for (let z = 0; z < cs; z++) {
+                                const nIdx = edgeLx + (z << 4) + yOff;
+                                const nLight = nBlockLight[nIdx];
+                                if (nLight > 1) {
+                                    // Propagate into this chunk
+                                    const thisLx = dx === -1 ? 0 : cs - 1;
+                                    const thisIdx = thisLx + (z << 4) + yOff;
+                                    const thisBlockId = blocks[thisIdx];
+                                    if (IS_TRANSPARENT[thisBlockId]) {
+                                        const propagated = clampBlockLight(Math.round(nLight - baseStepLoss));
+                                        if (propagated > blockLight[thisIdx]) {
+                                            blockLight[thisIdx] = propagated;
+                                            pushIfBudgetAllows(thisLx, ly, z, propagated);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (edgeLz >= 0) {
+                            // Sample horizontal edge (Z boundary)
+                            for (let x = 0; x < cs; x++) {
+                                const nIdx = x + (edgeLz << 4) + yOff;
+                                const nLight = nBlockLight[nIdx];
+                                if (nLight > 1) {
+                                    // Propagate into this chunk
+                                    const thisLz = dz === -1 ? 0 : cs - 1;
+                                    const thisIdx = x + (thisLz << 4) + yOff;
+                                    const thisBlockId = blocks[thisIdx];
+                                    if (IS_TRANSPARENT[thisBlockId]) {
+                                        const propagated = clampBlockLight(Math.round(nLight - baseStepLoss));
+                                        if (propagated > blockLight[thisIdx]) {
+                                            blockLight[thisIdx] = propagated;
+                                            pushIfBudgetAllows(x, ly, thisLz, propagated);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 // Step 2: BFS propagation with attenuation-aware falloff
+                // Now propagates across chunk boundaries for seamless lighting
                 let qIdx = 0;
                 while (qIdx < queue.length) {
                     const lx = queue[qIdx++];
                     const ly = queue[qIdx++];
                     const lz = queue[qIdx++];
                     const currentLight = clampBlockLight(queue[qIdx++]);
-                    if (currentLight <= 0) continue;
-                    // OPTIMIZATION: Use pre-computed NEIGHBOR_OFFSETS constant
+                    if (currentLight <= 1) continue; // Need light > 1 to propagate
+                    // Cardinal directions (6 neighbors)
                     for (let i = 0; i < 6; i++) {
                         const offset = NEIGHBOR_OFFSETS[i];
                         const nx = lx + offset[0];
                         const ny = ly + offset[1];
                         const nz = lz + offset[2];
-                        // Bounds check
-                        if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
-                        const nIdx = nx + (nz << 4) + (ny << 8);
-                        const nBlockId = blocks[nIdx];
+                        // Height bounds check (Y is always within single chunk)
+                        if (ny < 0 || ny >= chunkHeight) continue;
+                        const nBlockId = getBlockAtLocal(nx, ny, nz);
                         // Only spread to transparent blocks
                         if (!IS_TRANSPARENT[nBlockId]) continue;
                         const blockLoss = BLOCKLIGHT_ATTENUATION[nBlockId] || 0;
-                        const totalLoss = Math.max(0, baseStepLoss + blockLoss);
-                        const propagatedLight = clampBlockLight(Math.max(0, Math.round(applyFalloff(currentLight, totalLoss))));
-                        // Only update if we can improve the neighbor's light
-                        if (propagatedLight > blockLight[nIdx]) {
-                            blockLight[nIdx] = propagatedLight;
-                            // Only continue propagating if light > 0
-                            if (propagatedLight > 0) {
-                                pushIfBudgetAllows(nx, ny, nz, propagatedLight);
+                        const totalLoss = baseStepLoss + blockLoss;
+                        const propagatedLight = clampBlockLight(Math.max(0, Math.round(currentLight - totalLoss)));
+                        if (propagatedLight <= 0) continue;
+                        const existingLight = getLightAtLocal(nx, ny, nz);
+                        if (propagatedLight > existingLight) {
+                            if (setLightAtLocal(nx, ny, nz, propagatedLight)) {
+                                // Only continue BFS within this chunk (cross-chunk handled by neighbor seeding)
+                                if (nx >= 0 && nx < cs && nz >= 0 && nz < cs) {
+                                    pushIfBudgetAllows(nx, ny, nz, propagatedLight);
+                                }
                             }
                         }
                     }
-                    // Diagonal diffusion with extra attenuation so torches bend softly around corners
-                    if (currentLight > 1) {
+                    // Diagonal diffusion for softer shadows (reduced threshold for more diffusion)
+                    if (currentLight > 2) {
                         for (let i = 0; i < SKY_DIAGONAL_OFFSETS.length; i++) {
                             const offset = SKY_DIAGONAL_OFFSETS[i];
                             const nx = lx + offset[0];
                             const ny = ly + offset[1];
                             const nz = lz + offset[2];
-                            if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
+                            if (ny < 0 || ny >= chunkHeight) continue;
+                            // Skip cross-chunk diagonals for performance (cardinal handles most cases)
+                            if (nx < 0 || nx >= cs || nz < 0 || nz >= cs) continue;
                             const nIdx = nx + (nz << 4) + (ny << 8);
                             const nBlockId = blocks[nIdx];
                             if (!IS_TRANSPARENT[nBlockId]) continue;
                             const blockLoss = BLOCKLIGHT_ATTENUATION[nBlockId] || 0;
-                            const totalLoss = Math.max(0, baseStepLoss + diagonalPenalty + blockLoss);
-                            const propagatedLight = clampBlockLight(Math.max(0, Math.round(applyFalloff(currentLight, totalLoss))));
+                            const totalLoss = baseStepLoss + diagonalPenalty + blockLoss;
+                            const propagatedLight = clampBlockLight(Math.max(0, Math.round(currentLight - totalLoss)));
                             if (propagatedLight > blockLight[nIdx]) {
                                 blockLight[nIdx] = propagatedLight;
-                                if (propagatedLight > 0) {
+                                if (propagatedLight > 1) {
                                     pushIfBudgetAllows(nx, ny, nz, propagatedLight);
                                 }
                             }
@@ -6962,6 +7084,14 @@
                 }
                 queue.length = 0;
                 if (blockLightQueuePool.length < 4) blockLightQueuePool.push(queue);
+                // Schedule rebuilds for neighbor chunks that received light
+                if (affectedNeighborChunks.size > 0) {
+                    for (const nKey of affectedNeighborChunks) {
+                        const [ncx, ncz] = nKey.split(',').map(Number);
+                        scheduleChunkUpdate(ncx, ncz, false, "blocklight-propagation");
+                    }
+                }
+                return affectedNeighborChunks;
             }
             // Helper: Trilinear interpolation for cave noise (OPTIMIZED)
             // Extracted to module level for clarity
@@ -8396,9 +8526,9 @@
                 camera.fov += (targetFOV - camera.fov) * 0.1;
                 camera.updateProjectionMatrix();
                 controls.getObject().updateMatrixWorld();
-                // Torch flicker effect
+                // Torch flicker effect - use same intensity as placed torches (* 2)
                 if (torchActive && torchLight) {
-                    torchLight.intensity = SETTINGS.torchIntensity + Math.sin(time * 0.003) * 0.5;
+                    torchLight.intensity = (SETTINGS.torchIntensity * 2) + Math.sin(time * 0.003) * 0.5;
                     // Animate 3D torch flame
                     if (window.torchModel) {
                         const flame = window.torchModel.children[1];
@@ -8551,7 +8681,7 @@
                     case "Digit7": selectedBlockId = SAND; currentHotbarSlot = 7; highlightSlot(7); break;
                     case "Digit8": selectedBlockId = WATER; currentHotbarSlot = 8; highlightSlot(8); break;
                     case "Digit9": selectedBlockId = TORCH; currentHotbarSlot = 9; highlightSlot(9); break;
-                    case "KeyF": torchActive = !torchActive; if (window.torchModel) { window.torchModel.visible = torchActive; } if (torchLight) { torchLight.intensity = torchActive ? 3.0 : 0; } break;
+                    case "KeyF": torchActive = !torchActive; if (window.torchModel) { window.torchModel.visible = torchActive; } if (torchLight) { torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0; } break;
                 }
             };
             function onKeyUp(e) {
