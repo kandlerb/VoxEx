@@ -2820,6 +2820,10 @@
                         blocks: new Uint8Array(size),
                         skyLight: new Uint8Array(size).fill(15),
                         blockLight: new Uint8Array(size).fill(1),
+                        cx: cx,
+                        cz: cz,
+                        startX: cx * WORLD_DIMS.chunkSize,
+                        startZ: cz * WORLD_DIMS.chunkSize,
                     };
                     chunks.set(key, chunk);
                     activeChunks.add(key);
@@ -7084,38 +7088,28 @@
                 }
                 queue.length = 0;
                 if (blockLightQueuePool.length < 4) blockLightQueuePool.push(queue);
-                // Iteratively propagate lighting to all affected neighbor chunks
-                // This ensures light continues propagating across chunk boundaries
-                const processedChunks = new Set([getChunkKey(chunkCx, chunkCz)]);
-                const chunksToProcess = Array.from(affectedNeighborChunks);
-                let iteration = 0;
-                const maxIterations = 10; // Safety limit to prevent infinite loops
+                // Schedule mesh rebuilds for neighbor chunks that received light
+                // When they rebuild, they'll automatically seed from this chunk's edges
+                if (affectedNeighborChunks.size > 0) {
+                    for (const nKey of affectedNeighborChunks) {
+                        const [ncx, ncz] = nKey.split(',').map(Number);
+                        const neighborChunk = chunks.get(nKey);
+                        if (!neighborChunk) continue;
 
-                while (chunksToProcess.length > 0 && iteration < maxIterations) {
-                    iteration++;
-                    const nKey = chunksToProcess.shift();
-                    if (processedChunks.has(nKey)) continue;
-                    processedChunks.add(nKey);
+                        // Ensure the neighbor chunk has correct coordinates for lighting calculations
+                        if (neighborChunk.cx === undefined) neighborChunk.cx = ncx;
+                        if (neighborChunk.cz === undefined) neighborChunk.cz = ncz;
+                        if (neighborChunk.startX === undefined) neighborChunk.startX = ncx * chunkSize;
+                        if (neighborChunk.startZ === undefined) neighborChunk.startZ = ncz * chunkSize;
 
-                    const [ncx, ncz] = nKey.split(',').map(Number);
-                    const neighborChunk = chunks.get(nKey);
-                    if (!neighborChunk) continue;
+                        // Recalculate neighbor's block light so it propagates from the edge values we just set
+                        // This is safe because calculateBlockLight seeds from neighbor edges before propagating
+                        calculateBlockLight(neighborChunk, chunkSize, chunkHeight);
 
-                    // Recalculate block light in neighbor to propagate the incoming light
-                    const newlyAffected = calculateBlockLight(neighborChunk, chunkSize, chunkHeight);
-
-                    // Add any newly affected chunks to the queue
-                    if (newlyAffected && newlyAffected.size > 0) {
-                        for (const newKey of newlyAffected) {
-                            if (!processedChunks.has(newKey)) {
-                                chunksToProcess.push(newKey);
-                            }
-                        }
+                        // Schedule mesh rebuild to visualize the updated lighting
+                        scheduleChunkUpdate(ncx, ncz, true, "blocklight-propagation");
                     }
-
-                    scheduleChunkUpdate(ncx, ncz, false, "blocklight-propagation");
                 }
-
                 return affectedNeighborChunks;
             }
             // Helper: Trilinear interpolation for cave noise (OPTIMIZED)
@@ -7709,7 +7703,9 @@
                 if (!chunk || !chunk.skyLight) return 15;
                 const sky = chunk.skyLight[idx] || 1;
                 const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
-                return sky > block ? sky : block;
+                const maxLight = sky > block ? sky : block;
+                // Ensure minimum visibility in caves (at least light level 4 for basic visibility)
+                return maxLight < 4 ? 4 : maxLight;
             }
             function renderChunk(cx, cz) {
                 try {
