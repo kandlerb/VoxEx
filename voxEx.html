@@ -2188,6 +2188,13 @@
                 const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
                 chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
             }
+            const MAX_BLOCK_LIGHT_LEVEL = 15;
+            function clampBlockLight(level) { return level < 0 ? 0 : level > MAX_BLOCK_LIGHT_LEVEL ? MAX_BLOCK_LIGHT_LEVEL : level; }
+            function getTorchBlockLightLevel() {
+                const baseline = DEFAULTS?.torchIntensity || 1;
+                const normalized = baseline > 0 ? SETTINGS.torchIntensity / baseline : SETTINGS.torchIntensity;
+                return clampBlockLight(Math.round(normalized * MAX_BLOCK_LIGHT_LEVEL));
+            }
             function computeNeighborSunlight(x, y, z) {
                 let maxLight = 1;
                 for (let i = 0; i < NEIGHBOR_OFFSETS.length; i++) {
@@ -2212,7 +2219,7 @@
                     const nz = z + o[2];
                     const neighborId = getBlock(nx, ny, nz);
                     if (neighborId === undefined || !IS_TRANSPARENT[neighborId]) continue;
-                    const nLight = getBlockLight(nx, ny, nz);
+                    const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
                     const propagated = nLight > 0 ? nLight - 1 : 0;
                     if (propagated > maxLight) maxLight = propagated;
                 }
@@ -2654,10 +2661,11 @@
             function updateBlockLightAt(x, y, z, oldId, newId, tracker) {
                 const wasSource = oldId === TORCH;
                 const isSource = newId === TORCH;
-                const currentLight = getBlockLight(x, y, z);
+                const torchLevel = getTorchBlockLightLevel();
+                const currentLight = clampBlockLight(getBlockLight(x, y, z));
                 const addQueue = [];
                 const removeQueue = [];
-                const baseLevel = isSource ? 15 : 0;
+                const baseLevel = isSource ? torchLevel : 0;
                 const transparent = IS_TRANSPARENT[newId];
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const markBlockLightChunk = (qx, qz) => { if (!tracker) return; const chunkKey = getChunkKey(Math.floor(qx / chunkSize), Math.floor(qz / chunkSize)); tracker.mark(chunkKey); };
@@ -2678,7 +2686,7 @@
                     const lx = removeQueue[i++];
                     const ly = removeQueue[i++];
                     const lz = removeQueue[i++];
-                    const level = removeQueue[i++];
+                    const level = clampBlockLight(removeQueue[i++]);
                     for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
                         const o = NEIGHBOR_OFFSETS[n];
                         const nx = lx + o[0];
@@ -2687,11 +2695,11 @@
                         markBlockLightChunk(nx, nz);
                         const nId = getBlock(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = getBlockLight(nx, ny, nz);
+                        const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
                         if (nLight === 0) continue;
                         if (nLight < level) { setBlockLight(nx, ny, nz, 0); removeQueue.push(nx, ny, nz, nLight);
                         } else {
-                            const desiredNeighbor = Math.max(computeNeighborBlockLight(nx, ny, nz), nId === TORCH ? 15 : 0);
+                            const desiredNeighbor = Math.max(computeNeighborBlockLight(nx, ny, nz), nId === TORCH ? torchLevel : 0);
                             if (desiredNeighbor < nLight) { setBlockLight(nx, ny, nz, desiredNeighbor); removeQueue.push(nx, ny, nz, nLight);
                             } else if (desiredNeighbor > nLight) { addQueue.push(nx, ny, nz, desiredNeighbor); }
                         }
@@ -2701,7 +2709,7 @@
                     const lx = addQueue[i++];
                     const ly = addQueue[i++];
                     const lz = addQueue[i++];
-                    const level = addQueue[i++];
+                    const level = clampBlockLight(addQueue[i++]);
                     for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
                         const o = NEIGHBOR_OFFSETS[n];
                         const nx = lx + o[0];
@@ -2710,7 +2718,7 @@
                         markBlockLightChunk(nx, nz);
                         const nId = getBlock(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = getBlockLight(nx, ny, nz);
+                        const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
                         const propagated = level > 0 ? level - 1 : 0;
                         if (propagated > nLight) {
                             setBlockLight(nx, ny, nz, propagated);
@@ -2768,6 +2776,17 @@
                     const [cx, cz] = key.split(",").map(Number);
                     if (!chunkBuildQueue.some((q) => q.key === key)) { chunkBuildQueue.push({ key, cx, cz, priority: 1 }); }
                 }
+            }
+            function rebuildTorchLightingForActiveChunks() {
+                if (!activeChunks || activeChunks.size === 0) return;
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                activeChunks.forEach((key) => {
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks) return;
+                    calculateBlockLight(chunk, chunkSize, chunkHeight);
+                });
+                rebuildAllVisibleChunks();
             }
             // --- OPTIMIZED RLE COMPRESSION HELPER (Uses Uint16Array) ---
             const ChunkCompressor = {
@@ -3604,6 +3623,14 @@
                 const torchRangeVal = document.getElementById("torch-range-val");
                 const ambientIntensitySlider = document.getElementById("ambient-intensity-slider");
                 const ambientIntensityVal = document.getElementById("ambient-intensity-val");
+                let torchLightRebuildTimeout = null;
+                const scheduleTorchLightRebuild = () => {
+                    if (torchLightRebuildTimeout) clearTimeout(torchLightRebuildTimeout);
+                    torchLightRebuildTimeout = setTimeout(() => {
+                        rebuildTorchLightingForActiveChunks();
+                        torchLightRebuildTimeout = null;
+                    }, 200);
+                };
                 if (sunColorInput) sunColorInput.value = "#" + SETTINGS.sunColor.toString(16).padStart(6, "0");
                 if (sunIntensitySlider && sunIntensityVal) { sunIntensitySlider.value = SETTINGS.sunIntensity; sunIntensityVal.textContent = SETTINGS.sunIntensity; }
                 if (moonColorInput) moonColorInput.value = "#" + SETTINGS.moonColor.toString(16).padStart(6, "0");
@@ -3725,7 +3752,12 @@
                 moonIntensitySlider?.addEventListener("input", () => { SETTINGS.moonIntensity = parseFloat(moonIntensitySlider.value); moonIntensityVal.textContent = SETTINGS.moonIntensity; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 // EVENT HANDLERS - Graphics > Lighting > Torch
                 torchColorInput?.addEventListener("input", () => { SETTINGS.torchColor = parseInt(torchColorInput.value.substring(1), 16); if (torchLight) torchLight.color.setHex(SETTINGS.torchColor); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
-                torchIntensitySlider?.addEventListener("input", () => { SETTINGS.torchIntensity = parseFloat(torchIntensitySlider.value); torchIntensityVal.textContent = SETTINGS.torchIntensity; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                torchIntensitySlider?.addEventListener("input", () => {
+                    SETTINGS.torchIntensity = parseFloat(torchIntensitySlider.value);
+                    torchIntensityVal.textContent = SETTINGS.torchIntensity;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    scheduleTorchLightRebuild();
+                });
                 torchRangeSlider?.addEventListener("input", () => { SETTINGS.torchRange = parseInt(torchRangeSlider.value); torchRangeVal.textContent = SETTINGS.torchRange; if (torchLight) torchLight.distance = SETTINGS.torchRange; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 // EVENT HANDLERS - Graphics > Lighting > Ambient
                 ambientIntensitySlider?.addEventListener("input", () => { SETTINGS.ambientIntensity = parseFloat(ambientIntensitySlider.value); ambientIntensityVal.textContent = SETTINGS.ambientIntensity; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
@@ -3885,7 +3917,7 @@
                         });
                         localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                         updateUIFromSettings();
-                        rebuildAllVisibleChunks();
+                        rebuildTorchLightingForActiveChunks();
                     }
                 });
                 // Reset Performance - Rendering
@@ -3951,6 +3983,7 @@
                         moon.shadow.map?.dispose();
                         moon.shadow.map = null;
                     }
+                    rebuildTorchLightingForActiveChunks();
                     const shaderReloadNotice = document.getElementById("shader-reload-notice");
                     if (shaderReloadNotice) shaderReloadNotice.style.display = "block";
                 });
@@ -6589,6 +6622,7 @@
                 const blockLight = chunk.blockLight || (chunk.blockLight = new Uint8Array(blocks.length).fill(0));
                 blockLight.fill(0);
                 const cs = chunkSize; // 16
+                const torchLevel = getTorchBlockLightLevel();
                 // BFS queue - stores [x, y, z, light] as flat array for performance
                 const queue = [];
                 // Step 1: Find all light sources and seed the queue
@@ -6600,8 +6634,9 @@
                             const idx = lx + zOffset + yOffset;
                             const blockId = blocks[idx];
                             if (blockId === TORCH) {
-                                blockLight[idx] = 15; // Max brightness
-                                queue.push(lx, ly, lz, 15);
+                                const seedLight = clampBlockLight(torchLevel);
+                                blockLight[idx] = seedLight;
+                                if (seedLight > 0) { queue.push(lx, ly, lz, seedLight); }
                             }
                         }
                     }
@@ -6612,7 +6647,7 @@
                     const lx = queue[qIdx++];
                     const ly = queue[qIdx++];
                     const lz = queue[qIdx++];
-                    const currentLight = queue[qIdx++];
+                    const currentLight = clampBlockLight(queue[qIdx++]);
                     // OPTIMIZATION: Use pre-computed NEIGHBOR_OFFSETS constant
                     for (let i = 0; i < 6; i++) {
                         const offset = NEIGHBOR_OFFSETS[i];
