@@ -1392,6 +1392,7 @@
             const biomeCellCache = new Map();
             const treeMaskCache = new Map();
             const IS_TRANSPARENT = new Uint8Array(256);
+            const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const IS_FLUID = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
@@ -2195,8 +2196,22 @@
                 const normalized = baseline > 0 ? SETTINGS.torchIntensity / baseline : SETTINGS.torchIntensity;
                 return clampBlockLight(Math.round(normalized * MAX_BLOCK_LIGHT_LEVEL));
             }
+            function computeDirectSkyLight(x, y, z) {
+                // Walk straight up the column to capture true skylight with attenuation, ensuring open holes receive light
+                const maxY = WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset - 1;
+                let light = 15;
+                for (let cy = maxY; cy >= y; cy--) {
+                    const blockId = getBlock(x, cy, z);
+                    if (blockId === undefined) continue; // Skip unloaded slices
+                    const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;
+                    if (attenuation >= 15) { return 1; } // Fully blocked above this point
+                    if (attenuation > 0) { light = light > attenuation ? light - attenuation : 1; }
+                    if (cy === y) break; // Stop once we reach the target cell
+                }
+                return light > 1 ? light : 1;
+            }
             function computeNeighborSunlight(x, y, z) {
-                let maxLight = 1;
+                let maxLight = computeDirectSkyLight(x, y, z);
                 for (let i = 0; i < NEIGHBOR_OFFSETS.length; i++) {
                     const o = NEIGHBOR_OFFSETS[i];
                     const nx = x + o[0];
@@ -2234,7 +2249,8 @@
                 if (queuedLightUpdates.has(key)) return;
                 queuedLightUpdates.add(key);
                 const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
-                lightUpdateQueue.push({ x, y, z, oldId: neighborId,newId: neighborId, key, primeColumn: !!IS_TRANSPARENT[neighborId], pendingLightChunks: new Set([chunkKey]), });
+                // Neighbor relights reuse current IDs and should not reprime columns without an opacity change
+                lightUpdateQueue.push({ x, y, z, oldId: neighborId,newId: neighborId, key, primeColumn: false, pendingLightChunks: new Set([chunkKey]), });
             }
             const sunlightWorkQueue = [];
             function isCriticalLightJob(job) {
@@ -2296,6 +2312,7 @@
                 for (let cy = maxY; cy >= minY; cy--) {
                     const blockId = getBlock(x, cy, z);
                     if (blockId === undefined) continue; // Skip unloaded chunks
+                    const attenuation = SUNLIGHT_ATTENUATION[blockId] || 0;
                     const target = currentLight > 1 ? currentLight : 1;
                     const prev = getSkyLight(x, cy, z);
                     if (target !== prev) {
@@ -2306,7 +2323,8 @@
                             } else { task.enqueueRemove(x, cy, z, prev); }
                         }
                     }
-                    if (blockId !== AIR) { currentLight = currentLight > 2 ? currentLight - 1 : 1; }
+                    if (attenuation >= 15) { currentLight = 1; }
+                    else if (attenuation > 0) { currentLight = currentLight > attenuation ? currentLight - attenuation : 1; }
                 }
                 if (anyChange) { const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize)); tracker?.mark(chunkKey); task?.ensureQueued(); }
                 return anyChange;
@@ -2551,11 +2569,13 @@
             }
             // Update sunlight at a specific position (simplified orchestrator)
             function updateSunlightAt(x, y, z, oldId, newId, tracker, primeColumn = false) {
-                // Determine block transparency changes
+                // Normalize transparency/attenuation so air/unloaded are never treated as blockers
+                const oldAttenuation = SUNLIGHT_ATTENUATION[oldId] ?? SUNLIGHT_ATTENUATION[AIR];
+                const newAttenuation = SUNLIGHT_ATTENUATION[newId] ?? SUNLIGHT_ATTENUATION[AIR];
                 const currentLight = getSkyLight(x, y, z);
-                const becameOpaque = !IS_TRANSPARENT[newId];
-                const becameTransparent = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
-                const shouldPrimeColumn = primeColumn || becameTransparent;
+                const becameOpaque = newAttenuation >= 15 && oldAttenuation < 15;
+                const becameMoreTransparent = newAttenuation < oldAttenuation;
+                const shouldPrimeColumn = primeColumn || becameMoreTransparent;
                 // Create task to manage the update
                 const task = new SunlightTask(x, y, z, oldId, newId, tracker);
                 // Prime the sunlight column if needed (when block becomes transparent)
@@ -2772,6 +2792,23 @@
                 modifiedChunks.add(key);
                 pristineChunks.delete(key);
                 activeChunks.add(key);
+
+                // Schedule localized relight so sunlight/torches react to edits
+                const jobKey = `${x},${y},${z}`;
+                if (!queuedLightUpdates.has(jobKey)) {
+                    queuedLightUpdates.add(jobKey);
+                    lightUpdateQueue.push({
+                        x,
+                        y,
+                        z,
+                        oldId,
+                        newId: id,
+                        key: jobKey,
+                        // Only prime when transitioning from opaque to transparent to avoid resetting nearby columns
+                        primeColumn: IS_TRANSPARENT[id] && !IS_TRANSPARENT[oldId],
+                        pendingLightChunks: new Set([key]),
+                    });
+                }
             }
             function rebuildAllVisibleChunks() {
                 logDebug("Rebuilding all visible chunks for settings change...");
@@ -4081,10 +4118,16 @@
             function initBlockOptimization() {
                 IS_TRANSPARENT.fill(0);
                 IS_FLUID.fill(0);
+                // Default sunlight attenuation: treat everything as fully blocking until defined
+                SUNLIGHT_ATTENUATION.fill(15);
                 // 1. Define Transparent Blocks
                 // UNLOADED_BLOCK must be transparent to prevent false AO at chunk borders
                 const transparentIds = [AIR, LEAVES, WATER, TORCH, UNLOADED_BLOCK];
                 for (const id of transparentIds) IS_TRANSPARENT[id] = 1;
+                // Sunlight attenuation values (0 = no loss, 1 = slight loss like leaves, 15 = opaque)
+                for (let i = 0; i < 256; i++) { if (IS_TRANSPARENT[i]) SUNLIGHT_ATTENUATION[i] = 0; }
+                SUNLIGHT_ATTENUATION[LEAVES] = 1; // Leaves soften light instead of fully blocking
+                SUNLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Prevent chunk seams from acting opaque
                 // 2. Define Fluids
                 const fluidIds = [WATER];
                 for (const id of fluidIds) IS_FLUID[id] = 1;
@@ -6556,20 +6599,19 @@
                         for (let ly = chunkHeight - 1; ly >= 0; ly--) {
                             const idx = baseIdx + (ly << 8); // + ly * 256
                             const blockId = blocks[idx];
+                            const attenuation = SUNLIGHT_ATTENUATION[blockId] || 0;
                             // Set skylight for this block
                             skyLight[idx] = currentLight > 1 ? currentLight : 1;
 
-                            if (blockId === 0) {
-                                // Air - light passes through without reduction
-                                continue;
-                            } else if (blockId === LEAVES) {
-                                // Leaves - reduce light by 1 per layer
-                                currentLight = currentLight > 1 ? currentLight - 1 : 1;
-                            } else {
+                            if (attenuation >= 15) {
                                 // Opaque block - stop vertical propagation
                                 // Underground blocks get light only from horizontal spreading
                                 break;
+                            } else if (attenuation > 0) {
+                                // Semi-transparent attenuation (e.g., leaves)
+                                currentLight = currentLight > attenuation ? currentLight - attenuation : 1;
                             }
+                            // attenuation === 0 (air/water/torch/etc): light passes through unchanged
                         }
                     }
                 }
