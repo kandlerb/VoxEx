@@ -653,6 +653,15 @@
                         <label for="ambient-intensity-slider">Ambient Intensity: <span id="ambient-intensity-val">0.2</span></label>
                         <input type="range" id="ambient-intensity-slider" min="0.0" max="2.0" step="0.05" />
                     </div>
+                    <div style="font-weight: 600; margin: 16px 0 6px 0">Skylight Diffusion</div>
+                    <div class="setting-item">
+                        <label for="diffuse-skylight-toggle">Diffuse Skylight (wrap around corners)</label>
+                        <input type="checkbox" id="diffuse-skylight-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="ambient-skylight-slider">Ambient Skylight Floor: <span id="ambient-skylight-val">2</span></label>
+                        <input type="range" id="ambient-skylight-slider" min="0" max="5" step="1" />
+                    </div>
                     <p id="shader-reload-notice" style="color: #ffcc00; display: none; font-size: 12px">Shadow quality and bias changes may require a reload.</p>
                     <button class="menu-btn" id="btn-reset-graphics-lighting" style="margin-top: 20px; background: #884400; border-color: #aa5500">Reset Lighting</button>
                     <button class="menu-btn" id="btn-back-from-graphics-lighting">Back</button>
@@ -949,6 +958,7 @@
                 },
             };
             const savedSettings = JSON.parse(localStorage.getItem("voxex_settings")) || {};
+            const savedLighting = savedSettings.lighting || {};
             const SETTINGS = {
                 // Performance
                 renderDistance: savedSettings.renderDistance || 8,
@@ -974,6 +984,11 @@
                 moonColor: savedSettings.moonColor || 0x8899ff,
                 moonIntensity: savedSettings.moonIntensity !== undefined ? savedSettings.moonIntensity : 0.15,
                 ambientIntensity: savedSettings.ambientIntensity !== undefined ? savedSettings.ambientIntensity : 0.5,
+                lighting: {
+                    diffuseSkylight: savedLighting.diffuseSkylight !== undefined ? savedLighting.diffuseSkylight : true,
+                    ambientSkylight: savedLighting.ambientSkylight ?? 2,
+                    skyQueueBudget: savedLighting.skyQueueBudget ?? 131072, // Max queue array length (4 numbers per node)
+                },
                 torchColor: savedSettings.torchColor || 0xffaa33,
                 torchIntensity: savedSettings.torchIntensity !== undefined ? savedSettings.torchIntensity : 2.5,
                 torchRange: savedSettings.torchRange || 32,
@@ -1037,6 +1052,7 @@
                 moonColor: 0x8899ff,
                 moonIntensity: 0.15,
                 ambientIntensity: 0.5,
+                lighting: { diffuseSkylight: true, ambientSkylight: 2, skyQueueBudget: 131072 },
                 torchColor: 0xffaa33,
                 torchIntensity: 2.5,
                 torchRange: 32,
@@ -1149,6 +1165,15 @@
                 [0, -1, 0],
                 [0, 0, 1],
                 [0, 0, -1],
+            ];
+            const SKY_DIAGONAL_OFFSETS = [
+                // Edge-adjacent (12)
+                [1, 1, 0], [1, -1, 0], [-1, 1, 0], [-1, -1, 0],
+                [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+                [0, 1, 1], [0, 1, -1], [0, -1, 1], [0, -1, -1],
+                // Corner-adjacent (8)
+                [1, 1, 1], [1, 1, -1], [1, -1, 1], [1, -1, -1],
+                [-1, 1, 1], [-1, 1, -1], [-1, -1, 1], [-1, -1, -1],
             ];
             const FACE_DIRECTIONS = [ // --- OPTIMIZATION: Pre-computed face directions for rendering --- [dx, dy, dz, nx, ny, nz] - direction offset and normal
                 [0, 1, 0, 0, 1, 0], // Top
@@ -1393,6 +1418,7 @@
             const treeMaskCache = new Map();
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
+            const SUNLIGHT_PENETRATION = new Uint8Array(256);
             const IS_FLUID = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
@@ -2831,6 +2857,17 @@
                 });
                 rebuildAllVisibleChunks();
             }
+            function rebuildSkylightForActiveChunks() {
+                if (!activeChunks || activeChunks.size === 0) return;
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                activeChunks.forEach((key) => {
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks) return;
+                    calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                });
+                rebuildAllVisibleChunks();
+            }
             // --- OPTIMIZED RLE COMPRESSION HELPER (Uses Uint16Array) ---
             const ChunkCompressor = {
                 // Helper to compress a single Uint8Array
@@ -3666,6 +3703,9 @@
                 const torchRangeVal = document.getElementById("torch-range-val");
                 const ambientIntensitySlider = document.getElementById("ambient-intensity-slider");
                 const ambientIntensityVal = document.getElementById("ambient-intensity-val");
+                const diffuseSkylightToggle = document.getElementById("diffuse-skylight-toggle");
+                const ambientSkylightSlider = document.getElementById("ambient-skylight-slider");
+                const ambientSkylightVal = document.getElementById("ambient-skylight-val");
                 let torchLightRebuildTimeout = null;
                 const scheduleTorchLightRebuild = () => {
                     if (torchLightRebuildTimeout) clearTimeout(torchLightRebuildTimeout);
@@ -3682,6 +3722,8 @@
                 if (torchIntensitySlider && torchIntensityVal) { torchIntensitySlider.value = SETTINGS.torchIntensity; torchIntensityVal.textContent = SETTINGS.torchIntensity; }
                 if (torchRangeSlider && torchRangeVal) { torchRangeSlider.value = SETTINGS.torchRange; torchRangeVal.textContent = SETTINGS.torchRange; }
                 if (ambientIntensitySlider && ambientIntensityVal) { ambientIntensitySlider.value = SETTINGS.ambientIntensity; ambientIntensityVal.textContent = SETTINGS.ambientIntensity; }
+                if (diffuseSkylightToggle) { diffuseSkylightToggle.checked = SETTINGS.lighting.diffuseSkylight; }
+                if (ambientSkylightSlider && ambientSkylightVal) { ambientSkylightSlider.value = SETTINGS.lighting.ambientSkylight; ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight; }
                 // INITIALIZE UI VALUES - World > Environment
                 const daySkyTopColor = document.getElementById("day-sky-top-color");
                 const daySkyBottomColor = document.getElementById("day-sky-bottom-color");
@@ -3804,6 +3846,17 @@
                 torchRangeSlider?.addEventListener("input", () => { SETTINGS.torchRange = parseInt(torchRangeSlider.value); torchRangeVal.textContent = SETTINGS.torchRange; if (torchLight) torchLight.distance = SETTINGS.torchRange; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 // EVENT HANDLERS - Graphics > Lighting > Ambient
                 ambientIntensitySlider?.addEventListener("input", () => { SETTINGS.ambientIntensity = parseFloat(ambientIntensitySlider.value); ambientIntensityVal.textContent = SETTINGS.ambientIntensity; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                diffuseSkylightToggle?.addEventListener("change", () => {
+                    SETTINGS.lighting.diffuseSkylight = diffuseSkylightToggle.checked;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    rebuildSkylightForActiveChunks();
+                });
+                ambientSkylightSlider?.addEventListener("input", () => {
+                    SETTINGS.lighting.ambientSkylight = parseInt(ambientSkylightSlider.value, 10);
+                    ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    rebuildSkylightForActiveChunks();
+                });
                 // EVENT HANDLERS - World > Environment
                 daySkyTopColor?.addEventListener("input", () => { SETTINGS.daySkyTop = parseInt(daySkyTopColor.value.substring(1), 16); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); refreshSkyFogColorsFromSettings(); });
                 daySkyBottomColor?.addEventListener("input", () => { SETTINGS.daySkyBottom = parseInt(daySkyBottomColor.value.substring(1), 16); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); refreshSkyFogColorsFromSettings(); });
@@ -3911,6 +3964,8 @@
                     if (torchIntensitySlider && torchIntensityVal) { torchIntensitySlider.value = SETTINGS.torchIntensity; torchIntensityVal.textContent = SETTINGS.torchIntensity; }
                     if (torchRangeSlider && torchRangeVal) { torchRangeSlider.value = SETTINGS.torchRange; torchRangeVal.textContent = SETTINGS.torchRange; }
                     if (ambientIntensitySlider && ambientIntensityVal) { ambientIntensitySlider.value = SETTINGS.ambientIntensity; ambientIntensityVal.textContent = SETTINGS.ambientIntensity; }
+                    if (diffuseSkylightToggle) diffuseSkylightToggle.checked = SETTINGS.lighting.diffuseSkylight;
+                    if (ambientSkylightSlider && ambientSkylightVal) { ambientSkylightSlider.value = SETTINGS.lighting.ambientSkylight; ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight; }
                     // World - Environment
                     if (daySkyTopColor) daySkyTopColor.value = "#" + SETTINGS.daySkyTop.toString(16).padStart(6, "0");
                     if (daySkyBottomColor) daySkyBottomColor.value = "#" + SETTINGS.daySkyBottom.toString(16).padStart(6, "0");
@@ -3956,10 +4011,12 @@
                 document.getElementById("btn-reset-all")?.addEventListener("click", () => {
                     if (confirm("Reset ALL settings to default values?")) {
                         Object.keys(DEFAULTS).forEach((key) => {
-                            SETTINGS[key] = DEFAULTS[key];
+                            const value = DEFAULTS[key];
+                            SETTINGS[key] = typeof value === "object" ? JSON.parse(JSON.stringify(value)) : value;
                         });
                         localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                         updateUIFromSettings();
+                        rebuildSkylightForActiveChunks();
                         rebuildTorchLightingForActiveChunks();
                     }
                 });
@@ -4007,6 +4064,7 @@
                     SETTINGS.torchIntensity = DEFAULTS.torchIntensity;
                     SETTINGS.torchRange = DEFAULTS.torchRange;
                     SETTINGS.ambientIntensity = DEFAULTS.ambientIntensity;
+                    SETTINGS.lighting = { ...DEFAULTS.lighting };
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                     // Apply shadow settings immediately
@@ -4026,6 +4084,7 @@
                         moon.shadow.map?.dispose();
                         moon.shadow.map = null;
                     }
+                    rebuildSkylightForActiveChunks();
                     rebuildTorchLightingForActiveChunks();
                     const shaderReloadNotice = document.getElementById("shader-reload-notice");
                     if (shaderReloadNotice) shaderReloadNotice.style.display = "block";
@@ -4120,6 +4179,7 @@
                 IS_FLUID.fill(0);
                 // Default sunlight attenuation: treat everything as fully blocking until defined
                 SUNLIGHT_ATTENUATION.fill(15);
+                SUNLIGHT_PENETRATION.fill(0);
                 // 1. Define Transparent Blocks
                 // UNLOADED_BLOCK must be transparent to prevent false AO at chunk borders
                 const transparentIds = [AIR, LEAVES, WATER, TORCH, UNLOADED_BLOCK];
@@ -4128,6 +4188,11 @@
                 for (let i = 0; i < 256; i++) { if (IS_TRANSPARENT[i]) SUNLIGHT_ATTENUATION[i] = 0; }
                 SUNLIGHT_ATTENUATION[LEAVES] = 1; // Leaves soften light instead of fully blocking
                 SUNLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Prevent chunk seams from acting opaque
+                // Sunlight permeability (for blocks that are structurally thin but not fully open)
+                // Values represent how much light is lost while still leaking through instead of stopping entirely.
+                SUNLIGHT_PENETRATION[WOOD] = 2; // Planks leak a faint glow through thin roofs
+                SUNLIGHT_PENETRATION[LOG] = 2; // Logs leak slightly when used as beams
+                SUNLIGHT_PENETRATION[LEAVES] = 1; // Dense leaves leak tiny shafts when stacked
                 // 2. Define Fluids
                 const fluidIds = [WATER];
                 for (const id of fluidIds) IS_FLUID[id] = 1;
@@ -6589,6 +6654,9 @@
                 // Pre-compute chunk dimensions for bitwise operations
                 const cs = chunkSize; // 16
                 const cs2 = chunkSize * chunkSize; // 256
+                const diffuseEnabled = SETTINGS?.lighting?.diffuseSkylight;
+                const ambientFloor = diffuseEnabled ? Math.max(0, Math.min(15, SETTINGS.lighting.ambientSkylight | 0)) : 0;
+                const maxQueueLength = Math.max(64, SETTINGS?.lighting?.skyQueueBudget || 131072);
                 // Step 1: Vertical propagation from sky downward
                 // OPTIMIZATION: Use bitwise shifts for index calculation
                 for (let lx = 0; lx < cs; lx++) {
@@ -6600,6 +6668,13 @@
                             const idx = baseIdx + (ly << 8); // + ly * 256
                             const blockId = blocks[idx];
                             const attenuation = SUNLIGHT_ATTENUATION[blockId] || 0;
+                            const permeability = SUNLIGHT_PENETRATION[blockId] || 0;
+                            if (attenuation >= 15 && permeability > 0) {
+                                // Permeable opaque block: bleed light and continue downward with heavy loss
+                                currentLight = currentLight > permeability ? currentLight - permeability : 1;
+                                skyLight[idx] = currentLight;
+                                continue;
+                            }
                             // Set skylight for this block
                             skyLight[idx] = currentLight > 1 ? currentLight : 1;
 
@@ -6619,6 +6694,13 @@
                 // OPTIMIZATION: Queue-based approach only processes blocks that need updating
                 // instead of 15 fixed passes over all 32,768 blocks
                 const queue = [];
+                const pushIfBudgetAllows = (x, y, z, light) => {
+                    if (queue.length <= maxQueueLength - 4) {
+                        queue.push(x, y, z, light);
+                        return true;
+                    }
+                    return false;
+                };
                 // Seed the queue with all blocks that have light > 1 and transparent neighbors
                 for (let ly = 0; ly < chunkHeight; ly++) {
                     const yOffset = ly << 8;
@@ -6631,7 +6713,14 @@
                                 const blockId = blocks[idx];
                                 // Only process transparent blocks
                                 if (IS_TRANSPARENT[blockId]) {
-                                    queue.push(lx, ly, lz, light);
+                                    pushIfBudgetAllows(lx, ly, lz, light);
+                                }
+                            }
+                            if (diffuseEnabled && ambientFloor > 0) {
+                                const blockId = blocks[idx];
+                                if ((blockId === AIR || blockId === WATER || blockId === UNLOADED_BLOCK) && skyLight[idx] < ambientFloor) {
+                                    skyLight[idx] = ambientFloor;
+                                    pushIfBudgetAllows(lx, ly, lz, ambientFloor);
                                 }
                             }
                         }
@@ -6666,7 +6755,27 @@
                             skyLight[nIdx] = propagatedLight;
                             // Only continue propagating if light > 1
                             if (propagatedLight > 1) {
-                                queue.push(nx, ny, nz, propagatedLight);
+                                pushIfBudgetAllows(nx, ny, nz, propagatedLight);
+                            }
+                        }
+                    }
+                    if (diffuseEnabled && currentLight > 2) {
+                        const diagonalLight = currentLight > 3 ? currentLight - 2 : 1;
+                        for (let i = 0; i < SKY_DIAGONAL_OFFSETS.length; i++) {
+                            const offset = SKY_DIAGONAL_OFFSETS[i];
+                            const nx = lx + offset[0];
+                            const ny = ly + offset[1];
+                            const nz = lz + offset[2];
+                            // Bounds check
+                            if (nx < 0 || nx >= cs || ny < 0 || ny >= chunkHeight || nz < 0 || nz >= cs) continue;
+                            const nIdx = nx + (nz << 4) + (ny << 8);
+                            const nBlockId = blocks[nIdx];
+                            if (!IS_TRANSPARENT[nBlockId]) continue;
+                            if (diagonalLight > skyLight[nIdx]) {
+                                skyLight[nIdx] = diagonalLight;
+                                if (diagonalLight > 1) {
+                                    pushIfBudgetAllows(nx, ny, nz, diagonalLight);
+                                }
                             }
                         }
                     }
