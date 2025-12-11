@@ -1095,6 +1095,2444 @@
             import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
             import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
             import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+            // =====================================================
+            // VOXEX CLASS-BASED ARCHITECTURE
+            // =====================================================
+
+            // -------------------------
+            // 0. BLOCKS ENUM (Convenience object)
+            // -------------------------
+            const BLOCKS = {
+                AIR: 0,
+                GRASS: 1,
+                DIRT: 2,
+                STONE: 3,
+                WOOD: 4,
+                LOG: 5,
+                LEAVES: 6,
+                BEDROCK: 7,
+                SAND: 8,
+                WATER: 9,
+                TORCH: 10,
+                UNLOADED: 255
+            };
+
+            // =====================================================
+            // 1. SETTINGS MANAGER CLASS
+            // =====================================================
+
+            class SettingsManager {
+                constructor(defaults) {
+                    this.defaults = { ...defaults };
+                    this.values = { ...defaults };
+                    this.listeners = new Map();
+                }
+
+                loadFromStorage() {
+                    try {
+                        const saved = JSON.parse(localStorage.getItem("voxex_settings")) || {};
+                        for (const key of Object.keys(this.defaults)) {
+                            if (saved[key] !== undefined) {
+                                this.values[key] = saved[key];
+                            }
+                        }
+                    } catch (e) {
+                        console.warn("[SettingsManager] Failed to load settings from storage:", e);
+                    }
+                }
+
+                saveToStorage() {
+                    try {
+                        localStorage.setItem("voxex_settings", JSON.stringify(this.values));
+                    } catch (e) {
+                        console.warn("[SettingsManager] Failed to save settings to storage:", e);
+                    }
+                }
+
+                get(key) {
+                    return this.values[key] !== undefined ? this.values[key] : this.defaults[key];
+                }
+
+                set(key, value) {
+                    const oldValue = this.values[key];
+                    this.values[key] = value;
+                    // Notify listeners
+                    if (this.listeners.has(key)) {
+                        for (const callback of this.listeners.get(key)) {
+                            callback(value, oldValue, key);
+                        }
+                    }
+                    this.saveToStorage();
+                }
+
+                onChange(key, callback) {
+                    if (!this.listeners.has(key)) {
+                        this.listeners.set(key, []);
+                    }
+                    this.listeners.get(key).push(callback);
+                }
+
+                reset(key) {
+                    if (key) {
+                        this.set(key, this.defaults[key]);
+                    } else {
+                        this.values = { ...this.defaults };
+                        this.saveToStorage();
+                    }
+                }
+
+                applyToRender(renderEngine) {
+                    if (!renderEngine) return;
+                    // Apply fog settings
+                    if (renderEngine.scene?.fog) {
+                        renderEngine.scene.fog.far = this.get('renderDistance') * WORLD_DIMS.chunkSize;
+                    }
+                    // Apply shadow settings
+                    if (renderEngine.renderer) {
+                        renderEngine.renderer.shadowMap.enabled = this.get('shadows');
+                    }
+                }
+            }
+
+            // =====================================================
+            // 2. INPUT MANAGER CLASS
+            // =====================================================
+
+            class InputManager {
+                constructor(domElement) {
+                    this.domElement = domElement || document.body;
+                    this.keysDown = new Set();
+                    this.mouseDelta = { x: 0, y: 0 };
+                    this.mouseButtons = { left: false, right: false, middle: false };
+                    this.pointerLocked = false;
+                    this.wheelDelta = 0;
+                    this.listeners = {
+                        keydown: [],
+                        keyup: [],
+                        mousedown: [],
+                        mouseup: [],
+                        wheel: []
+                    };
+                }
+
+                init() {
+                    // Keyboard events
+                    document.addEventListener('keydown', (e) => {
+                        this.keysDown.add(e.code);
+                        for (const cb of this.listeners.keydown) cb(e);
+                    });
+                    document.addEventListener('keyup', (e) => {
+                        this.keysDown.delete(e.code);
+                        for (const cb of this.listeners.keyup) cb(e);
+                    });
+
+                    // Mouse events
+                    document.addEventListener('mousemove', (e) => {
+                        if (this.pointerLocked) {
+                            this.mouseDelta.x += e.movementX;
+                            this.mouseDelta.y += e.movementY;
+                        }
+                    });
+                    this.domElement.addEventListener('mousedown', (e) => {
+                        if (e.button === 0) this.mouseButtons.left = true;
+                        if (e.button === 1) this.mouseButtons.middle = true;
+                        if (e.button === 2) this.mouseButtons.right = true;
+                        for (const cb of this.listeners.mousedown) cb(e);
+                    });
+                    this.domElement.addEventListener('mouseup', (e) => {
+                        if (e.button === 0) this.mouseButtons.left = false;
+                        if (e.button === 1) this.mouseButtons.middle = false;
+                        if (e.button === 2) this.mouseButtons.right = false;
+                        for (const cb of this.listeners.mouseup) cb(e);
+                    });
+                    this.domElement.addEventListener('wheel', (e) => {
+                        this.wheelDelta = e.deltaY;
+                        for (const cb of this.listeners.wheel) cb(e);
+                    }, { passive: false });
+
+                    // Pointer lock change
+                    document.addEventListener('pointerlockchange', () => {
+                        this.pointerLocked = document.pointerLockElement === this.domElement;
+                    });
+                }
+
+                consumeMouseDelta() {
+                    const delta = { x: this.mouseDelta.x, y: this.mouseDelta.y };
+                    this.mouseDelta.x = 0;
+                    this.mouseDelta.y = 0;
+                    return delta;
+                }
+
+                consumeWheelDelta() {
+                    const delta = this.wheelDelta;
+                    this.wheelDelta = 0;
+                    return delta;
+                }
+
+                isKeyDown(code) {
+                    return this.keysDown.has(code);
+                }
+
+                on(event, callback) {
+                    if (this.listeners[event]) {
+                        this.listeners[event].push(callback);
+                    }
+                }
+
+                off(event, callback) {
+                    if (this.listeners[event]) {
+                        const idx = this.listeners[event].indexOf(callback);
+                        if (idx !== -1) this.listeners[event].splice(idx, 1);
+                    }
+                }
+            }
+
+            // =====================================================
+            // 3. TERRAIN GENERATOR CLASS
+            // =====================================================
+
+            class TerrainGenerator {
+                constructor(worldConfig, biomeConfig, treeConfig) {
+                    this.worldConfig = worldConfig;
+                    this.biomeConfig = biomeConfig;
+                    this.treeConfig = treeConfig;
+                    this.perm = new Uint8Array(512);
+                    this.p = new Uint8Array(256);
+                    this.biomeCellCache = new Map();
+                    this.treeMaskCache = new Map();
+                    this.biomeTable = null;
+                    this.BIOME_CELL_SIZE = 64;
+                }
+
+                init(seed) {
+                    this.worldConfig.seed = seed;
+                    // Initialize permutation table
+                    for (let i = 0; i < 256; i++) this.p[i] = i;
+                    // Shuffle using seed
+                    let s = seed;
+                    for (let i = 255; i > 0; i--) {
+                        s = (s * 1103515245 + 12345) & 0x7fffffff;
+                        const j = s % (i + 1);
+                        [this.p[i], this.p[j]] = [this.p[j], this.p[i]];
+                    }
+                    for (let i = 0; i < 512; i++) {
+                        this.perm[i] = this.p[i & 255];
+                    }
+                    // Build biome table
+                    this.buildBiomeTable();
+                }
+
+                buildBiomeTable() {
+                    const cumulative = [];
+                    let total = 0;
+                    for (const biome of this.worldConfig.biomes) {
+                        total += biome.weight;
+                        cumulative.push({ threshold: total, biome });
+                    }
+                    this.biomeTable = { cumulative, totalWeight: total };
+                }
+
+                // --- NOISE FUNCTIONS ---
+                noise3D(x, y, z) {
+                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+                    x -= Math.floor(x);
+                    y -= Math.floor(y);
+                    z -= Math.floor(z);
+                    const u = this.fade(x), v = this.fade(y), w = this.fade(z);
+                    const A = this.perm[X] + Y, AA = this.perm[A] + Z, AB = this.perm[A + 1] + Z;
+                    const B = this.perm[X + 1] + Y, BA = this.perm[B] + Z, BB = this.perm[B + 1] + Z;
+                    return this.lerp(w,
+                        this.lerp(v,
+                            this.lerp(u, this.grad3D(this.perm[AA], x, y, z), this.grad3D(this.perm[BA], x - 1, y, z)),
+                            this.lerp(u, this.grad3D(this.perm[AB], x, y - 1, z), this.grad3D(this.perm[BB], x - 1, y - 1, z))),
+                        this.lerp(v,
+                            this.lerp(u, this.grad3D(this.perm[AA + 1], x, y, z - 1), this.grad3D(this.perm[BA + 1], x - 1, y, z - 1)),
+                            this.lerp(u, this.grad3D(this.perm[AB + 1], x, y - 1, z - 1), this.grad3D(this.perm[BB + 1], x - 1, y - 1, z - 1)))
+                    );
+                }
+
+                grad3D(hash, x, y, z) {
+                    const h = hash & 15;
+                    const u = h < 8 ? x : y;
+                    const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+                    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+                }
+
+                fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
+                    const warpScale = 0.03;
+                    const offsetX = this.fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
+                    const offsetZ = this.fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
+                    return this.fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
+                }
+
+                treeNoise(gx, gz, seed) {
+                    return this.noise2D(gx * 0.07 + seed * 31.7, gz * 0.07 - seed * 12.3);
+                }
+
+                treePlacementValue(gx, gz, seed) {
+                    const h = Math.sin(gx * 12.9898 + gz * 78.233 + seed * 0.12345);
+                    const base = h - Math.floor(h);
+                    const warp = this.noise2D(gx * 0.05 + seed * 7.31, gz * 0.05 - seed * 3.17) * 0.3;
+                    const combined = base + warp;
+                    return combined - Math.floor(combined);
+                }
+
+                // --- HEIGHT FUNCTIONS ---
+                continentalHeight(gx, gz, seed) {
+                    const base = this.fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
+                    const erosion = this.fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8);
+                    let c = base * 0.7 + erosion * 0.3;
+                    c += 0.3;
+                    return Math.max(-1, Math.min(1, c));
+                }
+
+                defaultHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
+                    return biome.baseHeight + baseNoise * biome.amplitude;
+                }
+
+                hillsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 5, 0.55, 2.2);
+                    const ridge = Math.abs(this.noise2D(gx * 0.02, gz * 0.02)) * 8;
+                    return biome.baseHeight + baseNoise * biome.amplitude + ridge;
+                }
+
+                plainsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 3, 0.4, 2.0);
+                    return biome.baseHeight + baseNoise * biome.amplitude;
+                }
+
+                mountainsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 6, 0.6, 2.1);
+                    const ridge = Math.abs(this.noise2D(gx * 0.015, gz * 0.015));
+                    const ridge2 = Math.abs(this.noise2D(gx * 0.03 + 100, gz * 0.03 + 100));
+                    const combined = ridge * ridge2 * 25;
+                    return biome.baseHeight + baseNoise * biome.amplitude + combined;
+                }
+
+                getRiverFactor(gx, gz, seed) {
+                    const riverScale = 0.008;
+                    const riverNoise = this.noise2D(gx * riverScale + seed * 0.5, gz * riverScale - seed * 0.3);
+                    const riverWidth = 0.08;
+                    const transitionWidth = 0.06;
+                    const absNoise = Math.abs(riverNoise);
+                    if (absNoise < riverWidth) return 0;
+                    if (absNoise < riverWidth + transitionWidth) {
+                        return (absNoise - riverWidth) / transitionWidth;
+                    }
+                    return 1.0;
+                }
+
+                blendedHeight(gx, gz, seed) {
+                    const c = this.continentalHeight(gx, gz, seed);
+                    const gridScale = this.BIOME_CELL_SIZE;
+                    const u = gx / gridScale - 0.5;
+                    const v = gz / gridScale - 0.5;
+                    const x0 = Math.floor(u), z0 = Math.floor(v);
+                    const x1 = x0 + 1, z1 = z0 + 1;
+                    const wx = u - x0, wz = v - z0;
+                    const sx = wx * wx * (3 - 2 * wx);
+                    const sz = wz * wz * (3 - 2 * wz);
+
+                    const h00 = this.getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+                    const h10 = this.getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+                    const h01 = this.getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+                    const h11 = this.getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+
+                    const h0 = h00 + (h10 - h00) * sx;
+                    const h1 = h01 + (h11 - h01) * sx;
+                    let finalHeight = h0 + (h1 - h0) * sz;
+
+                    const r = this.getRiverFactor(gx, gz, seed);
+                    if (r < 1.0) {
+                        const riverBed = WORLD_DIMS.seaLevel - 2;
+                        const bank = r * r * (3 - 2 * r);
+                        finalHeight = riverBed + (finalHeight - riverBed) * bank;
+                    }
+                    return Math.floor(finalHeight);
+                }
+
+                getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
+                    const centerX = cx * this.BIOME_CELL_SIZE + this.BIOME_CELL_SIZE * 0.5;
+                    const centerZ = cz * this.BIOME_CELL_SIZE + this.BIOME_CELL_SIZE * 0.5;
+                    const biome = this.getBiomeAt(centerX, centerZ);
+                    let h = this.defaultHeightFunc(gx, gz, biome, seed);
+                    const t = (continentFactor + 1) * 0.5;
+                    const factor = 0.3 + t * 0.7;
+                    h = biome.baseHeight + (h - biome.baseHeight) * factor;
+                    h += Math.max(0, continentFactor - 0.15) * 10;
+                    return h;
+                }
+
+                getTreeDensityForBiome(biomeName) {
+                    const densityMap = {
+                        'forests': this.treeConfig.density?.forests ?? 0.15,
+                        'plains': this.treeConfig.density?.plains ?? 0.02,
+                        'hills': this.treeConfig.density?.hills ?? 0.05,
+                        'mountains': this.treeConfig.density?.mountains ?? 0.01,
+                        'swamp': this.treeConfig.density?.swamp ?? 0.08
+                    };
+                    return densityMap[biomeName] ?? 0.03;
+                }
+
+                // --- TREE MASK ---
+                getTreeMaskKey(cx, cz) {
+                    return `${cx},${cz}`;
+                }
+
+                generateTreeMaskForChunk(cx, cz, seed) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const mask = new Uint8Array(chunkSize * chunkSize);
+                    const startX = cx * chunkSize;
+                    const startZ = cz * chunkSize;
+
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        for (let lx = 0; lx < chunkSize; lx++) {
+                            const gx = startX + lx;
+                            const gz = startZ + lz;
+                            const biome = this.getBiomeAt(gx, gz);
+                            const density = this.getTreeDensityForBiome(biome.name);
+                            const p = this.treePlacementValue(gx, gz, seed);
+                            mask[lx + lz * chunkSize] = p <= density ? 1 : 0;
+                        }
+                    }
+                    return mask;
+                }
+
+                getTreeMaskForChunk(cx, cz, seed) {
+                    const key = this.getTreeMaskKey(cx, cz);
+                    if (this.treeMaskCache.has(key)) {
+                        return this.treeMaskCache.get(key);
+                    }
+                    const mask = this.generateTreeMaskForChunk(cx, cz, seed);
+                    this.treeMaskCache.set(key, mask);
+                    return mask;
+                }
+
+                getTreeMaskValueGlobal(gx, gz, seed) {
+                    const cs = WORLD_DIMS.chunkSize;
+                    const cx = Math.floor(gx / cs);
+                    const cz = Math.floor(gz / cs);
+                    const lx = ((gx % cs) + cs) % cs;
+                    const lz = ((gz % cs) + cs) % cs;
+                    const mask = this.getTreeMaskForChunk(cx, cz, seed);
+                    return mask[lx + lz * cs] === 1;
+                }
+
+                getBiomeAt(x, z) {
+                    const cellSize = this.BIOME_CELL_SIZE;
+                    const cellX = Math.floor(x / cellSize);
+                    const cellZ = Math.floor(z / cellSize);
+                    const key = `${cellX},${cellZ}`;
+
+                    if (this.biomeCellCache.has(key)) {
+                        return this.biomeCellCache.get(key);
+                    }
+
+                    const centerX = cellX * cellSize + cellSize * 0.5;
+                    const centerZ = cellZ * cellSize + cellSize * 0.5;
+                    const biome = this.getRawBiome(centerX, centerZ);
+                    this.biomeCellCache.set(key, biome);
+                    return biome;
+                }
+
+                getRawBiome(x, z) {
+                    const { seed, biomeFrequency } = this.worldConfig;
+                    const noiseVal = this.noise2D(x * biomeFrequency + seed * 0.37, z * biomeFrequency - seed * 0.71);
+                    const t = (noiseVal + 1) * 0.5;
+                    const target = t * this.biomeTable.totalWeight;
+
+                    for (const entry of this.biomeTable.cumulative) {
+                        if (target <= entry.threshold) {
+                            return entry.biome;
+                        }
+                    }
+                    return this.biomeTable.cumulative[0].biome;
+                }
+
+                getHeightAt(x, z) {
+                    // Simplified height calculation - actual implementation uses blendedHeight()
+                    const biome = this.getBiomeAt(x, z);
+                    const baseHeight = biome.baseHeight || 64;
+                    const amplitude = biome.amplitude || 10;
+                    const roughness = biome.roughness || 0.01;
+
+                    const noise = this.fbm2D(x * roughness, z * roughness, 4, 0.5, 2.0);
+                    return Math.floor(baseHeight + noise * amplitude);
+                }
+
+                // Noise functions
+                fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+                lerp(t, a, b) { return a + t * (b - a); }
+
+                grad(h, x, y) {
+                    const u = h < 8 ? x : y;
+                    const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
+                    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+                }
+
+                noise2D(x, y) {
+                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+                    x -= Math.floor(x);
+                    y -= Math.floor(y);
+                    const u = this.fade(x), v = this.fade(y);
+                    const A = this.perm[X] + Y, B = this.perm[X + 1] + Y;
+                    return this.lerp(v,
+                        this.lerp(u, this.grad(this.perm[A], x, y), this.grad(this.perm[B], x - 1, y)),
+                        this.lerp(u, this.grad(this.perm[A + 1], x, y - 1), this.grad(this.perm[B + 1], x - 1, y - 1))
+                    );
+                }
+
+                fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
+                    let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
+                    for (let i = 0; i < octaves; i++) {
+                        total += this.noise2D(x * frequency, z * frequency) * amplitude;
+                        maxValue += amplitude;
+                        amplitude *= persistence;
+                        frequency *= lacunarity;
+                    }
+                    return total / maxValue;
+                }
+
+                generateChunkData(cx, cz) {
+                    // This will be called by VoxelWorld - delegates to the existing generateChunkData function
+                    // Returns a promise for async generation
+                    return null; // Placeholder - actual implementation uses existing function
+                }
+            }
+
+            // =====================================================
+            // 4. VOXEL WORLD CLASS
+            // =====================================================
+
+            class VoxelWorld {
+                constructor(terrainGenerator, settingsManager, externalChunks = null) {
+                    this.terrainGenerator = terrainGenerator;
+                    this.settings = settingsManager;
+                    // Use external chunks Map if provided (for integration with existing code)
+                    this.chunks = externalChunks || new Map();
+                    this.chunkMeshes = new Map();
+                    this.activeChunks = new Set();
+                    this.modifiedChunks = new Set();
+                    this.pristineChunks = new Set();
+                    this.chunkBuildQueue = [];
+                    this.queuedChunkKeys = new Set();
+                    // Cache for optimized lookups
+                    this._lastChunkKey = null;
+                    this._lastChunk = null;
+                }
+
+                // Bind to external chunks Map (for existing code integration)
+                bindChunks(chunksMap) {
+                    this.chunks = chunksMap;
+                }
+
+                // Bind to external state sets (for existing code integration)
+                bindState(modifiedChunks, pristineChunks, activeChunks) {
+                    if (modifiedChunks) this.modifiedChunks = modifiedChunks;
+                    if (pristineChunks) this.pristineChunks = pristineChunks;
+                    if (activeChunks) this.activeChunks = activeChunks;
+                }
+
+                getChunkKey(cx, cz) {
+                    return `${cx},${cz}`;
+                }
+
+                parseChunkKey(key) {
+                    const [cx, cz] = key.split(',').map(Number);
+                    return { cx, cz };
+                }
+
+                worldToChunkCoords(x, y, z) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const cx = Math.floor(x / chunkSize);
+                    const cz = Math.floor(z / chunkSize);
+                    const lx = ((x % chunkSize) + chunkSize) % chunkSize;
+                    const ly = y + WORLD_DIMS.yOffset;
+                    const lz = ((z % chunkSize) + chunkSize) % chunkSize;
+                    return { cx, cz, lx: Math.floor(lx), ly: Math.floor(ly), lz: Math.floor(lz) };
+                }
+
+                chunkToWorldCoords(cx, cz, lx, ly, lz) {
+                    return {
+                        x: cx * WORLD_DIMS.chunkSize + lx,
+                        y: ly - WORLD_DIMS.yOffset,
+                        z: cz * WORLD_DIMS.chunkSize + lz
+                    };
+                }
+
+                ensureChunk(cx, cz) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (this.chunks.has(key)) {
+                        return this.chunks.get(key);
+                    }
+                    // Queue for generation
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0 });
+                        this.queuedChunkKeys.add(key);
+                    }
+                    return null;
+                }
+
+                getBlock(x, y, z) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    // Use cache for repeated lookups in same chunk
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    if (!chunk) return undefined;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    const idx = lx + (lz << 4) + (ly << 8);
+                    return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+                }
+
+                setBlock(x, y, z, blockId, createIfMissing = true) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return false;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    let chunk = this.chunks.get(key);
+
+                    if (!chunk) {
+                        if (!createIfMissing) return false;
+                        // Create new chunk with light data
+                        const size = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                        chunk = {
+                            blocks: new Uint8Array(size),
+                            skyLight: new Uint8Array(size).fill(15),
+                            blockLight: new Uint8Array(size).fill(1),
+                            cx: cx,
+                            cz: cz,
+                            startX: cx * WORLD_DIMS.chunkSize,
+                            startZ: cz * WORLD_DIMS.chunkSize,
+                        };
+                        this.chunks.set(key, chunk);
+                        this.activeChunks.add(key);
+                    } else if (!chunk.blocks) {
+                        // Upgrade legacy chunk format to include lighting buffers
+                        const legacy = chunk;
+                        const legacySize = legacy.length || WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                        chunk = {
+                            blocks: legacy,
+                            skyLight: new Uint8Array(legacySize).fill(15),
+                            blockLight: new Uint8Array(legacySize).fill(1),
+                        };
+                        this.chunks.set(key, chunk);
+                    } else {
+                        if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
+                        if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                    }
+
+                    const lx = ((x % 16) + 16) % 16;
+                    const lz = ((z % 16) + 16) % 16;
+                    const idx = lx + lz * 16 + ly * 256;
+                    const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+                    if (oldId === blockId) return false;
+
+                    if (chunk.blocks) { chunk.blocks[idx] = blockId; } else { chunk[idx] = blockId; }
+
+                    // Invalidate cache
+                    this._lastChunkKey = null;
+                    this._lastChunk = null;
+                    this.modifiedChunks.add(key);
+                    this.pristineChunks.delete(key);
+                    return true;
+                }
+
+                markChunkDirty(cx, cz) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0 });
+                        this.queuedChunkKeys.add(key);
+                    }
+                }
+
+                updateStreaming(playerPosition, renderDistance) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const playerCX = Math.floor(playerPosition.x / chunkSize);
+                    const playerCZ = Math.floor(playerPosition.z / chunkSize);
+
+                    const neededChunks = new Set();
+
+                    // Determine which chunks should be loaded
+                    for (let dx = -renderDistance; dx <= renderDistance; dx++) {
+                        for (let dz = -renderDistance; dz <= renderDistance; dz++) {
+                            const dist = Math.sqrt(dx * dx + dz * dz);
+                            if (dist <= renderDistance) {
+                                const key = this.getChunkKey(playerCX + dx, playerCZ + dz);
+                                neededChunks.add(key);
+                            }
+                        }
+                    }
+
+                    // Unload chunks that are too far
+                    for (const key of this.activeChunks) {
+                        if (!neededChunks.has(key)) {
+                            this.unloadChunk(key);
+                        }
+                    }
+
+                    // Load new chunks
+                    for (const key of neededChunks) {
+                        if (!this.activeChunks.has(key)) {
+                            const { cx, cz } = this.parseChunkKey(key);
+                            this.ensureChunk(cx, cz);
+                        }
+                    }
+
+                    this.activeChunks = neededChunks;
+                }
+
+                unloadChunk(key) {
+                    // Check if chunk can be evicted (not modified)
+                    if (this.modifiedChunks.has(key)) {
+                        return false;
+                    }
+                    this.chunks.delete(key);
+                    this.pristineChunks.delete(key);
+                    this.activeChunks.delete(key);
+                    return true;
+                }
+
+                // --- LIGHTING FUNCTIONS ---
+                getSkyLight(x, y, z) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0) return 1;
+                    if (ly >= WORLD_DIMS.chunkHeight) return 15;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    if (!chunk || !chunk.skyLight) return 15;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
+                }
+
+                setSkyLight(x, y, z, level) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.skyLight) return;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
+                    chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                }
+
+                getBlockLight(x, y, z) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    if (!chunk || !chunk.blockLight) return 0;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
+                }
+
+                setBlockLight(x, y, z, level) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.blockLight) return;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
+                    chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                }
+
+                getLocalLight(x, y, z) {
+                    const sky = this.getSkyLight(x, y, z);
+                    const block = this.getBlockLight(x, y, z);
+                    return Math.max(sky, block);
+                }
+
+                // --- CHUNK SCHEDULING ---
+                scheduleChunkUpdate(cx, cz, force = false) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0, force });
+                        this.queuedChunkKeys.add(key);
+                    }
+                }
+
+                // --- NEIGHBOR HELPERS ---
+                getNeighborChunks(cx, cz) {
+                    return {
+                        north: this.chunks.get(this.getChunkKey(cx, cz - 1)),
+                        south: this.chunks.get(this.getChunkKey(cx, cz + 1)),
+                        east: this.chunks.get(this.getChunkKey(cx + 1, cz)),
+                        west: this.chunks.get(this.getChunkKey(cx - 1, cz)),
+                        northWest: this.chunks.get(this.getChunkKey(cx - 1, cz - 1)),
+                        northEast: this.chunks.get(this.getChunkKey(cx + 1, cz - 1)),
+                        southWest: this.chunks.get(this.getChunkKey(cx - 1, cz + 1)),
+                        southEast: this.chunks.get(this.getChunkKey(cx + 1, cz + 1))
+                    };
+                }
+
+                // --- SOLID BLOCK CHECK ---
+                isSolidBlock(x, y, z) {
+                    const id = this.getBlock(x, y, z);
+                    return id !== BLOCKS.AIR && id !== BLOCKS.WATER && id !== undefined;
+                }
+
+                // --- EVICTION ---
+                canEvictChunk(key, persistModified = false) {
+                    if (this.modifiedChunks.has(key)) {
+                        return false;
+                    }
+                    return true;
+                }
+
+                purgeChunkData(key) {
+                    this.chunks.delete(key);
+                    this.pristineChunks.delete(key);
+                    this.modifiedChunks.delete(key);
+                    this.activeChunks.delete(key);
+                    this.queuedChunkKeys.delete(key);
+                }
+            }
+
+            // =====================================================
+            // 5. CHUNK MESHER CLASS
+            // =====================================================
+
+            class ChunkMesher {
+                constructor(materials) {
+                    this.materials = materials || {};
+                    this.faceVertexCache = new Map();
+                    this.terrainMeshPool = [];
+                    this.waterMeshPool = [];
+                }
+
+                setMaterials(terrain, water) {
+                    this.materials.terrain = terrain;
+                    this.materials.water = water;
+                }
+
+                // --- FACE VERTEX CACHE ---
+                getCachedFaceVertices(nx, ny, nz) {
+                    const key = `${nx},${ny},${nz}`;
+                    if (this.faceVertexCache.has(key)) return this.faceVertexCache.get(key);
+
+                    const verts = new Float32Array(18);
+                    let x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4;
+
+                    if (ny > 0) { x1 = 0; y1 = 1; z1 = 1; x2 = 1; y2 = 1; z2 = 1; x3 = 1; y3 = 1; z3 = 0; x4 = 0; y4 = 1; z4 = 0; }
+                    else if (ny < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 0; z3 = 1; x4 = 0; y4 = 0; z4 = 1; }
+                    else if (nx > 0) { x1 = 1; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 1; }
+                    else if (nx < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 1; x3 = 0; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 0; }
+                    else if (nz > 0) { x1 = 0; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 1; x3 = 1; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 1; }
+                    else { x1 = 1; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 0; x3 = 0; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 0; }
+
+                    verts[0] = x1; verts[1] = y1; verts[2] = z1;
+                    verts[3] = x2; verts[4] = y2; verts[5] = z2;
+                    verts[6] = x4; verts[7] = y4; verts[8] = z4;
+                    verts[9] = x2; verts[10] = y2; verts[11] = z2;
+                    verts[12] = x3; verts[13] = y3; verts[14] = z3;
+                    verts[15] = x4; verts[16] = y4; verts[17] = z4;
+
+                    this.faceVertexCache.set(key, verts);
+                    return verts;
+                }
+
+                // --- AO CALCULATION ---
+                getAOConfig(nx, ny, nz) {
+                    if (ny > 0) return { cornerOffsets: [[-1, 0, 1], [1, 0, 1], [1, 0, -1], [-1, 0, -1]], edgeOffsets: [[0, 0, 1], [1, 0, 0], [0, 0, -1], [-1, 0, 0]] };
+                    if (ny < 0) return { cornerOffsets: [[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], edgeOffsets: [[0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]] };
+                    if (nx > 0) return { cornerOffsets: [[0, 1, 1], [0, 1, -1], [0, -1, -1], [0, -1, 1]], edgeOffsets: [[0, 1, 0], [0, 0, -1], [0, -1, 0], [0, 0, 1]] };
+                    if (nx < 0) return { cornerOffsets: [[0, 1, -1], [0, 1, 1], [0, -1, 1], [0, -1, -1]], edgeOffsets: [[0, 1, 0], [0, 0, 1], [0, -1, 0], [0, 0, -1]] };
+                    if (nz > 0) return { cornerOffsets: [[-1, 1, 0], [1, 1, 0], [1, -1, 0], [-1, -1, 0]], edgeOffsets: [[0, 1, 0], [1, 0, 0], [0, -1, 0], [-1, 0, 0]] };
+                    return { cornerOffsets: [[1, 1, 0], [-1, 1, 0], [-1, -1, 0], [1, -1, 0]], edgeOffsets: [[0, 1, 0], [-1, 0, 0], [0, -1, 0], [1, 0, 0]] };
+                }
+
+                calculateVertexAO(lx, ly, lz, offsets, getter) {
+                    const side1 = getter(lx + offsets.edge1[0], ly + offsets.edge1[1], lz + offsets.edge1[2]) > 0 ? 1 : 0;
+                    const side2 = getter(lx + offsets.edge2[0], ly + offsets.edge2[1], lz + offsets.edge2[2]) > 0 ? 1 : 0;
+                    const corner = getter(lx + offsets.corner[0], ly + offsets.corner[1], lz + offsets.corner[2]) > 0 ? 1 : 0;
+                    if (side1 && side2) return 0;
+                    return 3 - (side1 + side2 + corner);
+                }
+
+                // --- MESH POOLING ---
+                acquireTerrainMesh() {
+                    return this.terrainMeshPool.pop() || null;
+                }
+
+                acquireWaterMesh() {
+                    return this.waterMeshPool.pop() || null;
+                }
+
+                releaseTerrainMesh(mesh) {
+                    if (mesh) this.terrainMeshPool.push(mesh);
+                }
+
+                releaseWaterMesh(mesh) {
+                    if (mesh) this.waterMeshPool.push(mesh);
+                }
+
+                buildMeshForChunk(chunk, neighbors, uvMap) {
+                    // This delegates to the existing renderChunk function
+                    // The actual mesh building logic is complex and already implemented
+                    return null; // Placeholder - uses existing renderChunk()
+                }
+
+                disposeChunkMesh(chunk) {
+                    if (chunk.mesh) {
+                        if (chunk.mesh.geometry) chunk.mesh.geometry.dispose();
+                        chunk.mesh = null;
+                    }
+                    if (chunk.waterMesh) {
+                        if (chunk.waterMesh.geometry) chunk.waterMesh.geometry.dispose();
+                        chunk.waterMesh = null;
+                    }
+                }
+            }
+
+            // =====================================================
+            // 6. RENDER ENGINE CLASS
+            // =====================================================
+
+            class RenderEngine {
+                constructor(canvas, settingsManager) {
+                    this.canvas = canvas;
+                    this.settings = settingsManager;
+
+                    this.renderer = null;
+                    this.scene = null;
+                    this.camera = null;
+
+                    // Post-processing
+                    this.composer = null;
+                    this.renderPass = null;
+                    this.zombieScarePass = null;
+
+                    // Lighting
+                    this.sun = null;
+                    this.moon = null;
+                    this.ambientLight = null;
+                    this.torchLight = null;
+
+                    // Sky
+                    this.skybox = null;
+                    this.skyMaterial = null;
+                    this.sunSprite = null;
+                    this.moonSprite = null;
+
+                    // Day/Night
+                    this.dayNightTime = 0.25;
+                }
+
+                init() {
+                    // Scene
+                    this.scene = new THREE.Scene();
+                    this.scene.matrixAutoUpdate = false;
+
+                    // Camera
+                    const fov = this.settings.get('normalFOV') || 75;
+                    this.camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.01, 800);
+                    this.camera.layers.enable(0);
+                    this.camera.layers.enable(1);
+
+                    // Renderer
+                    this.renderer = new THREE.WebGLRenderer({ antialias: this.settings.get('antialiasing') });
+                    this.renderer.setPixelRatio(window.devicePixelRatio * (this.settings.get('pixelRatio') || 1.0));
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                    this.renderer.shadowMap.enabled = this.settings.get('shadows');
+                    if (this.settings.get('shadows')) {
+                        this.renderer.shadowMap.type = THREE.PCFShadowMap;
+                    }
+
+                    // Append to DOM
+                    if (this.canvas) {
+                        this.canvas.appendChild(this.renderer.domElement);
+                    } else {
+                        document.body.appendChild(this.renderer.domElement);
+                    }
+
+                    // Style renderer
+                    this.renderer.domElement.style.position = "fixed";
+                    this.renderer.domElement.style.top = "0";
+                    this.renderer.domElement.style.left = "0";
+                    this.renderer.domElement.style.zIndex = "1";
+
+                    // Lighting
+                    this.ambientLight = new THREE.AmbientLight(0xffffff, this.settings.get('ambientIntensity') || 0.5);
+                    this.scene.add(this.ambientLight);
+
+                    this.sun = new THREE.DirectionalLight(this.settings.get('sunColor') || 0xfce7bb, 1);
+                    this.sun.castShadow = this.settings.get('shadows');
+                    this.scene.add(this.sun);
+
+                    this.moon = new THREE.DirectionalLight(this.settings.get('moonColor') || 0x8899ff, 0.2);
+                    this.moon.castShadow = this.settings.get('shadows');
+                    this.scene.add(this.moon);
+
+                    return this;
+                }
+
+                initPostProcessing() {
+                    this.composer = new EffectComposer(this.renderer);
+                    this.renderPass = new RenderPass(this.scene, this.camera);
+                    this.composer.addPass(this.renderPass);
+
+                    // Zombie scare shader would be added here
+                    return this;
+                }
+
+                applySettings() {
+                    if (!this.renderer) return;
+
+                    this.renderer.shadowMap.enabled = this.settings.get('shadows');
+
+                    if (this.sun) {
+                        this.sun.color.setHex(this.settings.get('sunColor') || 0xfce7bb);
+                        this.sun.intensity = this.settings.get('sunIntensity') || 0.8;
+                    }
+                    if (this.moon) {
+                        this.moon.color.setHex(this.settings.get('moonColor') || 0x8899ff);
+                        this.moon.intensity = this.settings.get('moonIntensity') || 0.15;
+                    }
+                    if (this.ambientLight) {
+                        this.ambientLight.intensity = this.settings.get('ambientIntensity') || 0.5;
+                    }
+                }
+
+                resize(width, height) {
+                    this.camera.aspect = width / height;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(width, height);
+                    if (this.composer) {
+                        this.composer.setSize(width, height);
+                    }
+                }
+
+                render(delta) {
+                    if (this.composer) {
+                        this.composer.render(delta);
+                    } else if (this.renderer && this.scene && this.camera) {
+                        this.renderer.render(this.scene, this.camera);
+                    }
+                }
+
+                updateZombieEffectUniforms(distanceToClosestZombie) {
+                    if (!this.zombieScarePass) return;
+
+                    const maxDist = 28; // ZOMBIE_CONFIG.detectionRadius
+                    const proximity = distanceToClosestZombie < maxDist
+                        ? 1.0 - (distanceToClosestZombie / maxDist)
+                        : 0;
+
+                    this.zombieScarePass.uniforms.zombieProximity.value = proximity;
+                }
+
+                // --- DAY/NIGHT CYCLE ---
+                updateDayNight(dt) {
+                    const dayLengthSeconds = this.settings.get('dayLengthSeconds') || 600;
+                    this.dayNightTime += dt / dayLengthSeconds;
+                    if (this.dayNightTime >= 1) this.dayNightTime -= 1;
+
+                    const angle = this.dayNightTime * Math.PI * 2;
+                    const sunY = Math.sin(angle);
+                    const sunXZ = Math.cos(angle);
+
+                    // Sun position
+                    if (this.sun) {
+                        this.sun.position.set(sunXZ * 100, sunY * 100, 50);
+                        this.sun.intensity = Math.max(0, sunY) * (this.settings.get('sunIntensity') || 0.8);
+                    }
+
+                    // Moon position (opposite sun)
+                    if (this.moon) {
+                        this.moon.position.set(-sunXZ * 100, -sunY * 100, 50);
+                        this.moon.intensity = Math.max(0, -sunY) * (this.settings.get('moonIntensity') || 0.15);
+                    }
+
+                    // Ambient light based on time
+                    if (this.ambientLight) {
+                        const dayFactor = (sunY + 1) * 0.5;
+                        const baseAmbient = this.settings.get('ambientIntensity') || 0.5;
+                        this.ambientLight.intensity = baseAmbient * (0.3 + dayFactor * 0.7);
+                    }
+
+                    // Update sky color if skybox exists
+                    if (this.skyMaterial && this.skyMaterial.uniforms) {
+                        if (this.skyMaterial.uniforms.sunPosition) {
+                            this.skyMaterial.uniforms.sunPosition.value.set(sunXZ, sunY, 0.5).normalize();
+                        }
+                    }
+
+                    return this.dayNightTime;
+                }
+
+                // --- FOG ---
+                setFog(near, far, color) {
+                    if (!this.scene.fog) {
+                        this.scene.fog = new THREE.Fog(color || 0x87ceeb, near, far);
+                    } else {
+                        this.scene.fog.near = near;
+                        this.scene.fog.far = far;
+                        if (color !== undefined) this.scene.fog.color.setHex(color);
+                    }
+                }
+
+                updateFogDistance(renderDistance) {
+                    const fogFar = renderDistance * WORLD_DIMS.chunkSize;
+                    if (this.scene.fog) {
+                        this.scene.fog.far = fogFar;
+                        this.scene.fog.near = fogFar * 0.5;
+                    }
+                }
+
+                // --- FRUSTUM CULLING ---
+                updateFrustum() {
+                    if (!this._frustum) {
+                        this._frustum = new THREE.Frustum();
+                        this._projScreenMatrix = new THREE.Matrix4();
+                    }
+                    this._projScreenMatrix.multiplyMatrices(
+                        this.camera.projectionMatrix,
+                        this.camera.matrixWorldInverse
+                    );
+                    this._frustum.setFromProjectionMatrix(this._projScreenMatrix);
+                    return this._frustum;
+                }
+
+                isInFrustum(boundingSphere) {
+                    if (!this._frustum) this.updateFrustum();
+                    return this._frustum.intersectsSphere(boundingSphere);
+                }
+
+                // --- TEXTURE REGISTRATION ---
+                registerPixelTexture(texture) {
+                    texture.magFilter = THREE.NearestFilter;
+                    texture.minFilter = THREE.NearestFilter;
+                    texture.generateMipmaps = false;
+                    texture.needsUpdate = true;
+                }
+
+                // --- VIEWMODEL LAYER ---
+                setupViewmodelLayer() {
+                    // Layer 1 is for viewmodels (torch, etc.)
+                    this.camera.layers.enable(1);
+                }
+
+                addToViewmodelLayer(object) {
+                    object.layers.set(1);
+                    object.renderOrder = 1000;
+                    if (object.material) {
+                        object.material.depthTest = false;
+                    }
+                }
+            }
+
+            // =====================================================
+            // 7. AUDIO MANAGER CLASS
+            // =====================================================
+
+            class AudioManager {
+                constructor(settingsManager) {
+                    this.settings = settingsManager;
+                    this.ctx = null;
+                    this.enabled = true;
+                    this.masterVolume = 0.3;
+                    this.sounds = new Map();
+                    this.bufferCache = new Map();
+                }
+
+                initContext() {
+                    if (!this.ctx) {
+                        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    return this.ctx;
+                }
+
+                async loadSound(name, base64Data) {
+                    const ctx = this.initContext();
+
+                    if (this.bufferCache.has(name)) {
+                        return this.bufferCache.get(name);
+                    }
+
+                    try {
+                        const binaryString = atob(base64Data);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+
+                        const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+                        this.bufferCache.set(name, audioBuffer);
+                        return audioBuffer;
+                    } catch (e) {
+                        console.warn(`[AudioManager] Failed to load sound '${name}':`, e);
+                        return null;
+                    }
+                }
+
+                play(name, options = {}) {
+                    if (!this.enabled || !this.ctx) return;
+
+                    const buffer = this.bufferCache.get(name);
+                    if (!buffer) return;
+
+                    const source = this.ctx.createBufferSource();
+                    source.buffer = buffer;
+
+                    const gainNode = this.ctx.createGain();
+                    gainNode.gain.value = (options.volume || 1.0) * this.masterVolume;
+
+                    source.connect(gainNode);
+                    gainNode.connect(this.ctx.destination);
+
+                    if (options.playbackRate) {
+                        source.playbackRate.value = options.playbackRate;
+                    }
+
+                    source.start(0);
+                }
+
+                playClick() {
+                    // Generate and play a rich UI click sound (clink)
+                    if (!this.enabled) return;
+
+                    const ctx = this.initContext();
+                    const now = ctx.currentTime;
+
+                    // Slight randomization so repeated clicks don't sound identical
+                    const baseFreq = 650 + Math.random() * 80; // 650–730 Hz
+
+                    // Main tonal body: soft, percussive blip
+                    const osc1 = ctx.createOscillator();
+                    const osc2 = ctx.createOscillator();
+                    osc1.type = 'triangle';
+                    osc2.type = 'sine';
+
+                    osc1.frequency.setValueAtTime(baseFreq, now);
+                    osc1.frequency.exponentialRampToValueAtTime(baseFreq * 0.6, now + 0.08);
+
+                    osc2.frequency.setValueAtTime(baseFreq * 1.5, now);
+                    osc2.frequency.exponentialRampToValueAtTime(baseFreq, now + 0.08);
+
+                    // Very short noise burst for the "mechanical" click transient
+                    const noiseDuration = 0.04;
+                    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * noiseDuration, ctx.sampleRate);
+                    const noiseData = noiseBuffer.getChannelData(0);
+                    for (let i = 0; i < noiseData.length; i++) {
+                        noiseData[i] = (Math.random() * 2 - 1) * 0.6;
+                    }
+                    const noiseSource = ctx.createBufferSource();
+                    noiseSource.buffer = noiseBuffer;
+
+                    const noiseGain = ctx.createGain();
+                    noiseGain.gain.setValueAtTime(this.masterVolume * 0.35, now);
+                    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDuration);
+
+                    // Shared gain envelope (final amplitude)
+                    const gainNode = ctx.createGain();
+                    gainNode.gain.setValueAtTime(0, now);
+                    gainNode.gain.linearRampToValueAtTime(this.masterVolume * 0.7, now + 0.01);
+                    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+
+                    // Gentle low-pass filter to keep things soft and UI-friendly
+                    const filter = ctx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.setValueAtTime(3500, now);
+                    filter.Q.value = 0.7;
+
+                    // Routing: oscillators -> filter -> gain -> destination
+                    osc1.connect(filter);
+                    osc2.connect(filter);
+                    noiseSource.connect(noiseGain);
+                    noiseGain.connect(filter);
+                    filter.connect(gainNode);
+                    gainNode.connect(ctx.destination);
+
+                    // Start/stop everything
+                    osc1.start(now);
+                    osc2.start(now);
+                    noiseSource.start(now);
+
+                    const stopTime = now + 0.2;
+                    osc1.stop(stopTime);
+                    osc2.stop(stopTime);
+                    noiseSource.stop(stopTime);
+                }
+
+                playBlockPlace() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    // Wood-like thunk sound
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(150, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(80, this.ctx.currentTime + 0.08);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.08);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.08);
+                }
+
+                playBlockBreak() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    // Breaking/crumble sound
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(50, this.ctx.currentTime + 0.1);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.3, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.1);
+                }
+
+                playFootstep() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(100 + Math.random() * 50, this.ctx.currentTime);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.15, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.05);
+                }
+
+                playZombieGrowl() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(80 + Math.random() * 40, this.ctx.currentTime);
+                    osc.frequency.linearRampToValueAtTime(60 + Math.random() * 30, this.ctx.currentTime + 0.3);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.25, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.3);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.3);
+                }
+
+                playZombieHurt() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'square';
+                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(100, this.ctx.currentTime + 0.15);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.35, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.15);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.15);
+                }
+
+                playPlayerHurt() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(400, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(200, this.ctx.currentTime + 0.1);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.1);
+                }
+
+                setEnabled(enabled) {
+                    this.enabled = enabled;
+                }
+
+                setVolume(volume) {
+                    this.masterVolume = Math.max(0, Math.min(1, volume));
+                }
+
+                resumeContext() {
+                    if (this.ctx && this.ctx.state === 'suspended') {
+                        this.ctx.resume();
+                    }
+                }
+            }
+
+            // =====================================================
+            // 8. ENTITY MANAGER & MOB CLASSES
+            // =====================================================
+
+            class EntityManager {
+                constructor() {
+                    this.entities = new Set();
+                    this.pools = new Map();
+                    this.zombiePool = [];
+                    this.maxZombies = 10;
+                }
+
+                add(entity) {
+                    this.entities.add(entity);
+                    return entity;
+                }
+
+                remove(entity) {
+                    this.entities.delete(entity);
+                    // Return to pool if it's a zombie
+                    if (entity instanceof Zombie) {
+                        entity.reset();
+                        this.zombiePool.push(entity);
+                    }
+                }
+
+                update(delta) {
+                    for (const entity of this.entities) {
+                        if (entity.update) {
+                            entity.update(delta);
+                        }
+                    }
+                }
+
+                getByType(type) {
+                    const result = [];
+                    for (const entity of this.entities) {
+                        if (entity instanceof type) {
+                            result.push(entity);
+                        }
+                    }
+                    return result;
+                }
+
+                clear() {
+                    this.entities.clear();
+                }
+
+                // --- ZOMBIE MANAGEMENT ---
+                acquireZombie() {
+                    if (this.zombiePool.length > 0) {
+                        return this.zombiePool.pop();
+                    }
+                    return new Zombie();
+                }
+
+                getZombies() {
+                    return this.getByType(Zombie);
+                }
+
+                getZombieCount() {
+                    return this.getZombies().length;
+                }
+
+                getClosestZombie(position) {
+                    let closest = null;
+                    let closestDist = Infinity;
+                    for (const entity of this.entities) {
+                        if (entity instanceof Zombie) {
+                            const dist = entity.position.distanceTo(position);
+                            if (dist < closestDist) {
+                                closestDist = dist;
+                                closest = entity;
+                            }
+                        }
+                    }
+                    return { zombie: closest, distance: closestDist };
+                }
+
+                // --- SPAWN HELPERS ---
+                spawnZombie(position, scene) {
+                    if (this.getZombieCount() >= this.maxZombies) return null;
+                    const zombie = this.acquireZombie();
+                    zombie.position.copy(position);
+                    zombie.state = 'wander';
+                    if (scene && zombie.mesh) {
+                        scene.add(zombie.mesh);
+                    }
+                    this.add(zombie);
+                    return zombie;
+                }
+
+                despawnZombie(zombie, scene) {
+                    if (scene && zombie.mesh) {
+                        scene.remove(zombie.mesh);
+                    }
+                    this.remove(zombie);
+                }
+            }
+
+            class Mob {
+                constructor() {
+                    this.position = new THREE.Vector3();
+                    this.velocity = new THREE.Vector3();
+                    this.rotation = new THREE.Euler();
+                    this.health = 20;
+                    this.maxHealth = 20;
+                    this.state = 'idle';
+                    this.mesh = null;
+                }
+
+                update(delta) {
+                    // Base mob update - apply velocity
+                    this.position.addScaledVector(this.velocity, delta);
+                }
+
+                damage(amount) {
+                    this.health = Math.max(0, this.health - amount);
+                    return this.health <= 0;
+                }
+
+                heal(amount) {
+                    this.health = Math.min(this.maxHealth, this.health + amount);
+                }
+
+                dispose() {
+                    if (this.mesh && this.mesh.parent) {
+                        this.mesh.parent.remove(this.mesh);
+                    }
+                }
+            }
+
+            class Zombie extends Mob {
+                constructor() {
+                    super();
+                    this.type = 'zombie';
+                    this.state = 'wander';
+                    this.target = null;
+                    this.attackCooldown = 0;
+                    this.wanderTimer = 0;
+                    this.wanderDirection = new THREE.Vector3();
+                    this.walkSpeed = 2.4;
+                    this.chaseSpeed = 4.8;
+                    this.attackRange = 2.5;
+                    this.detectionRadius = 28;
+                }
+
+                update(delta) {
+                    // Update attack cooldown
+                    if (this.attackCooldown > 0) {
+                        this.attackCooldown -= delta;
+                    }
+
+                    // State machine
+                    switch (this.state) {
+                        case 'wander':
+                            this.updateWander(delta);
+                            break;
+                        case 'chase':
+                            this.updateChase(delta);
+                            break;
+                        case 'attack':
+                            this.updateAttack(delta);
+                            break;
+                    }
+
+                    super.update(delta);
+                }
+
+                updateWander(delta) {
+                    this.wanderTimer -= delta;
+                    if (this.wanderTimer <= 0) {
+                        // Pick new random direction
+                        const angle = Math.random() * Math.PI * 2;
+                        this.wanderDirection.set(Math.cos(angle), 0, Math.sin(angle));
+                        this.wanderTimer = 2 + Math.random() * 3;
+                    }
+
+                    this.velocity.copy(this.wanderDirection).multiplyScalar(this.walkSpeed);
+                }
+
+                updateChase(delta) {
+                    if (!this.target) {
+                        this.state = 'wander';
+                        return;
+                    }
+
+                    const direction = new THREE.Vector3()
+                        .subVectors(this.target.position || this.target, this.position)
+                        .normalize();
+
+                    this.velocity.copy(direction).multiplyScalar(this.chaseSpeed);
+
+                    // Check if close enough to attack
+                    const dist = this.position.distanceTo(this.target.position || this.target);
+                    if (dist < this.attackRange) {
+                        this.state = 'attack';
+                    }
+                }
+
+                updateAttack(delta) {
+                    this.velocity.set(0, 0, 0);
+
+                    if (this.attackCooldown <= 0) {
+                        // Perform attack
+                        this.attackCooldown = 1.2;
+                        // Attack logic would go here
+                    }
+
+                    // Return to chase if target moved away
+                    if (this.target) {
+                        const dist = this.position.distanceTo(this.target.position || this.target);
+                        if (dist > this.attackRange * 1.5) {
+                            this.state = 'chase';
+                        }
+                    }
+                }
+
+                setTarget(target) {
+                    this.target = target;
+                    if (target) {
+                        this.state = 'chase';
+                    } else {
+                        this.state = 'wander';
+                    }
+                }
+
+                reset() {
+                    this.position.set(0, 0, 0);
+                    this.velocity.set(0, 0, 0);
+                    this.health = this.maxHealth;
+                    this.state = 'wander';
+                    this.target = null;
+                    this.attackCooldown = 0;
+                    this.wanderTimer = 0;
+                }
+
+                // --- LIMB ANIMATION ---
+                animateLimbs(dt, moveSpeed = 0) {
+                    if (!this.mesh) return;
+
+                    const isMoving = moveSpeed > 0.1;
+                    const swingSpeed = isMoving ? moveSpeed * 2.5 : 0;
+                    const swingAmplitude = isMoving ? 0.6 : 0;
+
+                    // Find limb parts
+                    const leftArm = this.mesh.getObjectByName('leftArm');
+                    const rightArm = this.mesh.getObjectByName('rightArm');
+                    const leftLeg = this.mesh.getObjectByName('leftLeg');
+                    const rightLeg = this.mesh.getObjectByName('rightLeg');
+
+                    if (!this._animTime) this._animTime = 0;
+                    this._animTime += dt * swingSpeed;
+
+                    const swing = Math.sin(this._animTime) * swingAmplitude;
+
+                    if (leftArm) leftArm.rotation.x = swing;
+                    if (rightArm) rightArm.rotation.x = -swing;
+                    if (leftLeg) leftLeg.rotation.x = -swing;
+                    if (rightLeg) rightLeg.rotation.x = swing;
+                }
+
+                // --- COLLISION ---
+                collidesWith(position, radius = 0.4) {
+                    const dx = this.position.x - position.x;
+                    const dz = this.position.z - position.z;
+                    const dist2D = Math.sqrt(dx * dx + dz * dz);
+                    const zombieRadius = 0.5;
+                    return dist2D < (radius + zombieRadius);
+                }
+
+                collidesWithBlock(blockX, blockY, blockZ) {
+                    const halfWidth = 0.4;
+                    const height = 1.9;
+                    const px = this.position.x, py = this.position.y, pz = this.position.z;
+
+                    return !(px + halfWidth <= blockX || px - halfWidth >= blockX + 1 ||
+                             py >= blockY + 1 || py + height <= blockY ||
+                             pz + halfWidth <= blockZ || pz - halfWidth >= blockZ + 1);
+                }
+
+                // --- FACING ---
+                faceTarget() {
+                    if (!this.target || !this.mesh) return;
+                    const targetPos = this.target.position || this.target;
+                    const dx = targetPos.x - this.position.x;
+                    const dz = targetPos.z - this.position.z;
+                    this.mesh.rotation.y = Math.atan2(dx, dz);
+                }
+
+                // --- MESH UPDATE ---
+                updateMeshPosition() {
+                    if (this.mesh) {
+                        this.mesh.position.copy(this.position);
+                    }
+                }
+            }
+
+            // =====================================================
+            // 9. PLAYER CONTROLLER CLASS
+            // =====================================================
+
+            class PlayerController {
+                constructor(camera, inputManager, voxelWorld, settingsManager) {
+                    this.camera = camera;
+                    this.input = inputManager;
+                    this.world = voxelWorld;
+                    this.settings = settingsManager;
+
+                    this.position = new THREE.Vector3();
+                    this.velocity = new THREE.Vector3();
+                    this.yaw = 0;
+                    this.pitch = 0;
+
+                    // Movement state
+                    this.isFlying = false;
+                    this.isSprinting = false;
+                    this.isCrouching = false;
+                    this.canJump = false;
+                    this.flyUp = false;
+                    this.flyDown = false;
+
+                    // Eye height
+                    this.standingEyeHeight = 1.8;
+                    this.crouchingEyeHeight = 1.4;
+                    this.eyeHeight = this.standingEyeHeight;
+
+                    // Double-tap flying
+                    this.lastSpaceTime = 0;
+
+                    // Selected block
+                    this.selectedBlockId = BLOCKS.GRASS;
+                    this.hotbarSlot = 1;
+
+                    // Torch
+                    this.torchActive = false;
+
+                    // Raycaster for block interaction
+                    this.raycaster = new THREE.Raycaster();
+                }
+
+                update(delta) {
+                    this.handleMovement(delta);
+                    this.updateCamera();
+                }
+
+                handleMovement(delta) {
+                    const speed = this.settings.get('playerSpeed') || 50;
+                    const sprintMult = this.settings.get('sprintMultiplier') || 2.0;
+                    const crouchMult = this.settings.get('crouchMultiplier') || 0.5;
+                    const flyMult = this.settings.get('flySpeedMultiplier') || 4.0;
+                    const gravity = this.settings.get('gravity') || 30;
+                    const jumpForce = this.settings.get('jumpForce') || 10;
+
+                    // Calculate movement direction
+                    const direction = new THREE.Vector3();
+
+                    const forward = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(0, this.yaw, 0));
+                    const right = new THREE.Vector3(1, 0, 0).applyEuler(new THREE.Euler(0, this.yaw, 0));
+
+                    if (this.input.isKeyDown('KeyW') || this.input.isKeyDown('ArrowUp')) direction.add(forward);
+                    if (this.input.isKeyDown('KeyS') || this.input.isKeyDown('ArrowDown')) direction.sub(forward);
+                    if (this.input.isKeyDown('KeyD') || this.input.isKeyDown('ArrowRight')) direction.add(right);
+                    if (this.input.isKeyDown('KeyA') || this.input.isKeyDown('ArrowLeft')) direction.sub(right);
+
+                    // Normalize and scale
+                    if (direction.lengthSq() > 0) {
+                        direction.normalize();
+                        let currentSpeed = speed;
+                        if (this.isFlying) currentSpeed *= flyMult;
+                        else if (this.isSprinting) currentSpeed *= sprintMult;
+                        else if (this.isCrouching) currentSpeed *= crouchMult;
+                        direction.multiplyScalar(currentSpeed * delta);
+                    }
+
+                    // Apply horizontal movement
+                    this.velocity.x = direction.x / delta;
+                    this.velocity.z = direction.z / delta;
+
+                    // Vertical movement
+                    if (this.isFlying) {
+                        if (this.flyUp) this.velocity.y = speed * flyMult;
+                        else if (this.flyDown) this.velocity.y = -speed * flyMult;
+                        else this.velocity.y = 0;
+                    } else {
+                        // Apply gravity
+                        this.velocity.y -= gravity * delta;
+
+                        // Jump
+                        if (this.canJump && this.input.isKeyDown('Space')) {
+                            this.velocity.y = jumpForce;
+                            this.canJump = false;
+                        }
+                    }
+
+                    // Update position
+                    this.position.addScaledVector(this.velocity, delta);
+
+                    // Eye height
+                    this.eyeHeight = this.isCrouching ? this.crouchingEyeHeight : this.standingEyeHeight;
+                }
+
+                updateCamera() {
+                    if (this.camera) {
+                        this.camera.position.copy(this.position);
+                        this.camera.position.y += this.eyeHeight;
+                    }
+                }
+
+                handleBlockInteraction(hit, button) {
+                    if (!hit) return;
+
+                    const { x, y, z, face } = hit;
+
+                    if (button === 0) {
+                        // Break block
+                        if (this.world.getBlock(x, y, z) !== BLOCKS.BEDROCK) {
+                            this.world.setBlock(x, y, z, BLOCKS.AIR);
+                            return { type: 'break', x, y, z };
+                        }
+                    } else if (button === 2 && face) {
+                        // Place block
+                        const nx = x + face[0];
+                        const ny = y + face[1];
+                        const nz = z + face[2];
+
+                        // Check player collision
+                        if (!this.wouldCollideWithPlayer(nx, ny, nz)) {
+                            this.world.setBlock(nx, ny, nz, this.selectedBlockId);
+                            return { type: 'place', x: nx, y: ny, z: nz, blockId: this.selectedBlockId };
+                        }
+                    }
+                    return null;
+                }
+
+                wouldCollideWithPlayer(bx, by, bz) {
+                    const px = this.position.x;
+                    const py = this.position.y;
+                    const pz = this.position.z;
+                    const playerBox = {
+                        minX: px - 0.4, maxX: px + 0.4,
+                        minY: py - 1.5, maxY: py + 0.3,
+                        minZ: pz - 0.4, maxZ: pz + 0.4
+                    };
+                    const blockBox = {
+                        minX: bx, maxX: bx + 1,
+                        minY: by, maxY: by + 1,
+                        minZ: bz, maxZ: bz + 1
+                    };
+                    return !(playerBox.maxX <= blockBox.minX || playerBox.minX >= blockBox.maxX ||
+                             playerBox.maxY <= blockBox.minY || playerBox.minY >= blockBox.maxY ||
+                             playerBox.maxZ <= blockBox.minZ || playerBox.minZ >= blockBox.maxZ);
+                }
+
+                setHotbarSlot(slot) {
+                    this.hotbarSlot = slot;
+                    const slotToBlock = [BLOCKS.GRASS, BLOCKS.DIRT, BLOCKS.STONE, BLOCKS.WOOD,
+                                        BLOCKS.LOG, BLOCKS.LEAVES, BLOCKS.SAND, BLOCKS.WATER, BLOCKS.TORCH];
+                    this.selectedBlockId = slotToBlock[slot - 1] || BLOCKS.GRASS;
+                }
+
+                toggleFly() {
+                    this.isFlying = !this.isFlying;
+                    if (this.isFlying) {
+                        this.velocity.y = 0;
+                    }
+                }
+
+                toggleTorch() {
+                    this.torchActive = !this.torchActive;
+                }
+
+                // --- COLLISION DETECTION ---
+                collide(pos) {
+                    if (!this.world) return pos;
+
+                    const halfWidth = 0.4;
+                    const height = 1.8;
+                    const stepHeight = 0.5;
+
+                    // Check all blocks player might intersect
+                    const minX = Math.floor(pos.x - halfWidth);
+                    const maxX = Math.floor(pos.x + halfWidth);
+                    const minY = Math.floor(pos.y);
+                    const maxY = Math.floor(pos.y + height);
+                    const minZ = Math.floor(pos.z - halfWidth);
+                    const maxZ = Math.floor(pos.z + halfWidth);
+
+                    for (let bx = minX; bx <= maxX; bx++) {
+                        for (let by = minY; by <= maxY; by++) {
+                            for (let bz = minZ; bz <= maxZ; bz++) {
+                                if (this.world.isSolidBlock(bx, by, bz)) {
+                                    // Simple push-out collision
+                                    const overlapX = Math.min(pos.x + halfWidth - bx, bx + 1 - (pos.x - halfWidth));
+                                    const overlapZ = Math.min(pos.z + halfWidth - bz, bz + 1 - (pos.z - halfWidth));
+                                    const overlapY = Math.min(pos.y + height - by, by + 1 - pos.y);
+
+                                    if (overlapX < overlapY && overlapX < overlapZ) {
+                                        if (pos.x < bx + 0.5) pos.x -= overlapX;
+                                        else pos.x += overlapX;
+                                    } else if (overlapZ < overlapY) {
+                                        if (pos.z < bz + 0.5) pos.z -= overlapZ;
+                                        else pos.z += overlapZ;
+                                    } else {
+                                        if (pos.y < by + 0.5) {
+                                            pos.y = by - height;
+                                            this.velocity.y = 0;
+                                        } else {
+                                            pos.y = by + 1;
+                                            this.velocity.y = 0;
+                                            this.canJump = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return pos;
+                }
+
+                checkGround() {
+                    if (!this.world) return false;
+                    const pos = this.position;
+                    const halfWidth = 0.3;
+                    const checkY = pos.y - 0.1;
+
+                    // Check corners and center for ground
+                    return this.world.isSolidBlock(Math.floor(pos.x), Math.floor(checkY), Math.floor(pos.z)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x - halfWidth), Math.floor(checkY), Math.floor(pos.z - halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x + halfWidth), Math.floor(checkY), Math.floor(pos.z - halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x - halfWidth), Math.floor(checkY), Math.floor(pos.z + halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x + halfWidth), Math.floor(checkY), Math.floor(pos.z + halfWidth));
+                }
+
+                // --- VOXEL PICKING (Raycasting) ---
+                pickVoxel(range = 5) {
+                    if (!this.camera || !this.world) return null;
+
+                    const origin = this.camera.position.clone();
+                    const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+
+                    const step = 0.05;
+                    let lastAir = null;
+
+                    for (let t = 0; t < range; t += step) {
+                        const x = Math.floor(origin.x + direction.x * t);
+                        const y = Math.floor(origin.y + direction.y * t);
+                        const z = Math.floor(origin.z + direction.z * t);
+
+                        const block = this.world.getBlock(x, y, z);
+                        if (block !== BLOCKS.AIR && block !== undefined) {
+                            // Calculate face normal
+                            let face = [0, 0, 0];
+                            if (lastAir) {
+                                face = [lastAir.x - x, lastAir.y - y, lastAir.z - z];
+                            }
+                            return { x, y, z, blockId: block, face };
+                        }
+                        lastAir = { x, y, z };
+                    }
+                    return null;
+                }
+
+                // --- MOUSE LOOK ---
+                handleMouseLook(deltaX, deltaY, sensitivity = 0.002) {
+                    this.yaw -= deltaX * sensitivity;
+                    this.pitch -= deltaY * sensitivity;
+                    this.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, this.pitch));
+
+                    if (this.camera) {
+                        this.camera.rotation.order = 'YXZ';
+                        this.camera.rotation.y = this.yaw;
+                        this.camera.rotation.x = this.pitch;
+                    }
+                }
+
+                // --- HEALTH ---
+                takeDamage(amount) {
+                    // Placeholder for player health system
+                    return false;
+                }
+
+                // --- SPAWN POINT ---
+                setSpawnPoint(x, y, z) {
+                    this.spawnPoint = new THREE.Vector3(x, y, z);
+                }
+
+                respawn() {
+                    if (this.spawnPoint) {
+                        this.position.copy(this.spawnPoint);
+                        this.velocity.set(0, 0, 0);
+                    }
+                }
+            }
+
+            // =====================================================
+            // 10. UI MANAGER CLASS
+            // =====================================================
+
+            class UIManager {
+                constructor(settingsManager, audioManager, voxelWorld) {
+                    this.settings = settingsManager;
+                    this.audio = audioManager;
+                    this.world = voxelWorld;
+
+                    // DOM element cache
+                    this.elements = {};
+                }
+
+                init() {
+                    // Cache common DOM elements
+                    this.elements = {
+                        seedMenu: document.getElementById('seed-menu'),
+                        blocker: document.getElementById('blocker'),
+                        instructions: document.getElementById('instructions'),
+                        mainPauseMenu: document.getElementById('main-pause-menu'),
+                        settingsMenu: document.getElementById('settings-menu'),
+                        controlsMenu: document.getElementById('controls-menu'),
+                        crosshair: document.getElementById('crosshair'),
+                        hotbar: document.getElementById('hotbar'),
+                        blockNameDisplay: document.getElementById('block-name-display'),
+                        flightIndicator: document.getElementById('flight-indicator'),
+                        sprintIndicator: document.getElementById('sprint-indicator'),
+                        crouchIndicator: document.getElementById('crouch-indicator'),
+                        debugOverlay: document.getElementById('debug-overlay'),
+                        slots: document.querySelectorAll('.slot')
+                    };
+
+                    // Initialize button audio
+                    this.initButtonAudio();
+                }
+
+                initButtonAudio() {
+                    const buttons = document.querySelectorAll('button');
+                    buttons.forEach(button => {
+                        button.addEventListener('click', () => {
+                            if (this.audio) this.audio.playClick();
+                        }, { capture: true });
+                    });
+                }
+
+                showSeedMenu() {
+                    this.setHUDVisible(false);
+                    if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'block';
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                }
+
+                hideSeedMenu() {
+                    if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'none';
+                }
+
+                showPauseMenu() {
+                    this.setHUDVisible(false);
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'flex';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'none';
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'none';
+                }
+
+                hidePauseMenu() {
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                    this.setHUDVisible(true);
+                }
+
+                setHUDVisible(visible) {
+                    const display = visible ? 'block' : 'none';
+                    if (this.elements.crosshair) this.elements.crosshair.style.display = display;
+                    if (this.elements.hotbar) this.elements.hotbar.style.display = visible ? 'flex' : 'none';
+                    if (this.elements.blockNameDisplay) this.elements.blockNameDisplay.style.display = display;
+                }
+
+                updateHotbar(selectedSlot) {
+                    this.highlightSlot(selectedSlot);
+                }
+
+                highlightSlot(slotNumber) {
+                    // Remove active class from all slots
+                    if (this.elements.slots) {
+                        this.elements.slots.forEach(s => s.classList.remove('active'));
+                    } else {
+                        document.querySelectorAll('.slot').forEach(s => s.classList.remove('active'));
+                    }
+                    // Add active class to selected slot
+                    const slot = document.getElementById('slot-' + slotNumber);
+                    if (slot) slot.classList.add('active');
+                    this.updateBlockNameDisplay(slotNumber);
+                }
+
+                updateBlockNameDisplay(slotNumber) {
+                    const blockNames = ['Grass Block', 'Dirt Block', 'Stone Block', 'Wood Planks',
+                                       'Log Block', 'Leaves', 'Sand Block', 'Water', 'Torch'];
+                    if (this.elements.blockNameDisplay) {
+                        this.elements.blockNameDisplay.textContent = blockNames[slotNumber - 1] || '';
+                    }
+                }
+
+                updateMovementIndicators(state) {
+                    if (this.elements.flightIndicator) {
+                        this.elements.flightIndicator.style.display = state.isFlying ? 'flex' : 'none';
+                    }
+                    if (this.elements.sprintIndicator) {
+                        this.elements.sprintIndicator.style.display =
+                            state.isSprinting && !state.isFlying ? 'flex' : 'none';
+                    }
+                    if (this.elements.crouchIndicator) {
+                        this.elements.crouchIndicator.style.display =
+                            state.isCrouching && !state.isFlying ? 'flex' : 'none';
+                    }
+                }
+
+                updateDebugOverlay(info) {
+                    if (this.elements.debugOverlay && info.visible) {
+                        this.elements.debugOverlay.style.display = 'block';
+                        this.elements.debugOverlay.textContent =
+                            `FPS: ${info.fps}\n` +
+                            `Pos: ${info.position}\n` +
+                            `Chunks: ${info.chunks}`;
+                    } else if (this.elements.debugOverlay) {
+                        this.elements.debugOverlay.style.display = 'none';
+                    }
+                }
+
+                // --- SETTINGS MENU ---
+                showSettingsMenu() {
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'none';
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'block';
+                }
+
+                hideSettingsMenu() {
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'none';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                }
+
+                // --- CONTROLS MENU ---
+                showControlsMenu() {
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'none';
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'block';
+                }
+
+                hideControlsMenu() {
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'none';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                }
+
+                // --- PAUSE STATE ---
+                setPauseState(isPaused, reason = 'pause', controls = null) {
+                    const settingsPanels = document.querySelectorAll('.settings-panel');
+
+                    // Hide all menu containers by default
+                    [this.elements.seedMenu, this.elements.mainPauseMenu,
+                     this.elements.settingsMenu, this.elements.controlsMenu].forEach((menu) => {
+                        if (menu) menu.style.display = 'none';
+                    });
+
+                    // Reset settings sub-panels unless we explicitly want to stay in the main settings hub
+                    if (reason === 'settings' && isPaused) {
+                        settingsPanels.forEach((panel) => {
+                            if (panel.id !== 'settings-menu') panel.style.display = 'none';
+                        });
+                    } else {
+                        settingsPanels.forEach((panel) => (panel.style.display = 'none'));
+                    }
+
+                    if (isPaused) {
+                        this.setHUDVisible(false);
+                        if (this.elements.blocker) this.elements.blocker.style.display = 'flex';
+                        if (this.elements.instructions) this.elements.instructions.style.display = 'block';
+
+                        switch (reason) {
+                            case 'seed':
+                                if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'block';
+                                break;
+                            case 'settings':
+                                if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'block';
+                                break;
+                            case 'controls':
+                                if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'block';
+                                break;
+                            default:
+                                if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                                break;
+                        }
+
+                        if (controls && controls.isLocked) controls.unlock();
+                    } else {
+                        this.setHUDVisible(true);
+                        if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                        if (this.elements.instructions) this.elements.instructions.style.display = 'none';
+                    }
+                }
+
+                // --- CHUNK LOADER STATUS ---
+                updateChunkLoaderStatus(info) {
+                    const chunkLoader = document.getElementById('chunk-loader');
+                    if (!chunkLoader) return;
+
+                    if (info.visible && info.total > 0) {
+                        chunkLoader.style.display = 'block';
+                        const percent = Math.round((info.loaded / info.total) * 100);
+                        chunkLoader.textContent = `Loading chunks: ${info.loaded}/${info.total} (${percent}%)`;
+                    } else {
+                        chunkLoader.style.display = 'none';
+                    }
+                }
+
+                // --- SLIDER BINDINGS ---
+                bindSlider(sliderId, settingKey, displayId, formatter) {
+                    const slider = document.getElementById(sliderId);
+                    const display = displayId ? document.getElementById(displayId) : null;
+
+                    if (slider) {
+                        slider.value = this.settings.get(settingKey);
+                        if (display && formatter) {
+                            display.textContent = formatter(slider.value);
+                        }
+
+                        slider.addEventListener('input', () => {
+                            const value = parseFloat(slider.value);
+                            this.settings.set(settingKey, value);
+                            if (display && formatter) {
+                                display.textContent = formatter(value);
+                            }
+                        });
+                    }
+                }
+
+                // --- CHECKBOX BINDINGS ---
+                bindCheckbox(checkboxId, settingKey) {
+                    const checkbox = document.getElementById(checkboxId);
+                    if (checkbox) {
+                        checkbox.checked = this.settings.get(settingKey);
+                        checkbox.addEventListener('change', () => {
+                            this.settings.set(settingKey, checkbox.checked);
+                        });
+                    }
+                }
+
+                // --- COORDINATE DISPLAY ---
+                updateCoordinateDisplay(x, y, z) {
+                    const coordDisplay = document.getElementById('coord-display');
+                    if (coordDisplay) {
+                        coordDisplay.textContent = `X: ${Math.floor(x)} Y: ${Math.floor(y)} Z: ${Math.floor(z)}`;
+                    }
+                }
+            }
+
+            // =====================================================
+            // 11. VOXEX GAME ORCHESTRATOR CLASS
+            // =====================================================
+
+            class VoxExGame {
+                constructor(canvas) {
+                    this.canvas = canvas;
+
+                    // Initialize managers with existing config objects
+                    this.settings = new SettingsManager(DEFAULTS);
+                    this.input = new InputManager(document.body);
+                    this.audio = new AudioManager(this.settings);
+                    this.renderEngine = new RenderEngine(null, this.settings);
+
+                    this.terrainGenerator = new TerrainGenerator(
+                        { ...WORLD_CONFIG, biomes: [] },
+                        BIOME_CONFIG,
+                        TREE_CONFIG
+                    );
+                    this.voxelWorld = new VoxelWorld(this.terrainGenerator, this.settings);
+                    this.chunkMesher = new ChunkMesher();
+
+                    this.entities = new EntityManager();
+                    this.ui = new UIManager(this.settings, this.audio, this.voxelWorld);
+
+                    this.playerController = null;
+
+                    // Loop state
+                    this.running = false;
+                    this.lastTime = 0;
+                    this.frameCount = 0;
+
+                    // FPS tracking
+                    this.fpsInstant = 0;
+                    this.fpsAvg = 0;
+                    this.fpsSamples = [];
+                }
+
+                init() {
+                    // Load settings from localStorage
+                    this.settings.loadFromStorage();
+
+                    // Initialize subsystems
+                    this.input.init();
+                    this.audio.initContext();
+                    this.ui.init();
+
+                    // Note: renderEngine.init() should be called after seed selection
+                    // when the actual game starts
+
+                    return this;
+                }
+
+                initWithSeed(seed) {
+                    // Initialize terrain generator with seed
+                    this.terrainGenerator.worldConfig.seed = typeof seed === 'string'
+                        ? this.hashSeed(seed)
+                        : seed;
+
+                    // Build biome configuration
+                    this.terrainGenerator.worldConfig.biomes = [
+                        { name: 'plains', ...BIOME_CONFIG.plains },
+                        { name: 'hills', ...BIOME_CONFIG.hills },
+                        { name: 'forests', ...BIOME_CONFIG.forests },
+                        { name: 'mountains', ...BIOME_CONFIG.mountains },
+                        { name: 'swamp', ...BIOME_CONFIG.swamp }
+                    ];
+
+                    this.terrainGenerator.init(this.terrainGenerator.worldConfig.seed);
+
+                    // Initialize render engine
+                    this.renderEngine.init();
+                    this.renderEngine.initPostProcessing();
+
+                    // Create player controller
+                    this.playerController = new PlayerController(
+                        this.renderEngine.camera,
+                        this.input,
+                        this.voxelWorld,
+                        this.settings
+                    );
+
+                    // Apply settings to render
+                    this.renderEngine.applySettings();
+
+                    return this;
+                }
+
+                hashSeed(str) {
+                    let hash = 0xdeadbeef;
+                    for (let i = 0; i < str.length; i++) {
+                        hash = Math.imul(hash ^ str.charCodeAt(i), 2654435761);
+                        hash = (hash ^ (hash >>> 16)) >>> 0;
+                    }
+                    return hash;
+                }
+
+                start() {
+                    if (this.running) return;
+                    this.running = true;
+                    this.lastTime = performance.now();
+                    requestAnimationFrame(this.loop.bind(this));
+                }
+
+                stop() {
+                    this.running = false;
+                }
+
+                loop(time) {
+                    if (!this.running) return;
+
+                    const dt = (time - this.lastTime) / 1000;
+                    this.lastTime = time;
+
+                    this.update(dt);
+                    this.render(dt);
+
+                    this.frameCount++;
+                    requestAnimationFrame(this.loop.bind(this));
+                }
+
+                update(delta) {
+                    // Update FPS
+                    this.fpsInstant = 1 / delta;
+                    this.fpsSamples.push(this.fpsInstant);
+                    if (this.fpsSamples.length > 60) this.fpsSamples.shift();
+                    this.fpsAvg = this.fpsSamples.reduce((a, b) => a + b, 0) / this.fpsSamples.length;
+
+                    // Update player
+                    if (this.playerController) {
+                        this.playerController.update(delta);
+                    }
+
+                    // Update entities
+                    this.entities.update(delta);
+
+                    // Update chunk streaming
+                    if (this.playerController && this.voxelWorld) {
+                        this.voxelWorld.updateStreaming(
+                            this.playerController.position,
+                            this.settings.get('renderDistance')
+                        );
+                    }
+
+                    // Update UI indicators
+                    if (this.playerController && this.ui) {
+                        this.ui.updateMovementIndicators({
+                            isFlying: this.playerController.isFlying,
+                            isSprinting: this.playerController.isSprinting,
+                            isCrouching: this.playerController.isCrouching
+                        });
+                    }
+                }
+
+                render(delta) {
+                    this.renderEngine.render(delta);
+                }
+
+                // Utility methods for external access
+                getPlayer() {
+                    return this.playerController;
+                }
+
+                getWorld() {
+                    return this.voxelWorld;
+                }
+
+                getSettings() {
+                    return this.settings;
+                }
+            }
+
+            // =====================================================
+            // EXPOSE CLASSES GLOBALLY FOR BACKWARDS COMPATIBILITY
+            // =====================================================
+            window.VoxExClasses = {
+                SettingsManager,
+                InputManager,
+                TerrainGenerator,
+                VoxelWorld,
+                ChunkMesher,
+                RenderEngine,
+                AudioManager,
+                EntityManager,
+                Mob,
+                Zombie,
+                PlayerController,
+                UIManager,
+                VoxExGame,
+                BLOCKS
+            };
+
+            // =====================================================
+            // END OF CLASS DEFINITIONS
+            // =====================================================
+
             let currentRenderRadius = SETTINGS.renderDistance;
             let fogFar = SETTINGS.renderDistance * WORLD_DIMS.chunkSize;
             let lastFogFar = -1;
@@ -1261,6 +3699,8 @@
             const PLAYER_EYE_HEIGHT_STAND = 1.8;
             let playerEyeHeight = PLAYER_EYE_HEIGHT_STAND;
             const chunks = new Map();
+            // Create global VoxelWorld instance bound to the chunks Map
+            const voxelWorld = new VoxelWorld(null, null, chunks);
             const chunkMeshes = new Map();
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
@@ -1586,6 +4026,8 @@
             // --- OPTIMIZATION: Modified Chunk Tracking ---
             const modifiedChunks = new Set(); // Tracks chunks modified by player (block place/break)
             const pristineChunks = new Set(); // Tracks unmodified generated chunks (can be safely discarded)
+            // Bind global state to voxelWorld instance
+            voxelWorld.bindState(modifiedChunks, pristineChunks, activeChunks);
             function canEvictChunk(key, { persistModified = false } = {}) {
                 // Optional persistence guard before skipping eviction
                 if (modifiedChunks.has(key)) { if (persistModified && chunks.has(key)) { saveChunkToCache(key, chunks.get(key)); } return false; }
@@ -1673,188 +4115,13 @@
 
             // --- GAME AUDIO SYSTEM ---
             // Example: Base64-encoded audio constant (replace with your own sound data)
-            // This is a placeholder - replace with actual base64-encoded WAV/OGG/MP3 data
-            const SOUND_EXAMPLE = "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xmZ7wrSRzJQoB85kk1nQ+b4byZhx4auldK+i4Z9ViEnSp4VFQASyzuaDwtjqM/wdlq8Twv8dpou5B9Pe20nBHtcqmxrnnOc50pZ2UhGEgiMgSGgRIwmfUu6563EkutzM+NURC6qKl5rGtLDVA/xDwE8ohmPvuvRn27ir5GnMl5hgD+jGnYqygcu1nNicDR3r1UzViQswBTRWcDjMdJFdCfbWYjsTvZ+/gDVyN+f5vmc2D4dtQ4JqolpZSQdyK0c8X4+GxMdtw4bchaAymdifaS5CdtyFfOUK28Yv7RVRLhVOTNNuQ6OcnzBxQTkOtt9p/dd/VRTQoKGHWC0oGFfJPGdIc/Xje6MlGFAxSmatcbcJHwkxn8klMyBTGCoIAABwAAADt21vb3YAAABsbXZoZAAAAAAAAAAAAAAAAAAAA+gAAADTAAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAJKdHJhawAAAFx0a2hkAAAAAwAAAAAAAAAAAAAAAQAAAAAAAADTAAAAAAAAAAAAAAABAQAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAJGVkdHMAAAAcZWxzdAAAAAAAAAABAAAAqAAACAAAAQAAAAABwm1kaWEAAAAgbWRoZAAAAAAAAAAAAAAAAAAAu4AAACeAVcQAAAAAAC1oZGxyAAAAAAAAAABzb3VuAAAAAAAAAAAAAAAAU291bmRIYW5kbGVyAAAAAW1taW5mAAAAEHNtaGQAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAATFzdGJsAAAAZ3N0c2QAAAAAAAAAAQAAAFdtcDRhAAAAAAAAAAEAAAAAAAAAAAACABAAAAAAu4AAAAAAADNlc2RzAAAAAAOAgIAiAAEABICAgBRAFQAAAAADRTkAA0U5BYCAgAIRkAaAgIABAgAAACBzdHRzAAAAAAAAAAIAAAAJAAAEAAAAAAEAAAOAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAKAAAAAQAAADxzdHN6AAAAAAAAAAAAAAAKAAACAAAAAgAAAALdAAAC6gAAAjgAAAIpAAACeAAAAcgAAAHqAAABugAAABRzdGNvAAAAAAAAAAEAAAAsAAAAGnNncGQBAAAAcm9sbAAAAAIAAAAB//8AAAAcc2JncAAAAAByb2xsAAAAAQAAAAoAAAABAAAA+XVkdGEAAADxbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAADEaWxzdAAAAC2pdG9vAAAAJWRhdGEAAAABAAAAAGh0dHBzOi8vY2xpcGNoYW1wLmNvbQAAAI+pY210AAAAh2RhdGEAAAABAAAAAENyZWF0ZSB2aWRlb3Mgd2l0aCBodHRwczovL2NsaXBjaGFtcC5jb20vZW4vdmlkZW8tZWRpdG9yIC0gZnJlZSBvbmxpbmUgdmlkZW8gZWRpdG9yLCB2aWRlbyBjb21wcmVzc29yLCB2aWRlbyBjb252ZXJ0ZXIu"; // Add your base64 audio string here
+            // Global audio instance (using AudioManager class)
+            const audioManager = new AudioManager(null);
+            // Legacy alias for backward compatibility (delegates to audioManager)
+            const gameAudio = { playClink: () => audioManager.playClick() };
 
-            // Usage examples:
-            // 1. Play with automatic caching:
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound');
-            //
-            // 2. Play with custom volume:
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound', { volume: 0.5 });
-            //
-            // 3. Play with custom playback rate (pitch):
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound', { playbackRate: 1.5 });
-            //
-            // 4. Pre-decode for instant playback later:
-            //    await gameAudio.base64ToAudioBuffer(SOUND_EXAMPLE, 'example-sound');
-            //    // Then later: gameAudio.playSound(SOUND_EXAMPLE, 'example-sound'); // Instant!
-
-            class GameAudio {
-                constructor() {
-                    this.audioContext = null;
-                    this.enabled = true;
-                    this.volume = 0.3; // Master volume for UI sounds
-                    this.bufferCache = new Map(); // Cache for decoded AudioBuffers
-                }
-
-                // Lazy init audio context (must be after user interaction)
-                initContext() {
-                    if (!this.audioContext) {
-                        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    }
-                    return this.audioContext;
-                }
-
-                // Decode base64 audio data into AudioBuffer (cached for reuse)
-                async base64ToAudioBuffer(base64String, cacheKey = null) {
-                    // Check cache first
-                    if (cacheKey && this.bufferCache.has(cacheKey)) {
-                        return this.bufferCache.get(cacheKey);
-                    }
-
-                    const ctx = this.initContext();
-
-                    // Decode base64 to binary
-                    const binaryString = atob(base64String);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-
-                    // Decode audio data into AudioBuffer
-                    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
-
-                    // Cache the buffer if a key was provided
-                    if (cacheKey) {
-                        this.bufferCache.set(cacheKey, audioBuffer);
-                    }
-
-                    return audioBuffer;
-                }
-
-                // Play a sound from cached AudioBuffer
-                async playSound(base64OrBuffer, cacheKey = null, options = {}) {
-                    if (!this.enabled) return;
-
-                    const ctx = this.initContext();
-                    const now = ctx.currentTime;
-
-                    // Get or decode the audio buffer
-                    let audioBuffer;
-                    if (base64OrBuffer instanceof AudioBuffer) {
-                        audioBuffer = base64OrBuffer;
-                    } else if (typeof base64OrBuffer === 'string') {
-                        audioBuffer = await this.base64ToAudioBuffer(base64OrBuffer, cacheKey);
-                    } else {
-                        console.error('Invalid audio source: must be base64 string or AudioBuffer');
-                        return;
-                    }
-
-                    // Create source and gain nodes
-                    const source = ctx.createBufferSource();
-                    source.buffer = audioBuffer;
-
-                    const gainNode = ctx.createGain();
-                    gainNode.gain.value = this.volume * (options.volume || 1.0);
-
-                    // Connect: source -> gain -> destination
-                    source.connect(gainNode);
-                    gainNode.connect(ctx.destination);
-
-                    // Apply playback rate if specified
-                    if (options.playbackRate) {
-                        source.playbackRate.value = options.playbackRate;
-                    }
-
-                    // Start playback
-                    source.start(now);
-
-                    return source; // Return source for external control if needed
-                }
-
-                // Generate and play a procedural "clink" sound (UI button click)
-                playClink() {
-				    if (!this.enabled) return;
-				
-				    const ctx = this.initContext();
-				    const now = ctx.currentTime;
-				
-				    // Slight randomization so repeated clicks don't sound identical
-				    const baseFreq = 650 + Math.random() * 80; // 650–730 Hz
-				
-				    // Main tonal body: soft, percussive blip
-				    const osc1 = ctx.createOscillator();
-				    const osc2 = ctx.createOscillator();
-				    osc1.type = 'triangle';
-				    osc2.type = 'sine';
-				
-				    osc1.frequency.setValueAtTime(baseFreq, now);
-				    osc1.frequency.exponentialRampToValueAtTime(baseFreq * 0.6, now + 0.08);
-				
-				    osc2.frequency.setValueAtTime(baseFreq * 1.5, now);
-				    osc2.frequency.exponentialRampToValueAtTime(baseFreq, now + 0.08);
-				
-				    // Very short noise burst for the "mechanical" click transient
-				    const noiseDuration = 0.04;
-				    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * noiseDuration, ctx.sampleRate);
-				    const noiseData = noiseBuffer.getChannelData(0);
-				    for (let i = 0; i < noiseData.length; i++) {
-				        noiseData[i] = (Math.random() * 2 - 1) * 0.6; // slightly tamed
-				    }
-				    const noiseSource = ctx.createBufferSource();
-				    noiseSource.buffer = noiseBuffer;
-				
-				    const noiseGain = ctx.createGain();
-				    noiseGain.gain.setValueAtTime(this.volume * 0.35, now);
-				    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDuration);
-				
-				    // Shared gain envelope (final amplitude)
-				    const gainNode = ctx.createGain();
-				    gainNode.gain.setValueAtTime(0, now);
-				    gainNode.gain.linearRampToValueAtTime(this.volume * 0.7, now + 0.01);   // fast but not instant attack
-				    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.14);         // smooth decay
-				
-				    // Gentle low-pass filter to keep things soft and UI-friendly
-				    const filter = ctx.createBiquadFilter();
-				    filter.type = 'lowpass';
-				    filter.frequency.setValueAtTime(3500, now); // enough brightness, not piercing
-				    filter.Q.value = 0.7;
-				
-				    // Routing:
-				    // oscillators -> filter -> gain -> destination
-				    // noise -> noiseGain -> filter (so it gets softened too)
-				    osc1.connect(filter);
-				    osc2.connect(filter);
-				    noiseSource.connect(noiseGain);
-				    noiseGain.connect(filter);
-				    filter.connect(gainNode);
-				    gainNode.connect(ctx.destination);
-				
-				    // Start/stop everything
-				    osc1.start(now);
-				    osc2.start(now);
-				    noiseSource.start(now);
-				
-				    const stopTime = now + 0.2;
-				    osc1.stop(stopTime);
-				    osc2.stop(stopTime);
-				    noiseSource.stop(stopTime);
-				}
-
-                // Set volume (0.0 to 1.0)
-                setVolume(vol) {
-                    this.volume = Math.max(0, Math.min(1, vol));
-                }
-
-                // Enable/disable audio
-                setEnabled(enabled) {
-                    this.enabled = enabled;
-                }
-            }
-
-            // Global audio instance
-            const gameAudio = new GameAudio();
+            // Global UI manager instance (initialized after DOM ready)
+            const uiManager = new UIManager(null, audioManager, null);
 
             class Float32ArrayPool { // --- POOLING & NOISE ---
                 constructor(initialSize = 10000) { this.pool = []; this.initialSize = initialSize; }
@@ -1929,85 +4196,22 @@
                 return combined - Math.floor(combined);
             }
 
-            // --- AUDIO INITIALIZATION ---
-            // Wire up click sounds to all buttons in the UI
-            function initButtonAudio() {
-                // Get all button elements
-                const buttons = document.querySelectorAll('button');
-
-                buttons.forEach(button => {
-                    // Add click sound to each button
-                    button.addEventListener('click', () => {
-                        gameAudio.playClink();
-                    }, { capture: true }); // Use capture phase to play before other handlers
-                });
-            }
-
-            // Initialize button audio when DOM is ready
-            initButtonAudio();
+            // --- UI INITIALIZATION ---
+            // Initialize UIManager when DOM is ready
+            uiManager.init();
 
             // --- HUD VISIBILITY HELPERS ---
+            // Delegate to UIManager class instance
             function setHUDVisible(isVisible) {
-                const crosshair = document.getElementById("crosshair");
-                const hotbar = document.getElementById("hotbar");
-                const blockNameDisplay = document.getElementById("block-name-display");
-
-                if (crosshair) crosshair.style.display = isVisible ? "block" : "none";
-                if (hotbar) hotbar.style.display = isVisible ? "flex" : "none";
-                if (blockNameDisplay) blockNameDisplay.style.display = isVisible ? "block" : "none";
+                uiManager.setHUDVisible(isVisible);
             }
 
-            // Centralized pause/resume controller to keep HUD, menus, and pointer lock in sync
+            // Centralized pause/resume controller - delegates to UIManager
             function setPauseState(isPaused, reason = "pause") {
-                const blocker = document.getElementById("blocker");
-                const instructions = document.getElementById("instructions");
-                const seedMenu = document.getElementById("seed-menu");
-                const mainPauseMenu = document.getElementById("main-pause-menu");
-                const settingsMenu = document.getElementById("settings-menu");
-                const controlsMenu = document.getElementById("controls-menu");
-                const settingsPanels = document.querySelectorAll(".settings-panel");
-
-                // Hide all menu containers by default; show only the active context below
-                [seedMenu, mainPauseMenu, settingsMenu, controlsMenu].forEach((menu) => {
-                    if (menu) menu.style.display = "none";
-                });
-
-                // Reset settings sub-panels unless we explicitly want to stay in the main settings hub
-                if (reason === "settings" && isPaused) {
-                    settingsPanels.forEach((panel) => {
-                        if (panel.id !== "settings-menu") panel.style.display = "none";
-                    });
-                } else {
-                    settingsPanels.forEach((panel) => (panel.style.display = "none"));
-                }
-
-                if (isPaused) {
-                    setHUDVisible(false);
-                    if (blocker) blocker.style.display = "flex";
-                    if (instructions) instructions.style.display = "block";
-
-                    switch (reason) {
-                        case "seed":
-                            if (seedMenu) seedMenu.style.display = "block";
-                            break;
-                        case "settings":
-                            if (settingsMenu) settingsMenu.style.display = "block";
-                            break;
-                        case "controls":
-                            if (controlsMenu) controlsMenu.style.display = "block";
-                            break;
-                        default:
-                            if (mainPauseMenu) mainPauseMenu.style.display = "block";
-                            break;
-                    }
-
-                    if (controls && controls.isLocked) controls.unlock();
-                } else {
-                    setHUDVisible(true);
-                    if (blocker) blocker.style.display = "none";
-                    if (instructions) instructions.style.display = "none";
-
-                    if (controls && !controls.isLocked) controls.lock();
+                uiManager.setPauseState(isPaused, reason, controls);
+                // Handle controls lock/unlock (not in UIManager since controls is external)
+                if (!isPaused && controls && !controls.isLocked) {
+                    controls.lock();
                 }
             }
 
@@ -2116,75 +4320,13 @@
                 if (loadedPlayerState) { controls.getObject().position.copy(loadedPlayerState.pos); controls.getObject().rotation.copy(loadedPlayerState.rot); lastChunkX = -Infinity; }
                 animate();
             }
-            function getChunkKey(cx, cz) { return `${cx},${cz}`; }
-            let _lastChunkKey = null;
-            let _lastChunk = null;
-            function getBlock(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk) return undefined;
-                _lastChunkKey = key;
-                _lastChunk = chunk;
-                const lx = x & 15;
-                const lz = z & 15;
-                const idx = lx + (lz << 4) + (ly << 8);
-                return chunk.blocks ? chunk.blocks[idx] : chunk[idx]; // Support both old and new format
-            }
-            function getSkyLight(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0) return 1; // Below world: minimum light
-                if (ly >= WORLD_DIMS.chunkHeight) return 15; // Above world: full sky light
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk || !chunk.skyLight) return 15; // Default full bright for unloaded chunks
-                const lx = x & 15;
-                const lz = z & 15;
-                return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
-            }
-            function getBlockLight(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk || !chunk.blockLight) return 0;
-                const lx = x & 15;
-                const lz = z & 15;
-                return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
-            }
-            function setSkyLight(x, y, z, level) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
-                if (!chunk || !chunk.skyLight) return;
-                const lx = x & 15;
-                const lz = z & 15;
-                const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
-                chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
-            }
-            function setBlockLight(x, y, z, level) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
-                if (!chunk || !chunk.blockLight) return;
-                const lx = x & 15;
-                const lz = z & 15;
-                const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
-                chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
-            }
+            // Delegate to VoxelWorld class instance
+            function getChunkKey(cx, cz) { return voxelWorld.getChunkKey(cx, cz); }
+            function getBlock(x, y, z) { return voxelWorld.getBlock(x, y, z); }
+            function getSkyLight(x, y, z) { return voxelWorld.getSkyLight(x, y, z); }
+            function getBlockLight(x, y, z) { return voxelWorld.getBlockLight(x, y, z); }
+            function setSkyLight(x, y, z, level) { return voxelWorld.setSkyLight(x, y, z, level); }
+            function setBlockLight(x, y, z, level) { return voxelWorld.setBlockLight(x, y, z, level); }
             const MAX_BLOCK_LIGHT_LEVEL = 15;
             function clampBlockLight(level) { return level < 0 ? 0 : level > MAX_BLOCK_LIGHT_LEVEL ? MAX_BLOCK_LIGHT_LEVEL : level; }
             function getTorchBlockLightLevel() {
@@ -2756,51 +4898,18 @@
                 }
             }
             function setBlock(x, y, z, id) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                // Get old block ID before setting
+                const oldId = voxelWorld.getBlock(x, y, z);
+                if (oldId === id) return;
+
+                // Delegate to VoxelWorld (handles chunk creation, state tracking)
+                const changed = voxelWorld.setBlock(x, y, z, id);
+                if (!changed) return;
+
+                // Schedule localized relight so sunlight/torches react to edits
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
-                let chunk = chunks.get(key);
-                if (!chunk) {
-                    const size = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // Create new chunk with light data
-                    chunk = { // Default full bright (max 15) - Default no block light
-                        blocks: new Uint8Array(size),
-                        skyLight: new Uint8Array(size).fill(15),
-                        blockLight: new Uint8Array(size).fill(1),
-                        cx: cx,
-                        cz: cz,
-                        startX: cx * WORLD_DIMS.chunkSize,
-                        startZ: cz * WORLD_DIMS.chunkSize,
-                    };
-                    chunks.set(key, chunk);
-                    activeChunks.add(key);
-                } else if (!chunk.blocks) { // Upgrade legacy chunk format to include lighting buffers
-                    const legacy = chunk;
-                    const legacySize = legacy.length || WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
-                    chunk = {
-                        blocks: legacy,
-                        skyLight: new Uint8Array(legacySize).fill(15),
-                        blockLight: new Uint8Array(legacySize).fill(1),
-                    };
-                    chunks.set(key, chunk);
-                } else {
-                    if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
-                    if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
-                }
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                const idx = lx + lz * 16 + ly * 256;
-                const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
-                if (oldId === id) return;
-                if (chunk.blocks) { chunk.blocks[idx] = id; } else { chunk[idx] = id; } // Handle both old and new format
-
-                // Mark chunk as modified by player (for smart memory management)
-                modifiedChunks.add(key);
-                pristineChunks.delete(key);
-                activeChunks.add(key);
-
-                // Schedule localized relight so sunlight/torches react to edits
                 const jobKey = `${x},${y},${z}`;
                 if (!queuedLightUpdates.has(jobKey)) {
                     queuedLightUpdates.add(jobKey);
@@ -2808,7 +4917,7 @@
                         x,
                         y,
                         z,
-                        oldId,
+                        oldId: oldId || 0,
                         newId: id,
                         key: jobKey,
                         // Only prime when transitioning from opaque to transparent to avoid resetting nearby columns
@@ -8302,27 +10411,15 @@
                     }
                 }
             }
-            function highlightSlot(i) {
-                document.querySelectorAll(".slot").forEach((s) => s.classList.remove("active"));
-                document.getElementById("slot-" + i).classList.add("active");
-                updateBlockNameDisplay(i);
-            }
-            function updateBlockNameDisplay(slotNumber) {
-                const blockNames = ["Grass Block", "Dirt Block", "Stone Block", "Wood Planks", "Log Block", "Leaves", "Sand Block", "Water", "Torch"];
-                const blockName = blockNames[slotNumber - 1];
-                const display = document.getElementById("block-name-display");
-                if (display) { display.textContent = blockName; }
-            }
+            // Delegate to UIManager class instance
+            function highlightSlot(i) { uiManager.highlightSlot(i); }
+            function updateBlockNameDisplay(slotNumber) { uiManager.updateBlockNameDisplay(slotNumber); }
             function updateMovementIndicators() {
-                const flightIndicator = document.getElementById("flight-indicator");
-                const sprintIndicator = document.getElementById("sprint-indicator");
-                const crouchIndicator = document.getElementById("crouch-indicator");
-                // Update flight indicator
-                if (flightIndicator) { flightIndicator.style.display = isFlying ? "flex" : "none"; }
-                // Update sprint indicator
-                if (sprintIndicator) { sprintIndicator.style.display = isSprinting && !isFlying && controls.isLocked ? "flex" : "none"; }
-                // Update crouch indicator
-                if (crouchIndicator) { crouchIndicator.style.display = isCrouching && !isFlying && controls.isLocked ? "flex" : "none"; }
+                uiManager.updateMovementIndicators({
+                    isFlying: isFlying,
+                    isSprinting: isSprinting && controls.isLocked,
+                    isCrouching: isCrouching && controls.isLocked
+                });
             }
             const onMouseWheel = function (event) {
                 event.preventDefault();
