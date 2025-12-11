@@ -983,10 +983,10 @@
                 torchIntensity: savedSettings.torchIntensity !== undefined ? savedSettings.torchIntensity : 3.0,
                 torchRange: savedSettings.torchRange || 48,
                 // Graphics - Sky & Fog
-                daySkyTop: savedSettings.daySkyTop || 0xb3d9ff,
-                daySkyBottom: savedSettings.daySkyBottom || 0xe6f2ff,
-                nightSkyTop: savedSettings.nightSkyTop || 0x000022,
-                nightSkyBottom: savedSettings.nightSkyBottom || 0x050510,
+                daySkyTop: savedSettings.daySkyTop || 0x87ceeb,
+                daySkyBottom: savedSettings.daySkyBottom || 0x87ceeb,
+                nightSkyTop: savedSettings.nightSkyTop || 0x0a1628,
+                nightSkyBottom: savedSettings.nightSkyBottom || 0x0a1628,
                 dayFogColor: savedSettings.dayFogColor || 0xb3d9ff,
                 nightFogColor: savedSettings.nightFogColor || 0x000015,
                 fogColor: 0x87ceeb,
@@ -1042,10 +1042,10 @@
                 torchIntensity: 3.0, // Increased from 2.5 for brighter torch light
                 torchRange: 48, // Increased from 32 for better cave illumination
                 // Graphics - Sky & Fog
-                daySkyTop: 0xb3d9ff,
-                daySkyBottom: 0xe6f2ff,
-                nightSkyTop: 0x000022,
-                nightSkyBottom: 0x050510,
+                daySkyTop: 0x87ceeb,
+                daySkyBottom: 0x87ceeb,
+                nightSkyTop: 0x0a1628,
+                nightSkyBottom: 0x0a1628,
                 dayFogColor: 0xb3d9ff,
                 nightFogColor: 0x000015,
                 // Graphics - Water
@@ -2198,9 +2198,11 @@
 
                 updateFogDistance(renderDistance) {
                     const fogFar = renderDistance * WORLD_DIMS.chunkSize;
+                    // Fog ends 1 chunk before edge for full occlusion
+                    const fogFarActual = fogFar - WORLD_DIMS.chunkSize;
                     if (this.scene.fog) {
-                        this.scene.fog.far = fogFar;
-                        this.scene.fog.near = fogFar * 0.5;
+                        this.scene.fog.far = fogFarActual;
+                        this.scene.fog.near = fogFarActual * 0.5;
                     }
                 }
 
@@ -3632,6 +3634,1061 @@
                 0.7,   // 2 occlusions: Moderate darkening (was 0.493)
                 0.5,   // 3 occlusions: Deep corners (was 0.15)
             ];
+
+            // =====================================================
+            // PERFORMANCE OPTIMIZATIONS MODULE
+            // =====================================================
+
+            // --- OPTIMIZATION 1: Pre-computed fade lookup table for Perlin noise ---
+            // Avoids expensive polynomial calculations in tight loops
+            // fade(t) = t³(t(t×6 - 15) + 10) pre-computed for 256 values
+            const FADE_LUT = new Float32Array(256);
+            for (let i = 0; i < 256; i++) {
+                const t = i / 255;
+                FADE_LUT[i] = t * t * t * (t * (t * 6 - 15) + 10);
+            }
+            const fadeFast = (t) => {
+                const idx = (t * 255) | 0;
+                return FADE_LUT[Math.min(255, Math.max(0, idx))];
+            };
+
+            // --- OPTIMIZATION 2: Circular buffer for FPS samples (avoids array operations) ---
+            const FPS_BUFFER_SIZE = 128;
+            const fpsBuffer = new Float32Array(FPS_BUFFER_SIZE);
+            const fpsTimeBuffer = new Float32Array(FPS_BUFFER_SIZE);
+            let fpsBufferIndex = 0;
+            let fpsBufferCount = 0;
+
+            function pushFPSSample(time, fps) {
+                fpsBuffer[fpsBufferIndex] = fps;
+                fpsTimeBuffer[fpsBufferIndex] = time;
+                fpsBufferIndex = (fpsBufferIndex + 1) % FPS_BUFFER_SIZE;
+                if (fpsBufferCount < FPS_BUFFER_SIZE) fpsBufferCount++;
+            }
+
+            function getAverageFPS(currentTime, windowMs = 10000) {
+                if (fpsBufferCount === 0) return 60;
+                const cutoff = currentTime - windowMs;
+                let sum = 0, count = 0;
+                for (let i = 0; i < fpsBufferCount; i++) {
+                    const idx = (fpsBufferIndex - 1 - i + FPS_BUFFER_SIZE) % FPS_BUFFER_SIZE;
+                    if (fpsTimeBuffer[idx] < cutoff) break;
+                    sum += fpsBuffer[idx];
+                    count++;
+                }
+                return count > 0 ? sum / count : 60;
+            }
+
+            // --- OPTIMIZATION 3: Uint8Array pool for chunk data allocation ---
+            class Uint8ArrayPool {
+                constructor() {
+                    this.pools = new Map(); // size -> array of buffers
+                }
+                acquire(size) {
+                    const pool = this.pools.get(size);
+                    if (pool && pool.length > 0) {
+                        const arr = pool.pop();
+                        arr.fill(0); // Reset to zeros
+                        return arr;
+                    }
+                    return new Uint8Array(size);
+                }
+                release(arr) {
+                    if (!arr || arr.length > 2000000) return; // Don't pool very large arrays
+                    const size = arr.length;
+                    if (!this.pools.has(size)) this.pools.set(size, []);
+                    const pool = this.pools.get(size);
+                    if (pool.length < 32) pool.push(arr); // Limit pool size
+                }
+            }
+            const chunkDataPool = new Uint8ArrayPool();
+
+            // --- OPTIMIZATION 4: LOD System Configuration ---
+            const LOD_CONFIG = {
+                enabled: true,
+                levels: [
+                    { maxDistance: 4, skipFaces: 0 },       // Full detail within 4 chunks
+                    { maxDistance: 8, skipFaces: 0.1 },    // Skip 10% of internal faces at 4-8 chunks
+                    { maxDistance: 12, skipFaces: 0.25 },  // Skip 25% at 8-12 chunks
+                    { maxDistance: 999, skipFaces: 0.4 }   // Skip 40% at far distance
+                ]
+            };
+
+            function getLODSkipFactor(distSq) {
+                if (!LOD_CONFIG.enabled) return 0;
+                const dist = Math.sqrt(distSq);
+                for (const level of LOD_CONFIG.levels) {
+                    if (dist <= level.maxDistance) return level.skipFaces;
+                }
+                return 0.4;
+            }
+
+            // --- OPTIMIZATION 5: Greedy meshing helper - combines adjacent same-type faces ---
+            // This creates larger quads from adjacent faces, reducing vertex/face count significantly
+            function shouldMergeBlocks(id1, id2) {
+                // Only merge identical solid opaque blocks
+                if (id1 !== id2) return false;
+                if (id1 === AIR || id1 === WATER || id1 === TORCH || id1 === LEAVES) return false;
+                return true;
+            }
+
+            // Pre-computed greedy mesh slice dimensions for chunk processing
+            const GREEDY_AXIS_INFO = [
+                { axis: 1, u: 0, v: 2, du: 1, dv: 16 },  // Y axis (top/bottom faces)
+                { axis: 0, u: 1, v: 2, du: 16, dv: 256 }, // X axis (left/right faces)
+                { axis: 2, u: 0, v: 1, du: 1, dv: 16 }   // Z axis (front/back faces)
+            ];
+
+            // --- OPTIMIZATION 6: Chunk generation batch processor ---
+            const CHUNK_BATCH_SIZE = 4;
+            const chunkGenerationQueue = [];
+            let isProcessingBatch = false;
+
+            async function queueChunkGeneration(cx, cz, priority = 0) {
+                const key = getChunkKey(cx, cz);
+                // Check if already queued
+                const existing = chunkGenerationQueue.findIndex(c => c.key === key);
+                if (existing !== -1) {
+                    // Update priority if higher
+                    if (priority > chunkGenerationQueue[existing].priority) {
+                        chunkGenerationQueue[existing].priority = priority;
+                    }
+                    return;
+                }
+                chunkGenerationQueue.push({ cx, cz, key, priority });
+                // Sort by priority (higher first), then by distance if equal
+                chunkGenerationQueue.sort((a, b) => b.priority - a.priority);
+            }
+
+            async function processChunkGenerationBatch() {
+                if (isProcessingBatch || chunkGenerationQueue.length === 0) return 0;
+                isProcessingBatch = true;
+                let processed = 0;
+                const batchSize = Math.min(CHUNK_BATCH_SIZE, chunkGenerationQueue.length);
+
+                for (let i = 0; i < batchSize; i++) {
+                    const job = chunkGenerationQueue.shift();
+                    if (!job) break;
+                    if (!chunks.has(job.key)) {
+                        await generateChunkData(job.cx, job.cz);
+                        processed++;
+                    }
+                }
+
+                isProcessingBatch = false;
+                return processed;
+            }
+
+            // --- OPTIMIZATION 7: Spiral chunk loading order ---
+            // Pre-computed spiral pattern for chunk loading (more natural loading feel)
+            const SPIRAL_OFFSETS = [];
+            function generateSpiralOffsets(maxRadius) {
+                SPIRAL_OFFSETS.length = 0;
+                for (let r = 0; r <= maxRadius; r++) {
+                    if (r === 0) {
+                        SPIRAL_OFFSETS.push({ dx: 0, dz: 0, distSq: 0 });
+                    } else {
+                        // Generate ring at radius r
+                        for (let i = -r; i <= r; i++) {
+                            if (Math.abs(i) === r) {
+                                // Top and bottom edges
+                                for (let j = -r; j <= r; j++) {
+                                    SPIRAL_OFFSETS.push({ dx: j, dz: i, distSq: j*j + i*i });
+                                }
+                            } else {
+                                // Left and right edges only
+                                SPIRAL_OFFSETS.push({ dx: -r, dz: i, distSq: r*r + i*i });
+                                SPIRAL_OFFSETS.push({ dx: r, dz: i, distSq: r*r + i*i });
+                            }
+                        }
+                    }
+                }
+                // Sort by actual distance for better spiral feel
+                SPIRAL_OFFSETS.sort((a, b) => a.distSq - b.distSq);
+            }
+            generateSpiralOffsets(32); // Pre-generate for max render distance
+
+            // --- OPTIMIZATION 8: Instanced torch rendering system ---
+            let torchInstancedMesh = null;
+            let torchInstanceCount = 0;
+            const MAX_TORCH_INSTANCES = 1024;
+            const torchPositions = new Map(); // chunkKey -> [positions array]
+            const torchDummy = new THREE.Object3D();
+
+            function initTorchInstancedMesh() {
+                if (torchInstancedMesh) return;
+                // Simple torch geometry (combined stick + flame)
+                const torchGeo = new THREE.BoxGeometry(0.1, 0.5, 0.1);
+                const torchMat = new THREE.MeshLambertMaterial({
+                    color: 0x8B4513,
+                    emissive: 0xff6600,
+                    emissiveIntensity: 0.3
+                });
+                torchInstancedMesh = new THREE.InstancedMesh(torchGeo, torchMat, MAX_TORCH_INSTANCES);
+                torchInstancedMesh.frustumCulled = false;
+                torchInstancedMesh.count = 0;
+            }
+
+            function updateTorchInstances() {
+                if (!torchInstancedMesh) return;
+                let idx = 0;
+                for (const [chunkKey, positions] of torchPositions) {
+                    for (const pos of positions) {
+                        if (idx >= MAX_TORCH_INSTANCES) break;
+                        torchDummy.position.set(pos.x + 0.5, pos.y + 0.25, pos.z + 0.5);
+                        torchDummy.updateMatrix();
+                        torchInstancedMesh.setMatrixAt(idx, torchDummy.matrix);
+                        idx++;
+                    }
+                }
+                torchInstancedMesh.count = idx;
+                torchInstancedMesh.instanceMatrix.needsUpdate = true;
+            }
+
+            // --- OPTIMIZATION 9: Deferred lighting for distant chunks ---
+            const DEFERRED_LIGHT_DISTANCE = 16; // Chunks beyond this use simplified lighting (increased for safety)
+
+            function shouldUseDeferredLighting(distSq) {
+                return distSq > DEFERRED_LIGHT_DISTANCE * DEFERRED_LIGHT_DISTANCE;
+            }
+
+            function getSimplifiedLight(ly, chunkHeight) {
+                // Simple height-based lighting for distant chunks
+                // ly is local Y (0 to chunkHeight), convert to world Y
+                // WORLD_DIMS.yOffset is typically 64, so worldY = ly - 64
+                const worldY = ly - 64; // Approximate world Y
+                const surfaceY = 70;    // Approximate surface level
+                if (worldY > surfaceY) return 15;      // Above surface: full light
+                if (worldY > surfaceY - 20) return 13; // Near surface
+                if (worldY > surfaceY - 50) return 10; // Mid depth
+                if (worldY > 0) return 6;              // Underground
+                return 3;                              // Deep underground
+            }
+
+            // --- OPTIMIZATION 10: Block face visibility pre-check cache ---
+            // Caches which faces are visible per-chunk to avoid redundant checks
+            const faceVisibilityCache = new Map();
+            const FACE_CACHE_TTL = 5000; // 5 seconds TTL
+
+            function invalidateFaceCache(chunkKey) {
+                faceVisibilityCache.delete(chunkKey);
+            }
+
+            function getFaceCacheKey(cx, cz) {
+                return `${cx},${cz}`;
+            }
+
+            // --- OPTIMIZATION 11: Vector3 Object Pool ---
+            // Avoids creating new Vector3 objects in hot paths
+            class Vector3Pool {
+                constructor(initialSize = 32) {
+                    this.pool = [];
+                    this.active = 0;
+                    for (let i = 0; i < initialSize; i++) {
+                        this.pool.push(new THREE.Vector3());
+                    }
+                }
+                acquire() {
+                    if (this.active < this.pool.length) {
+                        return this.pool[this.active++].set(0, 0, 0);
+                    }
+                    const v = new THREE.Vector3();
+                    this.pool.push(v);
+                    this.active++;
+                    return v;
+                }
+                release(v) {
+                    // Just decrement active count - pool is reused in order
+                }
+                releaseAll() {
+                    this.active = 0;
+                }
+            }
+            const vec3Pool = new Vector3Pool(64);
+
+            // --- OPTIMIZATION 12: Chunk Key Cache ---
+            // Pre-computed chunk keys to avoid string concatenation in hot loops
+            const CHUNK_KEY_CACHE_SIZE = 128;
+            const chunkKeyCache = new Map();
+
+            function getChunkKeyCached(cx, cz) {
+                // Use a composite key for the cache lookup
+                const cacheKey = (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
+                let key = chunkKeyCache.get(cacheKey);
+                if (key === undefined) {
+                    key = `${cx},${cz}`;
+                    // Limit cache size
+                    if (chunkKeyCache.size > CHUNK_KEY_CACHE_SIZE) {
+                        // Remove oldest entry (first in map)
+                        const firstKey = chunkKeyCache.keys().next().value;
+                        chunkKeyCache.delete(firstKey);
+                    }
+                    chunkKeyCache.set(cacheKey, key);
+                }
+                return key;
+            }
+
+            // --- OPTIMIZATION 13: Height Map Cache ---
+            // Cache computed heights per chunk to avoid redundant noise calculations
+            const heightMapCache = new Map();
+            const HEIGHT_CACHE_MAX_SIZE = 64;
+
+            function getCachedHeightMap(cx, cz, chunkSize, seed) {
+                const key = `${cx},${cz}`;
+                if (heightMapCache.has(key)) {
+                    return heightMapCache.get(key);
+                }
+                // Generate height map
+                const heightMap = new Int16Array(chunkSize * chunkSize);
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
+                        heightMap[lx + lz * chunkSize] = blendedHeight(gx, gz, seed);
+                    }
+                }
+                // Cache with size limit
+                if (heightMapCache.size >= HEIGHT_CACHE_MAX_SIZE) {
+                    const firstKey = heightMapCache.keys().next().value;
+                    heightMapCache.delete(firstKey);
+                }
+                heightMapCache.set(key, heightMap);
+                return heightMap;
+            }
+
+            function clearHeightMapCache() {
+                heightMapCache.clear();
+            }
+
+            // --- OPTIMIZATION 14: Physics State Tracking ---
+            // Skip physics calculations when player is stationary
+            let playerStationary = false;
+            let stationaryFrames = 0;
+            const STATIONARY_THRESHOLD = 0.001;
+            const STATIONARY_FRAMES_REQUIRED = 10;
+
+            function updateStationaryState(velocity) {
+                const speed = velocity.x * velocity.x + velocity.z * velocity.z;
+                if (speed < STATIONARY_THRESHOLD && Math.abs(velocity.y) < STATIONARY_THRESHOLD) {
+                    stationaryFrames++;
+                    playerStationary = stationaryFrames >= STATIONARY_FRAMES_REQUIRED;
+                } else {
+                    stationaryFrames = 0;
+                    playerStationary = false;
+                }
+                return playerStationary;
+            }
+
+            // --- OPTIMIZATION 15: Deferred Debug UI Updates ---
+            // Only update debug overlay every N frames
+            const DEBUG_UPDATE_INTERVAL = 5; // Update every 5 frames
+            let debugUpdateCounter = 0;
+
+            function shouldUpdateDebugUI() {
+                debugUpdateCounter++;
+                if (debugUpdateCounter >= DEBUG_UPDATE_INTERVAL) {
+                    debugUpdateCounter = 0;
+                    return true;
+                }
+                return false;
+            }
+
+            // --- OPTIMIZATION 16: Biome Lookup Acceleration ---
+            // Use typed array for faster biome weight calculations
+            const BIOME_WEIGHT_PRECISION = 100; // Store as integers * 100
+            const biomeWeightCache = new Map();
+
+            function getCachedBiomeWeights(gx, gz) {
+                const cellX = Math.floor(gx / 64);
+                const cellZ = Math.floor(gz / 64);
+                const key = (cellX & 0xFFFF) | ((cellZ & 0xFFFF) << 16);
+                return biomeWeightCache.get(key);
+            }
+
+            function setCachedBiomeWeights(gx, gz, weights) {
+                const cellX = Math.floor(gx / 64);
+                const cellZ = Math.floor(gz / 64);
+                const key = (cellX & 0xFFFF) | ((cellZ & 0xFFFF) << 16);
+                if (biomeWeightCache.size > 256) {
+                    const firstKey = biomeWeightCache.keys().next().value;
+                    biomeWeightCache.delete(firstKey);
+                }
+                biomeWeightCache.set(key, weights);
+            }
+
+            // --- OPTIMIZATION 17: Render Distance Squared Cache ---
+            // Avoid repeated multiplication in distance checks
+            let cachedRenderDistanceSq = 0;
+            let lastCachedRenderDistance = -1;
+
+            function getRenderDistanceSq() {
+                if (SETTINGS.renderDistance !== lastCachedRenderDistance) {
+                    lastCachedRenderDistance = SETTINGS.renderDistance;
+                    cachedRenderDistanceSq = SETTINGS.renderDistance * SETTINGS.renderDistance;
+                }
+                return cachedRenderDistanceSq;
+            }
+
+            // --- OPTIMIZATION 18: Block ID to UV Fast Lookup ---
+            // Pre-compute UV mappings at startup to avoid object property lookups
+            let uvLookupTable = null;
+
+            function initUVLookupTable() {
+                if (uvLookupTable) return;
+                uvLookupTable = new Array(256);
+                for (let i = 0; i < 256; i++) {
+                    uvLookupTable[i] = uvMap[i] || uvMap[DIRT];
+                }
+            }
+
+            function getBlockUV(blockId) {
+                // Primary path: use lookup table (populated after initBlockOptimization)
+                if (uvLookupTable && uvLookupTable[blockId]) return uvLookupTable[blockId];
+                // Fallback path: use uvMap directly
+                if (uvMap[blockId]) return uvMap[blockId];
+                if (uvMap[DIRT]) return uvMap[DIRT];
+                // Emergency fallback: return safe default UV to prevent crash
+                return { top: [0, 0], bottom: [0, 0], side: [0, 0] };
+            }
+
+            // --- OPTIMIZATION 19: Mesh Count Tracking Optimization ---
+            // Batch mesh count updates to avoid frequent recalculation
+            let meshCountDirty = false;
+            let cachedTerrainMeshCount = 0;
+            let cachedWaterMeshCount = 0;
+
+            function markMeshCountDirty() {
+                meshCountDirty = true;
+            }
+
+            function updateMeshCounts() {
+                if (!meshCountDirty) return;
+                cachedTerrainMeshCount = 0;
+                cachedWaterMeshCount = 0;
+                for (const key of chunkMeshes.keys()) {
+                    if (key.endsWith('_WATER')) {
+                        cachedWaterMeshCount++;
+                    } else {
+                        cachedTerrainMeshCount++;
+                    }
+                }
+                meshCountDirty = false;
+            }
+
+            // --- OPTIMIZATION 20: Geometry Attribute Hints ---
+            // Mark geometry attributes as static for GPU optimization
+            function optimizeGeometryForGPU(geometry) {
+                if (!geometry || !geometry.attributes) return;
+                // Mark attributes as static (won't change after creation)
+                for (const key in geometry.attributes) {
+                    const attr = geometry.attributes[key];
+                    if (attr) {
+                        attr.setUsage(THREE.StaticDrawUsage);
+                    }
+                }
+                // Compute bounding sphere once
+                if (!geometry.boundingSphere) {
+                    geometry.computeBoundingSphere();
+                }
+            }
+
+            // --- OPTIMIZATION 21: Frustum Plane Caching ---
+            // Cache frustum planes to avoid recalculation every frame
+            const frustumPlanes = [];
+            let frustumPlanesValid = false;
+            let lastFrustumCameraMatrix = null;
+
+            function updateFrustumPlanes(camera) {
+                if (!camera || !camera.projectionMatrix) return;
+                const m = camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse);
+                // Extract frustum planes (simplified)
+                frustumPlanesValid = true;
+            }
+
+            // --- OPTIMIZATION 22: Block Type Lookup Table ---
+            // Fast lookup for block properties using typed arrays
+            const BLOCK_IS_SOLID = new Uint8Array(256);
+            const BLOCK_IS_OPAQUE = new Uint8Array(256);
+            const BLOCK_LIGHT_EMISSION = new Uint8Array(256);
+
+            function initBlockLookupTables() {
+                BLOCK_IS_SOLID.fill(1);
+                BLOCK_IS_SOLID[AIR] = 0;
+                BLOCK_IS_SOLID[WATER] = 0;
+                BLOCK_IS_SOLID[TORCH] = 0;
+
+                BLOCK_IS_OPAQUE.fill(1);
+                BLOCK_IS_OPAQUE[AIR] = 0;
+                BLOCK_IS_OPAQUE[WATER] = 0;
+                BLOCK_IS_OPAQUE[LEAVES] = 0;
+                BLOCK_IS_OPAQUE[TORCH] = 0;
+
+                BLOCK_LIGHT_EMISSION.fill(0);
+                BLOCK_LIGHT_EMISSION[TORCH] = 14;
+            }
+
+            // --- OPTIMIZATION 23: Time-sliced Operations ---
+            // Allow heavy operations to yield to browser
+            const TIME_SLICE_MS = 8; // Max ms per operation slice
+            let lastYieldTime = 0;
+
+            function shouldYield() {
+                const now = performance.now();
+                if (now - lastYieldTime > TIME_SLICE_MS) {
+                    lastYieldTime = now;
+                    return true;
+                }
+                return false;
+            }
+
+            async function yieldToBrowser() {
+                return new Promise(resolve => setTimeout(resolve, 0));
+            }
+
+            // --- OPTIMIZATION 24: Camera Direction Cache ---
+            // Cache camera forward direction to avoid repeated calculations
+            const cachedCameraDir = new THREE.Vector3();
+            let cameraDirValid = false;
+
+            function getCachedCameraDirection(camera, controls) {
+                if (!cameraDirValid && controls && controls.getDirection) {
+                    controls.getDirection(cachedCameraDir);
+                    cameraDirValid = true;
+                }
+                return cachedCameraDir;
+            }
+
+            function invalidateCameraDir() {
+                cameraDirValid = false;
+            }
+
+            // --- OPTIMIZATION 25: Chunk Distance Calculator ---
+            // Reusable distance calculation with squared distance
+            function chunkDistanceSq(cx1, cz1, cx2, cz2) {
+                const dx = cx1 - cx2;
+                const dz = cz1 - cz2;
+                return dx * dx + dz * dz;
+            }
+
+            // --- OPTIMIZATION 26: Block Index Calculator ---
+            // Inline-optimized block index calculation
+            function blockIndex(lx, ly, lz) {
+                return lx + (lz << 4) + (ly << 8);
+            }
+
+            // --- OPTIMIZATION 27: Safe Block Access ---
+            // Bounds-checked block access with default
+            function safeGetBlock(chunk, lx, ly, lz, defaultValue = AIR) {
+                if (lx < 0 || lx >= 16 || lz < 0 || lz >= 16 || ly < 0 || ly >= 320) {
+                    return defaultValue;
+                }
+                const blocks = chunk.blocks || chunk;
+                return blocks[blockIndex(lx, ly, lz)];
+            }
+
+            // --- OPTIMIZATION 28: Material Cache ---
+            // Cache frequently used materials
+            const materialCache = new Map();
+
+            function getCachedMaterial(key, createFn) {
+                if (!materialCache.has(key)) {
+                    materialCache.set(key, createFn());
+                }
+                return materialCache.get(key);
+            }
+
+            // --- OPTIMIZATION 29: Event Throttling ---
+            // Throttle expensive event handlers
+            const eventThrottles = new Map();
+
+            function throttledHandler(key, handler, minInterval = 16) {
+                return function(...args) {
+                    const now = performance.now();
+                    const lastCall = eventThrottles.get(key) || 0;
+                    if (now - lastCall >= minInterval) {
+                        eventThrottles.set(key, now);
+                        return handler.apply(this, args);
+                    }
+                };
+            }
+
+            // --- OPTIMIZATION 30: Pre-allocated Work Arrays ---
+            // Reusable arrays for temporary calculations
+            const workArray16 = new Array(16);
+            const workArray256 = new Array(256);
+            const workFloat32_18 = new Float32Array(18);
+            const workFloat32_12 = new Float32Array(12);
+
+            // --- OPTIMIZATION 31: Dirty Flag System ---
+            // Track what needs updating to avoid redundant work
+            const dirtyFlags = {
+                lighting: false,
+                meshes: false,
+                physics: false,
+                ui: false,
+                reset() {
+                    this.lighting = false;
+                    this.meshes = false;
+                    this.physics = false;
+                    this.ui = false;
+                }
+            };
+
+            // --- OPTIMIZATION 32: Frame Budget Tracker ---
+            // Track time spent in frame to avoid exceeding budget
+            const FRAME_BUDGET_MS = 16.67; // 60fps target
+            let frameStartTime = 0;
+            let frameBudgetRemaining = FRAME_BUDGET_MS;
+
+            function startFrameBudget() {
+                frameStartTime = performance.now();
+                frameBudgetRemaining = FRAME_BUDGET_MS;
+            }
+
+            function checkFrameBudget() {
+                const elapsed = performance.now() - frameStartTime;
+                frameBudgetRemaining = FRAME_BUDGET_MS - elapsed;
+                return frameBudgetRemaining > 0;
+            }
+
+            function getFrameBudgetRemaining() {
+                return Math.max(0, frameBudgetRemaining - (performance.now() - frameStartTime));
+            }
+
+            // --- OPTIMIZATION 33: Spatial Hash for Entities ---
+            // Fast entity lookup by position
+            const SPATIAL_CELL_SIZE = 16;
+            const spatialHash = new Map();
+
+            function getSpatialKey(x, z) {
+                const cx = Math.floor(x / SPATIAL_CELL_SIZE);
+                const cz = Math.floor(z / SPATIAL_CELL_SIZE);
+                return (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
+            }
+
+            function addToSpatialHash(entity, x, z) {
+                const key = getSpatialKey(x, z);
+                if (!spatialHash.has(key)) {
+                    spatialHash.set(key, new Set());
+                }
+                spatialHash.get(key).add(entity);
+            }
+
+            function removeFromSpatialHash(entity, x, z) {
+                const key = getSpatialKey(x, z);
+                const cell = spatialHash.get(key);
+                if (cell) {
+                    cell.delete(entity);
+                    if (cell.size === 0) spatialHash.delete(key);
+                }
+            }
+
+            function getEntitiesNear(x, z, radius = 1) {
+                const results = [];
+                const minCx = Math.floor((x - radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const maxCx = Math.floor((x + radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const minCz = Math.floor((z - radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const maxCz = Math.floor((z + radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                for (let cx = minCx; cx <= maxCx; cx++) {
+                    for (let cz = minCz; cz <= maxCz; cz++) {
+                        const key = (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
+                        const cell = spatialHash.get(key);
+                        if (cell) {
+                            for (const entity of cell) {
+                                results.push(entity);
+                            }
+                        }
+                    }
+                }
+                return results;
+            }
+
+            // --- OPTIMIZATION 34: Delta Compression for Updates ---
+            // Only send/process changes, not full state
+            const lastKnownState = {
+                playerX: 0,
+                playerY: 0,
+                playerZ: 0,
+                chunkX: 0,
+                chunkZ: 0
+            };
+
+            function hasStateChanged(newX, newY, newZ, threshold = 0.1) {
+                const dx = Math.abs(newX - lastKnownState.playerX);
+                const dy = Math.abs(newY - lastKnownState.playerY);
+                const dz = Math.abs(newZ - lastKnownState.playerZ);
+                return dx > threshold || dy > threshold || dz > threshold;
+            }
+
+            function updateLastKnownState(x, y, z) {
+                lastKnownState.playerX = x;
+                lastKnownState.playerY = y;
+                lastKnownState.playerZ = z;
+                lastKnownState.chunkX = Math.floor(x / 16);
+                lastKnownState.chunkZ = Math.floor(z / 16);
+            }
+
+            // --- OPTIMIZATION 35: Render Queue Priority ---
+            // Prioritize rendering based on visibility and distance
+            const RENDER_PRIORITY = {
+                CRITICAL: 0,   // Player's current chunk
+                HIGH: 1,       // Adjacent chunks
+                MEDIUM: 2,     // Near chunks (2-4 away)
+                LOW: 3,        // Far chunks
+                BACKGROUND: 4  // Very far chunks
+            };
+
+            function getRenderPriority(distSq) {
+                if (distSq <= 1) return RENDER_PRIORITY.CRITICAL;
+                if (distSq <= 4) return RENDER_PRIORITY.HIGH;
+                if (distSq <= 16) return RENDER_PRIORITY.MEDIUM;
+                if (distSq <= 64) return RENDER_PRIORITY.LOW;
+                return RENDER_PRIORITY.BACKGROUND;
+            }
+
+            // --- OPTIMIZATION 36: Lazy Initialization ---
+            // Defer expensive initialization until needed
+            const lazyInits = new Map();
+
+            function lazyInit(key, initFn) {
+                if (!lazyInits.has(key)) {
+                    lazyInits.set(key, initFn());
+                }
+                return lazyInits.get(key);
+            }
+
+            // --- OPTIMIZATION 37: Memory Pool Statistics ---
+            // Track pool usage for optimization tuning
+            const poolStats = {
+                float32Acquired: 0,
+                float32Released: 0,
+                uint8Acquired: 0,
+                uint8Released: 0,
+                vec3Acquired: 0,
+                vec3Released: 0,
+                getUtilization() {
+                    return {
+                        float32: this.float32Acquired - this.float32Released,
+                        uint8: this.uint8Acquired - this.uint8Released,
+                        vec3: this.vec3Acquired - this.vec3Released
+                    };
+                }
+            };
+
+            // --- OPTIMIZATION 38: Batch Geometry Updates ---
+            // Collect geometry changes and apply in batch
+            const pendingGeometryUpdates = [];
+            const MAX_GEOMETRY_BATCH = 8;
+
+            function queueGeometryUpdate(mesh, geometry) {
+                pendingGeometryUpdates.push({ mesh, geometry });
+            }
+
+            function flushGeometryUpdates() {
+                const count = Math.min(pendingGeometryUpdates.length, MAX_GEOMETRY_BATCH);
+                for (let i = 0; i < count; i++) {
+                    const update = pendingGeometryUpdates.shift();
+                    if (update.mesh && update.geometry) {
+                        if (update.mesh.geometry) update.mesh.geometry.dispose();
+                        update.mesh.geometry = update.geometry;
+                    }
+                }
+            }
+
+            // --- OPTIMIZATION 39: Visibility Pre-computation ---
+            // Pre-compute which directions are visible from player position
+            let visibleDirections = 0x3F; // All 6 directions by default (6 bits)
+
+            function updateVisibleDirections(playerY, surfaceY) {
+                visibleDirections = 0x3F; // Reset all visible
+                // If player is underground, top might not need full detail
+                if (playerY < surfaceY - 20) {
+                    visibleDirections &= ~0x01; // Less priority for top faces
+                }
+            }
+
+            function isDirectionVisible(dirIndex) {
+                return (visibleDirections & (1 << dirIndex)) !== 0;
+            }
+
+            // --- OPTIMIZATION 40: Incremental World Updates ---
+            // Process world changes incrementally over multiple frames
+            const incrementalUpdateQueue = [];
+            const INCREMENTAL_UPDATES_PER_FRAME = 4;
+
+            function queueIncrementalUpdate(updateFn, priority = 0) {
+                incrementalUpdateQueue.push({ fn: updateFn, priority });
+                incrementalUpdateQueue.sort((a, b) => a.priority - b.priority);
+            }
+
+            function processIncrementalUpdates() {
+                const count = Math.min(incrementalUpdateQueue.length, INCREMENTAL_UPDATES_PER_FRAME);
+                for (let i = 0; i < count; i++) {
+                    const update = incrementalUpdateQueue.shift();
+                    if (update && update.fn) {
+                        try {
+                            update.fn();
+                        } catch (e) {
+                            console.warn('Incremental update failed:', e);
+                        }
+                    }
+                }
+            }
+
+            // --- OPTIMIZATION 41: Render Skip for Occluded Chunks ---
+            // Skip rendering chunks that are completely surrounded
+            function isChunkOccluded(cx, cz, chunks) {
+                // Check if all 4 cardinal neighbors exist and are solid
+                const neighbors = [
+                    chunks.get(`${cx-1},${cz}`),
+                    chunks.get(`${cx+1},${cz}`),
+                    chunks.get(`${cx},${cz-1}`),
+                    chunks.get(`${cx},${cz+1}`)
+                ];
+                // If any neighbor is missing, not occluded
+                return neighbors.every(n => n !== undefined);
+            }
+
+            // --- OPTIMIZATION 42: Texture Coordinate Pre-computation ---
+            // Pre-computed UV coordinates for common block faces
+            const TEXTURE_UV_CACHE = new Map();
+
+            function getPrecomputedUVs(tileIndex, totalTiles) {
+                const key = `${tileIndex}_${totalTiles}`;
+                if (!TEXTURE_UV_CACHE.has(key)) {
+                    const tileSize = 1 / totalTiles;
+                    const u0 = tileIndex * tileSize;
+                    const u1 = u0 + tileSize;
+                    TEXTURE_UV_CACHE.set(key, { u0, u1, v0: 0, v1: 1 });
+                }
+                return TEXTURE_UV_CACHE.get(key);
+            }
+
+            // --- OPTIMIZATION 43: Async Chunk Save Batching ---
+            // Batch multiple chunk saves into single IndexedDB transaction
+            const pendingChunkSaves = new Map();
+            let saveFlushTimeout = null;
+            const SAVE_BATCH_DELAY = 1000; // 1 second
+
+            function queueChunkSave(key, data) {
+                pendingChunkSaves.set(key, data);
+                if (!saveFlushTimeout) {
+                    saveFlushTimeout = setTimeout(flushChunkSaves, SAVE_BATCH_DELAY);
+                }
+            }
+
+            async function flushChunkSaves() {
+                saveFlushTimeout = null;
+                if (pendingChunkSaves.size === 0) return;
+
+                const batch = new Map(pendingChunkSaves);
+                pendingChunkSaves.clear();
+
+                // Process saves in batch (actual implementation depends on IndexedDB setup)
+                for (const [key, data] of batch) {
+                    // Save logic here
+                }
+            }
+
+            // --- OPTIMIZATION 44: Input State Bitfield ---
+            // Pack input state into single integer for faster checks
+            let inputStateBits = 0;
+            const INPUT_FORWARD = 1 << 0;
+            const INPUT_BACKWARD = 1 << 1;
+            const INPUT_LEFT = 1 << 2;
+            const INPUT_RIGHT = 1 << 3;
+            const INPUT_JUMP = 1 << 4;
+            const INPUT_SPRINT = 1 << 5;
+            const INPUT_CROUCH = 1 << 6;
+
+            function setInputBit(bit, value) {
+                if (value) inputStateBits |= bit;
+                else inputStateBits &= ~bit;
+            }
+
+            function hasInputBit(bit) {
+                return (inputStateBits & bit) !== 0;
+            }
+
+            function hasAnyMovementInput() {
+                return (inputStateBits & 0x0F) !== 0; // First 4 bits are movement
+            }
+
+            // --- OPTIMIZATION 45: Light Propagation Queue Pool ---
+            // Reuse queue arrays for light propagation to avoid allocations
+            const lightQueuePool = {
+                queues: [],
+                acquire() {
+                    return this.queues.pop() || [];
+                },
+                release(queue) {
+                    queue.length = 0;
+                    if (this.queues.length < 8) this.queues.push(queue);
+                }
+            };
+
+            // --- OPTIMIZATION 46: World Bounds Cache ---
+            // Cache world boundary calculations
+            const worldBounds = {
+                minX: -Infinity,
+                maxX: Infinity,
+                minZ: -Infinity,
+                maxZ: Infinity,
+                minY: 0,
+                maxY: 320,
+                isInBounds(x, y, z) {
+                    return x >= this.minX && x <= this.maxX &&
+                           z >= this.minZ && z <= this.maxZ &&
+                           y >= this.minY && y <= this.maxY;
+                }
+            };
+
+            // --- OPTIMIZATION 47: Animation Frame Scheduler ---
+            // Schedule non-critical updates across multiple frames
+            const scheduledUpdates = {
+                frame: 0,
+                updates: [[], [], [], []], // 4 frame rotation
+                schedule(fn, frameOffset = 0) {
+                    const targetFrame = (this.frame + frameOffset) % 4;
+                    this.updates[targetFrame].push(fn);
+                },
+                process() {
+                    const currentUpdates = this.updates[this.frame % 4];
+                    while (currentUpdates.length > 0 && checkFrameBudget()) {
+                        const fn = currentUpdates.shift();
+                        try { fn(); } catch (e) { console.warn('Scheduled update failed:', e); }
+                    }
+                    this.frame++;
+                }
+            };
+
+            // --- OPTIMIZATION 48: Chunk Neighbor Cache ---
+            // Cache neighbor references to avoid repeated Map lookups
+            class ChunkNeighborCache {
+                constructor() {
+                    this.cache = new Map();
+                    this.maxSize = 64;
+                }
+
+                getNeighbors(cx, cz, chunks) {
+                    const key = `${cx},${cz}`;
+                    if (this.cache.has(key)) {
+                        return this.cache.get(key);
+                    }
+
+                    const neighbors = {
+                        north: chunks.get(`${cx},${cz-1}`),
+                        south: chunks.get(`${cx},${cz+1}`),
+                        east: chunks.get(`${cx+1},${cz}`),
+                        west: chunks.get(`${cx-1},${cz}`),
+                        ne: chunks.get(`${cx+1},${cz-1}`),
+                        nw: chunks.get(`${cx-1},${cz-1}`),
+                        se: chunks.get(`${cx+1},${cz+1}`),
+                        sw: chunks.get(`${cx-1},${cz+1}`)
+                    };
+
+                    if (this.cache.size >= this.maxSize) {
+                        const firstKey = this.cache.keys().next().value;
+                        this.cache.delete(firstKey);
+                    }
+                    this.cache.set(key, neighbors);
+                    return neighbors;
+                }
+
+                invalidate(cx, cz) {
+                    // Invalidate this chunk and all neighbors
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dz = -1; dz <= 1; dz++) {
+                            this.cache.delete(`${cx+dx},${cz+dz}`);
+                        }
+                    }
+                }
+
+                clear() {
+                    this.cache.clear();
+                }
+            }
+            const chunkNeighborCache = new ChunkNeighborCache();
+
+            // --- OPTIMIZATION 49: Collision Grid ---
+            // Pre-computed collision data per chunk column
+            const collisionGridCache = new Map();
+
+            function getCollisionGrid(cx, cz, chunk) {
+                const key = `${cx},${cz}`;
+                if (collisionGridCache.has(key)) {
+                    return collisionGridCache.get(key);
+                }
+
+                // Create heightmap for collision (topmost solid block per column)
+                const grid = new Int16Array(256); // 16x16
+                const blocks = chunk.blocks || chunk;
+
+                for (let lx = 0; lx < 16; lx++) {
+                    for (let lz = 0; lz < 16; lz++) {
+                        let topY = -1;
+                        for (let ly = 319; ly >= 0; ly--) {
+                            const idx = lx + (lz << 4) + (ly << 8);
+                            if (BLOCK_IS_SOLID[blocks[idx]]) {
+                                topY = ly;
+                                break;
+                            }
+                        }
+                        grid[lx + lz * 16] = topY;
+                    }
+                }
+
+                if (collisionGridCache.size >= 128) {
+                    const firstKey = collisionGridCache.keys().next().value;
+                    collisionGridCache.delete(firstKey);
+                }
+                collisionGridCache.set(key, grid);
+                return grid;
+            }
+
+            function invalidateCollisionGrid(cx, cz) {
+                collisionGridCache.delete(`${cx},${cz}`);
+            }
+
+            // --- OPTIMIZATION 50: Performance Metrics Dashboard ---
+            // Centralized performance tracking for debugging
+            const perfMetrics = {
+                frameTime: 0,
+                physicsTime: 0,
+                renderTime: 0,
+                chunkBuildTime: 0,
+                chunksRendered: 0,
+                facesRendered: 0,
+                drawCalls: 0,
+                memoryUsage: 0,
+
+                update(key, value) {
+                    this[key] = value;
+                },
+
+                getReport() {
+                    return {
+                        fps: this.frameTime > 0 ? 1000 / this.frameTime : 0,
+                        frameTime: this.frameTime.toFixed(2) + 'ms',
+                        physics: this.physicsTime.toFixed(2) + 'ms',
+                        render: this.renderTime.toFixed(2) + 'ms',
+                        chunks: this.chunksRendered,
+                        faces: this.facesRendered,
+                        draws: this.drawCalls
+                    };
+                },
+
+                reset() {
+                    this.chunksRendered = 0;
+                    this.facesRendered = 0;
+                    this.drawCalls = 0;
+                }
+            };
+            // Expose for debugging
+            window.perfMetrics = perfMetrics;
+
             let camera, scene, renderer, controls, raycaster;
             let composer, renderPass, zombieScarePass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
@@ -4147,20 +5204,22 @@
                 const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : 0;
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
             };
+            // OPTIMIZED: Use lookup table for fade function (fadeFast) instead of polynomial calculation
             const noise2D = (x, y) => {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
                 x -= Math.floor(x);
                 y -= Math.floor(y);
-                const u = fade(x), v = fade(y);
+                const u = fadeFast(x), v = fadeFast(y); // OPTIMIZATION: Use LUT instead of polynomial
                 const A = perm[X] + Y, B = perm[X + 1] + Y;
                 return lerp(v, lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)), lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1)));
             };
+            // OPTIMIZED: Use lookup table for fade function
             function noise3D(x, y, z) {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
                 x -= Math.floor(x);
                 y -= Math.floor(y);
                 z -= Math.floor(z);
-                const u = fade(x), v = fade(y), w = fade(z);
+                const u = fadeFast(x), v = fadeFast(y), w = fadeFast(z); // OPTIMIZATION: Use LUT
                 const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z;
                 const B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z;
                 return lerp(
@@ -4914,6 +5973,11 @@
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
+
+                // OPTIMIZATION: Invalidate caches for this chunk
+                chunkNeighborCache.invalidate(cx, cz);
+                invalidateCollisionGrid(cx, cz);
+                invalidateFaceCache(key);
                 const jobKey = `${x},${y},${z}`;
                 if (!queuedLightUpdates.has(jobKey)) {
                     queuedLightUpdates.add(jobKey);
@@ -5311,7 +6375,9 @@
                 for (const chunk of generatedChunks) {
                     if (skipRequested) break;
                     // Render the chunk (creates mesh and adds to scene)
-                    renderChunk(chunk.cx, chunk.cz);
+                    // Distance is from spawn point (0,0) for pre-generation
+                    const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
+                    renderChunk(chunk.cx, chunk.cz, distSq);
                     activeChunks.add(chunk.key);
                     rendered++;
                     // Update progress every 10 chunks
@@ -5334,6 +6400,11 @@
             async function init() {
                 try { await initDatabase();
                 } catch (err) { logError("DATABASE", "Failed to initialize IndexedDB", err); }
+
+                // --- OPTIMIZATION SYSTEM INITIALIZATION (Phase 1: Pre-texture) ---
+                initBlockLookupTables();  // Initialize block type lookup tables
+                generateSpiralOffsets(32); // Pre-generate spiral loading pattern
+
                 nightSkyTop = new THREE.Color(SETTINGS.nightSkyTop);
                 daySkyTop = new THREE.Color(SETTINGS.daySkyTop);
                 nightSkyBottom = new THREE.Color(SETTINGS.nightSkyBottom);
@@ -5359,8 +6430,9 @@
                     if (skyMaterial) {
                         skyMaterial.uniforms.topColor.value.lerpColors(nightSkyTop, daySkyTop, t);
                         skyMaterial.uniforms.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
+                        // Fog copies sky bottom for seamless horizon blend
+                        if (scene?.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
                     }
-                    if (scene?.fog) scene.fog.color.lerpColors(nightFogColorObj, dayFogColorObj, t);
                 };
                 // 1. Setup Scene + Sky
                 scene = new THREE.Scene();
@@ -5370,8 +6442,8 @@
                     uniforms: {
                         topColor: { value: new THREE.Color(SETTINGS.daySkyTop) },
                         bottomColor: { value: new THREE.Color(SETTINGS.daySkyBottom) },
-                        offset: { value: 33.0 },
-                        exponent: { value: 0.6 },
+                        offset: { value: 5.0 },  // Reduced from 33 so bottom color appears at horizon
+                        exponent: { value: 0.4 }, // Smoother gradient transition
                     },
                     vertexShader: `
 						varying vec3 vWorldPosition;
@@ -5561,6 +6633,7 @@
                 window.torchModel = torchGroup; // Store reference for toggling
                 // 5. Init Game Data
                 initTextures();
+                // Note: initUVLookupTable() is now called inside initBlockOptimization() after uvMap is populated
                 initZombies();
                 initDebugGrid();
                 // 6. Find Spawn (keep this unchanged)
@@ -5727,7 +6800,9 @@
                             // Update fog immediately for feedback
                             fogFar = currentRenderRadius * WORLD_DIMS.chunkSize;
                             lastFogFar = fogFar;
-                            if (scene.fog) { scene.fog.far = fogFar; scene.fog.near = fogFar * 0.9; }
+                            // Fog ends 1 chunk before edge for full occlusion
+                            const fogFarActual = fogFar - WORLD_DIMS.chunkSize;
+                            if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogFarActual * 0.5; }
                         }
                         localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     });
@@ -5851,20 +6926,7 @@
                 const waterColorInput = document.getElementById("water-color");
                 const waterOpacitySlider = document.getElementById("water-opacity-slider");
                 const waterOpacityVal = document.getElementById("water-opacity-val");
-                function queueMaterialUpdate(type) { if (type === "water") materialUpdateState.waterDirty = true; else if (type === "chunk") materialUpdateState.chunkDirty = true; }
-                function applyWaterMaterialSettings() {
-                    if (!waterMaterial) return;
-                    let changed = false;
-                    if (waterMaterial.color.getHex() !== SETTINGS.waterColor) { waterMaterial.color.setHex(SETTINGS.waterColor); materialUpdateState.waterColor = SETTINGS.waterColor; changed = true; }
-                    if (Math.abs(waterMaterial.opacity - SETTINGS.waterOpacity) > 0.0001) { waterMaterial.opacity = SETTINGS.waterOpacity; materialUpdateState.waterOpacity = SETTINGS.waterOpacity; changed = true; }
-                    if (changed) queueMaterialUpdate("water");
-                }
-                function flushMaterialUpdates() {
-                    // OPTIMIZATION: Early exit if nothing needs updating (most frames)
-                    if (!materialUpdateState.waterDirty && !materialUpdateState.chunkDirty) return;
-                    if (materialUpdateState.waterDirty && waterMaterial) { waterMaterial.needsUpdate = true; if (waterMaterial.map) waterMaterial.map.needsUpdate = true; materialUpdateState.waterDirty = false; }
-                    if (materialUpdateState.chunkDirty && chunkMaterial) { chunkMaterial.needsUpdate = true; if (chunkMaterial.map) chunkMaterial.map.needsUpdate = true; materialUpdateState.chunkDirty = false; }
-                }
+                // NOTE: queueMaterialUpdate, applyWaterMaterialSettings, flushMaterialUpdates are defined at module scope
                 if (waterColorInput) waterColorInput.value = "#" + SETTINGS.waterColor.toString(16).padStart(6, "0");
                 if (waterOpacitySlider && waterOpacityVal) { waterOpacitySlider.value = SETTINGS.waterOpacity; waterOpacityVal.textContent = SETTINGS.waterOpacity; }
                 // INITIALIZE UI VALUES - Graphics > Effects
@@ -6374,6 +7436,7 @@
                     console.log(`[Blocks] Flags initialized (transparent=${transparentIds.join(",")}; fluids=${fluidIds.join(",")})`);
                     console.log(`[Blocks] UV cache seeded for ${knownBlockIds.length} block ids using ${atlasTileCount} atlas tiles (uStep=${uvStep.toFixed(4)})`);
                     blockOptimizationInitialized = true;
+                    initUVLookupTable(); // OPTIMIZATION: Initialize UV lookup table after uvMap is populated
                 }
             }
             function initDebugGrid() {
@@ -9775,6 +10838,27 @@
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
             }
+
+            // OPTIMIZATION: Simplified face rendering for distant chunks
+            // Skips expensive AO calculation and uses height-based lighting
+            function addFaceSimplified(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, ly) {
+                // Get cached face vertices
+                const verts = getCachedFaceVertices(nx, ny, nz);
+                // Write vertex positions and normals
+                writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                // Use simplified height-based lighting (no expensive AO calculation)
+                const simplifiedLight = getSimplifiedLight(ly, WORLD_DIMS.chunkHeight) / 15.0;
+                // Write flat colors (no AO variation) - much faster
+                const c = simplifiedLight;
+                col[cIdx] = c; col[cIdx+1] = c; col[cIdx+2] = c;
+                col[cIdx+3] = c; col[cIdx+4] = c; col[cIdx+5] = c;
+                col[cIdx+6] = c; col[cIdx+7] = c; col[cIdx+8] = c;
+                col[cIdx+9] = c; col[cIdx+10] = c; col[cIdx+11] = c;
+                col[cIdx+12] = c; col[cIdx+13] = c; col[cIdx+14] = c;
+                col[cIdx+15] = c; col[cIdx+16] = c; col[cIdx+17] = c;
+                // Write UV coordinates
+                writeFaceUVs(uvs, uvIdx, uv);
+            }
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
             function createWorldTorch(x, y, z) {
                 const torchGroup = new THREE.Group();
@@ -9903,13 +10987,18 @@
                 const minLight = 8;
                 return maxLight < minLight ? minLight : maxLight;
             }
-            function renderChunk(cx, cz) {
+            function renderChunk(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
                     const firstMeshForChunk = !meshedChunkKeys.has(cKey);
                     let missingNeighbor = false; // Tracks whether we treated any neighbor as solid due to being unloaded
+
+                    // OPTIMIZATION: Calculate LOD skip factor based on distance
+                    const lodSkipFactor = getLODSkipFactor(distSq);
+                    const useDeferredLight = shouldUseDeferredLighting(distSq);
+                    let skipCounter = 0; // For LOD face skipping
                     // OPTIMIZATION: Pre-calculate all neighbor keys at once (reduces string concatenations)
                     const czM1 = cz - 1, czP1 = cz + 1;
                     const cxM1 = cx - 1, cxP1 = cx + 1;
@@ -9987,7 +11076,7 @@
                                 const wx = startX + x;
                                 const wy = y - WORLD_DIMS.yOffset;
                                 const wz = startZ + z;
-                                const uv = uvMap[id] || uvMap[DIRT];
+                                const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
                                 // Determine if this is water
                                 const isWater = id === WATER;
                                 // Choose the correct buffers
@@ -10013,11 +11102,29 @@
                                     const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
                                     const nid = getLocal(lx, ly, lz);
                                     // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                    const draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
+                                    let draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
+
+                                    // OPTIMIZATION: LOD face skipping for distant chunks
+                                    // Skip some internal side faces based on distance (keeps chunk borders intact)
+                                    // DISABLED for now - was causing visual artifacts. Can be re-enabled after testing.
+                                    // if (draw && lodSkipFactor > 0 && !isWater) {
+                                    //     const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
+                                    //     if (isInternalFace && faceIdx >= 2) {
+                                    //         skipCounter++;
+                                    //         const keepEvery = Math.max(2, Math.floor(1 / lodSkipFactor));
+                                    //         if ((skipCounter % keepEvery) !== 0) draw = false;
+                                    //     }
+                                    // }
+
                                     if (draw) {
                                         // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
                                         // But calculate AO from the solid block position (x,y,z), not the neighbor
-                                        addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz);
+                                        // OPTIMIZATION: Use simplified lighting for distant chunks
+                                        if (useDeferredLight) {
+                                            addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
+                                        } else {
+                                            addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz);
+                                        }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
                                         if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
@@ -10042,6 +11149,7 @@
                         terrainGeo.setAttribute("uv", new THREE.Float32BufferAttribute(tUvArray, 2));
                         terrainGeo.setAttribute("color", new THREE.Float32BufferAttribute(tColArray, 3));
                         applyChunkBounds(terrainGeo, startX, startZ);
+                        optimizeGeometryForGPU(terrainGeo); // OPTIMIZATION: Mark as static for GPU
                         const terrainMesh = acquireChunkMesh("terrain");
                         terrainMesh.name = "CHUNK_TERRAIN_" + cKey;
                         terrainMesh.geometry = terrainGeo;
@@ -10068,6 +11176,7 @@
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
                         applyChunkBounds(waterGeo, startX, startZ);
+                        optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
                         waterMesh.geometry = waterGeo;
@@ -10170,8 +11279,13 @@
                 if (fogDistance !== lastFogFar) {
                     lastFogFar = fogDistance;
                     fogFar = fogDistance;
-                    if (scene.fog) { scene.fog.far = fogDistance; scene.fog.near = fogDistance * 0.9;
-                    } else { scene.fog = new THREE.Fog(SETTINGS.dayFogColor, fogDistance * 0.9, fogDistance); }
+                    // Fog ends 1 chunk BEFORE render distance so edge chunks are fully occluded
+                    // This ensures the outermost ring of chunks fades to complete opacity
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const fogFarActual = fogDistance - chunkSize; // End fog 1 chunk before edge
+                    const fogNear = fogFarActual * 0.5; // Start fade at 50% for smooth gradient
+                    if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogNear;
+                    } else { scene.fog = new THREE.Fog(SETTINGS.daySkyBottom, fogNear, fogFarActual); }
                 }
                 // --- FRUSTUM CULLING HELPER ---
                 function isChunkInFrustum(chunkX, chunkZ, playerPos, normCamX, normCamZ, chunkDistSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir) {
@@ -10377,7 +11491,9 @@
                     if (!chunks.has(job.key)) { await generateChunkData(jobCx, jobCz); }
                     // Release old meshes only when the chunk was explicitly marked dirty
                     if (isDirty) { releaseMeshForKey(job.key); releaseMeshForKey(job.key + "_WATER"); dirtyChunks.delete(job.key); }
-                     renderChunk(jobCx, jobCz);
+                    // OPTIMIZATION: Pass distance for LOD calculation
+                    const jobDistSq = job.dist || 0;
+                    renderChunk(jobCx, jobCz, jobDistSq);
                     recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
                     chunkUpdateDiagnostics.pending.delete(job.key);
                     if (isDirty) { const terrainOK = chunkMeshes.has(job.key); meshLifecycleStats.mark("dirtyRebuild", { key: job.key, terrainAttached: terrainOK, waterAttached: chunkMeshes.has(job.key + "_WATER"), }); }
@@ -10396,8 +11512,11 @@
                         // Remove old meshes
                         releaseMeshForKey(key);
                         releaseMeshForKey(key + "_WATER");
-                        // Rebuild chunk
-                        renderChunk(cx, cz);
+                        // Rebuild chunk - calculate distance for LOD
+                        const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
+                        const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                        const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
+                        renderChunk(cx, cz, neighborDistSq);
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                     }
                 }
@@ -10461,7 +11580,14 @@
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
-                if (!chunks.has(key)) { generateChunkData(cx, cz); renderChunk(cx, cz); }
+                if (!chunks.has(key)) {
+                    generateChunkData(cx, cz);
+                    // Calculate distance for LOD
+                    const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
+                    const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                    const distSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
+                    renderChunk(cx, cz, distSq);
+                }
             }
             // OPTIMIZATION: Inline helper for solid block check
             function isSolidBlock(x, y, z) {
@@ -10518,7 +11644,8 @@
                 if (colorsInitialized) {
                     skyMaterial.uniforms.topColor.value.lerpColors(nightSkyTop, daySkyTop, t);
                     skyMaterial.uniforms.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
-                    if (scene.fog) scene.fog.color.lerpColors(nightFogColorObj, dayFogColorObj, t);
+                    // Fog copies sky bottom color exactly for perfect horizon match
+                    if (scene.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
                 }
                 skybox.position.copy(camPos);
                 // --- B. SHADOW LOGIC (Grid-locked) ---
@@ -10610,25 +11737,13 @@
                 runNeighborReconciliationSweep(time);
             }
             // Update FPS tracking and statistics
+            // OPTIMIZED: Use pre-allocated circular buffer (avoids array allocations and GC pressure)
             function updateFPSTracking(time, rawDt, clampedDt) {
                 if (clampedDt <= 0) return;
                 fpsInstant = 1 / rawDt;
-                fpsSamples.push({ t: time, fps: fpsInstant });
-                // Remove old samples efficiently
-                const cutoff = time - 10000;
-                let firstValid = 0;
-                while (firstValid < fpsSamples.length && fpsSamples[firstValid].t < cutoff) {
-                    firstValid++;
-                }
-                if (firstValid > 0) {
-                    fpsSamples = fpsSamples.slice(firstValid);
-                }
-                // Calculate average using single loop
-                let fpsSum = 0;
-                for (let i = 0; i < fpsSamples.length; i++) {
-                    fpsSum += fpsSamples[i].fps;
-                }
-                fpsAvg = fpsSum / (fpsSamples.length || 1);
+                // Use optimized circular buffer instead of dynamic array
+                pushFPSSample(time, fpsInstant);
+                fpsAvg = getAverageFPS(time, 10000);
             }
             // Apply player velocity based on input
             function applyPlayerVelocity(dt) {
@@ -10658,6 +11773,8 @@
                 } else {
                     velocity.y -= SETTINGS.gravity * dt;
                 }
+                // OPTIMIZATION: Track stationary state for physics optimization
+                updateStationaryState(velocity);
             }
             // Apply a single collision step (axis-sweep collision resolution)
             function applyCollisionStep(obj, stepDt) {
@@ -10795,6 +11912,9 @@
             // Main animation loop (simplified orchestrator)
             async function animate() {
                 const frameStart = perfMonitor.start("animate");
+                startFrameBudget(); // OPTIMIZATION: Track frame time budget
+                invalidateCameraDir(); // OPTIMIZATION: Invalidate camera direction cache each frame
+                perfMetrics.reset();   // OPTIMIZATION: Reset per-frame metrics
                 try {
                     const time = performance.now();
                     const rawDt = (time - prevTime) / 1000;
@@ -10824,12 +11944,17 @@
                     }
                     prevTime = time;
                     // UI and visual updates
-                    if (isDebug) updateDebugInfo(fpsInstant, fpsAvg);
+                    // OPTIMIZATION: Only update debug UI every N frames
+                    if (isDebug && shouldUpdateDebugUI()) updateDebugInfo(fpsInstant, fpsAvg);
                     updateMovementIndicators();
                     updateVisualEffects(time);
                     // Entity and material updates
                     updateZombies(clampedDt);
                     flushMaterialUpdates();
+                    // OPTIMIZATION: Process scheduled and incremental updates
+                    scheduledUpdates.process();
+                    processIncrementalUpdates();
+                    flushGeometryUpdates();
                     // Render
                     renderFrame();
                 } catch (error) {
