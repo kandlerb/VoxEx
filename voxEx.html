@@ -680,6 +680,15 @@
                         <label for="ambient-skylight-slider">Ambient Skylight Floor: <span id="ambient-skylight-val">2</span></label>
                         <input type="range" id="ambient-skylight-slider" min="0" max="5" step="1" />
                     </div>
+                    <div style="font-weight: 600; margin: 16px 0 6px 0">Raytraced Lighting (Global Illumination)</div>
+                    <div class="setting-item">
+                        <label for="raytraced-lighting-toggle">Enable Raytraced Lighting (bounced light)</label>
+                        <input type="checkbox" id="raytraced-lighting-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="light-bounces-slider">Light Bounces: <span id="light-bounces-val">2</span></label>
+                        <input type="range" id="light-bounces-slider" min="0" max="5" step="1" />
+                    </div>
                     <div style="font-weight: 600; margin: 16px 0 6px 0">Block Light Diffusion</div>
                     <div class="setting-item">
                         <label for="block-falloff-select">Torch Falloff Curve</label>
@@ -1020,6 +1029,8 @@
                     skyQueueBudget: savedLighting.skyQueueBudget ?? 131072, // Max queue array length (4 numbers per node)
                     blockQueueBudget: savedLighting.blockQueueBudget ?? 98304,
                     blockFalloff: savedLighting.blockFalloff || "linear",
+                    raytracedLighting: savedLighting.raytracedLighting !== undefined ? savedLighting.raytracedLighting : false,
+                    lightBounces: savedLighting.lightBounces ?? 2,
                 },
                 torchColor: savedSettings.torchColor || 0xffaa33,
                 torchIntensity: savedSettings.torchIntensity !== undefined ? savedSettings.torchIntensity : 3.0,
@@ -1084,7 +1095,7 @@
                 moonColor: 0x8899ff,
                 moonIntensity: 0.15,
                 ambientIntensity: 0.5,
-                lighting: { diffuseSkylight: true, ambientSkylight: 2, skyQueueBudget: 131072, blockQueueBudget: 98304, blockFalloff: "linear" },
+                lighting: { diffuseSkylight: true, ambientSkylight: 2, skyQueueBudget: 131072, blockQueueBudget: 98304, blockFalloff: "linear", raytracedLighting: false, lightBounces: 2 },
                 torchColor: 0xffaa33,
                 torchIntensity: 3.0, // Increased from 2.5 for brighter torch light
                 torchRange: 48, // Increased from 32 for better cave illumination
@@ -3782,6 +3793,9 @@
                 const diffuseSkylightToggle = document.getElementById("diffuse-skylight-toggle");
                 const ambientSkylightSlider = document.getElementById("ambient-skylight-slider");
                 const ambientSkylightVal = document.getElementById("ambient-skylight-val");
+                const raytracedLightingToggle = document.getElementById("raytraced-lighting-toggle");
+                const lightBouncesSlider = document.getElementById("light-bounces-slider");
+                const lightBouncesVal = document.getElementById("light-bounces-val");
                 const blockFalloffSelect = document.getElementById("block-falloff-select");
                 const blockQueueSlider = document.getElementById("block-queue-slider");
                 const blockQueueVal = document.getElementById("block-queue-val");
@@ -3803,6 +3817,8 @@
                 if (ambientIntensitySlider && ambientIntensityVal) { ambientIntensitySlider.value = SETTINGS.ambientIntensity; ambientIntensityVal.textContent = SETTINGS.ambientIntensity; }
                 if (diffuseSkylightToggle) { diffuseSkylightToggle.checked = SETTINGS.lighting.diffuseSkylight; }
                 if (ambientSkylightSlider && ambientSkylightVal) { ambientSkylightSlider.value = SETTINGS.lighting.ambientSkylight; ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight; }
+                if (raytracedLightingToggle) { raytracedLightingToggle.checked = SETTINGS.lighting.raytracedLighting; }
+                if (lightBouncesSlider && lightBouncesVal) { lightBouncesSlider.value = SETTINGS.lighting.lightBounces; lightBouncesVal.textContent = SETTINGS.lighting.lightBounces; }
                 if (blockFalloffSelect) blockFalloffSelect.value = SETTINGS.lighting.blockFalloff;
                 if (blockQueueSlider && blockQueueVal) { blockQueueSlider.value = SETTINGS.lighting.blockQueueBudget; blockQueueVal.textContent = SETTINGS.lighting.blockQueueBudget; }
                 // INITIALIZE UI VALUES - World > Environment
@@ -3938,6 +3954,17 @@
                     ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     rebuildSkylightForActiveChunks();
+                });
+                raytracedLightingToggle?.addEventListener("change", () => {
+                    SETTINGS.lighting.raytracedLighting = raytracedLightingToggle.checked;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    scheduleTorchLightRebuild();
+                });
+                lightBouncesSlider?.addEventListener("input", () => {
+                    SETTINGS.lighting.lightBounces = parseInt(lightBouncesSlider.value, 10);
+                    lightBouncesVal.textContent = SETTINGS.lighting.lightBounces;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    scheduleTorchLightRebuild();
                 });
                 blockFalloffSelect?.addEventListener("change", () => {
                     SETTINGS.lighting.blockFalloff = blockFalloffSelect.value;
@@ -7097,6 +7124,72 @@
                 }
                 queue.length = 0;
                 if (blockLightQueuePool.length < 4) blockLightQueuePool.push(queue);
+
+                // Step 3: Multi-bounce lighting (raytraced global illumination)
+                // Simulates light bouncing off surfaces to create softer, more realistic lighting
+                const raytracedEnabled = SETTINGS?.lighting?.raytracedLighting;
+                const bounceCount = SETTINGS?.lighting?.lightBounces ?? 0;
+
+                if (raytracedEnabled && bounceCount > 0) {
+                    const bounceFactor = 0.4; // Each bounce contributes 40% of the light it receives
+                    const minBounceLight = 2; // Only bounce light level 2+
+
+                    for (let bounce = 0; bounce < bounceCount; bounce++) {
+                        // Create a snapshot of current lighting for this bounce iteration
+                        const currentLighting = new Uint8Array(blockLight);
+
+                        // Iterate through all blocks and propagate bounced light
+                        for (let ly = 0; ly < chunkHeight; ly++) {
+                            const yOff = ly << 8;
+                            for (let lz = 0; lz < cs; lz++) {
+                                const zOff = lz << 4;
+                                for (let lx = 0; lx < cs; lx++) {
+                                    const idx = lx + zOff + yOff;
+                                    const sourceLight = currentLighting[idx];
+
+                                    // Only bounce light from sufficiently lit blocks
+                                    if (sourceLight < minBounceLight) continue;
+
+                                    const blockId = blocks[idx];
+                                    // Only transparent blocks can emit bounced light
+                                    if (!IS_TRANSPARENT[blockId]) continue;
+
+                                    // Calculate bounced light intensity
+                                    const bouncedLight = Math.round(sourceLight * bounceFactor);
+                                    if (bouncedLight <= 0) continue;
+
+                                    // Propagate bounced light to neighbors
+                                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                                        const offset = NEIGHBOR_OFFSETS[n];
+                                        const nx = lx + offset[0];
+                                        const ny = ly + offset[1];
+                                        const nz = lz + offset[2];
+
+                                        // Bounds check
+                                        if (ny < 0 || ny >= chunkHeight) continue;
+                                        if (nx < 0 || nx >= cs || nz < 0 || nz >= cs) continue;
+
+                                        const nIdx = nx + zOff + offset[2] * 16 + offset[1] * 256;
+                                        const nBlockId = blocks[nIdx];
+
+                                        // Only add bounced light to transparent blocks
+                                        if (!IS_TRANSPARENT[nBlockId]) continue;
+
+                                        // Add bounced light with -1 falloff (like primary light)
+                                        const propagated = bouncedLight > 1 ? bouncedLight - 1 : 0;
+                                        if (propagated > 0 && propagated > currentLighting[nIdx]) {
+                                            // Don't exceed the maximum from direct + bounced light
+                                            const newLevel = Math.min(MAX_BLOCK_LIGHT_LEVEL, blockLight[nIdx] + propagated);
+                                            if (newLevel > blockLight[nIdx]) {
+                                                blockLight[nIdx] = newLevel;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Cascade lighting updates through multiple layers of chunks
                 // This ensures light propagates smoothly across many chunk boundaries
