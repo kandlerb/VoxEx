@@ -1607,16 +1607,32 @@
             // =====================================================
 
             class VoxelWorld {
-                constructor(terrainGenerator, settingsManager) {
+                constructor(terrainGenerator, settingsManager, externalChunks = null) {
                     this.terrainGenerator = terrainGenerator;
                     this.settings = settingsManager;
-                    this.chunks = new Map();
+                    // Use external chunks Map if provided (for integration with existing code)
+                    this.chunks = externalChunks || new Map();
                     this.chunkMeshes = new Map();
                     this.activeChunks = new Set();
                     this.modifiedChunks = new Set();
                     this.pristineChunks = new Set();
                     this.chunkBuildQueue = [];
                     this.queuedChunkKeys = new Set();
+                    // Cache for optimized lookups
+                    this._lastChunkKey = null;
+                    this._lastChunk = null;
+                }
+
+                // Bind to external chunks Map (for existing code integration)
+                bindChunks(chunksMap) {
+                    this.chunks = chunksMap;
+                }
+
+                // Bind to external state sets (for existing code integration)
+                bindState(modifiedChunks, pristineChunks, activeChunks) {
+                    if (modifiedChunks) this.modifiedChunks = modifiedChunks;
+                    if (pristineChunks) this.pristineChunks = pristineChunks;
+                    if (activeChunks) this.activeChunks = activeChunks;
                 }
 
                 getChunkKey(cx, cz) {
@@ -1660,28 +1676,71 @@
                 }
 
                 getBlock(x, y, z) {
-                    const { cx, cz, lx, ly, lz } = this.worldToChunkCoords(x, y, z);
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                     const key = this.getChunkKey(cx, cz);
-                    const chunk = this.chunks.get(key);
-                    if (!chunk) return BLOCKS.AIR;
-                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return BLOCKS.AIR;
-
-                    const idx = lx + lz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
-                    const data = chunk.blocks || chunk;
-                    return data[idx] || BLOCKS.AIR;
+                    // Use cache for repeated lookups in same chunk
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    if (!chunk) return undefined;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    const idx = lx + (lz << 4) + (ly << 8);
+                    return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
                 }
 
-                setBlock(x, y, z, blockId) {
-                    const { cx, cz, lx, ly, lz } = this.worldToChunkCoords(x, y, z);
-                    const key = this.getChunkKey(cx, cz);
-                    const chunk = this.chunks.get(key);
-                    if (!chunk) return false;
+                setBlock(x, y, z, blockId, createIfMissing = true) {
+                    const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return false;
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                    const key = this.getChunkKey(cx, cz);
+                    let chunk = this.chunks.get(key);
 
-                    const idx = lx + lz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
-                    const data = chunk.blocks || chunk;
-                    data[idx] = blockId;
+                    if (!chunk) {
+                        if (!createIfMissing) return false;
+                        // Create new chunk with light data
+                        const size = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                        chunk = {
+                            blocks: new Uint8Array(size),
+                            skyLight: new Uint8Array(size).fill(15),
+                            blockLight: new Uint8Array(size).fill(1),
+                            cx: cx,
+                            cz: cz,
+                            startX: cx * WORLD_DIMS.chunkSize,
+                            startZ: cz * WORLD_DIMS.chunkSize,
+                        };
+                        this.chunks.set(key, chunk);
+                        this.activeChunks.add(key);
+                    } else if (!chunk.blocks) {
+                        // Upgrade legacy chunk format to include lighting buffers
+                        const legacy = chunk;
+                        const legacySize = legacy.length || WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                        chunk = {
+                            blocks: legacy,
+                            skyLight: new Uint8Array(legacySize).fill(15),
+                            blockLight: new Uint8Array(legacySize).fill(1),
+                        };
+                        this.chunks.set(key, chunk);
+                    } else {
+                        if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
+                        if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                    }
 
+                    const lx = ((x % 16) + 16) % 16;
+                    const lz = ((z % 16) + 16) % 16;
+                    const idx = lx + lz * 16 + ly * 256;
+                    const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
+                    if (oldId === blockId) return false;
+
+                    if (chunk.blocks) { chunk.blocks[idx] = blockId; } else { chunk[idx] = blockId; }
+
+                    // Invalidate cache
+                    this._lastChunkKey = null;
+                    this._lastChunk = null;
                     this.modifiedChunks.add(key);
                     this.pristineChunks.delete(key);
                     return true;
@@ -1747,20 +1806,28 @@
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0) return 1;
                     if (ly >= WORLD_DIMS.chunkHeight) return 15;
-                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                     const key = this.getChunkKey(cx, cz);
-                    const chunk = this.chunks.get(key);
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
                     if (!chunk || !chunk.skyLight) return 15;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
                     return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
                 }
 
                 setSkyLight(x, y, z, level) {
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                     const key = this.getChunkKey(cx, cz);
                     const chunk = this.chunks.get(key);
                     if (!chunk || !chunk.skyLight) return;
+                    const lx = x & 15;
+                    const lz = z & 15;
                     const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
                     chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
                 }
@@ -1768,20 +1835,28 @@
                 getBlockLight(x, y, z) {
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                     const key = this.getChunkKey(cx, cz);
-                    const chunk = this.chunks.get(key);
+                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
                     if (!chunk || !chunk.blockLight) return 0;
+                    this._lastChunkKey = key;
+                    this._lastChunk = chunk;
+                    const lx = x & 15;
+                    const lz = z & 15;
                     return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
                 }
 
                 setBlockLight(x, y, z, level) {
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
+                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                     const key = this.getChunkKey(cx, cz);
                     const chunk = this.chunks.get(key);
                     if (!chunk || !chunk.blockLight) return;
+                    const lx = x & 15;
+                    const lz = z & 15;
                     const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
                     chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
                 }
@@ -3530,6 +3605,8 @@
             const PLAYER_EYE_HEIGHT_STAND = 1.8;
             let playerEyeHeight = PLAYER_EYE_HEIGHT_STAND;
             const chunks = new Map();
+            // Create global VoxelWorld instance bound to the chunks Map
+            const voxelWorld = new VoxelWorld(null, null, chunks);
             const chunkMeshes = new Map();
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
@@ -3855,6 +3932,8 @@
             // --- OPTIMIZATION: Modified Chunk Tracking ---
             const modifiedChunks = new Set(); // Tracks chunks modified by player (block place/break)
             const pristineChunks = new Set(); // Tracks unmodified generated chunks (can be safely discarded)
+            // Bind global state to voxelWorld instance
+            voxelWorld.bindState(modifiedChunks, pristineChunks, activeChunks);
             function canEvictChunk(key, { persistModified = false } = {}) {
                 // Optional persistence guard before skipping eviction
                 if (modifiedChunks.has(key)) { if (persistModified && chunks.has(key)) { saveChunkToCache(key, chunks.get(key)); } return false; }
@@ -4385,75 +4464,13 @@
                 if (loadedPlayerState) { controls.getObject().position.copy(loadedPlayerState.pos); controls.getObject().rotation.copy(loadedPlayerState.rot); lastChunkX = -Infinity; }
                 animate();
             }
-            function getChunkKey(cx, cz) { return `${cx},${cz}`; }
-            let _lastChunkKey = null;
-            let _lastChunk = null;
-            function getBlock(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk) return undefined;
-                _lastChunkKey = key;
-                _lastChunk = chunk;
-                const lx = x & 15;
-                const lz = z & 15;
-                const idx = lx + (lz << 4) + (ly << 8);
-                return chunk.blocks ? chunk.blocks[idx] : chunk[idx]; // Support both old and new format
-            }
-            function getSkyLight(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0) return 1; // Below world: minimum light
-                if (ly >= WORLD_DIMS.chunkHeight) return 15; // Above world: full sky light
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk || !chunk.skyLight) return 15; // Default full bright for unloaded chunks
-                const lx = x & 15;
-                const lz = z & 15;
-                return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
-            }
-            function getBlockLight(x, y, z) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = key === _lastChunkKey ? _lastChunk : chunks.get(key);
-                if (!chunk || !chunk.blockLight) return 0;
-                const lx = x & 15;
-                const lz = z & 15;
-                return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
-            }
-            function setSkyLight(x, y, z, level) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
-                if (!chunk || !chunk.skyLight) return;
-                const lx = x & 15;
-                const lz = z & 15;
-                const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
-                chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
-            }
-            function setBlockLight(x, y, z, level) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                const key = getChunkKey(cx, cz);
-                const chunk = chunks.get(key);
-                if (!chunk || !chunk.blockLight) return;
-                const lx = x & 15;
-                const lz = z & 15;
-                const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
-                chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
-            }
+            // Delegate to VoxelWorld class instance
+            function getChunkKey(cx, cz) { return voxelWorld.getChunkKey(cx, cz); }
+            function getBlock(x, y, z) { return voxelWorld.getBlock(x, y, z); }
+            function getSkyLight(x, y, z) { return voxelWorld.getSkyLight(x, y, z); }
+            function getBlockLight(x, y, z) { return voxelWorld.getBlockLight(x, y, z); }
+            function setSkyLight(x, y, z, level) { return voxelWorld.setSkyLight(x, y, z, level); }
+            function setBlockLight(x, y, z, level) { return voxelWorld.setBlockLight(x, y, z, level); }
             const MAX_BLOCK_LIGHT_LEVEL = 15;
             function clampBlockLight(level) { return level < 0 ? 0 : level > MAX_BLOCK_LIGHT_LEVEL ? MAX_BLOCK_LIGHT_LEVEL : level; }
             function getTorchBlockLightLevel() {
@@ -5025,51 +5042,18 @@
                 }
             }
             function setBlock(x, y, z, id) {
-                const ly = y + WORLD_DIMS.yOffset;
-                if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                // Get old block ID before setting
+                const oldId = voxelWorld.getBlock(x, y, z);
+                if (oldId === id) return;
+
+                // Delegate to VoxelWorld (handles chunk creation, state tracking)
+                const changed = voxelWorld.setBlock(x, y, z, id);
+                if (!changed) return;
+
+                // Schedule localized relight so sunlight/torches react to edits
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
-                let chunk = chunks.get(key);
-                if (!chunk) {
-                    const size = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // Create new chunk with light data
-                    chunk = { // Default full bright (max 15) - Default no block light
-                        blocks: new Uint8Array(size),
-                        skyLight: new Uint8Array(size).fill(15),
-                        blockLight: new Uint8Array(size).fill(1),
-                        cx: cx,
-                        cz: cz,
-                        startX: cx * WORLD_DIMS.chunkSize,
-                        startZ: cz * WORLD_DIMS.chunkSize,
-                    };
-                    chunks.set(key, chunk);
-                    activeChunks.add(key);
-                } else if (!chunk.blocks) { // Upgrade legacy chunk format to include lighting buffers
-                    const legacy = chunk;
-                    const legacySize = legacy.length || WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
-                    chunk = {
-                        blocks: legacy,
-                        skyLight: new Uint8Array(legacySize).fill(15),
-                        blockLight: new Uint8Array(legacySize).fill(1),
-                    };
-                    chunks.set(key, chunk);
-                } else {
-                    if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
-                    if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
-                }
-                const lx = ((x % 16) + 16) % 16;
-                const lz = ((z % 16) + 16) % 16;
-                const idx = lx + lz * 16 + ly * 256;
-                const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
-                if (oldId === id) return;
-                if (chunk.blocks) { chunk.blocks[idx] = id; } else { chunk[idx] = id; } // Handle both old and new format
-
-                // Mark chunk as modified by player (for smart memory management)
-                modifiedChunks.add(key);
-                pristineChunks.delete(key);
-                activeChunks.add(key);
-
-                // Schedule localized relight so sunlight/torches react to edits
                 const jobKey = `${x},${y},${z}`;
                 if (!queuedLightUpdates.has(jobKey)) {
                     queuedLightUpdates.add(jobKey);
@@ -5077,7 +5061,7 @@
                         x,
                         y,
                         z,
-                        oldId,
+                        oldId: oldId || 0,
                         newId: id,
                         key: jobKey,
                         // Only prime when transitioning from opaque to transparent to avoid resetting nearby columns
