@@ -1302,6 +1302,7 @@
                     this.biomeCellCache = new Map();
                     this.treeMaskCache = new Map();
                     this.biomeTable = null;
+                    this.BIOME_CELL_SIZE = 64;
                 }
 
                 init(seed) {
@@ -1332,8 +1333,195 @@
                     this.biomeTable = { cumulative, totalWeight: total };
                 }
 
+                // --- NOISE FUNCTIONS ---
+                noise3D(x, y, z) {
+                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+                    x -= Math.floor(x);
+                    y -= Math.floor(y);
+                    z -= Math.floor(z);
+                    const u = this.fade(x), v = this.fade(y), w = this.fade(z);
+                    const A = this.perm[X] + Y, AA = this.perm[A] + Z, AB = this.perm[A + 1] + Z;
+                    const B = this.perm[X + 1] + Y, BA = this.perm[B] + Z, BB = this.perm[B + 1] + Z;
+                    return this.lerp(w,
+                        this.lerp(v,
+                            this.lerp(u, this.grad3D(this.perm[AA], x, y, z), this.grad3D(this.perm[BA], x - 1, y, z)),
+                            this.lerp(u, this.grad3D(this.perm[AB], x, y - 1, z), this.grad3D(this.perm[BB], x - 1, y - 1, z))),
+                        this.lerp(v,
+                            this.lerp(u, this.grad3D(this.perm[AA + 1], x, y, z - 1), this.grad3D(this.perm[BA + 1], x - 1, y, z - 1)),
+                            this.lerp(u, this.grad3D(this.perm[AB + 1], x, y - 1, z - 1), this.grad3D(this.perm[BB + 1], x - 1, y - 1, z - 1)))
+                    );
+                }
+
+                grad3D(hash, x, y, z) {
+                    const h = hash & 15;
+                    const u = h < 8 ? x : y;
+                    const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+                    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+                }
+
+                fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
+                    const warpScale = 0.03;
+                    const offsetX = this.fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
+                    const offsetZ = this.fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
+                    return this.fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
+                }
+
+                treeNoise(gx, gz, seed) {
+                    return this.noise2D(gx * 0.07 + seed * 31.7, gz * 0.07 - seed * 12.3);
+                }
+
+                treePlacementValue(gx, gz, seed) {
+                    const h = Math.sin(gx * 12.9898 + gz * 78.233 + seed * 0.12345);
+                    const base = h - Math.floor(h);
+                    const warp = this.noise2D(gx * 0.05 + seed * 7.31, gz * 0.05 - seed * 3.17) * 0.3;
+                    const combined = base + warp;
+                    return combined - Math.floor(combined);
+                }
+
+                // --- HEIGHT FUNCTIONS ---
+                continentalHeight(gx, gz, seed) {
+                    const base = this.fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
+                    const erosion = this.fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8);
+                    let c = base * 0.7 + erosion * 0.3;
+                    c += 0.3;
+                    return Math.max(-1, Math.min(1, c));
+                }
+
+                defaultHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
+                    return biome.baseHeight + baseNoise * biome.amplitude;
+                }
+
+                hillsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 5, 0.55, 2.2);
+                    const ridge = Math.abs(this.noise2D(gx * 0.02, gz * 0.02)) * 8;
+                    return biome.baseHeight + baseNoise * biome.amplitude + ridge;
+                }
+
+                plainsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 3, 0.4, 2.0);
+                    return biome.baseHeight + baseNoise * biome.amplitude;
+                }
+
+                mountainsHeightFunc(gx, gz, biome, seed) {
+                    const baseNoise = this.fbm2D(gx * biome.roughness, gz * biome.roughness, 6, 0.6, 2.1);
+                    const ridge = Math.abs(this.noise2D(gx * 0.015, gz * 0.015));
+                    const ridge2 = Math.abs(this.noise2D(gx * 0.03 + 100, gz * 0.03 + 100));
+                    const combined = ridge * ridge2 * 25;
+                    return biome.baseHeight + baseNoise * biome.amplitude + combined;
+                }
+
+                getRiverFactor(gx, gz, seed) {
+                    const riverScale = 0.008;
+                    const riverNoise = this.noise2D(gx * riverScale + seed * 0.5, gz * riverScale - seed * 0.3);
+                    const riverWidth = 0.08;
+                    const transitionWidth = 0.06;
+                    const absNoise = Math.abs(riverNoise);
+                    if (absNoise < riverWidth) return 0;
+                    if (absNoise < riverWidth + transitionWidth) {
+                        return (absNoise - riverWidth) / transitionWidth;
+                    }
+                    return 1.0;
+                }
+
+                blendedHeight(gx, gz, seed) {
+                    const c = this.continentalHeight(gx, gz, seed);
+                    const gridScale = this.BIOME_CELL_SIZE;
+                    const u = gx / gridScale - 0.5;
+                    const v = gz / gridScale - 0.5;
+                    const x0 = Math.floor(u), z0 = Math.floor(v);
+                    const x1 = x0 + 1, z1 = z0 + 1;
+                    const wx = u - x0, wz = v - z0;
+                    const sx = wx * wx * (3 - 2 * wx);
+                    const sz = wz * wz * (3 - 2 * wz);
+
+                    const h00 = this.getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+                    const h10 = this.getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+                    const h01 = this.getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+                    const h11 = this.getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+
+                    const h0 = h00 + (h10 - h00) * sx;
+                    const h1 = h01 + (h11 - h01) * sx;
+                    let finalHeight = h0 + (h1 - h0) * sz;
+
+                    const r = this.getRiverFactor(gx, gz, seed);
+                    if (r < 1.0) {
+                        const riverBed = WORLD_DIMS.seaLevel - 2;
+                        const bank = r * r * (3 - 2 * r);
+                        finalHeight = riverBed + (finalHeight - riverBed) * bank;
+                    }
+                    return Math.floor(finalHeight);
+                }
+
+                getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
+                    const centerX = cx * this.BIOME_CELL_SIZE + this.BIOME_CELL_SIZE * 0.5;
+                    const centerZ = cz * this.BIOME_CELL_SIZE + this.BIOME_CELL_SIZE * 0.5;
+                    const biome = this.getBiomeAt(centerX, centerZ);
+                    let h = this.defaultHeightFunc(gx, gz, biome, seed);
+                    const t = (continentFactor + 1) * 0.5;
+                    const factor = 0.3 + t * 0.7;
+                    h = biome.baseHeight + (h - biome.baseHeight) * factor;
+                    h += Math.max(0, continentFactor - 0.15) * 10;
+                    return h;
+                }
+
+                getTreeDensityForBiome(biomeName) {
+                    const densityMap = {
+                        'forests': this.treeConfig.density?.forests ?? 0.15,
+                        'plains': this.treeConfig.density?.plains ?? 0.02,
+                        'hills': this.treeConfig.density?.hills ?? 0.05,
+                        'mountains': this.treeConfig.density?.mountains ?? 0.01,
+                        'swamp': this.treeConfig.density?.swamp ?? 0.08
+                    };
+                    return densityMap[biomeName] ?? 0.03;
+                }
+
+                // --- TREE MASK ---
+                getTreeMaskKey(cx, cz) {
+                    return `${cx},${cz}`;
+                }
+
+                generateTreeMaskForChunk(cx, cz, seed) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const mask = new Uint8Array(chunkSize * chunkSize);
+                    const startX = cx * chunkSize;
+                    const startZ = cz * chunkSize;
+
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        for (let lx = 0; lx < chunkSize; lx++) {
+                            const gx = startX + lx;
+                            const gz = startZ + lz;
+                            const biome = this.getBiomeAt(gx, gz);
+                            const density = this.getTreeDensityForBiome(biome.name);
+                            const p = this.treePlacementValue(gx, gz, seed);
+                            mask[lx + lz * chunkSize] = p <= density ? 1 : 0;
+                        }
+                    }
+                    return mask;
+                }
+
+                getTreeMaskForChunk(cx, cz, seed) {
+                    const key = this.getTreeMaskKey(cx, cz);
+                    if (this.treeMaskCache.has(key)) {
+                        return this.treeMaskCache.get(key);
+                    }
+                    const mask = this.generateTreeMaskForChunk(cx, cz, seed);
+                    this.treeMaskCache.set(key, mask);
+                    return mask;
+                }
+
+                getTreeMaskValueGlobal(gx, gz, seed) {
+                    const cs = WORLD_DIMS.chunkSize;
+                    const cx = Math.floor(gx / cs);
+                    const cz = Math.floor(gz / cs);
+                    const lx = ((gx % cs) + cs) % cs;
+                    const lz = ((gz % cs) + cs) % cs;
+                    const mask = this.getTreeMaskForChunk(cx, cz, seed);
+                    return mask[lx + lz * cs] === 1;
+                }
+
                 getBiomeAt(x, z) {
-                    const cellSize = 64; // BIOME_CELL_SIZE
+                    const cellSize = this.BIOME_CELL_SIZE;
                     const cellX = Math.floor(x / cellSize);
                     const cellZ = Math.floor(z / cellSize);
                     const key = `${cellX},${cellZ}`;
@@ -1553,6 +1741,101 @@
                     this.activeChunks.delete(key);
                     return true;
                 }
+
+                // --- LIGHTING FUNCTIONS ---
+                getSkyLight(x, y, z) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0) return 1;
+                    if (ly >= WORLD_DIMS.chunkHeight) return 15;
+                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.skyLight) return 15;
+                    return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
+                }
+
+                setSkyLight(x, y, z, level) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.skyLight) return;
+                    const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
+                    chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                }
+
+                getBlockLight(x, y, z) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.blockLight) return 0;
+                    return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
+                }
+
+                setBlockLight(x, y, z, level) {
+                    const ly = y + WORLD_DIMS.yOffset;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
+                    const { cx, cz, lx, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk || !chunk.blockLight) return;
+                    const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
+                    chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                }
+
+                getLocalLight(x, y, z) {
+                    const sky = this.getSkyLight(x, y, z);
+                    const block = this.getBlockLight(x, y, z);
+                    return Math.max(sky, block);
+                }
+
+                // --- CHUNK SCHEDULING ---
+                scheduleChunkUpdate(cx, cz, force = false) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0, force });
+                        this.queuedChunkKeys.add(key);
+                    }
+                }
+
+                // --- NEIGHBOR HELPERS ---
+                getNeighborChunks(cx, cz) {
+                    return {
+                        north: this.chunks.get(this.getChunkKey(cx, cz - 1)),
+                        south: this.chunks.get(this.getChunkKey(cx, cz + 1)),
+                        east: this.chunks.get(this.getChunkKey(cx + 1, cz)),
+                        west: this.chunks.get(this.getChunkKey(cx - 1, cz)),
+                        northWest: this.chunks.get(this.getChunkKey(cx - 1, cz - 1)),
+                        northEast: this.chunks.get(this.getChunkKey(cx + 1, cz - 1)),
+                        southWest: this.chunks.get(this.getChunkKey(cx - 1, cz + 1)),
+                        southEast: this.chunks.get(this.getChunkKey(cx + 1, cz + 1))
+                    };
+                }
+
+                // --- SOLID BLOCK CHECK ---
+                isSolidBlock(x, y, z) {
+                    const id = this.getBlock(x, y, z);
+                    return id !== BLOCKS.AIR && id !== BLOCKS.WATER && id !== undefined;
+                }
+
+                // --- EVICTION ---
+                canEvictChunk(key, persistModified = false) {
+                    if (this.modifiedChunks.has(key)) {
+                        return false;
+                    }
+                    return true;
+                }
+
+                purgeChunkData(key) {
+                    this.chunks.delete(key);
+                    this.pristineChunks.delete(key);
+                    this.modifiedChunks.delete(key);
+                    this.activeChunks.delete(key);
+                    this.queuedChunkKeys.delete(key);
+                }
             }
 
             // =====================================================
@@ -1563,6 +1846,8 @@
                 constructor(materials) {
                     this.materials = materials || {};
                     this.faceVertexCache = new Map();
+                    this.terrainMeshPool = [];
+                    this.waterMeshPool = [];
                 }
 
                 setMaterials(terrain, water) {
@@ -1570,10 +1855,71 @@
                     this.materials.water = water;
                 }
 
+                // --- FACE VERTEX CACHE ---
+                getCachedFaceVertices(nx, ny, nz) {
+                    const key = `${nx},${ny},${nz}`;
+                    if (this.faceVertexCache.has(key)) return this.faceVertexCache.get(key);
+
+                    const verts = new Float32Array(18);
+                    let x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4;
+
+                    if (ny > 0) { x1 = 0; y1 = 1; z1 = 1; x2 = 1; y2 = 1; z2 = 1; x3 = 1; y3 = 1; z3 = 0; x4 = 0; y4 = 1; z4 = 0; }
+                    else if (ny < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 0; z3 = 1; x4 = 0; y4 = 0; z4 = 1; }
+                    else if (nx > 0) { x1 = 1; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 1; }
+                    else if (nx < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 1; x3 = 0; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 0; }
+                    else if (nz > 0) { x1 = 0; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 1; x3 = 1; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 1; }
+                    else { x1 = 1; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 0; x3 = 0; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 0; }
+
+                    verts[0] = x1; verts[1] = y1; verts[2] = z1;
+                    verts[3] = x2; verts[4] = y2; verts[5] = z2;
+                    verts[6] = x4; verts[7] = y4; verts[8] = z4;
+                    verts[9] = x2; verts[10] = y2; verts[11] = z2;
+                    verts[12] = x3; verts[13] = y3; verts[14] = z3;
+                    verts[15] = x4; verts[16] = y4; verts[17] = z4;
+
+                    this.faceVertexCache.set(key, verts);
+                    return verts;
+                }
+
+                // --- AO CALCULATION ---
+                getAOConfig(nx, ny, nz) {
+                    if (ny > 0) return { cornerOffsets: [[-1, 0, 1], [1, 0, 1], [1, 0, -1], [-1, 0, -1]], edgeOffsets: [[0, 0, 1], [1, 0, 0], [0, 0, -1], [-1, 0, 0]] };
+                    if (ny < 0) return { cornerOffsets: [[-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1]], edgeOffsets: [[0, 0, -1], [1, 0, 0], [0, 0, 1], [-1, 0, 0]] };
+                    if (nx > 0) return { cornerOffsets: [[0, 1, 1], [0, 1, -1], [0, -1, -1], [0, -1, 1]], edgeOffsets: [[0, 1, 0], [0, 0, -1], [0, -1, 0], [0, 0, 1]] };
+                    if (nx < 0) return { cornerOffsets: [[0, 1, -1], [0, 1, 1], [0, -1, 1], [0, -1, -1]], edgeOffsets: [[0, 1, 0], [0, 0, 1], [0, -1, 0], [0, 0, -1]] };
+                    if (nz > 0) return { cornerOffsets: [[-1, 1, 0], [1, 1, 0], [1, -1, 0], [-1, -1, 0]], edgeOffsets: [[0, 1, 0], [1, 0, 0], [0, -1, 0], [-1, 0, 0]] };
+                    return { cornerOffsets: [[1, 1, 0], [-1, 1, 0], [-1, -1, 0], [1, -1, 0]], edgeOffsets: [[0, 1, 0], [-1, 0, 0], [0, -1, 0], [1, 0, 0]] };
+                }
+
+                calculateVertexAO(lx, ly, lz, offsets, getter) {
+                    const side1 = getter(lx + offsets.edge1[0], ly + offsets.edge1[1], lz + offsets.edge1[2]) > 0 ? 1 : 0;
+                    const side2 = getter(lx + offsets.edge2[0], ly + offsets.edge2[1], lz + offsets.edge2[2]) > 0 ? 1 : 0;
+                    const corner = getter(lx + offsets.corner[0], ly + offsets.corner[1], lz + offsets.corner[2]) > 0 ? 1 : 0;
+                    if (side1 && side2) return 0;
+                    return 3 - (side1 + side2 + corner);
+                }
+
+                // --- MESH POOLING ---
+                acquireTerrainMesh() {
+                    return this.terrainMeshPool.pop() || null;
+                }
+
+                acquireWaterMesh() {
+                    return this.waterMeshPool.pop() || null;
+                }
+
+                releaseTerrainMesh(mesh) {
+                    if (mesh) this.terrainMeshPool.push(mesh);
+                }
+
+                releaseWaterMesh(mesh) {
+                    if (mesh) this.waterMeshPool.push(mesh);
+                }
+
                 buildMeshForChunk(chunk, neighbors, uvMap) {
                     // This delegates to the existing renderChunk function
                     // The actual mesh building logic is complex and already implemented
-                    return null; // Placeholder
+                    return null; // Placeholder - uses existing renderChunk()
                 }
 
                 disposeChunkMesh(chunk) {
@@ -1724,6 +2070,105 @@
 
                     this.zombieScarePass.uniforms.zombieProximity.value = proximity;
                 }
+
+                // --- DAY/NIGHT CYCLE ---
+                updateDayNight(dt) {
+                    const dayLengthSeconds = this.settings.get('dayLengthSeconds') || 600;
+                    this.dayNightTime += dt / dayLengthSeconds;
+                    if (this.dayNightTime >= 1) this.dayNightTime -= 1;
+
+                    const angle = this.dayNightTime * Math.PI * 2;
+                    const sunY = Math.sin(angle);
+                    const sunXZ = Math.cos(angle);
+
+                    // Sun position
+                    if (this.sun) {
+                        this.sun.position.set(sunXZ * 100, sunY * 100, 50);
+                        this.sun.intensity = Math.max(0, sunY) * (this.settings.get('sunIntensity') || 0.8);
+                    }
+
+                    // Moon position (opposite sun)
+                    if (this.moon) {
+                        this.moon.position.set(-sunXZ * 100, -sunY * 100, 50);
+                        this.moon.intensity = Math.max(0, -sunY) * (this.settings.get('moonIntensity') || 0.15);
+                    }
+
+                    // Ambient light based on time
+                    if (this.ambientLight) {
+                        const dayFactor = (sunY + 1) * 0.5;
+                        const baseAmbient = this.settings.get('ambientIntensity') || 0.5;
+                        this.ambientLight.intensity = baseAmbient * (0.3 + dayFactor * 0.7);
+                    }
+
+                    // Update sky color if skybox exists
+                    if (this.skyMaterial && this.skyMaterial.uniforms) {
+                        if (this.skyMaterial.uniforms.sunPosition) {
+                            this.skyMaterial.uniforms.sunPosition.value.set(sunXZ, sunY, 0.5).normalize();
+                        }
+                    }
+
+                    return this.dayNightTime;
+                }
+
+                // --- FOG ---
+                setFog(near, far, color) {
+                    if (!this.scene.fog) {
+                        this.scene.fog = new THREE.Fog(color || 0x87ceeb, near, far);
+                    } else {
+                        this.scene.fog.near = near;
+                        this.scene.fog.far = far;
+                        if (color !== undefined) this.scene.fog.color.setHex(color);
+                    }
+                }
+
+                updateFogDistance(renderDistance) {
+                    const fogFar = renderDistance * WORLD_DIMS.chunkSize;
+                    if (this.scene.fog) {
+                        this.scene.fog.far = fogFar;
+                        this.scene.fog.near = fogFar * 0.5;
+                    }
+                }
+
+                // --- FRUSTUM CULLING ---
+                updateFrustum() {
+                    if (!this._frustum) {
+                        this._frustum = new THREE.Frustum();
+                        this._projScreenMatrix = new THREE.Matrix4();
+                    }
+                    this._projScreenMatrix.multiplyMatrices(
+                        this.camera.projectionMatrix,
+                        this.camera.matrixWorldInverse
+                    );
+                    this._frustum.setFromProjectionMatrix(this._projScreenMatrix);
+                    return this._frustum;
+                }
+
+                isInFrustum(boundingSphere) {
+                    if (!this._frustum) this.updateFrustum();
+                    return this._frustum.intersectsSphere(boundingSphere);
+                }
+
+                // --- TEXTURE REGISTRATION ---
+                registerPixelTexture(texture) {
+                    texture.magFilter = THREE.NearestFilter;
+                    texture.minFilter = THREE.NearestFilter;
+                    texture.generateMipmaps = false;
+                    texture.needsUpdate = true;
+                }
+
+                // --- VIEWMODEL LAYER ---
+                setupViewmodelLayer() {
+                    // Layer 1 is for viewmodels (torch, etc.)
+                    this.camera.layers.enable(1);
+                }
+
+                addToViewmodelLayer(object) {
+                    object.layers.set(1);
+                    object.renderOrder = 1000;
+                    if (object.material) {
+                        object.material.depthTest = false;
+                    }
+                }
             }
 
             // =====================================================
@@ -1815,11 +2260,100 @@
                 }
 
                 playBlockPlace() {
-                    this.playClick(); // Simplified
+                    if (!this.enabled) return;
+                    this.initContext();
+                    // Wood-like thunk sound
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(150, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(80, this.ctx.currentTime + 0.08);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.08);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.08);
                 }
 
                 playBlockBreak() {
-                    this.playClick(); // Simplified
+                    if (!this.enabled) return;
+                    this.initContext();
+                    // Breaking/crumble sound
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(50, this.ctx.currentTime + 0.1);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.3, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.1);
+                }
+
+                playFootstep() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(100 + Math.random() * 50, this.ctx.currentTime);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.15, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.05);
+                }
+
+                playZombieGrowl() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(80 + Math.random() * 40, this.ctx.currentTime);
+                    osc.frequency.linearRampToValueAtTime(60 + Math.random() * 30, this.ctx.currentTime + 0.3);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.25, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.3);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.3);
+                }
+
+                playZombieHurt() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'square';
+                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(100, this.ctx.currentTime + 0.15);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.35, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.15);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.15);
+                }
+
+                playPlayerHurt() {
+                    if (!this.enabled) return;
+                    this.initContext();
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(400, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(200, this.ctx.currentTime + 0.1);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + 0.1);
                 }
 
                 setEnabled(enabled) {
@@ -1828,6 +2362,12 @@
 
                 setVolume(volume) {
                     this.masterVolume = Math.max(0, Math.min(1, volume));
+                }
+
+                resumeContext() {
+                    if (this.ctx && this.ctx.state === 'suspended') {
+                        this.ctx.resume();
+                    }
                 }
             }
 
@@ -1839,6 +2379,8 @@
                 constructor() {
                     this.entities = new Set();
                     this.pools = new Map();
+                    this.zombiePool = [];
+                    this.maxZombies = 10;
                 }
 
                 add(entity) {
@@ -1848,6 +2390,11 @@
 
                 remove(entity) {
                     this.entities.delete(entity);
+                    // Return to pool if it's a zombie
+                    if (entity instanceof Zombie) {
+                        entity.reset();
+                        this.zombiePool.push(entity);
+                    }
                 }
 
                 update(delta) {
@@ -1870,6 +2417,57 @@
 
                 clear() {
                     this.entities.clear();
+                }
+
+                // --- ZOMBIE MANAGEMENT ---
+                acquireZombie() {
+                    if (this.zombiePool.length > 0) {
+                        return this.zombiePool.pop();
+                    }
+                    return new Zombie();
+                }
+
+                getZombies() {
+                    return this.getByType(Zombie);
+                }
+
+                getZombieCount() {
+                    return this.getZombies().length;
+                }
+
+                getClosestZombie(position) {
+                    let closest = null;
+                    let closestDist = Infinity;
+                    for (const entity of this.entities) {
+                        if (entity instanceof Zombie) {
+                            const dist = entity.position.distanceTo(position);
+                            if (dist < closestDist) {
+                                closestDist = dist;
+                                closest = entity;
+                            }
+                        }
+                    }
+                    return { zombie: closest, distance: closestDist };
+                }
+
+                // --- SPAWN HELPERS ---
+                spawnZombie(position, scene) {
+                    if (this.getZombieCount() >= this.maxZombies) return null;
+                    const zombie = this.acquireZombie();
+                    zombie.position.copy(position);
+                    zombie.state = 'wander';
+                    if (scene && zombie.mesh) {
+                        scene.add(zombie.mesh);
+                    }
+                    this.add(zombie);
+                    return zombie;
+                }
+
+                despawnZombie(zombie, scene) {
+                    if (scene && zombie.mesh) {
+                        scene.remove(zombie.mesh);
+                    }
+                    this.remove(zombie);
                 }
             }
 
@@ -1997,6 +2595,76 @@
                         this.state = 'chase';
                     } else {
                         this.state = 'wander';
+                    }
+                }
+
+                reset() {
+                    this.position.set(0, 0, 0);
+                    this.velocity.set(0, 0, 0);
+                    this.health = this.maxHealth;
+                    this.state = 'wander';
+                    this.target = null;
+                    this.attackCooldown = 0;
+                    this.wanderTimer = 0;
+                }
+
+                // --- LIMB ANIMATION ---
+                animateLimbs(dt, moveSpeed = 0) {
+                    if (!this.mesh) return;
+
+                    const isMoving = moveSpeed > 0.1;
+                    const swingSpeed = isMoving ? moveSpeed * 2.5 : 0;
+                    const swingAmplitude = isMoving ? 0.6 : 0;
+
+                    // Find limb parts
+                    const leftArm = this.mesh.getObjectByName('leftArm');
+                    const rightArm = this.mesh.getObjectByName('rightArm');
+                    const leftLeg = this.mesh.getObjectByName('leftLeg');
+                    const rightLeg = this.mesh.getObjectByName('rightLeg');
+
+                    if (!this._animTime) this._animTime = 0;
+                    this._animTime += dt * swingSpeed;
+
+                    const swing = Math.sin(this._animTime) * swingAmplitude;
+
+                    if (leftArm) leftArm.rotation.x = swing;
+                    if (rightArm) rightArm.rotation.x = -swing;
+                    if (leftLeg) leftLeg.rotation.x = -swing;
+                    if (rightLeg) rightLeg.rotation.x = swing;
+                }
+
+                // --- COLLISION ---
+                collidesWith(position, radius = 0.4) {
+                    const dx = this.position.x - position.x;
+                    const dz = this.position.z - position.z;
+                    const dist2D = Math.sqrt(dx * dx + dz * dz);
+                    const zombieRadius = 0.5;
+                    return dist2D < (radius + zombieRadius);
+                }
+
+                collidesWithBlock(blockX, blockY, blockZ) {
+                    const halfWidth = 0.4;
+                    const height = 1.9;
+                    const px = this.position.x, py = this.position.y, pz = this.position.z;
+
+                    return !(px + halfWidth <= blockX || px - halfWidth >= blockX + 1 ||
+                             py >= blockY + 1 || py + height <= blockY ||
+                             pz + halfWidth <= blockZ || pz - halfWidth >= blockZ + 1);
+                }
+
+                // --- FACING ---
+                faceTarget() {
+                    if (!this.target || !this.mesh) return;
+                    const targetPos = this.target.position || this.target;
+                    const dx = targetPos.x - this.position.x;
+                    const dz = targetPos.z - this.position.z;
+                    this.mesh.rotation.y = Math.atan2(dx, dz);
+                }
+
+                // --- MESH UPDATE ---
+                updateMeshPosition() {
+                    if (this.mesh) {
+                        this.mesh.position.copy(this.position);
                     }
                 }
             }
@@ -2174,6 +2842,128 @@
                 toggleTorch() {
                     this.torchActive = !this.torchActive;
                 }
+
+                // --- COLLISION DETECTION ---
+                collide(pos) {
+                    if (!this.world) return pos;
+
+                    const halfWidth = 0.4;
+                    const height = 1.8;
+                    const stepHeight = 0.5;
+
+                    // Check all blocks player might intersect
+                    const minX = Math.floor(pos.x - halfWidth);
+                    const maxX = Math.floor(pos.x + halfWidth);
+                    const minY = Math.floor(pos.y);
+                    const maxY = Math.floor(pos.y + height);
+                    const minZ = Math.floor(pos.z - halfWidth);
+                    const maxZ = Math.floor(pos.z + halfWidth);
+
+                    for (let bx = minX; bx <= maxX; bx++) {
+                        for (let by = minY; by <= maxY; by++) {
+                            for (let bz = minZ; bz <= maxZ; bz++) {
+                                if (this.world.isSolidBlock(bx, by, bz)) {
+                                    // Simple push-out collision
+                                    const overlapX = Math.min(pos.x + halfWidth - bx, bx + 1 - (pos.x - halfWidth));
+                                    const overlapZ = Math.min(pos.z + halfWidth - bz, bz + 1 - (pos.z - halfWidth));
+                                    const overlapY = Math.min(pos.y + height - by, by + 1 - pos.y);
+
+                                    if (overlapX < overlapY && overlapX < overlapZ) {
+                                        if (pos.x < bx + 0.5) pos.x -= overlapX;
+                                        else pos.x += overlapX;
+                                    } else if (overlapZ < overlapY) {
+                                        if (pos.z < bz + 0.5) pos.z -= overlapZ;
+                                        else pos.z += overlapZ;
+                                    } else {
+                                        if (pos.y < by + 0.5) {
+                                            pos.y = by - height;
+                                            this.velocity.y = 0;
+                                        } else {
+                                            pos.y = by + 1;
+                                            this.velocity.y = 0;
+                                            this.canJump = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return pos;
+                }
+
+                checkGround() {
+                    if (!this.world) return false;
+                    const pos = this.position;
+                    const halfWidth = 0.3;
+                    const checkY = pos.y - 0.1;
+
+                    // Check corners and center for ground
+                    return this.world.isSolidBlock(Math.floor(pos.x), Math.floor(checkY), Math.floor(pos.z)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x - halfWidth), Math.floor(checkY), Math.floor(pos.z - halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x + halfWidth), Math.floor(checkY), Math.floor(pos.z - halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x - halfWidth), Math.floor(checkY), Math.floor(pos.z + halfWidth)) ||
+                           this.world.isSolidBlock(Math.floor(pos.x + halfWidth), Math.floor(checkY), Math.floor(pos.z + halfWidth));
+                }
+
+                // --- VOXEL PICKING (Raycasting) ---
+                pickVoxel(range = 5) {
+                    if (!this.camera || !this.world) return null;
+
+                    const origin = this.camera.position.clone();
+                    const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+
+                    const step = 0.05;
+                    let lastAir = null;
+
+                    for (let t = 0; t < range; t += step) {
+                        const x = Math.floor(origin.x + direction.x * t);
+                        const y = Math.floor(origin.y + direction.y * t);
+                        const z = Math.floor(origin.z + direction.z * t);
+
+                        const block = this.world.getBlock(x, y, z);
+                        if (block !== BLOCKS.AIR && block !== undefined) {
+                            // Calculate face normal
+                            let face = [0, 0, 0];
+                            if (lastAir) {
+                                face = [lastAir.x - x, lastAir.y - y, lastAir.z - z];
+                            }
+                            return { x, y, z, blockId: block, face };
+                        }
+                        lastAir = { x, y, z };
+                    }
+                    return null;
+                }
+
+                // --- MOUSE LOOK ---
+                handleMouseLook(deltaX, deltaY, sensitivity = 0.002) {
+                    this.yaw -= deltaX * sensitivity;
+                    this.pitch -= deltaY * sensitivity;
+                    this.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, this.pitch));
+
+                    if (this.camera) {
+                        this.camera.rotation.order = 'YXZ';
+                        this.camera.rotation.y = this.yaw;
+                        this.camera.rotation.x = this.pitch;
+                    }
+                }
+
+                // --- HEALTH ---
+                takeDamage(amount) {
+                    // Placeholder for player health system
+                    return false;
+                }
+
+                // --- SPAWN POINT ---
+                setSpawnPoint(x, y, z) {
+                    this.spawnPoint = new THREE.Vector3(x, y, z);
+                }
+
+                respawn() {
+                    if (this.spawnPoint) {
+                        this.position.copy(this.spawnPoint);
+                        this.velocity.set(0, 0, 0);
+                    }
+                }
             }
 
             // =====================================================
@@ -2289,6 +3079,91 @@
                             `Chunks: ${info.chunks}`;
                     } else if (this.elements.debugOverlay) {
                         this.elements.debugOverlay.style.display = 'none';
+                    }
+                }
+
+                // --- SETTINGS MENU ---
+                showSettingsMenu() {
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'none';
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'block';
+                }
+
+                hideSettingsMenu() {
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'none';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                }
+
+                // --- CONTROLS MENU ---
+                showControlsMenu() {
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'none';
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'block';
+                }
+
+                hideControlsMenu() {
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'none';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                }
+
+                // --- PAUSE STATE ---
+                setPauseState(isPaused, reason = 'pause') {
+                    if (isPaused) {
+                        this.showPauseMenu();
+                    } else {
+                        this.hidePauseMenu();
+                    }
+                }
+
+                // --- CHUNK LOADER STATUS ---
+                updateChunkLoaderStatus(info) {
+                    const chunkLoader = document.getElementById('chunk-loader');
+                    if (!chunkLoader) return;
+
+                    if (info.visible && info.total > 0) {
+                        chunkLoader.style.display = 'block';
+                        const percent = Math.round((info.loaded / info.total) * 100);
+                        chunkLoader.textContent = `Loading chunks: ${info.loaded}/${info.total} (${percent}%)`;
+                    } else {
+                        chunkLoader.style.display = 'none';
+                    }
+                }
+
+                // --- SLIDER BINDINGS ---
+                bindSlider(sliderId, settingKey, displayId, formatter) {
+                    const slider = document.getElementById(sliderId);
+                    const display = displayId ? document.getElementById(displayId) : null;
+
+                    if (slider) {
+                        slider.value = this.settings.get(settingKey);
+                        if (display && formatter) {
+                            display.textContent = formatter(slider.value);
+                        }
+
+                        slider.addEventListener('input', () => {
+                            const value = parseFloat(slider.value);
+                            this.settings.set(settingKey, value);
+                            if (display && formatter) {
+                                display.textContent = formatter(value);
+                            }
+                        });
+                    }
+                }
+
+                // --- CHECKBOX BINDINGS ---
+                bindCheckbox(checkboxId, settingKey) {
+                    const checkbox = document.getElementById(checkboxId);
+                    if (checkbox) {
+                        checkbox.checked = this.settings.get(settingKey);
+                        checkbox.addEventListener('change', () => {
+                            this.settings.set(settingKey, checkbox.checked);
+                        });
+                    }
+                }
+
+                // --- COORDINATE DISPLAY ---
+                updateCoordinateDisplay(x, y, z) {
+                    const coordDisplay = document.getElementById('coord-display');
+                    if (coordDisplay) {
+                        coordDisplay.textContent = `X: ${Math.floor(x)} Y: ${Math.floor(y)} Z: ${Math.floor(z)}`;
                     }
                 }
             }
