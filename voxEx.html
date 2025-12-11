@@ -6892,9 +6892,9 @@
                 const queue = blockLightQueuePool.pop() || [];
                 queue.length = 0;
                 const maxQueueLength = Math.max(4, SETTINGS?.lighting?.blockQueueBudget ?? 131072);
-                // Raytracing-like smooth falloff: extremely gentle step loss for realistic light spread
-                const baseStepLoss = 0.15; // Further reduced from 0.25 for even smoother, longer-range propagation
-                const diagonalPenalty = 0.1; // Further reduced from 0.15 for more isotropic lighting
+                // Use skylight diffusion algorithm: clean integer step loss for smooth, uniform lighting
+                // Cardinal directions: -1 per block, Diagonal directions: -2 per block
+                // This creates the same smooth diffusion as skylight but for torch/block light
                 const pushIfBudgetAllows = (x, y, z, light) => {
                     if (queue.length + 4 > maxQueueLength) return false;
                     queue.push(x, y, z, light);
@@ -6991,12 +6991,12 @@
                                 const nIdx = edgeLx + (z << 4) + yOff;
                                 const nLight = nBlockLight[nIdx];
                                 if (nLight > 1) {
-                                    // Propagate into this chunk
+                                    // Propagate into this chunk with skylight-style integer step loss
                                     const thisLx = dx === -1 ? 0 : cs - 1;
                                     const thisIdx = thisLx + (z << 4) + yOff;
                                     const thisBlockId = blocks[thisIdx];
                                     if (IS_TRANSPARENT[thisBlockId]) {
-                                        const propagated = clampBlockLight(Math.round(nLight - baseStepLoss));
+                                        const propagated = nLight > 1 ? nLight - 1 : 0;
                                         if (propagated > blockLight[thisIdx]) {
                                             blockLight[thisIdx] = propagated;
                                             pushIfBudgetAllows(thisLx, ly, z, propagated);
@@ -7011,12 +7011,12 @@
                                 const nIdx = x + (edgeLz << 4) + yOff;
                                 const nLight = nBlockLight[nIdx];
                                 if (nLight > 1) {
-                                    // Propagate into this chunk
+                                    // Propagate into this chunk with skylight-style integer step loss
                                     const thisLz = dz === -1 ? 0 : cs - 1;
                                     const thisIdx = x + (thisLz << 4) + yOff;
                                     const thisBlockId = blocks[thisIdx];
                                     if (IS_TRANSPARENT[thisBlockId]) {
-                                        const propagated = clampBlockLight(Math.round(nLight - baseStepLoss));
+                                        const propagated = nLight > 1 ? nLight - 1 : 0;
                                         if (propagated > blockLight[thisIdx]) {
                                             blockLight[thisIdx] = propagated;
                                             pushIfBudgetAllows(x, ly, thisLz, propagated);
@@ -7027,16 +7027,15 @@
                         }
                     }
                 }
-                // Step 2: BFS propagation with attenuation-aware falloff
-                // Now propagates across chunk boundaries for seamless lighting
+                // Step 2: BFS propagation using skylight diffusion algorithm
+                // Same clean integer step loss as skylight for uniform, predictable lighting
                 let qIdx = 0;
                 while (qIdx < queue.length) {
                     const lx = queue[qIdx++];
                     const ly = queue[qIdx++];
                     const lz = queue[qIdx++];
                     const currentLight = clampBlockLight(queue[qIdx++]);
-                    if (currentLight <= 0) continue; // Allow even weak light to attempt propagation
-                    // Cardinal directions (6 neighbors)
+                    // Cardinal directions (6 neighbors) - skylight-style integer step loss
                     for (let i = 0; i < 6; i++) {
                         const offset = NEIGHBOR_OFFSETS[i];
                         const nx = lx + offset[0];
@@ -7047,23 +7046,23 @@
                         const nBlockId = getBlockAtLocal(nx, ny, nz);
                         // Only spread to transparent blocks
                         if (!IS_TRANSPARENT[nBlockId]) continue;
-                        const blockLoss = BLOCKLIGHT_ATTENUATION[nBlockId] || 0;
-                        const totalLoss = baseStepLoss + blockLoss;
-                        const propagatedLight = clampBlockLight(Math.max(0, Math.round(currentLight - totalLoss)));
+                        // Skylight-style propagation: light - 1 (minimum 0)
+                        const propagatedLight = currentLight > 1 ? currentLight - 1 : 0;
                         if (propagatedLight <= 0) continue;
                         const existingLight = getLightAtLocal(nx, ny, nz);
                         if (propagatedLight > existingLight) {
                             if (setLightAtLocal(nx, ny, nz, propagatedLight)) {
-                                // Only continue BFS within this chunk (cross-chunk handled by neighbor seeding)
+                                // Continue BFS within this chunk AND across boundaries
                                 if (nx >= 0 && nx < cs && nz >= 0 && nz < cs) {
                                     pushIfBudgetAllows(nx, ny, nz, propagatedLight);
                                 }
                             }
                         }
                     }
-                    // Diagonal diffusion for softer shadows and smoother lighting
-                    // Very low threshold allows maximum diagonal spread for raytracing-like smoothness
-                    if (currentLight > 0) {
+                    // Diagonal diffusion - skylight-style: light - 2 per diagonal step
+                    // This creates softer shadows and smoother lighting transitions
+                    if (currentLight > 2) {
+                        const diagonalLight = currentLight > 2 ? currentLight - 2 : 0;
                         for (let i = 0; i < SKY_DIAGONAL_OFFSETS.length; i++) {
                             const offset = SKY_DIAGONAL_OFFSETS[i];
                             const nx = lx + offset[0];
@@ -7075,13 +7074,10 @@
                             const nIdx = nx + (nz << 4) + (ny << 8);
                             const nBlockId = blocks[nIdx];
                             if (!IS_TRANSPARENT[nBlockId]) continue;
-                            const blockLoss = BLOCKLIGHT_ATTENUATION[nBlockId] || 0;
-                            const totalLoss = baseStepLoss + diagonalPenalty + blockLoss;
-                            const propagatedLight = clampBlockLight(Math.max(0, Math.round(currentLight - totalLoss)));
-                            if (propagatedLight > blockLight[nIdx]) {
-                                blockLight[nIdx] = propagatedLight;
-                                if (propagatedLight > 0) {
-                                    pushIfBudgetAllows(nx, ny, nz, propagatedLight);
+                            if (diagonalLight > blockLight[nIdx]) {
+                                blockLight[nIdx] = diagonalLight;
+                                if (diagonalLight > 0) {
+                                    pushIfBudgetAllows(nx, ny, nz, diagonalLight);
                                 }
                             }
                         }
