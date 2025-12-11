@@ -993,6 +993,9 @@
                 // Graphics - Water
                 waterColor: savedSettings.waterColor || 0x4488ff,
                 waterOpacity: savedSettings.waterOpacity !== undefined ? savedSettings.waterOpacity : 0.7,
+                // Underwater fog settings
+                underwaterFogNear: savedSettings.underwaterFogNear || 1,
+                underwaterFogFar: savedSettings.underwaterFogFar || 30,
                 // Gameplay - Movement
                 playerSpeed: savedSettings.playerSpeed || 50.0,
                 sprintMultiplier: savedSettings.sprintMultiplier || 2.0,
@@ -1051,6 +1054,9 @@
                 // Graphics - Water
                 waterColor: 0x4488ff,
                 waterOpacity: 0.7,
+                // Underwater fog settings
+                underwaterFogNear: 1,
+                underwaterFogFar: 30,
                 // Gameplay - Movement
                 playerSpeed: 50.0,
                 sprintMultiplier: 2.0,
@@ -1412,16 +1418,59 @@
                 }
 
                 getRiverFactor(gx, gz, seed) {
-                    const riverScale = 0.008;
-                    const riverNoise = this.noise2D(gx * riverScale + seed * 0.5, gz * riverScale - seed * 0.3);
-                    const riverWidth = 0.08;
-                    const transitionWidth = 0.06;
-                    const absNoise = Math.abs(riverNoise);
-                    if (absNoise < riverWidth) return 0;
-                    if (absNoise < riverWidth + transitionWidth) {
-                        return (absNoise - riverWidth) / transitionWidth;
+                    // Reduce warp frequency and strength by 50%
+                    const warpScale = 0.004;
+                    const warpStrength = 20.0;
+                    const wx = gx + this.noise2D(gx * warpScale, gz * warpScale) * warpStrength;
+                    const wz = gz + this.noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
+                    const scale = 0.001;
+                    const n = Math.abs(this.noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
+
+                    // Add coastal noise for natural shorelines
+                    const coastNoiseScale = 0.05;
+                    const coastNoise = this.noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
+                    const coastVariation = coastNoise * 0.02;
+                    const width = 0.055 + coastVariation;
+
+                    if (n < width) {
+                        let t = n / width;
+                        return t * t * (3 - 2 * t);
                     }
                     return 1.0;
+                }
+
+                getOceanFactor(gx, gz, seed) {
+                    const oceanScale = 0.0008;
+                    const oceanNoise = this.noise2D(gx * oceanScale + seed * 1.5, gz * oceanScale - seed * 0.8);
+                    const coastScale = 0.004;
+                    const coastNoise = this.noise2D(gx * coastScale + seed * 2.1, gz * coastScale + seed * 1.3);
+                    const detailScale = 0.02;
+                    const detailNoise = this.noise2D(gx * detailScale - seed * 0.5, gz * detailScale + seed * 0.9) * 0.1;
+                    const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
+                    const oceanThreshold = -0.3;
+                    const shallowThreshold = -0.1;
+                    if (combined < oceanThreshold) return 0.0;
+                    if (combined < shallowThreshold) {
+                        let t = (combined - oceanThreshold) / (shallowThreshold - oceanThreshold);
+                        return t * t * (3 - 2 * t);
+                    }
+                    return 1.0;
+                }
+
+                getRiverDepth(riverFactor, gx, gz, seed) {
+                    const baseRiverDepth = 6;
+                    const depthNoise = this.noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
+                    const depthVariation = (depthNoise + 1) * 0.5 * 3;
+                    const centerFactor = 1.0 - riverFactor;
+                    return baseRiverDepth + depthVariation * centerFactor;
+                }
+
+                getOceanDepth(oceanFactor, gx, gz, seed) {
+                    const baseOceanDepth = 20;
+                    const depthNoise = this.noise2D(gx * 0.008 + seed * 0.9, gz * 0.008 - seed * 0.6);
+                    const depthVariation = (depthNoise + 1) * 0.5 * 15;
+                    const centerFactor = 1.0 - oceanFactor;
+                    return baseOceanDepth + depthVariation * centerFactor;
                 }
 
                 blendedHeight(gx, gz, seed) {
@@ -1444,11 +1493,23 @@
                     const h1 = h01 + (h11 - h01) * sx;
                     let finalHeight = h0 + (h1 - h0) * sz;
 
+                    // Apply oceans first (larger scale feature)
+                    const oceanFactor = this.getOceanFactor(gx, gz, seed);
+                    if (oceanFactor < 1.0) {
+                        const oceanDepth = this.getOceanDepth(oceanFactor, gx, gz, seed);
+                        const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+                        const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+                        finalHeight = oceanFloor + (finalHeight - oceanFloor) * bank;
+                    }
+
+                    // Apply rivers (can carve through ocean edges too)
                     const r = this.getRiverFactor(gx, gz, seed);
                     if (r < 1.0) {
-                        const riverBed = WORLD_DIMS.seaLevel - 2;
+                        const riverDepth = this.getRiverDepth(r, gx, gz, seed);
+                        const riverBed = WORLD_DIMS.seaLevel - riverDepth;
                         const bank = r * r * (3 - 2 * r);
-                        finalHeight = riverBed + (finalHeight - riverBed) * bank;
+                        const carvedHeight = Math.min(finalHeight, riverBed);
+                        finalHeight = carvedHeight + (finalHeight - carvedHeight) * bank;
                     }
                     return Math.floor(finalHeight);
                 }
@@ -3551,6 +3612,9 @@
             let flyDown = false;
             let lastSpaceTime = 0;
             let spacePressed = false; // Track if space is physically held
+            let isUnderwater = false; // Track if player's eyes are underwater
+            let underwaterDepth = 0; // How deep underwater (for fog darkness)
+            let savedFogState = null; // Store normal fog settings when going underwater
             // --- BLOCK DEFINITIONS ---
             const AIR = 0,
                 GRASS = 1,
@@ -7968,7 +8032,7 @@
                 waterMaterial = new THREE.MeshLambertMaterial({
                     map: tex,
                     vertexColors: true,
-                    side: THREE.FrontSide,
+                    side: THREE.DoubleSide, // Render both sides so water surface is visible from below
                     transparent: true,
                     opacity: SETTINGS.waterOpacity,
                     color: SETTINGS.waterColor,
@@ -9664,13 +9728,27 @@
                 const h0 = THREE.MathUtils.lerp(h00, h10, sx);
                 const h1 = THREE.MathUtils.lerp(h01, h11, sx);
                 let finalHeight = THREE.MathUtils.lerp(h0, h1, sz);
-                // 4. Apply rivers (unchanged)
+
+                // 4. Apply oceans first (larger scale feature)
+                const oceanFactor = getOceanFactor(gx, gz, seed);
+                if (oceanFactor < 1.0) {
+                    const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
+                    const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+                    const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+                    finalHeight = THREE.MathUtils.lerp(oceanFloor, finalHeight, bank);
+                }
+
+                // 5. Apply rivers (can carve through ocean edges too)
                 const r = getRiverFactor(gx, gz, seed);
                 if (r < 1.0) {
-                    const riverBed = WORLD_DIMS.seaLevel - 2;
+                    const riverDepth = getRiverDepth(r, gx, gz, seed);
+                    const riverBed = WORLD_DIMS.seaLevel - riverDepth;
                     const bank = r * r * (3 - 2 * r);
-                    finalHeight = THREE.MathUtils.lerp(riverBed, finalHeight, bank);
+                    // Rivers carve down from current height (whether land or ocean edge)
+                    const carvedHeight = Math.min(finalHeight, riverBed);
+                    finalHeight = THREE.MathUtils.lerp(carvedHeight, finalHeight, bank);
                 }
+
                 return Math.floor(finalHeight);
             }
             // UPDATE getBiomeHeightAtCell to use continentalness properly:
@@ -9930,13 +10008,72 @@
                 const wz = gz + noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
                 const scale = 0.001;
                 const n = Math.abs(noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
-                const width = 0.055;
-                // Smoothstep
+
+                // Add coastal noise for natural shorelines
+                const coastNoiseScale = 0.05;
+                const coastNoise = noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
+                const coastVariation = coastNoise * 0.02; // Varies width by up to 0.02
+                const width = 0.055 + coastVariation;
+
+                // Smoothstep with noisy edges
                 if (n < width) {
                     let t = n / width;
                     return t * t * (3 - 2 * t);
                 }
                 return 1.0;
+            }
+
+            // Get ocean factor - oceans form where rivers end near continental edges
+            function getOceanFactor(gx, gz, seed) {
+                // Large-scale ocean noise
+                const oceanScale = 0.0008;
+                const oceanNoise = noise2D(gx * oceanScale + seed * 1.5, gz * oceanScale - seed * 0.8);
+
+                // Secondary noise for irregular coastlines
+                const coastScale = 0.004;
+                const coastNoise = noise2D(gx * coastScale + seed * 2.1, gz * coastScale + seed * 1.3);
+
+                // Tertiary noise for small coastal features
+                const detailScale = 0.02;
+                const detailNoise = noise2D(gx * detailScale - seed * 0.5, gz * detailScale + seed * 0.9) * 0.1;
+
+                // Combine noises - ocean forms where combined noise is low
+                const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
+                const oceanThreshold = -0.3; // Below this is deep ocean
+                const shallowThreshold = -0.1; // Below this is shallow ocean/coast
+
+                if (combined < oceanThreshold) {
+                    return 0.0; // Deep ocean
+                } else if (combined < shallowThreshold) {
+                    // Smooth transition from deep ocean to coast
+                    let t = (combined - oceanThreshold) / (shallowThreshold - oceanThreshold);
+                    return t * t * (3 - 2 * t);
+                }
+                return 1.0; // Land
+            }
+
+            // Get river depth at location (deeper in center, shallower at edges)
+            function getRiverDepth(riverFactor, gx, gz, seed) {
+                // Base depth for rivers (deeper than before)
+                const baseRiverDepth = 6;
+                // Center of river is deeper
+                const depthNoise = noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
+                const depthVariation = (depthNoise + 1) * 0.5 * 3; // 0-3 extra depth
+                // Deeper in center (where riverFactor is closer to 0)
+                const centerFactor = 1.0 - riverFactor;
+                return baseRiverDepth + depthVariation * centerFactor;
+            }
+
+            // Get ocean depth at location
+            function getOceanDepth(oceanFactor, gx, gz, seed) {
+                // Base ocean depth (much deeper than rivers)
+                const baseOceanDepth = 20;
+                // Add variation for underwater terrain
+                const depthNoise = noise2D(gx * 0.008 + seed * 0.9, gz * 0.008 - seed * 0.6);
+                const depthVariation = (depthNoise + 1) * 0.5 * 15; // 0-15 extra depth
+                // Deeper in center (where oceanFactor is closer to 0)
+                const centerFactor = 1.0 - oceanFactor;
+                return baseOceanDepth + depthVariation * centerFactor;
             }
             function getTreeDensityForBiome(biomeName) {
                 const d = TREE_CONFIG.density;
@@ -10371,6 +10508,11 @@
                                         } else {
                                             id = GRASS;
                                         }
+                                    }
+
+                                    // Convert grass to dirt if underwater (below sea level)
+                                    if (id === GRASS && worldTopY < WORLD_DIMS.seaLevel) {
+                                        id = DIRT;
                                     }
                                 }
 
@@ -11275,8 +11417,9 @@
                 lastRenderRadius = currentRenderRadius;
                 // --- 4. Efficient Fog Update ---
                 // Don't create 'new Fog' every frame. Update properties instead.
+                // Skip fog distance updates when underwater (underwater fog handles its own distances)
                 const fogDistance = currentRenderRadius * WORLD_DIMS.chunkSize;
-                if (fogDistance !== lastFogFar) {
+                if (fogDistance !== lastFogFar && !isUnderwater) {
                     lastFogFar = fogDistance;
                     fogFar = fogDistance;
                     // Fog ends 1 chunk BEFORE render distance so edge chunks are fully occluded
@@ -11644,8 +11787,8 @@
                 if (colorsInitialized) {
                     skyMaterial.uniforms.topColor.value.lerpColors(nightSkyTop, daySkyTop, t);
                     skyMaterial.uniforms.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
-                    // Fog copies sky bottom color exactly for perfect horizon match
-                    if (scene.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                    // Fog copies sky bottom color exactly for perfect horizon match (but not when underwater)
+                    if (scene.fog && !isUnderwater) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
                 }
                 skybox.position.copy(camPos);
                 // --- B. SHADOW LOGIC (Grid-locked) ---
@@ -11765,11 +11908,29 @@
                 velocity.z *= dampingFactor;
                 if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
                 if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
-                // Apply gravity or flying
+                // Apply gravity or flying or swimming
                 if (isFlying) {
                     velocity.y = 0;
                     if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25;
                     if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25;
+                } else if (isUnderwater) {
+                    // Swimming physics - reduced gravity and ability to swim up
+                    const waterGravity = SETTINGS.gravity * 0.15; // 15% of normal gravity (buoyancy)
+                    const swimSpeed = SETTINGS.playerSpeed * 0.4; // Swimming speed
+                    velocity.y -= waterGravity * dt;
+                    // Swim up when holding space
+                    if (spacePressed) {
+                        velocity.y += swimSpeed * dt * 2.5; // Swim upward
+                    }
+                    // Swim down when holding shift/crouch
+                    if (isCrouching) {
+                        velocity.y -= swimSpeed * dt * 1.5; // Sink faster
+                    }
+                    // Apply water drag to vertical velocity
+                    velocity.y *= Math.pow(0.92, dt * 60); // Water resistance
+                    // Also slow horizontal movement in water
+                    velocity.x *= Math.pow(0.95, dt * 60);
+                    velocity.z *= Math.pow(0.95, dt * 60);
                 } else {
                     velocity.y -= SETTINGS.gravity * dt;
                 }
@@ -11909,6 +12070,73 @@
                 }
                 perfMonitor.end("rendering", renderStart);
             }
+            // Update underwater fog based on player position
+            function updateUnderwaterFog() {
+                if (!scene.fog || !controls) return;
+
+                const camPos = controls.getObject().position;
+                const eyeY = camPos.y;
+                const eyeX = Math.floor(camPos.x);
+                const eyeZ = Math.floor(camPos.z);
+                const eyeBlockY = Math.floor(eyeY);
+
+                // Check if player's eyes are in water
+                const blockAtEye = getBlock(eyeX, eyeBlockY, eyeZ);
+                const wasUnderwater = isUnderwater;
+                isUnderwater = (blockAtEye === WATER);
+
+                if (isUnderwater) {
+                    // Calculate depth below water surface
+                    let surfaceY = eyeBlockY;
+                    for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
+                        const blockAbove = getBlock(eyeX, y, eyeZ);
+                        if (blockAbove !== WATER) {
+                            surfaceY = y;
+                            break;
+                        }
+                    }
+                    underwaterDepth = Math.max(0, surfaceY - eyeY);
+
+                    // Save normal fog state when entering water
+                    if (!wasUnderwater) {
+                        savedFogState = {
+                            near: scene.fog.near,
+                            far: scene.fog.far,
+                            color: scene.fog.color.clone()
+                        };
+                    }
+
+                    // Base underwater fog color (water color)
+                    const baseWaterColor = new THREE.Color(SETTINGS.waterColor);
+
+                    // Darken based on depth - deeper = darker and shorter visibility
+                    const maxDepth = 35; // Maximum depth for full darkness
+                    const depthFactor = Math.min(underwaterDepth / maxDepth, 1.0);
+
+                    // Interpolate from light blue to dark blue/black
+                    const darkColor = new THREE.Color(0x001122); // Very dark blue
+                    const underwaterColor = baseWaterColor.clone().lerp(darkColor, depthFactor * 0.9);
+
+                    // Fog distance decreases with depth (murkier water deeper down)
+                    const baseFogFar = SETTINGS.underwaterFogFar;
+                    const baseFogNear = SETTINGS.underwaterFogNear;
+                    const fogFar = THREE.MathUtils.lerp(baseFogFar, 8, depthFactor);
+                    const fogNear = THREE.MathUtils.lerp(baseFogNear, 0.5, depthFactor);
+
+                    // Apply underwater fog
+                    scene.fog.color.copy(underwaterColor);
+                    scene.fog.near = fogNear;
+                    scene.fog.far = fogFar;
+                } else if (wasUnderwater && savedFogState) {
+                    // Restore normal fog when exiting water
+                    // Note: updateDayNight will override the color, so just restore distances
+                    scene.fog.near = savedFogState.near;
+                    scene.fog.far = savedFogState.far;
+                    savedFogState = null;
+                    underwaterDepth = 0;
+                }
+            }
+
             // Main animation loop (simplified orchestrator)
             async function animate() {
                 const frameStart = perfMonitor.start("animate");
@@ -11936,6 +12164,7 @@
                     // Game active updates
                     if (controls.isLocked) {
                         updateDayNight(clampedDt);
+                        updateUnderwaterFog(); // Apply underwater fog after day/night (overrides when underwater)
                         updateFPSTracking(time, rawDt, clampedDt);
                         updatePhysicsAndMovement();
                     } else {
