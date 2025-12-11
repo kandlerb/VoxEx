@@ -1009,6 +1009,14 @@
                 zombieVignetteEnabled: savedSettings.zombieVignetteEnabled !== undefined ? savedSettings.zombieVignetteEnabled : true,
                 zombieDesaturationEnabled: savedSettings.zombieDesaturationEnabled !== undefined ? savedSettings.zombieDesaturationEnabled : true,
                 zombieVignetteIntensity: savedSettings.zombieVignetteIntensity !== undefined ? savedSettings.zombieVignetteIntensity : 0.7,
+                // Volumetric Lighting (God Rays)
+                volumetricLightingEnabled: savedSettings.volumetricLightingEnabled !== undefined ? savedSettings.volumetricLightingEnabled : true,
+                volumetricDensity: savedSettings.volumetricDensity !== undefined ? savedSettings.volumetricDensity : 0.015,
+                volumetricDecay: savedSettings.volumetricDecay !== undefined ? savedSettings.volumetricDecay : 0.97,
+                volumetricWeight: savedSettings.volumetricWeight !== undefined ? savedSettings.volumetricWeight : 0.3,
+                volumetricSamples: savedSettings.volumetricSamples !== undefined ? savedSettings.volumetricSamples : 50,
+                volumetricExposure: savedSettings.volumetricExposure !== undefined ? savedSettings.volumetricExposure : 0.25,
+                volumetricFogDensity: savedSettings.volumetricFogDensity !== undefined ? savedSettings.volumetricFogDensity : 0.008,
             };
             const DEFAULTS = {
                 // Performance
@@ -1068,6 +1076,14 @@
                 zombieVignetteEnabled: true,
                 zombieDesaturationEnabled: true,
                 zombieVignetteIntensity: 0.7,
+                // Volumetric Lighting (God Rays)
+                volumetricLightingEnabled: true,
+                volumetricDensity: 0.015,
+                volumetricDecay: 0.97,
+                volumetricWeight: 0.3,
+                volumetricSamples: 50,
+                volumetricExposure: 0.25,
+                volumetricFogDensity: 0.008,
             };
             const WORLD_DIMS = {
                 chunkSize: 16,
@@ -4742,7 +4758,7 @@
             window.perfMetrics = perfMetrics;
 
             let camera, scene, renderer, controls, raycaster;
-            let composer, renderPass, zombieScarePass;
+            let composer, renderPass, zombieScarePass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
             let moveForward = false;
@@ -6774,6 +6790,150 @@
                 zombieScarePass = new ShaderPass(ZombieScareShader);
                 zombieScarePass.enabled = true; // Always enabled, effects controlled by uniforms
                 composer.addPass(zombieScarePass);
+
+                // Volumetric Lighting (God Rays) shader
+                const MAX_POINT_LIGHTS = 16; // Max torches + zombie eyes to process
+                const VolumetricLightShader = {
+                    uniforms: {
+                        tDiffuse: { value: null },
+                        enabled: { value: SETTINGS.volumetricLightingEnabled },
+                        // Sun/Moon (directional lights)
+                        sunScreenPos: { value: new THREE.Vector2(0.5, 0.5) },
+                        sunVisible: { value: 1.0 },
+                        sunColor: { value: new THREE.Color(SETTINGS.sunColor) },
+                        moonScreenPos: { value: new THREE.Vector2(0.5, 0.5) },
+                        moonVisible: { value: 0.0 },
+                        moonColor: { value: new THREE.Color(SETTINGS.moonColor) },
+                        // Point lights (torches, handheld torch, zombie eyes)
+                        pointLightCount: { value: 0 },
+                        pointLightPositions: { value: new Array(MAX_POINT_LIGHTS).fill(null).map(() => new THREE.Vector2(0, 0)) },
+                        pointLightColors: { value: new Array(MAX_POINT_LIGHTS).fill(null).map(() => new THREE.Color(0x000000)) },
+                        pointLightIntensities: { value: new Float32Array(MAX_POINT_LIGHTS) },
+                        // Parameters
+                        density: { value: SETTINGS.volumetricDensity },
+                        decay: { value: SETTINGS.volumetricDecay },
+                        weight: { value: SETTINGS.volumetricWeight },
+                        samples: { value: SETTINGS.volumetricSamples },
+                        exposure: { value: SETTINGS.volumetricExposure },
+                        fogDensity: { value: SETTINGS.volumetricFogDensity },
+                        time: { value: 0.0 },
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform sampler2D tDiffuse;
+                        uniform bool enabled;
+                        // Directional lights (sun/moon)
+                        uniform vec2 sunScreenPos;
+                        uniform float sunVisible;
+                        uniform vec3 sunColor;
+                        uniform vec2 moonScreenPos;
+                        uniform float moonVisible;
+                        uniform vec3 moonColor;
+                        // Point lights
+                        uniform int pointLightCount;
+                        uniform vec2 pointLightPositions[${MAX_POINT_LIGHTS}];
+                        uniform vec3 pointLightColors[${MAX_POINT_LIGHTS}];
+                        uniform float pointLightIntensities[${MAX_POINT_LIGHTS}];
+                        // Parameters
+                        uniform float density;
+                        uniform float decay;
+                        uniform float weight;
+                        uniform int samples;
+                        uniform float exposure;
+                        uniform float fogDensity;
+                        uniform float time;
+                        varying vec2 vUv;
+
+                        // God ray calculation for a single light source
+                        vec3 calculateGodRay(vec2 lightPos, vec3 lightColor, float intensity) {
+                            vec2 deltaTexCoord = vUv - lightPos;
+                            float dist = length(deltaTexCoord);
+
+                            // Skip if too far from light or light is off-screen
+                            if (dist > 1.5 || intensity <= 0.0) return vec3(0.0);
+
+                            deltaTexCoord *= density / float(samples);
+                            vec2 texCoord = vUv;
+                            float illuminationDecay = 1.0;
+                            vec3 godRay = vec3(0.0);
+
+                            for (int i = 0; i < ${SETTINGS.volumetricSamples}; i++) {
+                                texCoord -= deltaTexCoord;
+                                // Clamp to valid UV range
+                                vec2 sampleCoord = clamp(texCoord, 0.001, 0.999);
+                                vec3 sampleColor = texture2D(tDiffuse, sampleCoord).rgb;
+                                // Extract brightness
+                                float brightness = dot(sampleColor, vec3(0.2126, 0.7152, 0.0722));
+                                sampleColor *= illuminationDecay * weight * brightness;
+                                godRay += sampleColor;
+                                illuminationDecay *= decay;
+                            }
+
+                            // Falloff based on distance from light center
+                            float falloff = 1.0 - smoothstep(0.0, 1.2, dist);
+                            return godRay * lightColor * intensity * exposure * falloff;
+                        }
+
+                        // Atmospheric fog/haze for volumetric scattering
+                        vec3 calculateAtmosphericFog(vec3 color, vec2 sunPos, float sunVis) {
+                            // Simple radial fog from sun position
+                            float dist = length(vUv - sunPos);
+                            float fogAmount = exp(-dist * dist * 3.0) * fogDensity * sunVis;
+                            vec3 fogColor = sunColor * 0.5 + vec3(0.8, 0.85, 0.9) * 0.5;
+                            return mix(color, color + fogColor * fogAmount, fogAmount);
+                        }
+
+                        void main() {
+                            vec4 texel = texture2D(tDiffuse, vUv);
+                            vec3 color = texel.rgb;
+
+                            if (!enabled) {
+                                gl_FragColor = vec4(color, texel.a);
+                                return;
+                            }
+
+                            vec3 totalGodRays = vec3(0.0);
+
+                            // Sun god rays
+                            if (sunVisible > 0.0) {
+                                totalGodRays += calculateGodRay(sunScreenPos, sunColor, sunVisible * 1.2);
+                            }
+
+                            // Moon god rays (softer, cooler)
+                            if (moonVisible > 0.0) {
+                                totalGodRays += calculateGodRay(moonScreenPos, moonColor, moonVisible * 0.6);
+                            }
+
+                            // Point light god rays (torches, handheld torch, zombie eyes)
+                            for (int i = 0; i < ${MAX_POINT_LIGHTS}; i++) {
+                                if (i >= pointLightCount) break;
+                                vec2 lightPos = pointLightPositions[i];
+                                // Only process if on screen
+                                if (lightPos.x >= -0.5 && lightPos.x <= 1.5 && lightPos.y >= -0.5 && lightPos.y <= 1.5) {
+                                    totalGodRays += calculateGodRay(lightPos, pointLightColors[i], pointLightIntensities[i] * 0.4);
+                                }
+                            }
+
+                            // Add atmospheric fog/haze
+                            color = calculateAtmosphericFog(color, sunScreenPos, sunVisible);
+
+                            // Blend god rays additively
+                            color += totalGodRays;
+
+                            gl_FragColor = vec4(color, texel.a);
+                        }
+                    `
+                };
+
+                volumetricLightPass = new ShaderPass(VolumetricLightShader);
+                volumetricLightPass.enabled = SETTINGS.volumetricLightingEnabled;
+                composer.addPass(volumetricLightPass);
 
                 // 9. Controls & Pause Menu Logic
                 controls = new PointerLockControls(camera, document.body);
@@ -12030,9 +12190,154 @@
                     }
                 }
             }
+            // Update volumetric lighting shader uniforms with light positions
+            const volumetricTempVec3 = new THREE.Vector3();
+            const volumetricTempVec2 = new THREE.Vector2();
+            const MAX_VOLUMETRIC_POINT_LIGHTS = 16;
+            function updateVolumetricLighting(time) {
+                if (!volumetricLightPass || !SETTINGS.volumetricLightingEnabled) return;
+
+                const uniforms = volumetricLightPass.uniforms;
+
+                // Disable god rays underwater (fog is too dense)
+                if (isUnderwater) {
+                    uniforms.sunVisible.value = 0;
+                    uniforms.moonVisible.value = 0;
+                    uniforms.pointLightCount.value = 0;
+                    return;
+                }
+                uniforms.time.value = time;
+
+                // Helper: project world position to screen space (0-1)
+                function worldToScreen(worldPos) {
+                    volumetricTempVec3.copy(worldPos);
+                    volumetricTempVec3.project(camera);
+                    return volumetricTempVec2.set(
+                        (volumetricTempVec3.x + 1) * 0.5,
+                        (volumetricTempVec3.y + 1) * 0.5
+                    );
+                }
+
+                // Sun position and visibility
+                if (sunSprite && sunSprite.visible) {
+                    const screenPos = worldToScreen(sunSprite.position);
+                    uniforms.sunScreenPos.value.copy(screenPos);
+                    // Calculate visibility based on if sun is in front of camera
+                    const toSun = volumetricTempVec3.copy(sunSprite.position).sub(camera.position).normalize();
+                    camera.getWorldDirection(volumetricTempVec3);
+                    const dot = toSun.dot(volumetricTempVec3);
+                    uniforms.sunVisible.value = Math.max(0, dot) * (screenPos.x >= -0.5 && screenPos.x <= 1.5 && screenPos.y >= -0.5 && screenPos.y <= 1.5 ? 1 : 0);
+                } else {
+                    uniforms.sunVisible.value = 0;
+                }
+
+                // Moon position and visibility
+                if (moonSprite && moonSprite.visible) {
+                    const screenPos = worldToScreen(moonSprite.position);
+                    uniforms.moonScreenPos.value.copy(screenPos);
+                    const toMoon = volumetricTempVec3.copy(moonSprite.position).sub(camera.position).normalize();
+                    camera.getWorldDirection(volumetricTempVec3);
+                    const dot = toMoon.dot(volumetricTempVec3);
+                    uniforms.moonVisible.value = Math.max(0, dot) * (screenPos.x >= -0.5 && screenPos.x <= 1.5 && screenPos.y >= -0.5 && screenPos.y <= 1.5 ? 1 : 0);
+                } else {
+                    uniforms.moonVisible.value = 0;
+                }
+
+                // Collect point lights (torches, handheld torch, zombie eyes)
+                let pointLightIndex = 0;
+                const camPos = controls ? controls.getObject().position : camera.position;
+                const maxDistSq = 64 * 64; // Only process lights within 64 blocks
+
+                // Handheld torch (if active)
+                if (torchActive && torchLight && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS) {
+                    // Get world position of torch light
+                    torchLight.getWorldPosition(volumetricTempVec3);
+                    const screenPos = worldToScreen(volumetricTempVec3);
+                    // Check if in front of camera
+                    const toLight = volumetricTempVec3.clone().sub(camera.position);
+                    camera.getWorldDirection(volumetricTempVec3);
+                    const dot = toLight.normalize().dot(volumetricTempVec3);
+                    if (dot > 0 && screenPos.x >= -0.3 && screenPos.x <= 1.3 && screenPos.y >= -0.3 && screenPos.y <= 1.3) {
+                        uniforms.pointLightPositions.value[pointLightIndex].copy(screenPos);
+                        uniforms.pointLightColors.value[pointLightIndex].setHex(SETTINGS.torchColor);
+                        uniforms.pointLightIntensities.value[pointLightIndex] = 1.2;
+                        pointLightIndex++;
+                    }
+                }
+
+                // Placed torches (from chunkTorches map)
+                if (chunkTorches && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS) {
+                    for (const [chunkKey, torches] of chunkTorches) {
+                        if (pointLightIndex >= MAX_VOLUMETRIC_POINT_LIGHTS) break;
+                        for (const torch of torches) {
+                            if (pointLightIndex >= MAX_VOLUMETRIC_POINT_LIGHTS) break;
+                            // Get torch position
+                            const torchPos = torch.position;
+                            const distSq = torchPos.distanceToSquared(camPos);
+                            if (distSq > maxDistSq) continue;
+
+                            const screenPos = worldToScreen(torchPos);
+                            // Check if in front of camera
+                            volumetricTempVec3.copy(torchPos).sub(camera.position);
+                            const toLight = volumetricTempVec3.clone();
+                            camera.getWorldDirection(volumetricTempVec3);
+                            const dot = toLight.normalize().dot(volumetricTempVec3);
+                            if (dot > 0 && screenPos.x >= -0.3 && screenPos.x <= 1.3 && screenPos.y >= -0.3 && screenPos.y <= 1.3) {
+                                uniforms.pointLightPositions.value[pointLightIndex].copy(screenPos);
+                                uniforms.pointLightColors.value[pointLightIndex].setHex(SETTINGS.torchColor);
+                                // Intensity falls off with distance
+                                const intensity = 1.0 - Math.sqrt(distSq) / 64;
+                                uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.2, intensity);
+                                pointLightIndex++;
+                            }
+                        }
+                    }
+                }
+
+                // Zombie eye glows (from mobs array)
+                if (mobs && mobs.length > 0 && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS) {
+                    for (let i = 0; i < mobs.length && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS; i++) {
+                        const mob = mobs[i];
+                        if (!mob || !mob.position) continue;
+
+                        // Get zombie head position (eyes are in the head)
+                        const headY = mob.position.y + 1.5; // Approximate head height
+                        volumetricTempVec3.set(mob.position.x, headY, mob.position.z);
+
+                        const distSq = volumetricTempVec3.distanceToSquared(camPos);
+                        if (distSq > maxDistSq) continue;
+
+                        const screenPos = worldToScreen(volumetricTempVec3);
+                        // Check if in front of camera
+                        const toLight = volumetricTempVec3.clone().sub(camera.position);
+                        camera.getWorldDirection(volumetricTempVec3);
+                        const dot = toLight.normalize().dot(volumetricTempVec3);
+                        if (dot > 0 && screenPos.x >= -0.3 && screenPos.x <= 1.3 && screenPos.y >= -0.3 && screenPos.y <= 1.3) {
+                            uniforms.pointLightPositions.value[pointLightIndex].copy(screenPos);
+                            // Zombie eye glow color (yellowish-orange)
+                            uniforms.pointLightColors.value[pointLightIndex].setHex(0xd9c002);
+                            const intensity = 0.8 - Math.sqrt(distSq) / 80;
+                            uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.3, intensity);
+                            pointLightIndex++;
+                        }
+                    }
+                }
+
+                // Update point light count
+                uniforms.pointLightCount.value = pointLightIndex;
+
+                // Clear unused light slots
+                for (let i = pointLightIndex; i < MAX_VOLUMETRIC_POINT_LIGHTS; i++) {
+                    uniforms.pointLightIntensities.value[i] = 0;
+                }
+            }
+
             // Render the frame (single-pass or two-pass for viewmodel)
             function renderFrame() {
                 const renderStart = perfMonitor.start("rendering");
+
+                // Update volumetric lighting uniforms
+                updateVolumetricLighting(performance.now());
 
                 // Update zombie proximity for scare effects
                 // TODO: Add zombie proximity detection here when zombies are implemented
