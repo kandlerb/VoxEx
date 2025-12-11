@@ -2313,25 +2313,70 @@
                 }
 
                 playClick() {
-                    // Generate and play a click sound
+                    // Generate and play a rich UI click sound (clink)
                     if (!this.enabled) return;
-                    this.initContext();
 
-                    const oscillator = this.ctx.createOscillator();
-                    const gainNode = this.ctx.createGain();
+                    const ctx = this.initContext();
+                    const now = ctx.currentTime;
 
-                    oscillator.type = 'sine';
-                    oscillator.frequency.setValueAtTime(800, this.ctx.currentTime);
-                    oscillator.frequency.exponentialRampToValueAtTime(400, this.ctx.currentTime + 0.05);
+                    // Slight randomization so repeated clicks don't sound identical
+                    const baseFreq = 650 + Math.random() * 80; // 650–730 Hz
 
-                    gainNode.gain.setValueAtTime(this.masterVolume * 0.3, this.ctx.currentTime);
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
+                    // Main tonal body: soft, percussive blip
+                    const osc1 = ctx.createOscillator();
+                    const osc2 = ctx.createOscillator();
+                    osc1.type = 'triangle';
+                    osc2.type = 'sine';
 
-                    oscillator.connect(gainNode);
-                    gainNode.connect(this.ctx.destination);
+                    osc1.frequency.setValueAtTime(baseFreq, now);
+                    osc1.frequency.exponentialRampToValueAtTime(baseFreq * 0.6, now + 0.08);
 
-                    oscillator.start();
-                    oscillator.stop(this.ctx.currentTime + 0.05);
+                    osc2.frequency.setValueAtTime(baseFreq * 1.5, now);
+                    osc2.frequency.exponentialRampToValueAtTime(baseFreq, now + 0.08);
+
+                    // Very short noise burst for the "mechanical" click transient
+                    const noiseDuration = 0.04;
+                    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * noiseDuration, ctx.sampleRate);
+                    const noiseData = noiseBuffer.getChannelData(0);
+                    for (let i = 0; i < noiseData.length; i++) {
+                        noiseData[i] = (Math.random() * 2 - 1) * 0.6;
+                    }
+                    const noiseSource = ctx.createBufferSource();
+                    noiseSource.buffer = noiseBuffer;
+
+                    const noiseGain = ctx.createGain();
+                    noiseGain.gain.setValueAtTime(this.masterVolume * 0.35, now);
+                    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDuration);
+
+                    // Shared gain envelope (final amplitude)
+                    const gainNode = ctx.createGain();
+                    gainNode.gain.setValueAtTime(0, now);
+                    gainNode.gain.linearRampToValueAtTime(this.masterVolume * 0.7, now + 0.01);
+                    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
+
+                    // Gentle low-pass filter to keep things soft and UI-friendly
+                    const filter = ctx.createBiquadFilter();
+                    filter.type = 'lowpass';
+                    filter.frequency.setValueAtTime(3500, now);
+                    filter.Q.value = 0.7;
+
+                    // Routing: oscillators -> filter -> gain -> destination
+                    osc1.connect(filter);
+                    osc2.connect(filter);
+                    noiseSource.connect(noiseGain);
+                    noiseGain.connect(filter);
+                    filter.connect(gainNode);
+                    gainNode.connect(ctx.destination);
+
+                    // Start/stop everything
+                    osc1.start(now);
+                    osc2.start(now);
+                    noiseSource.start(now);
+
+                    const stopTime = now + 0.2;
+                    osc1.stop(stopTime);
+                    osc2.stop(stopTime);
+                    noiseSource.stop(stopTime);
                 }
 
                 playBlockPlace() {
@@ -3070,7 +3115,8 @@
                         flightIndicator: document.getElementById('flight-indicator'),
                         sprintIndicator: document.getElementById('sprint-indicator'),
                         crouchIndicator: document.getElementById('crouch-indicator'),
-                        debugOverlay: document.getElementById('debug-overlay')
+                        debugOverlay: document.getElementById('debug-overlay'),
+                        slots: document.querySelectorAll('.slot')
                     };
 
                     // Initialize button audio
@@ -3117,10 +3163,20 @@
                 }
 
                 updateHotbar(selectedSlot) {
-                    document.querySelectorAll('.slot').forEach(s => s.classList.remove('active'));
-                    const slot = document.getElementById('slot-' + selectedSlot);
+                    this.highlightSlot(selectedSlot);
+                }
+
+                highlightSlot(slotNumber) {
+                    // Remove active class from all slots
+                    if (this.elements.slots) {
+                        this.elements.slots.forEach(s => s.classList.remove('active'));
+                    } else {
+                        document.querySelectorAll('.slot').forEach(s => s.classList.remove('active'));
+                    }
+                    // Add active class to selected slot
+                    const slot = document.getElementById('slot-' + slotNumber);
                     if (slot) slot.classList.add('active');
-                    this.updateBlockNameDisplay(selectedSlot);
+                    this.updateBlockNameDisplay(slotNumber);
                 }
 
                 updateBlockNameDisplay(slotNumber) {
@@ -3180,11 +3236,49 @@
                 }
 
                 // --- PAUSE STATE ---
-                setPauseState(isPaused, reason = 'pause') {
-                    if (isPaused) {
-                        this.showPauseMenu();
+                setPauseState(isPaused, reason = 'pause', controls = null) {
+                    const settingsPanels = document.querySelectorAll('.settings-panel');
+
+                    // Hide all menu containers by default
+                    [this.elements.seedMenu, this.elements.mainPauseMenu,
+                     this.elements.settingsMenu, this.elements.controlsMenu].forEach((menu) => {
+                        if (menu) menu.style.display = 'none';
+                    });
+
+                    // Reset settings sub-panels unless we explicitly want to stay in the main settings hub
+                    if (reason === 'settings' && isPaused) {
+                        settingsPanels.forEach((panel) => {
+                            if (panel.id !== 'settings-menu') panel.style.display = 'none';
+                        });
                     } else {
-                        this.hidePauseMenu();
+                        settingsPanels.forEach((panel) => (panel.style.display = 'none'));
+                    }
+
+                    if (isPaused) {
+                        this.setHUDVisible(false);
+                        if (this.elements.blocker) this.elements.blocker.style.display = 'flex';
+                        if (this.elements.instructions) this.elements.instructions.style.display = 'block';
+
+                        switch (reason) {
+                            case 'seed':
+                                if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'block';
+                                break;
+                            case 'settings':
+                                if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'block';
+                                break;
+                            case 'controls':
+                                if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'block';
+                                break;
+                            default:
+                                if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                                break;
+                        }
+
+                        if (controls && controls.isLocked) controls.unlock();
+                    } else {
+                        this.setHUDVisible(true);
+                        if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                        if (this.elements.instructions) this.elements.instructions.style.display = 'none';
                     }
                 }
 
@@ -4021,188 +4115,13 @@
 
             // --- GAME AUDIO SYSTEM ---
             // Example: Base64-encoded audio constant (replace with your own sound data)
-            // This is a placeholder - replace with actual base64-encoded WAV/OGG/MP3 data
-            const SOUND_EXAMPLE = "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xmZ7wrSRzJQoB85kk1nQ+b4byZhx4auldK+i4Z9ViEnSp4VFQASyzuaDwtjqM/wdlq8Twv8dpou5B9Pe20nBHtcqmxrnnOc50pZ2UhGEgiMgSGgRIwmfUu6563EkutzM+NURC6qKl5rGtLDVA/xDwE8ohmPvuvRn27ir5GnMl5hgD+jGnYqygcu1nNicDR3r1UzViQswBTRWcDjMdJFdCfbWYjsTvZ+/gDVyN+f5vmc2D4dtQ4JqolpZSQdyK0c8X4+GxMdtw4bchaAymdifaS5CdtyFfOUK28Yv7RVRLhVOTNNuQ6OcnzBxQTkOtt9p/dd/VRTQoKGHWC0oGFfJPGdIc/Xje6MlGFAxSmatcbcJHwkxn8klMyBTGCoIAABwAAADt21vb3YAAABsbXZoZAAAAAAAAAAAAAAAAAAAA+gAAADTAAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAJKdHJhawAAAFx0a2hkAAAAAwAAAAAAAAAAAAAAAQAAAAAAAADTAAAAAAAAAAAAAAABAQAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAJGVkdHMAAAAcZWxzdAAAAAAAAAABAAAAqAAACAAAAQAAAAABwm1kaWEAAAAgbWRoZAAAAAAAAAAAAAAAAAAAu4AAACeAVcQAAAAAAC1oZGxyAAAAAAAAAABzb3VuAAAAAAAAAAAAAAAAU291bmRIYW5kbGVyAAAAAW1taW5mAAAAEHNtaGQAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAATFzdGJsAAAAZ3N0c2QAAAAAAAAAAQAAAFdtcDRhAAAAAAAAAAEAAAAAAAAAAAACABAAAAAAu4AAAAAAADNlc2RzAAAAAAOAgIAiAAEABICAgBRAFQAAAAADRTkAA0U5BYCAgAIRkAaAgIABAgAAACBzdHRzAAAAAAAAAAIAAAAJAAAEAAAAAAEAAAOAAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAKAAAAAQAAADxzdHN6AAAAAAAAAAAAAAAKAAACAAAAAgAAAALdAAAC6gAAAjgAAAIpAAACeAAAAcgAAAHqAAABugAAABRzdGNvAAAAAAAAAAEAAAAsAAAAGnNncGQBAAAAcm9sbAAAAAIAAAAB//8AAAAcc2JncAAAAAByb2xsAAAAAQAAAAoAAAABAAAA+XVkdGEAAADxbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAADEaWxzdAAAAC2pdG9vAAAAJWRhdGEAAAABAAAAAGh0dHBzOi8vY2xpcGNoYW1wLmNvbQAAAI+pY210AAAAh2RhdGEAAAABAAAAAENyZWF0ZSB2aWRlb3Mgd2l0aCBodHRwczovL2NsaXBjaGFtcC5jb20vZW4vdmlkZW8tZWRpdG9yIC0gZnJlZSBvbmxpbmUgdmlkZW8gZWRpdG9yLCB2aWRlbyBjb21wcmVzc29yLCB2aWRlbyBjb252ZXJ0ZXIu"; // Add your base64 audio string here
+            // Global audio instance (using AudioManager class)
+            const audioManager = new AudioManager(null);
+            // Legacy alias for backward compatibility (delegates to audioManager)
+            const gameAudio = { playClink: () => audioManager.playClick() };
 
-            // Usage examples:
-            // 1. Play with automatic caching:
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound');
-            //
-            // 2. Play with custom volume:
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound', { volume: 0.5 });
-            //
-            // 3. Play with custom playback rate (pitch):
-            //    gameAudio.playSound(SOUND_EXAMPLE, 'example-sound', { playbackRate: 1.5 });
-            //
-            // 4. Pre-decode for instant playback later:
-            //    await gameAudio.base64ToAudioBuffer(SOUND_EXAMPLE, 'example-sound');
-            //    // Then later: gameAudio.playSound(SOUND_EXAMPLE, 'example-sound'); // Instant!
-
-            class GameAudio {
-                constructor() {
-                    this.audioContext = null;
-                    this.enabled = true;
-                    this.volume = 0.3; // Master volume for UI sounds
-                    this.bufferCache = new Map(); // Cache for decoded AudioBuffers
-                }
-
-                // Lazy init audio context (must be after user interaction)
-                initContext() {
-                    if (!this.audioContext) {
-                        this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    }
-                    return this.audioContext;
-                }
-
-                // Decode base64 audio data into AudioBuffer (cached for reuse)
-                async base64ToAudioBuffer(base64String, cacheKey = null) {
-                    // Check cache first
-                    if (cacheKey && this.bufferCache.has(cacheKey)) {
-                        return this.bufferCache.get(cacheKey);
-                    }
-
-                    const ctx = this.initContext();
-
-                    // Decode base64 to binary
-                    const binaryString = atob(base64String);
-                    const bytes = new Uint8Array(binaryString.length);
-                    for (let i = 0; i < binaryString.length; i++) {
-                        bytes[i] = binaryString.charCodeAt(i);
-                    }
-
-                    // Decode audio data into AudioBuffer
-                    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
-
-                    // Cache the buffer if a key was provided
-                    if (cacheKey) {
-                        this.bufferCache.set(cacheKey, audioBuffer);
-                    }
-
-                    return audioBuffer;
-                }
-
-                // Play a sound from cached AudioBuffer
-                async playSound(base64OrBuffer, cacheKey = null, options = {}) {
-                    if (!this.enabled) return;
-
-                    const ctx = this.initContext();
-                    const now = ctx.currentTime;
-
-                    // Get or decode the audio buffer
-                    let audioBuffer;
-                    if (base64OrBuffer instanceof AudioBuffer) {
-                        audioBuffer = base64OrBuffer;
-                    } else if (typeof base64OrBuffer === 'string') {
-                        audioBuffer = await this.base64ToAudioBuffer(base64OrBuffer, cacheKey);
-                    } else {
-                        console.error('Invalid audio source: must be base64 string or AudioBuffer');
-                        return;
-                    }
-
-                    // Create source and gain nodes
-                    const source = ctx.createBufferSource();
-                    source.buffer = audioBuffer;
-
-                    const gainNode = ctx.createGain();
-                    gainNode.gain.value = this.volume * (options.volume || 1.0);
-
-                    // Connect: source -> gain -> destination
-                    source.connect(gainNode);
-                    gainNode.connect(ctx.destination);
-
-                    // Apply playback rate if specified
-                    if (options.playbackRate) {
-                        source.playbackRate.value = options.playbackRate;
-                    }
-
-                    // Start playback
-                    source.start(now);
-
-                    return source; // Return source for external control if needed
-                }
-
-                // Generate and play a procedural "clink" sound (UI button click)
-                playClink() {
-				    if (!this.enabled) return;
-				
-				    const ctx = this.initContext();
-				    const now = ctx.currentTime;
-				
-				    // Slight randomization so repeated clicks don't sound identical
-				    const baseFreq = 650 + Math.random() * 80; // 650–730 Hz
-				
-				    // Main tonal body: soft, percussive blip
-				    const osc1 = ctx.createOscillator();
-				    const osc2 = ctx.createOscillator();
-				    osc1.type = 'triangle';
-				    osc2.type = 'sine';
-				
-				    osc1.frequency.setValueAtTime(baseFreq, now);
-				    osc1.frequency.exponentialRampToValueAtTime(baseFreq * 0.6, now + 0.08);
-				
-				    osc2.frequency.setValueAtTime(baseFreq * 1.5, now);
-				    osc2.frequency.exponentialRampToValueAtTime(baseFreq, now + 0.08);
-				
-				    // Very short noise burst for the "mechanical" click transient
-				    const noiseDuration = 0.04;
-				    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * noiseDuration, ctx.sampleRate);
-				    const noiseData = noiseBuffer.getChannelData(0);
-				    for (let i = 0; i < noiseData.length; i++) {
-				        noiseData[i] = (Math.random() * 2 - 1) * 0.6; // slightly tamed
-				    }
-				    const noiseSource = ctx.createBufferSource();
-				    noiseSource.buffer = noiseBuffer;
-				
-				    const noiseGain = ctx.createGain();
-				    noiseGain.gain.setValueAtTime(this.volume * 0.35, now);
-				    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDuration);
-				
-				    // Shared gain envelope (final amplitude)
-				    const gainNode = ctx.createGain();
-				    gainNode.gain.setValueAtTime(0, now);
-				    gainNode.gain.linearRampToValueAtTime(this.volume * 0.7, now + 0.01);   // fast but not instant attack
-				    gainNode.gain.exponentialRampToValueAtTime(0.001, now + 0.14);         // smooth decay
-				
-				    // Gentle low-pass filter to keep things soft and UI-friendly
-				    const filter = ctx.createBiquadFilter();
-				    filter.type = 'lowpass';
-				    filter.frequency.setValueAtTime(3500, now); // enough brightness, not piercing
-				    filter.Q.value = 0.7;
-				
-				    // Routing:
-				    // oscillators -> filter -> gain -> destination
-				    // noise -> noiseGain -> filter (so it gets softened too)
-				    osc1.connect(filter);
-				    osc2.connect(filter);
-				    noiseSource.connect(noiseGain);
-				    noiseGain.connect(filter);
-				    filter.connect(gainNode);
-				    gainNode.connect(ctx.destination);
-				
-				    // Start/stop everything
-				    osc1.start(now);
-				    osc2.start(now);
-				    noiseSource.start(now);
-				
-				    const stopTime = now + 0.2;
-				    osc1.stop(stopTime);
-				    osc2.stop(stopTime);
-				    noiseSource.stop(stopTime);
-				}
-
-                // Set volume (0.0 to 1.0)
-                setVolume(vol) {
-                    this.volume = Math.max(0, Math.min(1, vol));
-                }
-
-                // Enable/disable audio
-                setEnabled(enabled) {
-                    this.enabled = enabled;
-                }
-            }
-
-            // Global audio instance
-            const gameAudio = new GameAudio();
+            // Global UI manager instance (initialized after DOM ready)
+            const uiManager = new UIManager(null, audioManager, null);
 
             class Float32ArrayPool { // --- POOLING & NOISE ---
                 constructor(initialSize = 10000) { this.pool = []; this.initialSize = initialSize; }
@@ -4277,85 +4196,22 @@
                 return combined - Math.floor(combined);
             }
 
-            // --- AUDIO INITIALIZATION ---
-            // Wire up click sounds to all buttons in the UI
-            function initButtonAudio() {
-                // Get all button elements
-                const buttons = document.querySelectorAll('button');
-
-                buttons.forEach(button => {
-                    // Add click sound to each button
-                    button.addEventListener('click', () => {
-                        gameAudio.playClink();
-                    }, { capture: true }); // Use capture phase to play before other handlers
-                });
-            }
-
-            // Initialize button audio when DOM is ready
-            initButtonAudio();
+            // --- UI INITIALIZATION ---
+            // Initialize UIManager when DOM is ready
+            uiManager.init();
 
             // --- HUD VISIBILITY HELPERS ---
+            // Delegate to UIManager class instance
             function setHUDVisible(isVisible) {
-                const crosshair = document.getElementById("crosshair");
-                const hotbar = document.getElementById("hotbar");
-                const blockNameDisplay = document.getElementById("block-name-display");
-
-                if (crosshair) crosshair.style.display = isVisible ? "block" : "none";
-                if (hotbar) hotbar.style.display = isVisible ? "flex" : "none";
-                if (blockNameDisplay) blockNameDisplay.style.display = isVisible ? "block" : "none";
+                uiManager.setHUDVisible(isVisible);
             }
 
-            // Centralized pause/resume controller to keep HUD, menus, and pointer lock in sync
+            // Centralized pause/resume controller - delegates to UIManager
             function setPauseState(isPaused, reason = "pause") {
-                const blocker = document.getElementById("blocker");
-                const instructions = document.getElementById("instructions");
-                const seedMenu = document.getElementById("seed-menu");
-                const mainPauseMenu = document.getElementById("main-pause-menu");
-                const settingsMenu = document.getElementById("settings-menu");
-                const controlsMenu = document.getElementById("controls-menu");
-                const settingsPanels = document.querySelectorAll(".settings-panel");
-
-                // Hide all menu containers by default; show only the active context below
-                [seedMenu, mainPauseMenu, settingsMenu, controlsMenu].forEach((menu) => {
-                    if (menu) menu.style.display = "none";
-                });
-
-                // Reset settings sub-panels unless we explicitly want to stay in the main settings hub
-                if (reason === "settings" && isPaused) {
-                    settingsPanels.forEach((panel) => {
-                        if (panel.id !== "settings-menu") panel.style.display = "none";
-                    });
-                } else {
-                    settingsPanels.forEach((panel) => (panel.style.display = "none"));
-                }
-
-                if (isPaused) {
-                    setHUDVisible(false);
-                    if (blocker) blocker.style.display = "flex";
-                    if (instructions) instructions.style.display = "block";
-
-                    switch (reason) {
-                        case "seed":
-                            if (seedMenu) seedMenu.style.display = "block";
-                            break;
-                        case "settings":
-                            if (settingsMenu) settingsMenu.style.display = "block";
-                            break;
-                        case "controls":
-                            if (controlsMenu) controlsMenu.style.display = "block";
-                            break;
-                        default:
-                            if (mainPauseMenu) mainPauseMenu.style.display = "block";
-                            break;
-                    }
-
-                    if (controls && controls.isLocked) controls.unlock();
-                } else {
-                    setHUDVisible(true);
-                    if (blocker) blocker.style.display = "none";
-                    if (instructions) instructions.style.display = "none";
-
-                    if (controls && !controls.isLocked) controls.lock();
+                uiManager.setPauseState(isPaused, reason, controls);
+                // Handle controls lock/unlock (not in UIManager since controls is external)
+                if (!isPaused && controls && !controls.isLocked) {
+                    controls.lock();
                 }
             }
 
@@ -10555,27 +10411,15 @@
                     }
                 }
             }
-            function highlightSlot(i) {
-                document.querySelectorAll(".slot").forEach((s) => s.classList.remove("active"));
-                document.getElementById("slot-" + i).classList.add("active");
-                updateBlockNameDisplay(i);
-            }
-            function updateBlockNameDisplay(slotNumber) {
-                const blockNames = ["Grass Block", "Dirt Block", "Stone Block", "Wood Planks", "Log Block", "Leaves", "Sand Block", "Water", "Torch"];
-                const blockName = blockNames[slotNumber - 1];
-                const display = document.getElementById("block-name-display");
-                if (display) { display.textContent = blockName; }
-            }
+            // Delegate to UIManager class instance
+            function highlightSlot(i) { uiManager.highlightSlot(i); }
+            function updateBlockNameDisplay(slotNumber) { uiManager.updateBlockNameDisplay(slotNumber); }
             function updateMovementIndicators() {
-                const flightIndicator = document.getElementById("flight-indicator");
-                const sprintIndicator = document.getElementById("sprint-indicator");
-                const crouchIndicator = document.getElementById("crouch-indicator");
-                // Update flight indicator
-                if (flightIndicator) { flightIndicator.style.display = isFlying ? "flex" : "none"; }
-                // Update sprint indicator
-                if (sprintIndicator) { sprintIndicator.style.display = isSprinting && !isFlying && controls.isLocked ? "flex" : "none"; }
-                // Update crouch indicator
-                if (crouchIndicator) { crouchIndicator.style.display = isCrouching && !isFlying && controls.isLocked ? "flex" : "none"; }
+                uiManager.updateMovementIndicators({
+                    isFlying: isFlying,
+                    isSprinting: isSprinting && controls.isLocked,
+                    isCrouching: isCrouching && controls.isLocked
+                });
             }
             const onMouseWheel = function (event) {
                 event.preventDefault();
