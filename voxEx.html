@@ -1095,6 +1095,1400 @@
             import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
             import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
             import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+            // =====================================================
+            // VOXEX CLASS-BASED ARCHITECTURE
+            // =====================================================
+
+            // -------------------------
+            // 0. BLOCKS ENUM (Convenience object)
+            // -------------------------
+            const BLOCKS = {
+                AIR: 0,
+                GRASS: 1,
+                DIRT: 2,
+                STONE: 3,
+                WOOD: 4,
+                LOG: 5,
+                LEAVES: 6,
+                BEDROCK: 7,
+                SAND: 8,
+                WATER: 9,
+                TORCH: 10,
+                UNLOADED: 255
+            };
+
+            // =====================================================
+            // 1. SETTINGS MANAGER CLASS
+            // =====================================================
+
+            class SettingsManager {
+                constructor(defaults) {
+                    this.defaults = { ...defaults };
+                    this.values = { ...defaults };
+                    this.listeners = new Map();
+                }
+
+                loadFromStorage() {
+                    try {
+                        const saved = JSON.parse(localStorage.getItem("voxex_settings")) || {};
+                        for (const key of Object.keys(this.defaults)) {
+                            if (saved[key] !== undefined) {
+                                this.values[key] = saved[key];
+                            }
+                        }
+                    } catch (e) {
+                        console.warn("[SettingsManager] Failed to load settings from storage:", e);
+                    }
+                }
+
+                saveToStorage() {
+                    try {
+                        localStorage.setItem("voxex_settings", JSON.stringify(this.values));
+                    } catch (e) {
+                        console.warn("[SettingsManager] Failed to save settings to storage:", e);
+                    }
+                }
+
+                get(key) {
+                    return this.values[key] !== undefined ? this.values[key] : this.defaults[key];
+                }
+
+                set(key, value) {
+                    const oldValue = this.values[key];
+                    this.values[key] = value;
+                    // Notify listeners
+                    if (this.listeners.has(key)) {
+                        for (const callback of this.listeners.get(key)) {
+                            callback(value, oldValue, key);
+                        }
+                    }
+                    this.saveToStorage();
+                }
+
+                onChange(key, callback) {
+                    if (!this.listeners.has(key)) {
+                        this.listeners.set(key, []);
+                    }
+                    this.listeners.get(key).push(callback);
+                }
+
+                reset(key) {
+                    if (key) {
+                        this.set(key, this.defaults[key]);
+                    } else {
+                        this.values = { ...this.defaults };
+                        this.saveToStorage();
+                    }
+                }
+
+                applyToRender(renderEngine) {
+                    if (!renderEngine) return;
+                    // Apply fog settings
+                    if (renderEngine.scene?.fog) {
+                        renderEngine.scene.fog.far = this.get('renderDistance') * WORLD_DIMS.chunkSize;
+                    }
+                    // Apply shadow settings
+                    if (renderEngine.renderer) {
+                        renderEngine.renderer.shadowMap.enabled = this.get('shadows');
+                    }
+                }
+            }
+
+            // =====================================================
+            // 2. INPUT MANAGER CLASS
+            // =====================================================
+
+            class InputManager {
+                constructor(domElement) {
+                    this.domElement = domElement || document.body;
+                    this.keysDown = new Set();
+                    this.mouseDelta = { x: 0, y: 0 };
+                    this.mouseButtons = { left: false, right: false, middle: false };
+                    this.pointerLocked = false;
+                    this.wheelDelta = 0;
+                    this.listeners = {
+                        keydown: [],
+                        keyup: [],
+                        mousedown: [],
+                        mouseup: [],
+                        wheel: []
+                    };
+                }
+
+                init() {
+                    // Keyboard events
+                    document.addEventListener('keydown', (e) => {
+                        this.keysDown.add(e.code);
+                        for (const cb of this.listeners.keydown) cb(e);
+                    });
+                    document.addEventListener('keyup', (e) => {
+                        this.keysDown.delete(e.code);
+                        for (const cb of this.listeners.keyup) cb(e);
+                    });
+
+                    // Mouse events
+                    document.addEventListener('mousemove', (e) => {
+                        if (this.pointerLocked) {
+                            this.mouseDelta.x += e.movementX;
+                            this.mouseDelta.y += e.movementY;
+                        }
+                    });
+                    this.domElement.addEventListener('mousedown', (e) => {
+                        if (e.button === 0) this.mouseButtons.left = true;
+                        if (e.button === 1) this.mouseButtons.middle = true;
+                        if (e.button === 2) this.mouseButtons.right = true;
+                        for (const cb of this.listeners.mousedown) cb(e);
+                    });
+                    this.domElement.addEventListener('mouseup', (e) => {
+                        if (e.button === 0) this.mouseButtons.left = false;
+                        if (e.button === 1) this.mouseButtons.middle = false;
+                        if (e.button === 2) this.mouseButtons.right = false;
+                        for (const cb of this.listeners.mouseup) cb(e);
+                    });
+                    this.domElement.addEventListener('wheel', (e) => {
+                        this.wheelDelta = e.deltaY;
+                        for (const cb of this.listeners.wheel) cb(e);
+                    }, { passive: false });
+
+                    // Pointer lock change
+                    document.addEventListener('pointerlockchange', () => {
+                        this.pointerLocked = document.pointerLockElement === this.domElement;
+                    });
+                }
+
+                consumeMouseDelta() {
+                    const delta = { x: this.mouseDelta.x, y: this.mouseDelta.y };
+                    this.mouseDelta.x = 0;
+                    this.mouseDelta.y = 0;
+                    return delta;
+                }
+
+                consumeWheelDelta() {
+                    const delta = this.wheelDelta;
+                    this.wheelDelta = 0;
+                    return delta;
+                }
+
+                isKeyDown(code) {
+                    return this.keysDown.has(code);
+                }
+
+                on(event, callback) {
+                    if (this.listeners[event]) {
+                        this.listeners[event].push(callback);
+                    }
+                }
+
+                off(event, callback) {
+                    if (this.listeners[event]) {
+                        const idx = this.listeners[event].indexOf(callback);
+                        if (idx !== -1) this.listeners[event].splice(idx, 1);
+                    }
+                }
+            }
+
+            // =====================================================
+            // 3. TERRAIN GENERATOR CLASS
+            // =====================================================
+
+            class TerrainGenerator {
+                constructor(worldConfig, biomeConfig, treeConfig) {
+                    this.worldConfig = worldConfig;
+                    this.biomeConfig = biomeConfig;
+                    this.treeConfig = treeConfig;
+                    this.perm = new Uint8Array(512);
+                    this.p = new Uint8Array(256);
+                    this.biomeCellCache = new Map();
+                    this.treeMaskCache = new Map();
+                    this.biomeTable = null;
+                }
+
+                init(seed) {
+                    this.worldConfig.seed = seed;
+                    // Initialize permutation table
+                    for (let i = 0; i < 256; i++) this.p[i] = i;
+                    // Shuffle using seed
+                    let s = seed;
+                    for (let i = 255; i > 0; i--) {
+                        s = (s * 1103515245 + 12345) & 0x7fffffff;
+                        const j = s % (i + 1);
+                        [this.p[i], this.p[j]] = [this.p[j], this.p[i]];
+                    }
+                    for (let i = 0; i < 512; i++) {
+                        this.perm[i] = this.p[i & 255];
+                    }
+                    // Build biome table
+                    this.buildBiomeTable();
+                }
+
+                buildBiomeTable() {
+                    const cumulative = [];
+                    let total = 0;
+                    for (const biome of this.worldConfig.biomes) {
+                        total += biome.weight;
+                        cumulative.push({ threshold: total, biome });
+                    }
+                    this.biomeTable = { cumulative, totalWeight: total };
+                }
+
+                getBiomeAt(x, z) {
+                    const cellSize = 64; // BIOME_CELL_SIZE
+                    const cellX = Math.floor(x / cellSize);
+                    const cellZ = Math.floor(z / cellSize);
+                    const key = `${cellX},${cellZ}`;
+
+                    if (this.biomeCellCache.has(key)) {
+                        return this.biomeCellCache.get(key);
+                    }
+
+                    const centerX = cellX * cellSize + cellSize * 0.5;
+                    const centerZ = cellZ * cellSize + cellSize * 0.5;
+                    const biome = this.getRawBiome(centerX, centerZ);
+                    this.biomeCellCache.set(key, biome);
+                    return biome;
+                }
+
+                getRawBiome(x, z) {
+                    const { seed, biomeFrequency } = this.worldConfig;
+                    const noiseVal = this.noise2D(x * biomeFrequency + seed * 0.37, z * biomeFrequency - seed * 0.71);
+                    const t = (noiseVal + 1) * 0.5;
+                    const target = t * this.biomeTable.totalWeight;
+
+                    for (const entry of this.biomeTable.cumulative) {
+                        if (target <= entry.threshold) {
+                            return entry.biome;
+                        }
+                    }
+                    return this.biomeTable.cumulative[0].biome;
+                }
+
+                getHeightAt(x, z) {
+                    // Simplified height calculation - actual implementation uses blendedHeight()
+                    const biome = this.getBiomeAt(x, z);
+                    const baseHeight = biome.baseHeight || 64;
+                    const amplitude = biome.amplitude || 10;
+                    const roughness = biome.roughness || 0.01;
+
+                    const noise = this.fbm2D(x * roughness, z * roughness, 4, 0.5, 2.0);
+                    return Math.floor(baseHeight + noise * amplitude);
+                }
+
+                // Noise functions
+                fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+                lerp(t, a, b) { return a + t * (b - a); }
+
+                grad(h, x, y) {
+                    const u = h < 8 ? x : y;
+                    const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
+                    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+                }
+
+                noise2D(x, y) {
+                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+                    x -= Math.floor(x);
+                    y -= Math.floor(y);
+                    const u = this.fade(x), v = this.fade(y);
+                    const A = this.perm[X] + Y, B = this.perm[X + 1] + Y;
+                    return this.lerp(v,
+                        this.lerp(u, this.grad(this.perm[A], x, y), this.grad(this.perm[B], x - 1, y)),
+                        this.lerp(u, this.grad(this.perm[A + 1], x, y - 1), this.grad(this.perm[B + 1], x - 1, y - 1))
+                    );
+                }
+
+                fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
+                    let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
+                    for (let i = 0; i < octaves; i++) {
+                        total += this.noise2D(x * frequency, z * frequency) * amplitude;
+                        maxValue += amplitude;
+                        amplitude *= persistence;
+                        frequency *= lacunarity;
+                    }
+                    return total / maxValue;
+                }
+
+                generateChunkData(cx, cz) {
+                    // This will be called by VoxelWorld - delegates to the existing generateChunkData function
+                    // Returns a promise for async generation
+                    return null; // Placeholder - actual implementation uses existing function
+                }
+            }
+
+            // =====================================================
+            // 4. VOXEL WORLD CLASS
+            // =====================================================
+
+            class VoxelWorld {
+                constructor(terrainGenerator, settingsManager) {
+                    this.terrainGenerator = terrainGenerator;
+                    this.settings = settingsManager;
+                    this.chunks = new Map();
+                    this.chunkMeshes = new Map();
+                    this.activeChunks = new Set();
+                    this.modifiedChunks = new Set();
+                    this.pristineChunks = new Set();
+                    this.chunkBuildQueue = [];
+                    this.queuedChunkKeys = new Set();
+                }
+
+                getChunkKey(cx, cz) {
+                    return `${cx},${cz}`;
+                }
+
+                parseChunkKey(key) {
+                    const [cx, cz] = key.split(',').map(Number);
+                    return { cx, cz };
+                }
+
+                worldToChunkCoords(x, y, z) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const cx = Math.floor(x / chunkSize);
+                    const cz = Math.floor(z / chunkSize);
+                    const lx = ((x % chunkSize) + chunkSize) % chunkSize;
+                    const ly = y + WORLD_DIMS.yOffset;
+                    const lz = ((z % chunkSize) + chunkSize) % chunkSize;
+                    return { cx, cz, lx: Math.floor(lx), ly: Math.floor(ly), lz: Math.floor(lz) };
+                }
+
+                chunkToWorldCoords(cx, cz, lx, ly, lz) {
+                    return {
+                        x: cx * WORLD_DIMS.chunkSize + lx,
+                        y: ly - WORLD_DIMS.yOffset,
+                        z: cz * WORLD_DIMS.chunkSize + lz
+                    };
+                }
+
+                ensureChunk(cx, cz) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (this.chunks.has(key)) {
+                        return this.chunks.get(key);
+                    }
+                    // Queue for generation
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0 });
+                        this.queuedChunkKeys.add(key);
+                    }
+                    return null;
+                }
+
+                getBlock(x, y, z) {
+                    const { cx, cz, lx, ly, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk) return BLOCKS.AIR;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return BLOCKS.AIR;
+
+                    const idx = lx + lz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
+                    const data = chunk.blocks || chunk;
+                    return data[idx] || BLOCKS.AIR;
+                }
+
+                setBlock(x, y, z, blockId) {
+                    const { cx, cz, lx, ly, lz } = this.worldToChunkCoords(x, y, z);
+                    const key = this.getChunkKey(cx, cz);
+                    const chunk = this.chunks.get(key);
+                    if (!chunk) return false;
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return false;
+
+                    const idx = lx + lz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
+                    const data = chunk.blocks || chunk;
+                    data[idx] = blockId;
+
+                    this.modifiedChunks.add(key);
+                    this.pristineChunks.delete(key);
+                    return true;
+                }
+
+                markChunkDirty(cx, cz) {
+                    const key = this.getChunkKey(cx, cz);
+                    if (!this.queuedChunkKeys.has(key)) {
+                        this.chunkBuildQueue.push({ key, cx, cz, dist: 0 });
+                        this.queuedChunkKeys.add(key);
+                    }
+                }
+
+                updateStreaming(playerPosition, renderDistance) {
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const playerCX = Math.floor(playerPosition.x / chunkSize);
+                    const playerCZ = Math.floor(playerPosition.z / chunkSize);
+
+                    const neededChunks = new Set();
+
+                    // Determine which chunks should be loaded
+                    for (let dx = -renderDistance; dx <= renderDistance; dx++) {
+                        for (let dz = -renderDistance; dz <= renderDistance; dz++) {
+                            const dist = Math.sqrt(dx * dx + dz * dz);
+                            if (dist <= renderDistance) {
+                                const key = this.getChunkKey(playerCX + dx, playerCZ + dz);
+                                neededChunks.add(key);
+                            }
+                        }
+                    }
+
+                    // Unload chunks that are too far
+                    for (const key of this.activeChunks) {
+                        if (!neededChunks.has(key)) {
+                            this.unloadChunk(key);
+                        }
+                    }
+
+                    // Load new chunks
+                    for (const key of neededChunks) {
+                        if (!this.activeChunks.has(key)) {
+                            const { cx, cz } = this.parseChunkKey(key);
+                            this.ensureChunk(cx, cz);
+                        }
+                    }
+
+                    this.activeChunks = neededChunks;
+                }
+
+                unloadChunk(key) {
+                    // Check if chunk can be evicted (not modified)
+                    if (this.modifiedChunks.has(key)) {
+                        return false;
+                    }
+                    this.chunks.delete(key);
+                    this.pristineChunks.delete(key);
+                    this.activeChunks.delete(key);
+                    return true;
+                }
+            }
+
+            // =====================================================
+            // 5. CHUNK MESHER CLASS
+            // =====================================================
+
+            class ChunkMesher {
+                constructor(materials) {
+                    this.materials = materials || {};
+                    this.faceVertexCache = new Map();
+                }
+
+                setMaterials(terrain, water) {
+                    this.materials.terrain = terrain;
+                    this.materials.water = water;
+                }
+
+                buildMeshForChunk(chunk, neighbors, uvMap) {
+                    // This delegates to the existing renderChunk function
+                    // The actual mesh building logic is complex and already implemented
+                    return null; // Placeholder
+                }
+
+                disposeChunkMesh(chunk) {
+                    if (chunk.mesh) {
+                        if (chunk.mesh.geometry) chunk.mesh.geometry.dispose();
+                        chunk.mesh = null;
+                    }
+                    if (chunk.waterMesh) {
+                        if (chunk.waterMesh.geometry) chunk.waterMesh.geometry.dispose();
+                        chunk.waterMesh = null;
+                    }
+                }
+            }
+
+            // =====================================================
+            // 6. RENDER ENGINE CLASS
+            // =====================================================
+
+            class RenderEngine {
+                constructor(canvas, settingsManager) {
+                    this.canvas = canvas;
+                    this.settings = settingsManager;
+
+                    this.renderer = null;
+                    this.scene = null;
+                    this.camera = null;
+
+                    // Post-processing
+                    this.composer = null;
+                    this.renderPass = null;
+                    this.zombieScarePass = null;
+
+                    // Lighting
+                    this.sun = null;
+                    this.moon = null;
+                    this.ambientLight = null;
+                    this.torchLight = null;
+
+                    // Sky
+                    this.skybox = null;
+                    this.skyMaterial = null;
+                    this.sunSprite = null;
+                    this.moonSprite = null;
+
+                    // Day/Night
+                    this.dayNightTime = 0.25;
+                }
+
+                init() {
+                    // Scene
+                    this.scene = new THREE.Scene();
+                    this.scene.matrixAutoUpdate = false;
+
+                    // Camera
+                    const fov = this.settings.get('normalFOV') || 75;
+                    this.camera = new THREE.PerspectiveCamera(fov, window.innerWidth / window.innerHeight, 0.01, 800);
+                    this.camera.layers.enable(0);
+                    this.camera.layers.enable(1);
+
+                    // Renderer
+                    this.renderer = new THREE.WebGLRenderer({ antialias: this.settings.get('antialiasing') });
+                    this.renderer.setPixelRatio(window.devicePixelRatio * (this.settings.get('pixelRatio') || 1.0));
+                    this.renderer.setSize(window.innerWidth, window.innerHeight);
+                    this.renderer.shadowMap.enabled = this.settings.get('shadows');
+                    if (this.settings.get('shadows')) {
+                        this.renderer.shadowMap.type = THREE.PCFShadowMap;
+                    }
+
+                    // Append to DOM
+                    if (this.canvas) {
+                        this.canvas.appendChild(this.renderer.domElement);
+                    } else {
+                        document.body.appendChild(this.renderer.domElement);
+                    }
+
+                    // Style renderer
+                    this.renderer.domElement.style.position = "fixed";
+                    this.renderer.domElement.style.top = "0";
+                    this.renderer.domElement.style.left = "0";
+                    this.renderer.domElement.style.zIndex = "1";
+
+                    // Lighting
+                    this.ambientLight = new THREE.AmbientLight(0xffffff, this.settings.get('ambientIntensity') || 0.5);
+                    this.scene.add(this.ambientLight);
+
+                    this.sun = new THREE.DirectionalLight(this.settings.get('sunColor') || 0xfce7bb, 1);
+                    this.sun.castShadow = this.settings.get('shadows');
+                    this.scene.add(this.sun);
+
+                    this.moon = new THREE.DirectionalLight(this.settings.get('moonColor') || 0x8899ff, 0.2);
+                    this.moon.castShadow = this.settings.get('shadows');
+                    this.scene.add(this.moon);
+
+                    return this;
+                }
+
+                initPostProcessing() {
+                    this.composer = new EffectComposer(this.renderer);
+                    this.renderPass = new RenderPass(this.scene, this.camera);
+                    this.composer.addPass(this.renderPass);
+
+                    // Zombie scare shader would be added here
+                    return this;
+                }
+
+                applySettings() {
+                    if (!this.renderer) return;
+
+                    this.renderer.shadowMap.enabled = this.settings.get('shadows');
+
+                    if (this.sun) {
+                        this.sun.color.setHex(this.settings.get('sunColor') || 0xfce7bb);
+                        this.sun.intensity = this.settings.get('sunIntensity') || 0.8;
+                    }
+                    if (this.moon) {
+                        this.moon.color.setHex(this.settings.get('moonColor') || 0x8899ff);
+                        this.moon.intensity = this.settings.get('moonIntensity') || 0.15;
+                    }
+                    if (this.ambientLight) {
+                        this.ambientLight.intensity = this.settings.get('ambientIntensity') || 0.5;
+                    }
+                }
+
+                resize(width, height) {
+                    this.camera.aspect = width / height;
+                    this.camera.updateProjectionMatrix();
+                    this.renderer.setSize(width, height);
+                    if (this.composer) {
+                        this.composer.setSize(width, height);
+                    }
+                }
+
+                render(delta) {
+                    if (this.composer) {
+                        this.composer.render(delta);
+                    } else if (this.renderer && this.scene && this.camera) {
+                        this.renderer.render(this.scene, this.camera);
+                    }
+                }
+
+                updateZombieEffectUniforms(distanceToClosestZombie) {
+                    if (!this.zombieScarePass) return;
+
+                    const maxDist = 28; // ZOMBIE_CONFIG.detectionRadius
+                    const proximity = distanceToClosestZombie < maxDist
+                        ? 1.0 - (distanceToClosestZombie / maxDist)
+                        : 0;
+
+                    this.zombieScarePass.uniforms.zombieProximity.value = proximity;
+                }
+            }
+
+            // =====================================================
+            // 7. AUDIO MANAGER CLASS
+            // =====================================================
+
+            class AudioManager {
+                constructor(settingsManager) {
+                    this.settings = settingsManager;
+                    this.ctx = null;
+                    this.enabled = true;
+                    this.masterVolume = 0.3;
+                    this.sounds = new Map();
+                    this.bufferCache = new Map();
+                }
+
+                initContext() {
+                    if (!this.ctx) {
+                        this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    return this.ctx;
+                }
+
+                async loadSound(name, base64Data) {
+                    const ctx = this.initContext();
+
+                    if (this.bufferCache.has(name)) {
+                        return this.bufferCache.get(name);
+                    }
+
+                    try {
+                        const binaryString = atob(base64Data);
+                        const bytes = new Uint8Array(binaryString.length);
+                        for (let i = 0; i < binaryString.length; i++) {
+                            bytes[i] = binaryString.charCodeAt(i);
+                        }
+
+                        const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+                        this.bufferCache.set(name, audioBuffer);
+                        return audioBuffer;
+                    } catch (e) {
+                        console.warn(`[AudioManager] Failed to load sound '${name}':`, e);
+                        return null;
+                    }
+                }
+
+                play(name, options = {}) {
+                    if (!this.enabled || !this.ctx) return;
+
+                    const buffer = this.bufferCache.get(name);
+                    if (!buffer) return;
+
+                    const source = this.ctx.createBufferSource();
+                    source.buffer = buffer;
+
+                    const gainNode = this.ctx.createGain();
+                    gainNode.gain.value = (options.volume || 1.0) * this.masterVolume;
+
+                    source.connect(gainNode);
+                    gainNode.connect(this.ctx.destination);
+
+                    if (options.playbackRate) {
+                        source.playbackRate.value = options.playbackRate;
+                    }
+
+                    source.start(0);
+                }
+
+                playClick() {
+                    // Generate and play a click sound
+                    if (!this.enabled) return;
+                    this.initContext();
+
+                    const oscillator = this.ctx.createOscillator();
+                    const gainNode = this.ctx.createGain();
+
+                    oscillator.type = 'sine';
+                    oscillator.frequency.setValueAtTime(800, this.ctx.currentTime);
+                    oscillator.frequency.exponentialRampToValueAtTime(400, this.ctx.currentTime + 0.05);
+
+                    gainNode.gain.setValueAtTime(this.masterVolume * 0.3, this.ctx.currentTime);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
+
+                    oscillator.connect(gainNode);
+                    gainNode.connect(this.ctx.destination);
+
+                    oscillator.start();
+                    oscillator.stop(this.ctx.currentTime + 0.05);
+                }
+
+                playBlockPlace() {
+                    this.playClick(); // Simplified
+                }
+
+                playBlockBreak() {
+                    this.playClick(); // Simplified
+                }
+
+                setEnabled(enabled) {
+                    this.enabled = enabled;
+                }
+
+                setVolume(volume) {
+                    this.masterVolume = Math.max(0, Math.min(1, volume));
+                }
+            }
+
+            // =====================================================
+            // 8. ENTITY MANAGER & MOB CLASSES
+            // =====================================================
+
+            class EntityManager {
+                constructor() {
+                    this.entities = new Set();
+                    this.pools = new Map();
+                }
+
+                add(entity) {
+                    this.entities.add(entity);
+                    return entity;
+                }
+
+                remove(entity) {
+                    this.entities.delete(entity);
+                }
+
+                update(delta) {
+                    for (const entity of this.entities) {
+                        if (entity.update) {
+                            entity.update(delta);
+                        }
+                    }
+                }
+
+                getByType(type) {
+                    const result = [];
+                    for (const entity of this.entities) {
+                        if (entity instanceof type) {
+                            result.push(entity);
+                        }
+                    }
+                    return result;
+                }
+
+                clear() {
+                    this.entities.clear();
+                }
+            }
+
+            class Mob {
+                constructor() {
+                    this.position = new THREE.Vector3();
+                    this.velocity = new THREE.Vector3();
+                    this.rotation = new THREE.Euler();
+                    this.health = 20;
+                    this.maxHealth = 20;
+                    this.state = 'idle';
+                    this.mesh = null;
+                }
+
+                update(delta) {
+                    // Base mob update - apply velocity
+                    this.position.addScaledVector(this.velocity, delta);
+                }
+
+                damage(amount) {
+                    this.health = Math.max(0, this.health - amount);
+                    return this.health <= 0;
+                }
+
+                heal(amount) {
+                    this.health = Math.min(this.maxHealth, this.health + amount);
+                }
+
+                dispose() {
+                    if (this.mesh && this.mesh.parent) {
+                        this.mesh.parent.remove(this.mesh);
+                    }
+                }
+            }
+
+            class Zombie extends Mob {
+                constructor() {
+                    super();
+                    this.type = 'zombie';
+                    this.state = 'wander';
+                    this.target = null;
+                    this.attackCooldown = 0;
+                    this.wanderTimer = 0;
+                    this.wanderDirection = new THREE.Vector3();
+                    this.walkSpeed = 2.4;
+                    this.chaseSpeed = 4.8;
+                    this.attackRange = 2.5;
+                    this.detectionRadius = 28;
+                }
+
+                update(delta) {
+                    // Update attack cooldown
+                    if (this.attackCooldown > 0) {
+                        this.attackCooldown -= delta;
+                    }
+
+                    // State machine
+                    switch (this.state) {
+                        case 'wander':
+                            this.updateWander(delta);
+                            break;
+                        case 'chase':
+                            this.updateChase(delta);
+                            break;
+                        case 'attack':
+                            this.updateAttack(delta);
+                            break;
+                    }
+
+                    super.update(delta);
+                }
+
+                updateWander(delta) {
+                    this.wanderTimer -= delta;
+                    if (this.wanderTimer <= 0) {
+                        // Pick new random direction
+                        const angle = Math.random() * Math.PI * 2;
+                        this.wanderDirection.set(Math.cos(angle), 0, Math.sin(angle));
+                        this.wanderTimer = 2 + Math.random() * 3;
+                    }
+
+                    this.velocity.copy(this.wanderDirection).multiplyScalar(this.walkSpeed);
+                }
+
+                updateChase(delta) {
+                    if (!this.target) {
+                        this.state = 'wander';
+                        return;
+                    }
+
+                    const direction = new THREE.Vector3()
+                        .subVectors(this.target.position || this.target, this.position)
+                        .normalize();
+
+                    this.velocity.copy(direction).multiplyScalar(this.chaseSpeed);
+
+                    // Check if close enough to attack
+                    const dist = this.position.distanceTo(this.target.position || this.target);
+                    if (dist < this.attackRange) {
+                        this.state = 'attack';
+                    }
+                }
+
+                updateAttack(delta) {
+                    this.velocity.set(0, 0, 0);
+
+                    if (this.attackCooldown <= 0) {
+                        // Perform attack
+                        this.attackCooldown = 1.2;
+                        // Attack logic would go here
+                    }
+
+                    // Return to chase if target moved away
+                    if (this.target) {
+                        const dist = this.position.distanceTo(this.target.position || this.target);
+                        if (dist > this.attackRange * 1.5) {
+                            this.state = 'chase';
+                        }
+                    }
+                }
+
+                setTarget(target) {
+                    this.target = target;
+                    if (target) {
+                        this.state = 'chase';
+                    } else {
+                        this.state = 'wander';
+                    }
+                }
+            }
+
+            // =====================================================
+            // 9. PLAYER CONTROLLER CLASS
+            // =====================================================
+
+            class PlayerController {
+                constructor(camera, inputManager, voxelWorld, settingsManager) {
+                    this.camera = camera;
+                    this.input = inputManager;
+                    this.world = voxelWorld;
+                    this.settings = settingsManager;
+
+                    this.position = new THREE.Vector3();
+                    this.velocity = new THREE.Vector3();
+                    this.yaw = 0;
+                    this.pitch = 0;
+
+                    // Movement state
+                    this.isFlying = false;
+                    this.isSprinting = false;
+                    this.isCrouching = false;
+                    this.canJump = false;
+                    this.flyUp = false;
+                    this.flyDown = false;
+
+                    // Eye height
+                    this.standingEyeHeight = 1.8;
+                    this.crouchingEyeHeight = 1.4;
+                    this.eyeHeight = this.standingEyeHeight;
+
+                    // Double-tap flying
+                    this.lastSpaceTime = 0;
+
+                    // Selected block
+                    this.selectedBlockId = BLOCKS.GRASS;
+                    this.hotbarSlot = 1;
+
+                    // Torch
+                    this.torchActive = false;
+
+                    // Raycaster for block interaction
+                    this.raycaster = new THREE.Raycaster();
+                }
+
+                update(delta) {
+                    this.handleMovement(delta);
+                    this.updateCamera();
+                }
+
+                handleMovement(delta) {
+                    const speed = this.settings.get('playerSpeed') || 50;
+                    const sprintMult = this.settings.get('sprintMultiplier') || 2.0;
+                    const crouchMult = this.settings.get('crouchMultiplier') || 0.5;
+                    const flyMult = this.settings.get('flySpeedMultiplier') || 4.0;
+                    const gravity = this.settings.get('gravity') || 30;
+                    const jumpForce = this.settings.get('jumpForce') || 10;
+
+                    // Calculate movement direction
+                    const direction = new THREE.Vector3();
+
+                    const forward = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(0, this.yaw, 0));
+                    const right = new THREE.Vector3(1, 0, 0).applyEuler(new THREE.Euler(0, this.yaw, 0));
+
+                    if (this.input.isKeyDown('KeyW') || this.input.isKeyDown('ArrowUp')) direction.add(forward);
+                    if (this.input.isKeyDown('KeyS') || this.input.isKeyDown('ArrowDown')) direction.sub(forward);
+                    if (this.input.isKeyDown('KeyD') || this.input.isKeyDown('ArrowRight')) direction.add(right);
+                    if (this.input.isKeyDown('KeyA') || this.input.isKeyDown('ArrowLeft')) direction.sub(right);
+
+                    // Normalize and scale
+                    if (direction.lengthSq() > 0) {
+                        direction.normalize();
+                        let currentSpeed = speed;
+                        if (this.isFlying) currentSpeed *= flyMult;
+                        else if (this.isSprinting) currentSpeed *= sprintMult;
+                        else if (this.isCrouching) currentSpeed *= crouchMult;
+                        direction.multiplyScalar(currentSpeed * delta);
+                    }
+
+                    // Apply horizontal movement
+                    this.velocity.x = direction.x / delta;
+                    this.velocity.z = direction.z / delta;
+
+                    // Vertical movement
+                    if (this.isFlying) {
+                        if (this.flyUp) this.velocity.y = speed * flyMult;
+                        else if (this.flyDown) this.velocity.y = -speed * flyMult;
+                        else this.velocity.y = 0;
+                    } else {
+                        // Apply gravity
+                        this.velocity.y -= gravity * delta;
+
+                        // Jump
+                        if (this.canJump && this.input.isKeyDown('Space')) {
+                            this.velocity.y = jumpForce;
+                            this.canJump = false;
+                        }
+                    }
+
+                    // Update position
+                    this.position.addScaledVector(this.velocity, delta);
+
+                    // Eye height
+                    this.eyeHeight = this.isCrouching ? this.crouchingEyeHeight : this.standingEyeHeight;
+                }
+
+                updateCamera() {
+                    if (this.camera) {
+                        this.camera.position.copy(this.position);
+                        this.camera.position.y += this.eyeHeight;
+                    }
+                }
+
+                handleBlockInteraction(hit, button) {
+                    if (!hit) return;
+
+                    const { x, y, z, face } = hit;
+
+                    if (button === 0) {
+                        // Break block
+                        if (this.world.getBlock(x, y, z) !== BLOCKS.BEDROCK) {
+                            this.world.setBlock(x, y, z, BLOCKS.AIR);
+                            return { type: 'break', x, y, z };
+                        }
+                    } else if (button === 2 && face) {
+                        // Place block
+                        const nx = x + face[0];
+                        const ny = y + face[1];
+                        const nz = z + face[2];
+
+                        // Check player collision
+                        if (!this.wouldCollideWithPlayer(nx, ny, nz)) {
+                            this.world.setBlock(nx, ny, nz, this.selectedBlockId);
+                            return { type: 'place', x: nx, y: ny, z: nz, blockId: this.selectedBlockId };
+                        }
+                    }
+                    return null;
+                }
+
+                wouldCollideWithPlayer(bx, by, bz) {
+                    const px = this.position.x;
+                    const py = this.position.y;
+                    const pz = this.position.z;
+                    const playerBox = {
+                        minX: px - 0.4, maxX: px + 0.4,
+                        minY: py - 1.5, maxY: py + 0.3,
+                        minZ: pz - 0.4, maxZ: pz + 0.4
+                    };
+                    const blockBox = {
+                        minX: bx, maxX: bx + 1,
+                        minY: by, maxY: by + 1,
+                        minZ: bz, maxZ: bz + 1
+                    };
+                    return !(playerBox.maxX <= blockBox.minX || playerBox.minX >= blockBox.maxX ||
+                             playerBox.maxY <= blockBox.minY || playerBox.minY >= blockBox.maxY ||
+                             playerBox.maxZ <= blockBox.minZ || playerBox.minZ >= blockBox.maxZ);
+                }
+
+                setHotbarSlot(slot) {
+                    this.hotbarSlot = slot;
+                    const slotToBlock = [BLOCKS.GRASS, BLOCKS.DIRT, BLOCKS.STONE, BLOCKS.WOOD,
+                                        BLOCKS.LOG, BLOCKS.LEAVES, BLOCKS.SAND, BLOCKS.WATER, BLOCKS.TORCH];
+                    this.selectedBlockId = slotToBlock[slot - 1] || BLOCKS.GRASS;
+                }
+
+                toggleFly() {
+                    this.isFlying = !this.isFlying;
+                    if (this.isFlying) {
+                        this.velocity.y = 0;
+                    }
+                }
+
+                toggleTorch() {
+                    this.torchActive = !this.torchActive;
+                }
+            }
+
+            // =====================================================
+            // 10. UI MANAGER CLASS
+            // =====================================================
+
+            class UIManager {
+                constructor(settingsManager, audioManager, voxelWorld) {
+                    this.settings = settingsManager;
+                    this.audio = audioManager;
+                    this.world = voxelWorld;
+
+                    // DOM element cache
+                    this.elements = {};
+                }
+
+                init() {
+                    // Cache common DOM elements
+                    this.elements = {
+                        seedMenu: document.getElementById('seed-menu'),
+                        blocker: document.getElementById('blocker'),
+                        instructions: document.getElementById('instructions'),
+                        mainPauseMenu: document.getElementById('main-pause-menu'),
+                        settingsMenu: document.getElementById('settings-menu'),
+                        controlsMenu: document.getElementById('controls-menu'),
+                        crosshair: document.getElementById('crosshair'),
+                        hotbar: document.getElementById('hotbar'),
+                        blockNameDisplay: document.getElementById('block-name-display'),
+                        flightIndicator: document.getElementById('flight-indicator'),
+                        sprintIndicator: document.getElementById('sprint-indicator'),
+                        crouchIndicator: document.getElementById('crouch-indicator'),
+                        debugOverlay: document.getElementById('debug-overlay')
+                    };
+
+                    // Initialize button audio
+                    this.initButtonAudio();
+                }
+
+                initButtonAudio() {
+                    const buttons = document.querySelectorAll('button');
+                    buttons.forEach(button => {
+                        button.addEventListener('click', () => {
+                            if (this.audio) this.audio.playClick();
+                        }, { capture: true });
+                    });
+                }
+
+                showSeedMenu() {
+                    this.setHUDVisible(false);
+                    if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'block';
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                }
+
+                hideSeedMenu() {
+                    if (this.elements.seedMenu) this.elements.seedMenu.style.display = 'none';
+                }
+
+                showPauseMenu() {
+                    this.setHUDVisible(false);
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'flex';
+                    if (this.elements.mainPauseMenu) this.elements.mainPauseMenu.style.display = 'block';
+                    if (this.elements.settingsMenu) this.elements.settingsMenu.style.display = 'none';
+                    if (this.elements.controlsMenu) this.elements.controlsMenu.style.display = 'none';
+                }
+
+                hidePauseMenu() {
+                    if (this.elements.blocker) this.elements.blocker.style.display = 'none';
+                    this.setHUDVisible(true);
+                }
+
+                setHUDVisible(visible) {
+                    const display = visible ? 'block' : 'none';
+                    if (this.elements.crosshair) this.elements.crosshair.style.display = display;
+                    if (this.elements.hotbar) this.elements.hotbar.style.display = visible ? 'flex' : 'none';
+                    if (this.elements.blockNameDisplay) this.elements.blockNameDisplay.style.display = display;
+                }
+
+                updateHotbar(selectedSlot) {
+                    document.querySelectorAll('.slot').forEach(s => s.classList.remove('active'));
+                    const slot = document.getElementById('slot-' + selectedSlot);
+                    if (slot) slot.classList.add('active');
+                    this.updateBlockNameDisplay(selectedSlot);
+                }
+
+                updateBlockNameDisplay(slotNumber) {
+                    const blockNames = ['Grass Block', 'Dirt Block', 'Stone Block', 'Wood Planks',
+                                       'Log Block', 'Leaves', 'Sand Block', 'Water', 'Torch'];
+                    if (this.elements.blockNameDisplay) {
+                        this.elements.blockNameDisplay.textContent = blockNames[slotNumber - 1] || '';
+                    }
+                }
+
+                updateMovementIndicators(state) {
+                    if (this.elements.flightIndicator) {
+                        this.elements.flightIndicator.style.display = state.isFlying ? 'flex' : 'none';
+                    }
+                    if (this.elements.sprintIndicator) {
+                        this.elements.sprintIndicator.style.display =
+                            state.isSprinting && !state.isFlying ? 'flex' : 'none';
+                    }
+                    if (this.elements.crouchIndicator) {
+                        this.elements.crouchIndicator.style.display =
+                            state.isCrouching && !state.isFlying ? 'flex' : 'none';
+                    }
+                }
+
+                updateDebugOverlay(info) {
+                    if (this.elements.debugOverlay && info.visible) {
+                        this.elements.debugOverlay.style.display = 'block';
+                        this.elements.debugOverlay.textContent =
+                            `FPS: ${info.fps}\n` +
+                            `Pos: ${info.position}\n` +
+                            `Chunks: ${info.chunks}`;
+                    } else if (this.elements.debugOverlay) {
+                        this.elements.debugOverlay.style.display = 'none';
+                    }
+                }
+            }
+
+            // =====================================================
+            // 11. VOXEX GAME ORCHESTRATOR CLASS
+            // =====================================================
+
+            class VoxExGame {
+                constructor(canvas) {
+                    this.canvas = canvas;
+
+                    // Initialize managers with existing config objects
+                    this.settings = new SettingsManager(DEFAULTS);
+                    this.input = new InputManager(document.body);
+                    this.audio = new AudioManager(this.settings);
+                    this.renderEngine = new RenderEngine(null, this.settings);
+
+                    this.terrainGenerator = new TerrainGenerator(
+                        { ...WORLD_CONFIG, biomes: [] },
+                        BIOME_CONFIG,
+                        TREE_CONFIG
+                    );
+                    this.voxelWorld = new VoxelWorld(this.terrainGenerator, this.settings);
+                    this.chunkMesher = new ChunkMesher();
+
+                    this.entities = new EntityManager();
+                    this.ui = new UIManager(this.settings, this.audio, this.voxelWorld);
+
+                    this.playerController = null;
+
+                    // Loop state
+                    this.running = false;
+                    this.lastTime = 0;
+                    this.frameCount = 0;
+
+                    // FPS tracking
+                    this.fpsInstant = 0;
+                    this.fpsAvg = 0;
+                    this.fpsSamples = [];
+                }
+
+                init() {
+                    // Load settings from localStorage
+                    this.settings.loadFromStorage();
+
+                    // Initialize subsystems
+                    this.input.init();
+                    this.audio.initContext();
+                    this.ui.init();
+
+                    // Note: renderEngine.init() should be called after seed selection
+                    // when the actual game starts
+
+                    return this;
+                }
+
+                initWithSeed(seed) {
+                    // Initialize terrain generator with seed
+                    this.terrainGenerator.worldConfig.seed = typeof seed === 'string'
+                        ? this.hashSeed(seed)
+                        : seed;
+
+                    // Build biome configuration
+                    this.terrainGenerator.worldConfig.biomes = [
+                        { name: 'plains', ...BIOME_CONFIG.plains },
+                        { name: 'hills', ...BIOME_CONFIG.hills },
+                        { name: 'forests', ...BIOME_CONFIG.forests },
+                        { name: 'mountains', ...BIOME_CONFIG.mountains },
+                        { name: 'swamp', ...BIOME_CONFIG.swamp }
+                    ];
+
+                    this.terrainGenerator.init(this.terrainGenerator.worldConfig.seed);
+
+                    // Initialize render engine
+                    this.renderEngine.init();
+                    this.renderEngine.initPostProcessing();
+
+                    // Create player controller
+                    this.playerController = new PlayerController(
+                        this.renderEngine.camera,
+                        this.input,
+                        this.voxelWorld,
+                        this.settings
+                    );
+
+                    // Apply settings to render
+                    this.renderEngine.applySettings();
+
+                    return this;
+                }
+
+                hashSeed(str) {
+                    let hash = 0xdeadbeef;
+                    for (let i = 0; i < str.length; i++) {
+                        hash = Math.imul(hash ^ str.charCodeAt(i), 2654435761);
+                        hash = (hash ^ (hash >>> 16)) >>> 0;
+                    }
+                    return hash;
+                }
+
+                start() {
+                    if (this.running) return;
+                    this.running = true;
+                    this.lastTime = performance.now();
+                    requestAnimationFrame(this.loop.bind(this));
+                }
+
+                stop() {
+                    this.running = false;
+                }
+
+                loop(time) {
+                    if (!this.running) return;
+
+                    const dt = (time - this.lastTime) / 1000;
+                    this.lastTime = time;
+
+                    this.update(dt);
+                    this.render(dt);
+
+                    this.frameCount++;
+                    requestAnimationFrame(this.loop.bind(this));
+                }
+
+                update(delta) {
+                    // Update FPS
+                    this.fpsInstant = 1 / delta;
+                    this.fpsSamples.push(this.fpsInstant);
+                    if (this.fpsSamples.length > 60) this.fpsSamples.shift();
+                    this.fpsAvg = this.fpsSamples.reduce((a, b) => a + b, 0) / this.fpsSamples.length;
+
+                    // Update player
+                    if (this.playerController) {
+                        this.playerController.update(delta);
+                    }
+
+                    // Update entities
+                    this.entities.update(delta);
+
+                    // Update chunk streaming
+                    if (this.playerController && this.voxelWorld) {
+                        this.voxelWorld.updateStreaming(
+                            this.playerController.position,
+                            this.settings.get('renderDistance')
+                        );
+                    }
+
+                    // Update UI indicators
+                    if (this.playerController && this.ui) {
+                        this.ui.updateMovementIndicators({
+                            isFlying: this.playerController.isFlying,
+                            isSprinting: this.playerController.isSprinting,
+                            isCrouching: this.playerController.isCrouching
+                        });
+                    }
+                }
+
+                render(delta) {
+                    this.renderEngine.render(delta);
+                }
+
+                // Utility methods for external access
+                getPlayer() {
+                    return this.playerController;
+                }
+
+                getWorld() {
+                    return this.voxelWorld;
+                }
+
+                getSettings() {
+                    return this.settings;
+                }
+            }
+
+            // =====================================================
+            // EXPOSE CLASSES GLOBALLY FOR BACKWARDS COMPATIBILITY
+            // =====================================================
+            window.VoxExClasses = {
+                SettingsManager,
+                InputManager,
+                TerrainGenerator,
+                VoxelWorld,
+                ChunkMesher,
+                RenderEngine,
+                AudioManager,
+                EntityManager,
+                Mob,
+                Zombie,
+                PlayerController,
+                UIManager,
+                VoxExGame,
+                BLOCKS
+            };
+
+            // =====================================================
+            // END OF CLASS DEFINITIONS
+            // =====================================================
+
             let currentRenderRadius = SETTINGS.renderDistance;
             let fogFar = SETTINGS.renderDistance * WORLD_DIMS.chunkSize;
             let lastFogFar = -1;
