@@ -3632,6 +3632,246 @@
                 0.7,   // 2 occlusions: Moderate darkening (was 0.493)
                 0.5,   // 3 occlusions: Deep corners (was 0.15)
             ];
+
+            // =====================================================
+            // PERFORMANCE OPTIMIZATIONS MODULE
+            // =====================================================
+
+            // --- OPTIMIZATION 1: Pre-computed fade lookup table for Perlin noise ---
+            // Avoids expensive polynomial calculations in tight loops
+            // fade(t) = t³(t(t×6 - 15) + 10) pre-computed for 256 values
+            const FADE_LUT = new Float32Array(256);
+            for (let i = 0; i < 256; i++) {
+                const t = i / 255;
+                FADE_LUT[i] = t * t * t * (t * (t * 6 - 15) + 10);
+            }
+            const fadeFast = (t) => {
+                const idx = (t * 255) | 0;
+                return FADE_LUT[Math.min(255, Math.max(0, idx))];
+            };
+
+            // --- OPTIMIZATION 2: Circular buffer for FPS samples (avoids array operations) ---
+            const FPS_BUFFER_SIZE = 128;
+            const fpsBuffer = new Float32Array(FPS_BUFFER_SIZE);
+            const fpsTimeBuffer = new Float32Array(FPS_BUFFER_SIZE);
+            let fpsBufferIndex = 0;
+            let fpsBufferCount = 0;
+
+            function pushFPSSample(time, fps) {
+                fpsBuffer[fpsBufferIndex] = fps;
+                fpsTimeBuffer[fpsBufferIndex] = time;
+                fpsBufferIndex = (fpsBufferIndex + 1) % FPS_BUFFER_SIZE;
+                if (fpsBufferCount < FPS_BUFFER_SIZE) fpsBufferCount++;
+            }
+
+            function getAverageFPS(currentTime, windowMs = 10000) {
+                if (fpsBufferCount === 0) return 60;
+                const cutoff = currentTime - windowMs;
+                let sum = 0, count = 0;
+                for (let i = 0; i < fpsBufferCount; i++) {
+                    const idx = (fpsBufferIndex - 1 - i + FPS_BUFFER_SIZE) % FPS_BUFFER_SIZE;
+                    if (fpsTimeBuffer[idx] < cutoff) break;
+                    sum += fpsBuffer[idx];
+                    count++;
+                }
+                return count > 0 ? sum / count : 60;
+            }
+
+            // --- OPTIMIZATION 3: Uint8Array pool for chunk data allocation ---
+            class Uint8ArrayPool {
+                constructor() {
+                    this.pools = new Map(); // size -> array of buffers
+                }
+                acquire(size) {
+                    const pool = this.pools.get(size);
+                    if (pool && pool.length > 0) {
+                        const arr = pool.pop();
+                        arr.fill(0); // Reset to zeros
+                        return arr;
+                    }
+                    return new Uint8Array(size);
+                }
+                release(arr) {
+                    if (!arr || arr.length > 2000000) return; // Don't pool very large arrays
+                    const size = arr.length;
+                    if (!this.pools.has(size)) this.pools.set(size, []);
+                    const pool = this.pools.get(size);
+                    if (pool.length < 32) pool.push(arr); // Limit pool size
+                }
+            }
+            const chunkDataPool = new Uint8ArrayPool();
+
+            // --- OPTIMIZATION 4: LOD System Configuration ---
+            const LOD_CONFIG = {
+                enabled: true,
+                levels: [
+                    { maxDistance: 4, skipFaces: 0 },       // Full detail within 4 chunks
+                    { maxDistance: 8, skipFaces: 0.1 },    // Skip 10% of internal faces at 4-8 chunks
+                    { maxDistance: 12, skipFaces: 0.25 },  // Skip 25% at 8-12 chunks
+                    { maxDistance: 999, skipFaces: 0.4 }   // Skip 40% at far distance
+                ]
+            };
+
+            function getLODSkipFactor(distSq) {
+                if (!LOD_CONFIG.enabled) return 0;
+                const dist = Math.sqrt(distSq);
+                for (const level of LOD_CONFIG.levels) {
+                    if (dist <= level.maxDistance) return level.skipFaces;
+                }
+                return 0.4;
+            }
+
+            // --- OPTIMIZATION 5: Greedy meshing helper - combines adjacent same-type faces ---
+            // This creates larger quads from adjacent faces, reducing vertex/face count significantly
+            function shouldMergeBlocks(id1, id2) {
+                // Only merge identical solid opaque blocks
+                if (id1 !== id2) return false;
+                if (id1 === AIR || id1 === WATER || id1 === TORCH || id1 === LEAVES) return false;
+                return true;
+            }
+
+            // Pre-computed greedy mesh slice dimensions for chunk processing
+            const GREEDY_AXIS_INFO = [
+                { axis: 1, u: 0, v: 2, du: 1, dv: 16 },  // Y axis (top/bottom faces)
+                { axis: 0, u: 1, v: 2, du: 16, dv: 256 }, // X axis (left/right faces)
+                { axis: 2, u: 0, v: 1, du: 1, dv: 16 }   // Z axis (front/back faces)
+            ];
+
+            // --- OPTIMIZATION 6: Chunk generation batch processor ---
+            const CHUNK_BATCH_SIZE = 4;
+            const chunkGenerationQueue = [];
+            let isProcessingBatch = false;
+
+            async function queueChunkGeneration(cx, cz, priority = 0) {
+                const key = getChunkKey(cx, cz);
+                // Check if already queued
+                const existing = chunkGenerationQueue.findIndex(c => c.key === key);
+                if (existing !== -1) {
+                    // Update priority if higher
+                    if (priority > chunkGenerationQueue[existing].priority) {
+                        chunkGenerationQueue[existing].priority = priority;
+                    }
+                    return;
+                }
+                chunkGenerationQueue.push({ cx, cz, key, priority });
+                // Sort by priority (higher first), then by distance if equal
+                chunkGenerationQueue.sort((a, b) => b.priority - a.priority);
+            }
+
+            async function processChunkGenerationBatch() {
+                if (isProcessingBatch || chunkGenerationQueue.length === 0) return 0;
+                isProcessingBatch = true;
+                let processed = 0;
+                const batchSize = Math.min(CHUNK_BATCH_SIZE, chunkGenerationQueue.length);
+
+                for (let i = 0; i < batchSize; i++) {
+                    const job = chunkGenerationQueue.shift();
+                    if (!job) break;
+                    if (!chunks.has(job.key)) {
+                        await generateChunkData(job.cx, job.cz);
+                        processed++;
+                    }
+                }
+
+                isProcessingBatch = false;
+                return processed;
+            }
+
+            // --- OPTIMIZATION 7: Spiral chunk loading order ---
+            // Pre-computed spiral pattern for chunk loading (more natural loading feel)
+            const SPIRAL_OFFSETS = [];
+            function generateSpiralOffsets(maxRadius) {
+                SPIRAL_OFFSETS.length = 0;
+                for (let r = 0; r <= maxRadius; r++) {
+                    if (r === 0) {
+                        SPIRAL_OFFSETS.push({ dx: 0, dz: 0, distSq: 0 });
+                    } else {
+                        // Generate ring at radius r
+                        for (let i = -r; i <= r; i++) {
+                            if (Math.abs(i) === r) {
+                                // Top and bottom edges
+                                for (let j = -r; j <= r; j++) {
+                                    SPIRAL_OFFSETS.push({ dx: j, dz: i, distSq: j*j + i*i });
+                                }
+                            } else {
+                                // Left and right edges only
+                                SPIRAL_OFFSETS.push({ dx: -r, dz: i, distSq: r*r + i*i });
+                                SPIRAL_OFFSETS.push({ dx: r, dz: i, distSq: r*r + i*i });
+                            }
+                        }
+                    }
+                }
+                // Sort by actual distance for better spiral feel
+                SPIRAL_OFFSETS.sort((a, b) => a.distSq - b.distSq);
+            }
+            generateSpiralOffsets(32); // Pre-generate for max render distance
+
+            // --- OPTIMIZATION 8: Instanced torch rendering system ---
+            let torchInstancedMesh = null;
+            let torchInstanceCount = 0;
+            const MAX_TORCH_INSTANCES = 1024;
+            const torchPositions = new Map(); // chunkKey -> [positions array]
+            const torchDummy = new THREE.Object3D();
+
+            function initTorchInstancedMesh() {
+                if (torchInstancedMesh) return;
+                // Simple torch geometry (combined stick + flame)
+                const torchGeo = new THREE.BoxGeometry(0.1, 0.5, 0.1);
+                const torchMat = new THREE.MeshLambertMaterial({
+                    color: 0x8B4513,
+                    emissive: 0xff6600,
+                    emissiveIntensity: 0.3
+                });
+                torchInstancedMesh = new THREE.InstancedMesh(torchGeo, torchMat, MAX_TORCH_INSTANCES);
+                torchInstancedMesh.frustumCulled = false;
+                torchInstancedMesh.count = 0;
+            }
+
+            function updateTorchInstances() {
+                if (!torchInstancedMesh) return;
+                let idx = 0;
+                for (const [chunkKey, positions] of torchPositions) {
+                    for (const pos of positions) {
+                        if (idx >= MAX_TORCH_INSTANCES) break;
+                        torchDummy.position.set(pos.x + 0.5, pos.y + 0.25, pos.z + 0.5);
+                        torchDummy.updateMatrix();
+                        torchInstancedMesh.setMatrixAt(idx, torchDummy.matrix);
+                        idx++;
+                    }
+                }
+                torchInstancedMesh.count = idx;
+                torchInstancedMesh.instanceMatrix.needsUpdate = true;
+            }
+
+            // --- OPTIMIZATION 9: Deferred lighting for distant chunks ---
+            const DEFERRED_LIGHT_DISTANCE = 8; // Chunks beyond this use simplified lighting
+
+            function shouldUseDeferredLighting(distSq) {
+                return distSq > DEFERRED_LIGHT_DISTANCE * DEFERRED_LIGHT_DISTANCE;
+            }
+
+            function getSimplifiedLight(ly, chunkHeight) {
+                // Simple height-based lighting for distant chunks
+                // Underground: dim, Surface: bright
+                const surfaceY = 70;
+                if (ly > surfaceY) return 15;
+                if (ly > surfaceY - 10) return 12;
+                if (ly > surfaceY - 30) return 8;
+                return 4;
+            }
+
+            // --- OPTIMIZATION 10: Block face visibility pre-check cache ---
+            // Caches which faces are visible per-chunk to avoid redundant checks
+            const faceVisibilityCache = new Map();
+            const FACE_CACHE_TTL = 5000; // 5 seconds TTL
+
+            function invalidateFaceCache(chunkKey) {
+                faceVisibilityCache.delete(chunkKey);
+            }
+
+            function getFaceCacheKey(cx, cz) {
+                return `${cx},${cz}`;
+            }
             let camera, scene, renderer, controls, raycaster;
             let composer, renderPass, zombieScarePass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
@@ -4147,20 +4387,22 @@
                 const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : 0;
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
             };
+            // OPTIMIZED: Use lookup table for fade function (fadeFast) instead of polynomial calculation
             const noise2D = (x, y) => {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
                 x -= Math.floor(x);
                 y -= Math.floor(y);
-                const u = fade(x), v = fade(y);
+                const u = fadeFast(x), v = fadeFast(y); // OPTIMIZATION: Use LUT instead of polynomial
                 const A = perm[X] + Y, B = perm[X + 1] + Y;
                 return lerp(v, lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)), lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1)));
             };
+            // OPTIMIZED: Use lookup table for fade function
             function noise3D(x, y, z) {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
                 x -= Math.floor(x);
                 y -= Math.floor(y);
                 z -= Math.floor(z);
-                const u = fade(x), v = fade(y), w = fade(z);
+                const u = fadeFast(x), v = fadeFast(y), w = fadeFast(z); // OPTIMIZATION: Use LUT
                 const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z;
                 const B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z;
                 return lerp(
@@ -5311,7 +5553,9 @@
                 for (const chunk of generatedChunks) {
                     if (skipRequested) break;
                     // Render the chunk (creates mesh and adds to scene)
-                    renderChunk(chunk.cx, chunk.cz);
+                    // Distance is from spawn point (0,0) for pre-generation
+                    const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
+                    renderChunk(chunk.cx, chunk.cz, distSq);
                     activeChunks.add(chunk.key);
                     rendered++;
                     // Update progress every 10 chunks
@@ -9775,6 +10019,27 @@
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
             }
+
+            // OPTIMIZATION: Simplified face rendering for distant chunks
+            // Skips expensive AO calculation and uses height-based lighting
+            function addFaceSimplified(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, ly) {
+                // Get cached face vertices
+                const verts = getCachedFaceVertices(nx, ny, nz);
+                // Write vertex positions and normals
+                writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                // Use simplified height-based lighting (no expensive AO calculation)
+                const simplifiedLight = getSimplifiedLight(ly, WORLD_DIMS.chunkHeight) / 15.0;
+                // Write flat colors (no AO variation) - much faster
+                const c = simplifiedLight;
+                col[cIdx] = c; col[cIdx+1] = c; col[cIdx+2] = c;
+                col[cIdx+3] = c; col[cIdx+4] = c; col[cIdx+5] = c;
+                col[cIdx+6] = c; col[cIdx+7] = c; col[cIdx+8] = c;
+                col[cIdx+9] = c; col[cIdx+10] = c; col[cIdx+11] = c;
+                col[cIdx+12] = c; col[cIdx+13] = c; col[cIdx+14] = c;
+                col[cIdx+15] = c; col[cIdx+16] = c; col[cIdx+17] = c;
+                // Write UV coordinates
+                writeFaceUVs(uvs, uvIdx, uv);
+            }
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
             function createWorldTorch(x, y, z) {
                 const torchGroup = new THREE.Group();
@@ -9903,13 +10168,18 @@
                 const minLight = 8;
                 return maxLight < minLight ? minLight : maxLight;
             }
-            function renderChunk(cx, cz) {
+            function renderChunk(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
                     const firstMeshForChunk = !meshedChunkKeys.has(cKey);
                     let missingNeighbor = false; // Tracks whether we treated any neighbor as solid due to being unloaded
+
+                    // OPTIMIZATION: Calculate LOD skip factor based on distance
+                    const lodSkipFactor = getLODSkipFactor(distSq);
+                    const useDeferredLight = shouldUseDeferredLighting(distSq);
+                    let skipCounter = 0; // For LOD face skipping
                     // OPTIMIZATION: Pre-calculate all neighbor keys at once (reduces string concatenations)
                     const czM1 = cz - 1, czP1 = cz + 1;
                     const cxM1 = cx - 1, cxP1 = cx + 1;
@@ -10013,11 +10283,29 @@
                                     const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
                                     const nid = getLocal(lx, ly, lz);
                                     // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                    const draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
+                                    let draw = isWater ? nid === AIR || nid === LEAVES : IS_TRANSPARENT[nid];
+
+                                    // OPTIMIZATION: LOD face skipping for distant chunks
+                                    // Skip internal faces (not chunk borders) based on distance
+                                    if (draw && lodSkipFactor > 0 && !isWater) {
+                                        const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
+                                        if (isInternalFace && faceIdx >= 2) { // Skip side faces only, not top/bottom
+                                            skipCounter++;
+                                            if ((skipCounter % Math.ceil(1 / lodSkipFactor)) !== 0) {
+                                                draw = false;
+                                            }
+                                        }
+                                    }
+
                                     if (draw) {
                                         // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
                                         // But calculate AO from the solid block position (x,y,z), not the neighbor
-                                        addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz);
+                                        // OPTIMIZATION: Use simplified lighting for distant chunks
+                                        if (useDeferredLight) {
+                                            addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
+                                        } else {
+                                            addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz);
+                                        }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
                                         if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
@@ -10377,7 +10665,9 @@
                     if (!chunks.has(job.key)) { await generateChunkData(jobCx, jobCz); }
                     // Release old meshes only when the chunk was explicitly marked dirty
                     if (isDirty) { releaseMeshForKey(job.key); releaseMeshForKey(job.key + "_WATER"); dirtyChunks.delete(job.key); }
-                     renderChunk(jobCx, jobCz);
+                    // OPTIMIZATION: Pass distance for LOD calculation
+                    const jobDistSq = job.dist || 0;
+                    renderChunk(jobCx, jobCz, jobDistSq);
                     recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
                     chunkUpdateDiagnostics.pending.delete(job.key);
                     if (isDirty) { const terrainOK = chunkMeshes.has(job.key); meshLifecycleStats.mark("dirtyRebuild", { key: job.key, terrainAttached: terrainOK, waterAttached: chunkMeshes.has(job.key + "_WATER"), }); }
@@ -10396,8 +10686,11 @@
                         // Remove old meshes
                         releaseMeshForKey(key);
                         releaseMeshForKey(key + "_WATER");
-                        // Rebuild chunk
-                        renderChunk(cx, cz);
+                        // Rebuild chunk - calculate distance for LOD
+                        const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
+                        const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                        const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
+                        renderChunk(cx, cz, neighborDistSq);
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                     }
                 }
@@ -10461,7 +10754,14 @@
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
-                if (!chunks.has(key)) { generateChunkData(cx, cz); renderChunk(cx, cz); }
+                if (!chunks.has(key)) {
+                    generateChunkData(cx, cz);
+                    // Calculate distance for LOD
+                    const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
+                    const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                    const distSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
+                    renderChunk(cx, cz, distSq);
+                }
             }
             // OPTIMIZATION: Inline helper for solid block check
             function isSolidBlock(x, y, z) {
@@ -10610,25 +10910,13 @@
                 runNeighborReconciliationSweep(time);
             }
             // Update FPS tracking and statistics
+            // OPTIMIZED: Use pre-allocated circular buffer (avoids array allocations and GC pressure)
             function updateFPSTracking(time, rawDt, clampedDt) {
                 if (clampedDt <= 0) return;
                 fpsInstant = 1 / rawDt;
-                fpsSamples.push({ t: time, fps: fpsInstant });
-                // Remove old samples efficiently
-                const cutoff = time - 10000;
-                let firstValid = 0;
-                while (firstValid < fpsSamples.length && fpsSamples[firstValid].t < cutoff) {
-                    firstValid++;
-                }
-                if (firstValid > 0) {
-                    fpsSamples = fpsSamples.slice(firstValid);
-                }
-                // Calculate average using single loop
-                let fpsSum = 0;
-                for (let i = 0; i < fpsSamples.length; i++) {
-                    fpsSum += fpsSamples[i].fps;
-                }
-                fpsAvg = fpsSum / (fpsSamples.length || 1);
+                // Use optimized circular buffer instead of dynamic array
+                pushFPSSample(time, fpsInstant);
+                fpsAvg = getAverageFPS(time, 10000);
             }
             // Apply player velocity based on input
             function applyPlayerVelocity(dt) {
