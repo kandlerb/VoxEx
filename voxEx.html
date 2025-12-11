@@ -917,9 +917,9 @@
                 },
                 mountains: {
                     weight: 6, // Much more common - mountains everywhere!
-                    roughness: 0.004,
-                    amplitude: 200,
-                    baseHeight: 75,
+                    roughness: 0.003,
+                    amplitude: 180,  // Max height ~250-290 with variation
+                    baseHeight: 70,
                     heightFunc: mountainsHeightFunc,
                 },
                 swamp: {
@@ -1077,10 +1077,10 @@
             };
             const WORLD_DIMS = {
                 chunkSize: 16,
-                chunkHeight: 256,
+                chunkHeight: 320,
                 yOffset: 0,
                 seaLevel: 60,
-                worldHeight: 256,
+                worldHeight: 320,
             };
             const CHUNK_BOUNDING_RADIUS = Math.sqrt(8 * 8 + Math.pow(WORLD_DIMS.chunkHeight * 0.5, 2) + 8 * 8);
             const WORLD_PIXEL_SIZE = 1 / SETTINGS.textureResolution;
@@ -8752,28 +8752,50 @@
             function mountainsHeightFunc(gx, gz, biome, seed) {
                 const x = gx * biome.roughness;
                 const z = gz * biome.roughness;
-                let sum = 0;
+
+                // Regional variation - determines if this area has small hills or tall peaks
+                // Very low frequency so it creates large regions of varying mountain intensity
+                const regionNoise = noise2D(gx * 0.0008 + seed * 0.5, gz * 0.0008 - seed * 0.5);
+                const regionScale = 0.25 + (regionNoise + 1) * 0.375; // Range: 0.25 to 1.0
+
+                // Secondary variation for more local differences
+                const localVar = noise2D(gx * 0.004 + seed * 2, gz * 0.004 - seed * 2);
+                const localScale = 0.7 + (localVar + 1) * 0.15; // Range: 0.7 to 1.0
+
+                // Combined scale factor - some areas are foothills (25%), some are massive peaks (100%)
+                const heightScale = regionScale * localScale;
+
+                // Main ridged noise - creates the mountain ridges
+                let ridgeSum = 0;
                 let amp = 1.0;
                 let freq = 1.0;
-                let weight = 1.0;
-                // Main ridged noise - 6 octaves for more detail
-                for (let i = 0; i < 6; i++) {
-                    // Ridged noise: invert absolute value for sharp peaks (no squaring - keeps it jagged)
+                for (let i = 0; i < 5; i++) {
+                    // Ridged noise: 1 - |noise| creates sharp ridges
                     let n = 1.0 - Math.abs(noise2D(x * freq + seed * 10, z * freq + seed * 10));
-                    // Apply current weight
-                    sum += n * amp * weight;
-                    // Update weight for next octave - sharper falloff for more dramatic ridges
-                    weight = Math.max(Math.min(n * 1.5, 1.0), 0.2);
-                    freq *= 2.2;  // Higher frequency multiplier = more jagged
-                    amp *= 0.55;
+                    // Sharpen the peaks by raising to a power (higher = sharper)
+                    n = Math.pow(n, 1.3);
+                    ridgeSum += n * amp;
+                    freq *= 2.1;
+                    amp *= 0.5;
                 }
-                // Add sharp detail noise for jagged peaks
-                const detailFreq = 0.08;
-                const detail = (1.0 - Math.abs(noise2D(gx * detailFreq + seed, gz * detailFreq - seed))) * 0.15;
-                // Add occasional sharp spires
-                const spireNoise = noise2D(gx * 0.02 + seed * 3, gz * 0.02 - seed * 3);
-                const spire = spireNoise > 0.7 ? (spireNoise - 0.7) * 0.4 : 0;
-                return Math.floor(biome.baseHeight + (sum + detail + spire) * biome.amplitude);
+                // Normalize ridge sum (max theoretical is about 2.0)
+                ridgeSum = ridgeSum / 2.0;
+
+                // Peak sharpening - make the very tops pointy, not flat
+                // Use another noise layer to create individual peak points
+                const peakNoise = noise2D(gx * 0.015 + seed * 7, gz * 0.015 - seed * 7);
+                const peakFactor = peakNoise > 0.5 ? Math.pow((peakNoise - 0.5) * 2, 2) * 0.3 : 0;
+
+                // Jagged detail - high frequency noise for rocky texture
+                const jaggedNoise = noise2D(gx * 0.1 + seed * 3, gz * 0.1 - seed * 3);
+                const jagged = Math.abs(jaggedNoise) * 0.08;
+
+                // Combine everything
+                const totalHeight = (ridgeSum + peakFactor + jagged) * heightScale;
+
+                // Final height with amplitude, capped to prevent exceeding world height
+                const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
+                return Math.floor(Math.min(rawHeight, 290)); // Hard cap at 290
             }
             function getRiverFactor(gx, gz, seed) {
                 // Reduce warp frequency and strength by 50%
@@ -8961,11 +8983,14 @@
             function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set) {
                 const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
                 const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
-                // Mountain elevation thresholds (adjusted for 256 world height)
-                const SNOW_LINE = 140;           // Above this: snow cap
-                const ROCK_LINE = 110;           // Above this: exposed rock/gravel
-                const ALPINE_LINE = 85;          // Above this: sparse vegetation (some grass, some stone)
-                const SLOPE_THRESHOLD = 4;       // Height difference that indicates steep slope
+                // Mountain elevation thresholds (adjusted for 320 world height, peaks at 250-290)
+                const SNOW_LINE = 200;           // Above this: snow cap
+                const HIGH_ROCK_LINE = 160;      // Above this: mostly bare rock
+                const ROCK_LINE = 120;           // Above this: exposed rock/gravel mix
+                const ALPINE_LINE = 90;          // Above this: sparse vegetation
+                const SLOPE_THRESHOLD = 3;       // Height difference that indicates steep slope
+                // River sand only applies below this elevation
+                const RIVER_MAX_ELEVATION = 75;
                 for (let lx = 0; lx < chunkSize; lx++) {
                     for (let lz = 0; lz < chunkSize; lz++) {
                         const idx = lx + lz * chunkSize;
@@ -8974,22 +8999,23 @@
                         const biome = biomeCache[idx];
                         const isMountain = biome && biome.name === "mountains";
                         const bedrockY = 0;
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
                         // Calculate slope by checking neighbor heights
                         let maxSlope = 0;
-                        if (isMountain) {
-                            const neighbors = [
-                                [lx - 1, lz], [lx + 1, lz], [lx, lz - 1], [lx, lz + 1]
-                            ];
-                            for (const [nx, nz] of neighbors) {
-                                if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
-                                    const nIdx = nx + nz * chunkSize;
-                                    const neighborY = heightCache[nIdx];
-                                    const slope = Math.abs(worldTopY - neighborY);
-                                    if (slope > maxSlope) maxSlope = slope;
-                                }
+                        const neighbors = [
+                            [lx - 1, lz], [lx + 1, lz], [lx, lz - 1], [lx, lz + 1]
+                        ];
+                        for (const [nx, nz] of neighbors) {
+                            if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
+                                const nIdx = nx + nz * chunkSize;
+                                const neighborY = heightCache[nIdx];
+                                const slope = Math.abs(worldTopY - neighborY);
+                                if (slope > maxSlope) maxSlope = slope;
                             }
                         }
                         const isSteepSlope = maxSlope >= SLOPE_THRESHOLD;
+                        const isVerySteep = maxSlope >= SLOPE_THRESHOLD * 2;
                         for (let ly = 0; ly < chunkHeight; ly++) {
                             const worldY = ly - WORLD_DIMS.yOffset;
                             let id = AIR;
@@ -9000,52 +9026,79 @@
                                 const depth = worldTopY - worldY;
                                 if (depth === 0) {
                                     // Surface block logic
-                                    if (riverFactor < 0.8) {
+                                    // River sand ONLY near sea level, not on mountains
+                                    if (riverFactor < 0.8 && worldTopY <= RIVER_MAX_ELEVATION) {
                                         id = SAND;
                                     } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) {
                                         id = SAND;
-                                    } else if (isMountain) {
-                                        // Mountain surface blocks based on elevation and slope
+                                    } else if (isMountain || worldTopY >= ALPINE_LINE) {
+                                        // Mountain/high elevation surface blocks
                                         if (worldTopY >= SNOW_LINE) {
-                                            // Snow cap zone
-                                            id = SNOW;
-                                        } else if (worldTopY >= ROCK_LINE || isSteepSlope) {
-                                            // Rocky zone - mix of stone and gravel
-                                            const gx = startX + lx;
-                                            const gz = startZ + lz;
-                                            const rockNoise = noise2D(gx * 0.1, gz * 0.1);
-                                            if (rockNoise > 0.3) {
+                                            // Snow cap zone - pure snow with occasional exposed rock
+                                            const snowNoise = noise2D(gx * 0.15, gz * 0.15);
+                                            if (isVerySteep || snowNoise > 0.7) {
+                                                id = STONE; // Wind-blown exposed rock
+                                            } else {
+                                                id = SNOW;
+                                            }
+                                        } else if (worldTopY >= HIGH_ROCK_LINE) {
+                                            // High rock zone - mostly stone with patches of snow/gravel
+                                            const highNoise = noise2D(gx * 0.12, gz * 0.12);
+                                            if (highNoise > 0.6) {
+                                                id = SNOW; // Snow patches
+                                            } else if (highNoise > 0.2) {
                                                 id = STONE;
-                                            } else if (rockNoise > -0.2) {
+                                            } else {
+                                                id = GRAVEL;
+                                            }
+                                        } else if (worldTopY >= ROCK_LINE || isVerySteep) {
+                                            // Rocky zone - mix of stone and gravel
+                                            const rockNoise = noise2D(gx * 0.1, gz * 0.1);
+                                            if (rockNoise > 0.4) {
+                                                id = STONE;
+                                            } else if (rockNoise > -0.1) {
                                                 id = GRAVEL;
                                             } else {
                                                 id = STONE;
                                             }
-                                        } else if (worldTopY >= ALPINE_LINE) {
-                                            // Alpine zone - sparse grass with some exposed rock
-                                            const gx = startX + lx;
-                                            const gz = startZ + lz;
+                                        } else if (worldTopY >= ALPINE_LINE || isSteepSlope) {
+                                            // Alpine zone - sparse grass with exposed rock
                                             const alpineNoise = noise2D(gx * 0.08, gz * 0.08);
-                                            if (alpineNoise > 0.4 || isSteepSlope) {
+                                            if (isSteepSlope || alpineNoise > 0.5) {
                                                 id = STONE;
-                                            } else if (alpineNoise > 0.1) {
+                                            } else if (alpineNoise > 0.2) {
                                                 id = GRAVEL;
-                                            } else {
+                                            } else if (alpineNoise > -0.2) {
+                                                // Sparse grass patches
                                                 id = GRASS;
+                                            } else {
+                                                id = DIRT; // Bare dirt patches
                                             }
                                         } else {
-                                            // Lower mountain - normal grass
-                                            id = GRASS;
+                                            // Lower mountain slopes - more grass but still patchy
+                                            const lowerNoise = noise2D(gx * 0.06, gz * 0.06);
+                                            if (isSteepSlope) {
+                                                id = lowerNoise > 0 ? STONE : GRAVEL;
+                                            } else if (lowerNoise > 0.3) {
+                                                id = GRASS;
+                                            } else if (lowerNoise > -0.3) {
+                                                id = GRASS;
+                                            } else {
+                                                id = DIRT; // Occasional bare patches
+                                            }
                                         }
                                     } else {
+                                        // Non-mountain low elevation - normal grass
                                         id = GRASS;
                                     }
                                 } else if (depth < 4) {
-                                    // Subsurface layer - dirt normally, but stone in high mountains
-                                    if (isMountain && worldTopY >= ROCK_LINE) {
-                                        id = STONE;
-                                    } else if (isMountain && worldTopY >= ALPINE_LINE) {
+                                    // Subsurface layer
+                                    if (worldTopY >= HIGH_ROCK_LINE) {
+                                        id = STONE; // No dirt at high elevations
+                                    } else if (worldTopY >= ROCK_LINE) {
                                         id = depth < 2 ? GRAVEL : STONE;
+                                    } else if (worldTopY >= ALPINE_LINE) {
+                                        id = depth < 2 ? DIRT : STONE;
                                     } else {
                                         id = DIRT;
                                     }
@@ -9124,8 +9177,8 @@
                         const centerY = findSurfaceY(data, lx, lz);
                         if (centerY <= 0) continue;
                         const worldY = centerY - WORLD_DIMS.yOffset;
-                        // Tree line check - no trees above 85 in mountains
-                        const TREE_LINE = 85;
+                        // Tree line check - no trees above 90 in mountains (matches ALPINE_LINE)
+                        const TREE_LINE = 90;
                         if (biome.name === "mountains" && worldY >= TREE_LINE) continue;
                         const groundId = get(lx, worldY, lz);
                         if (groundId !== GRASS && groundId !== DIRT) continue;
