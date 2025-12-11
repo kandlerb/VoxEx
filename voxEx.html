@@ -6892,9 +6892,9 @@
                 const queue = blockLightQueuePool.pop() || [];
                 queue.length = 0;
                 const maxQueueLength = Math.max(4, SETTINGS?.lighting?.blockQueueBudget ?? 131072);
-                // Raytracing-like smooth falloff: very gentle step loss for realistic light spread
-                const baseStepLoss = 0.25; // Reduced from 0.5 for much smoother, realistic falloff
-                const diagonalPenalty = 0.15; // Reduced from 0.75 - raytracing doesn't discriminate by direction
+                // Raytracing-like smooth falloff: extremely gentle step loss for realistic light spread
+                const baseStepLoss = 0.15; // Further reduced from 0.25 for even smoother, longer-range propagation
+                const diagonalPenalty = 0.1; // Further reduced from 0.15 for more isotropic lighting
                 const pushIfBudgetAllows = (x, y, z, light) => {
                     if (queue.length + 4 > maxQueueLength) return false;
                     queue.push(x, y, z, light);
@@ -7035,7 +7035,7 @@
                     const ly = queue[qIdx++];
                     const lz = queue[qIdx++];
                     const currentLight = clampBlockLight(queue[qIdx++]);
-                    if (currentLight <= 1) continue; // Need light > 1 to propagate
+                    if (currentLight <= 0) continue; // Allow even weak light to attempt propagation
                     // Cardinal directions (6 neighbors)
                     for (let i = 0; i < 6; i++) {
                         const offset = NEIGHBOR_OFFSETS[i];
@@ -7062,8 +7062,8 @@
                         }
                     }
                     // Diagonal diffusion for softer shadows and smoother lighting
-                    // Lower threshold allows more diagonal spread for raytracing-like smoothness
-                    if (currentLight > 1) {
+                    // Very low threshold allows maximum diagonal spread for raytracing-like smoothness
+                    if (currentLight > 0) {
                         for (let i = 0; i < SKY_DIAGONAL_OFFSETS.length; i++) {
                             const offset = SKY_DIAGONAL_OFFSETS[i];
                             const nx = lx + offset[0];
@@ -7080,7 +7080,7 @@
                             const propagatedLight = clampBlockLight(Math.max(0, Math.round(currentLight - totalLoss)));
                             if (propagatedLight > blockLight[nIdx]) {
                                 blockLight[nIdx] = propagatedLight;
-                                if (propagatedLight > 1) {
+                                if (propagatedLight > 0) {
                                     pushIfBudgetAllows(nx, ny, nz, propagatedLight);
                                 }
                             }
@@ -7089,28 +7089,49 @@
                 }
                 queue.length = 0;
                 if (blockLightQueuePool.length < 4) blockLightQueuePool.push(queue);
-                // Schedule mesh rebuilds for neighbor chunks that received light
-                // When they rebuild, they'll automatically seed from this chunk's edges
-                if (affectedNeighborChunks.size > 0) {
-                    for (const nKey of affectedNeighborChunks) {
-                        const [ncx, ncz] = nKey.split(',').map(Number);
-                        const neighborChunk = chunks.get(nKey);
-                        if (!neighborChunk) continue;
 
-                        // Ensure the neighbor chunk has correct coordinates for lighting calculations
-                        if (neighborChunk.cx === undefined) neighborChunk.cx = ncx;
-                        if (neighborChunk.cz === undefined) neighborChunk.cz = ncz;
-                        if (neighborChunk.startX === undefined) neighborChunk.startX = ncx * chunkSize;
-                        if (neighborChunk.startZ === undefined) neighborChunk.startZ = ncz * chunkSize;
+                // Cascade lighting updates through multiple layers of chunks
+                // This ensures light propagates smoothly across many chunk boundaries
+                const allProcessedChunks = new Set([getChunkKey(chunkCx, chunkCz)]);
+                const chunksToProcess = Array.from(affectedNeighborChunks);
+                let cascadeDepth = 0;
+                const maxCascadeDepth = 8; // Allow light to cascade through up to 8 chunk layers
 
-                        // Recalculate neighbor's block light so it propagates from the edge values we just set
-                        // This is safe because calculateBlockLight seeds from neighbor edges before propagating
-                        calculateBlockLight(neighborChunk, chunkSize, chunkHeight);
+                while (chunksToProcess.length > 0 && cascadeDepth < maxCascadeDepth) {
+                    cascadeDepth++;
+                    const nKey = chunksToProcess.shift();
 
-                        // Schedule mesh rebuild to visualize the updated lighting
-                        scheduleChunkUpdate(ncx, ncz, true, "blocklight-propagation");
+                    // Skip if already processed
+                    if (allProcessedChunks.has(nKey)) continue;
+                    allProcessedChunks.add(nKey);
+
+                    const [ncx, ncz] = nKey.split(',').map(Number);
+                    const neighborChunk = chunks.get(nKey);
+                    if (!neighborChunk) continue;
+
+                    // Ensure the neighbor chunk has correct coordinates
+                    if (neighborChunk.cx === undefined) neighborChunk.cx = ncx;
+                    if (neighborChunk.cz === undefined) neighborChunk.cz = ncz;
+                    if (neighborChunk.startX === undefined) neighborChunk.startX = ncx * chunkSize;
+                    if (neighborChunk.startZ === undefined) neighborChunk.startZ = ncz * chunkSize;
+
+                    // Recalculate this neighbor's lighting
+                    // It will seed from all its neighbors (including the chunks we just calculated)
+                    const newlyAffectedChunks = calculateBlockLight(neighborChunk, chunkSize, chunkHeight);
+
+                    // Add any newly affected chunks to the processing queue
+                    if (newlyAffectedChunks && newlyAffectedChunks.size > 0) {
+                        for (const newKey of newlyAffectedChunks) {
+                            if (!allProcessedChunks.has(newKey) && !chunksToProcess.includes(newKey)) {
+                                chunksToProcess.push(newKey);
+                            }
+                        }
                     }
+
+                    // Schedule mesh rebuild
+                    scheduleChunkUpdate(ncx, ncz, true, "blocklight-cascade");
                 }
+
                 return affectedNeighborChunks;
             }
             // Helper: Trilinear interpolation for cave noise (OPTIMIZED)
