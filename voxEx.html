@@ -4051,8 +4051,9 @@
             let underwaterDepth = 0; // How deep underwater (for fog darkness)
             let savedFogState = null; // Store normal fog settings when going underwater
             // OPTIMIZATION: Reusable color objects for underwater fog (avoid per-frame allocations)
-            const _underwaterBaseColor = new THREE.Color();
-            const _underwaterDarkColor = new THREE.Color(0x001122);
+            // Colors matched to water texture: #2389DA (upper), #1B609E (lower), #1565C0 (ripple shadow)
+            const _underwaterBaseColor = new THREE.Color(0x2389DA); // Matches water texture upper half
+            const _underwaterDarkColor = new THREE.Color(0x0A2A40); // Dark cyan-blue (matches texture hue)
             const _underwaterResultColor = new THREE.Color();
             let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             // --- BLOCK DEFINITIONS ---
@@ -5296,7 +5297,7 @@
             }
 
             let camera, scene, renderer, controls, raycaster;
-            let composer, renderPass, zombieScarePass, volumetricLightPass;
+            let composer, renderPass, zombieScarePass, underwaterPass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
             let moveForward = false;
@@ -7335,6 +7336,116 @@
                 zombieScarePass = new ShaderPass(ZombieScareShader);
                 zombieScarePass.enabled = true; // Always enabled, effects controlled by uniforms
                 composer.addPass(zombieScarePass);
+
+                // Underwater effect shader - adds realistic underwater visuals
+                const UnderwaterShader = {
+                    uniforms: {
+                        tDiffuse: { value: null },
+                        time: { value: 0.0 },
+                        isUnderwater: { value: false },
+                        underwaterDepth: { value: 0.0 },
+                        // Underwater tint color (matches water texture #2389DA)
+                        waterColor: { value: new THREE.Color(0x2389DA) },
+                        // Effect intensities
+                        tintStrength: { value: 0.25 },
+                        causticStrength: { value: 0.15 },
+                        distortionStrength: { value: 0.002 },
+                        vignetteStrength: { value: 0.4 }
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform sampler2D tDiffuse;
+                        uniform float time;
+                        uniform bool isUnderwater;
+                        uniform float underwaterDepth;
+                        uniform vec3 waterColor;
+                        uniform float tintStrength;
+                        uniform float causticStrength;
+                        uniform float distortionStrength;
+                        uniform float vignetteStrength;
+                        varying vec2 vUv;
+
+                        // Pseudo-random function for caustics
+                        float hash(vec2 p) {
+                            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+                        }
+
+                        // Smooth noise for caustic pattern
+                        float noise(vec2 p) {
+                            vec2 i = floor(p);
+                            vec2 f = fract(p);
+                            f = f * f * (3.0 - 2.0 * f);
+                            float a = hash(i);
+                            float b = hash(i + vec2(1.0, 0.0));
+                            float c = hash(i + vec2(0.0, 1.0));
+                            float d = hash(i + vec2(1.0, 1.0));
+                            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                        }
+
+                        // Caustic light pattern
+                        float caustic(vec2 uv, float t) {
+                            float c = 0.0;
+                            // Layer multiple noise patterns at different scales and speeds
+                            c += noise(uv * 8.0 + vec2(t * 0.5, t * 0.3)) * 0.5;
+                            c += noise(uv * 12.0 - vec2(t * 0.4, t * 0.6)) * 0.3;
+                            c += noise(uv * 20.0 + vec2(t * 0.7, -t * 0.2)) * 0.2;
+                            return c;
+                        }
+
+                        void main() {
+                            if (!isUnderwater) {
+                                gl_FragColor = texture2D(tDiffuse, vUv);
+                                return;
+                            }
+
+                            // Wavy distortion effect - subtle screen wobble
+                            vec2 distortedUV = vUv;
+                            float waveX = sin(vUv.y * 15.0 + time * 2.0) * distortionStrength;
+                            float waveY = cos(vUv.x * 12.0 + time * 1.5) * distortionStrength * 0.7;
+                            distortedUV += vec2(waveX, waveY);
+
+                            // Sample with distorted UVs
+                            vec4 texel = texture2D(tDiffuse, distortedUV);
+                            vec3 color = texel.rgb;
+
+                            // Depth factor affects all effects (deeper = stronger effects)
+                            float depthFactor = clamp(underwaterDepth / 20.0, 0.0, 1.0);
+
+                            // Caustic light patterns on upper parts of the screen (simulating light from surface)
+                            float causticPattern = caustic(vUv, time * 0.001);
+                            // Caustics stronger near top of screen (where surface light comes from)
+                            float causticMask = smoothstep(0.8, 0.2, vUv.y);
+                            float causticEffect = causticPattern * causticMask * causticStrength * (1.0 - depthFactor * 0.7);
+                            color += vec3(causticEffect * 0.8, causticEffect * 0.9, causticEffect);
+
+                            // Color tint - blend toward water color
+                            float tint = tintStrength * (1.0 + depthFactor * 0.5);
+                            color = mix(color, color * waterColor * 2.0, tint);
+
+                            // Slight desaturation with depth
+                            float gray = dot(color, vec3(0.299, 0.587, 0.114));
+                            color = mix(color, vec3(gray) * waterColor * 1.5, depthFactor * 0.3);
+
+                            // Vignette - darker edges underwater
+                            vec2 centerUV = vUv - 0.5;
+                            float distFromCenter = length(centerUV);
+                            float vignette = smoothstep(0.3, 0.9, distFromCenter);
+                            color *= 1.0 - (vignette * vignetteStrength * (1.0 + depthFactor * 0.5));
+
+                            gl_FragColor = vec4(color, texel.a);
+                        }
+                    `
+                };
+
+                underwaterPass = new ShaderPass(UnderwaterShader);
+                underwaterPass.enabled = true; // Always enabled, controlled by isUnderwater uniform
+                composer.addPass(underwaterPass);
 
                 // Volumetric Lighting (God Rays) shader
                 const MAX_POINT_LIGHTS = 4; // OPTIMIZED: Reduced from 16 for better FPS
@@ -13630,8 +13741,8 @@
                         };
                     }
 
-                    // OPTIMIZATION: Use reusable color objects instead of allocating new ones
-                    _underwaterBaseColor.setHex(SETTINGS.waterColor);
+                    // Use texture-matched underwater fog color (0x2389DA matches water texture)
+                    // Don't use SETTINGS.waterColor here - that's for the surface material, not underwater fog
 
                     // Darken based on depth - deeper = darker and shorter visibility
                     const maxDepth = 35; // Maximum depth for full darkness
@@ -13650,6 +13761,13 @@
                     scene.fog.color.copy(_underwaterResultColor);
                     scene.fog.near = fogNear;
                     scene.fog.far = fogFar;
+
+                    // Update underwater shader uniforms
+                    if (underwaterPass) {
+                        underwaterPass.uniforms.isUnderwater.value = true;
+                        underwaterPass.uniforms.underwaterDepth.value = underwaterDepth;
+                        underwaterPass.uniforms.time.value = performance.now();
+                    }
                 } else if (wasUnderwater && savedFogState) {
                     // Restore normal fog when exiting water
                     // Note: updateDayNight will override the color, so just restore distances
@@ -13658,6 +13776,11 @@
                     savedFogState = null;
                     underwaterDepth = 0;
                     _lastUnderwaterCheckY = -Infinity; // Reset cache when exiting water
+
+                    // Disable underwater shader effects
+                    if (underwaterPass) {
+                        underwaterPass.uniforms.isUnderwater.value = false;
+                    }
                 }
             }
 
