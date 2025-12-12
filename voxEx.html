@@ -7146,18 +7146,8 @@
                 renderer.domElement.style.left = "0";
                 renderer.domElement.style.zIndex = "1";
 
-                // Post-processing setup with depth texture support
-                const renderTarget = new THREE.WebGLRenderTarget(window.innerWidth, window.innerHeight, {
-                    minFilter: THREE.LinearFilter,
-                    magFilter: THREE.LinearFilter,
-                    format: THREE.RGBAFormat,
-                    depthTexture: new THREE.DepthTexture(window.innerWidth, window.innerHeight),
-                    depthBuffer: true
-                });
-                renderTarget.depthTexture.format = THREE.DepthFormat;
-                renderTarget.depthTexture.type = THREE.UnsignedIntType;
-
-                composer = new EffectComposer(renderer, renderTarget);
+                // Post-processing setup
+                composer = new EffectComposer(renderer);
                 renderPass = new RenderPass(scene, camera);
                 composer.addPass(renderPass);
 
@@ -7223,9 +7213,6 @@
                 const VolumetricLightShader = {
                     uniforms: {
                         tDiffuse: { value: null },
-                        tDepth: { value: null }, // Depth texture for depth-aware effects
-                        cameraNear: { value: 0.01 },
-                        cameraFar: { value: 800.0 },
                         enabled: { value: SETTINGS.volumetricLightingEnabled },
                         // Sun/Moon (directional lights)
                         sunScreenPos: { value: new THREE.Vector2(0.5, 0.5) },
@@ -7260,9 +7247,6 @@
                     `,
                     fragmentShader: `
                         uniform sampler2D tDiffuse;
-                        uniform sampler2D tDepth;
-                        uniform float cameraNear;
-                        uniform float cameraFar;
                         uniform bool enabled;
                         // Directional lights (sun/moon)
                         uniform vec2 sunScreenPos;
@@ -7288,27 +7272,6 @@
                         uniform float nightFactor;
                         uniform float aspectRatio;
                         varying vec2 vUv;
-
-                        // Convert depth buffer value to linear depth (0 = near, 1 = far)
-                        float getLinearDepth(vec2 uv) {
-                            float depth = texture2D(tDepth, uv).r;
-                            // Reverse the perspective projection
-                            float z = depth * 2.0 - 1.0; // NDC
-                            float linearDepth = (2.0 * cameraNear * cameraFar) / (cameraFar + cameraNear - z * (cameraFar - cameraNear));
-                            return linearDepth / cameraFar; // Normalize to 0-1
-                        }
-
-                        // Get depth-based attenuation factor for atmospheric effects
-                        // Close geometry (low depth) = low attenuation = less fog/glow
-                        // Far/sky geometry (high depth) = high attenuation = more fog/glow
-                        float getDepthAttenuation(vec2 uv) {
-                            float linearDepth = getLinearDepth(uv);
-                            // Objects closer than 50 units start reducing fog
-                            // Objects at sky/far distance get full fog
-                            float nearThreshold = 50.0 / cameraFar;
-                            float farThreshold = 0.5; // Half of far plane = full fog
-                            return smoothstep(nearThreshold * 0.5, farThreshold, linearDepth);
-                        }
 
                         // OPTIMIZED: God ray calculation for sun/moon (full samples)
                         vec3 calculateGodRay(vec2 lightPos, vec3 lightColor, float intensity) {
@@ -7413,9 +7376,6 @@
                                 return;
                             }
 
-                            // Get depth-based attenuation - reduces fog/glow on close geometry
-                            float depthAtten = getDepthAttenuation(vUv);
-
                             // Sanitize sun position (avoid NaN/Infinity)
                             vec2 safeSunPos = sunScreenPos;
                             if (safeSunPos.x != safeSunPos.x || safeSunPos.y != safeSunPos.y) {
@@ -7432,18 +7392,18 @@
                             }
                             safeMoonPos = clamp(safeMoonPos, vec2(-2.0), vec2(3.0));
 
-                            // Sun god rays (attenuated by depth)
+                            // Sun god rays
                             if (sunVisible > 0.0) {
-                                totalGodRays += calculateGodRay(safeSunPos, sunColor, sunVisible * 1.2) * depthAtten;
+                                totalGodRays += calculateGodRay(safeSunPos, sunColor, sunVisible * 1.2);
                             }
 
-                            // Moon god rays (softer, cooler, attenuated by depth)
+                            // Moon god rays (softer, cooler)
                             if (moonVisible > 0.0) {
-                                totalGodRays += calculateGodRay(safeMoonPos, moonColor, moonVisible * 0.6) * depthAtten;
+                                totalGodRays += calculateGodRay(safeMoonPos, moonColor, moonVisible * 0.6);
                             }
 
                             // OPTIMIZED: Point lights use ONLY atmospheric fog (no expensive god ray sampling)
-                            // Point lights don't need depth attenuation - they're local effects
+                            // This is much cheaper - just math operations, no texture samples
                             for (int i = 0; i < ${MAX_POINT_LIGHTS}; i++) {
                                 float intensity = pointLightIntensities[i];
                                 if (intensity > 0.0) {
@@ -7455,9 +7415,8 @@
                                 }
                             }
 
-                            // Add atmospheric fog/haze from sun/moon (attenuated by depth)
-                            vec3 colorWithFog = calculateSkyAtmosphericFog(color, safeSunPos, sunVisible, safeMoonPos, moonVisible);
-                            color = mix(color, colorWithFog, depthAtten);
+                            // Add atmospheric fog/haze from sun/moon (only when visible)
+                            color = calculateSkyAtmosphericFog(color, safeSunPos, sunVisible, safeMoonPos, moonVisible);
 
                             // Blend god rays additively
                             color += totalGodRays;
@@ -7469,8 +7428,6 @@
 
                 volumetricLightPass = new ShaderPass(VolumetricLightShader);
                 volumetricLightPass.enabled = SETTINGS.volumetricLightingEnabled;
-                // Connect depth texture to the shader for depth-aware god rays
-                volumetricLightPass.uniforms.tDepth.value = renderTarget.depthTexture;
                 composer.addPass(volumetricLightPass);
 
                 // 9. Controls & Pause Menu Logic
