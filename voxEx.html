@@ -12435,19 +12435,21 @@
                 const shadowCam = sun.shadow.camera;
                 const mapWidth = sun.shadow.mapSize.x;
                 const frustumWidth = shadowCam.right - shadowCam.left;
-                const texelWorldSize = frustumWidth / mapWidth; // 256/4096 = 1/16
+                const texelWorldSize = frustumWidth / mapWidth; // 256/2048 = 0.125
                 // 1. Snap camera position to texel grid
                 const snapTargetX = Math.round(camPos.x / texelWorldSize) * texelWorldSize;
                 const snapTargetY = Math.round(camPos.y / texelWorldSize) * texelWorldSize;
                 const snapTargetZ = Math.round(camPos.z / texelWorldSize) * texelWorldSize;
                 // 2. Calculate sun angle (smooth, no quantization)
                 const sunAngle = dayNightTime < 0.667 ? (dayNightTime / 0.667) * Math.PI : Math.PI + ((dayNightTime - 0.667) / 0.333) * Math.PI;
-                // OPTIMIZATION: Skip shadow updates if position hasn't changed significantly (within 0.01 units or 0.01 radians)
+                // OPTIMIZATION: Use texelWorldSize as threshold (was 0.01, now ~0.125)
+                // This prevents shadow jitter and reduces unnecessary updates
+                const posThreshold = texelWorldSize * 1.5; // Slightly larger than one texel to add hysteresis
                 const posChanged =
-                    Math.abs(snapTargetX - lastShadowState.targetX) > 0.01 ||
-                    Math.abs(snapTargetY - lastShadowState.targetY) > 0.01 ||
-                    Math.abs(snapTargetZ - lastShadowState.targetZ) > 0.01;
-                const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.01;
+                    Math.abs(snapTargetX - lastShadowState.targetX) > posThreshold ||
+                    Math.abs(snapTargetY - lastShadowState.targetY) > posThreshold ||
+                    Math.abs(snapTargetZ - lastShadowState.targetZ) > posThreshold;
+                const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.02; // Slightly larger threshold
                 if (posChanged || angleChanged) {
                     // 3. Sun direction from angle
                     const diskH = Math.sin(sunAngle);
@@ -12684,22 +12686,32 @@
             const volumetricTempVec2 = new THREE.Vector2();
             const MAX_VOLUMETRIC_POINT_LIGHTS = 16;
 
+            // OPTIMIZATION: Reusable vectors to avoid per-frame allocations
+            const _occlusionDir = new THREE.Vector3();
+            const _lightReachDir = new THREE.Vector3();
+
+            // OPTIMIZATION: Throttle occlusion checks - only update every N frames
+            let occlusionCheckFrame = 0;
+            let lastSunOccluded = false;
+            let lastMoonOccluded = true;
+            const OCCLUSION_CHECK_INTERVAL = 5; // Check every 5 frames
+
             // Raycast to check if sun/moon is occluded by terrain (player -> light direction)
             function isLightOccluded(lightWorldPos) {
                 const camPos = controls ? controls.getObject().position : camera.position;
 
-                // Direction from player to light (normalized)
-                const dir = new THREE.Vector3().subVectors(lightWorldPos, camPos).normalize();
+                // OPTIMIZATION: Reuse vector instead of allocating new one
+                _occlusionDir.subVectors(lightWorldPos, camPos).normalize();
 
                 // Raycast from player position toward the light
-                // Check up to 100 blocks or until we exit the world bounds
-                const maxDist = 100;
-                const stepSize = 0.5; // Check every half block for accuracy
+                // OPTIMIZATION: Increased step size for better performance (was 0.5)
+                const maxDist = 80; // Reduced from 100
+                const stepSize = 1.0; // Increased from 0.5 - check every block instead of half-block
 
                 for (let dist = 1; dist < maxDist; dist += stepSize) {
-                    const checkX = Math.floor(camPos.x + dir.x * dist);
-                    const checkY = Math.floor(camPos.y + dir.y * dist);
-                    const checkZ = Math.floor(camPos.z + dir.z * dist);
+                    const checkX = Math.floor(camPos.x + _occlusionDir.x * dist);
+                    const checkY = Math.floor(camPos.y + _occlusionDir.y * dist);
+                    const checkZ = Math.floor(camPos.z + _occlusionDir.z * dist);
 
                     // If we've gone above world height, we have clear sky - not occluded
                     if (checkY >= WORLD_DIMS.worldHeight) {
@@ -12725,19 +12737,27 @@
             function canLightReachPlayer(lightWorldPos, maxRange = 64) {
                 const camPos = controls ? controls.getObject().position : camera.position;
 
-                // Direction from light to player
-                const dir = new THREE.Vector3().subVectors(camPos, lightWorldPos).normalize();
-                const totalDist = camPos.distanceTo(lightWorldPos);
+                // OPTIMIZATION: Calculate distance squared first (avoid sqrt)
+                const dx = camPos.x - lightWorldPos.x;
+                const dy = camPos.y - lightWorldPos.y;
+                const dz = camPos.z - lightWorldPos.z;
+                const distSq = dx * dx + dy * dy + dz * dz;
 
                 // Don't check lights beyond max range
-                if (totalDist > maxRange) return false;
+                if (distSq > maxRange * maxRange) return false;
 
-                const stepSize = 0.5;
+                const totalDist = Math.sqrt(distSq);
+
+                // OPTIMIZATION: Reuse vector
+                _lightReachDir.set(dx / totalDist, dy / totalDist, dz / totalDist);
+
+                // OPTIMIZATION: Increased step size
+                const stepSize = 1.0; // Was 0.5
 
                 for (let dist = 0.5; dist < totalDist - 0.5; dist += stepSize) {
-                    const checkX = Math.floor(lightWorldPos.x + dir.x * dist);
-                    const checkY = Math.floor(lightWorldPos.y + dir.y * dist);
-                    const checkZ = Math.floor(lightWorldPos.z + dir.z * dist);
+                    const checkX = Math.floor(lightWorldPos.x + _lightReachDir.x * dist);
+                    const checkY = Math.floor(lightWorldPos.y + _lightReachDir.y * dist);
+                    const checkZ = Math.floor(lightWorldPos.z + _lightReachDir.z * dist);
 
                     // Skip if out of world bounds
                     if (checkY < 0 || checkY >= WORLD_DIMS.worldHeight) continue;
@@ -12753,6 +12773,12 @@
                 // Clear line of sight
                 return true;
             }
+
+            // OPTIMIZATION: Reusable vectors for volumetric lighting calculations
+            const _toSunDir = new THREE.Vector3();
+            const _toMoonDir = new THREE.Vector3();
+            const _camDir = new THREE.Vector3();
+            let matricesUpdatedThisFrame = false;
 
             function updateVolumetricLighting(time) {
                 if (!volumetricLightPass) return;
@@ -12773,13 +12799,10 @@
                 // Night is roughly dayNightTime > 0.55 or < 0.2
                 let nightFactor = 0;
                 if (dayNightTime > 0.5 && dayNightTime < 0.7) {
-                    // Dusk transition (0.5-0.7)
                     nightFactor = (dayNightTime - 0.5) / 0.2;
                 } else if (dayNightTime >= 0.7 || dayNightTime < 0.15) {
-                    // Full night
                     nightFactor = 1;
                 } else if (dayNightTime >= 0.15 && dayNightTime < 0.25) {
-                    // Dawn transition (0.15-0.25)
                     nightFactor = 1 - (dayNightTime - 0.15) / 0.1;
                 }
                 uniforms.nightFactor.value = nightFactor;
@@ -12787,62 +12810,65 @@
                 // Calculate depth below sea level (0 = at/above sea, 1 = deep underground)
                 const camPos = controls ? controls.getObject().position : camera.position;
                 const seaLevel = WORLD_DIMS.seaLevel;
-                const maxDepth = 40; // Full darkness at 40 blocks below sea level
+                const maxDepth = 40;
                 const depthBelow = Math.max(0, seaLevel - camPos.y);
                 uniforms.depthBelowSea.value = Math.min(1.0, depthBelow / maxDepth);
 
-                // Helper: project world position to screen space
-                // Use Three.js's built-in project() but ensure ALL matrices are synced
-                function worldToScreen(worldPos) {
-                    // Force full matrix update chain including inverse matrix
-                    if (controls) {
-                        controls.getObject().updateMatrixWorld(true);
-                    }
+                // OPTIMIZATION: Update matrices only ONCE per frame, not per worldToScreen call
+                if (!matricesUpdatedThisFrame) {
+                    if (controls) controls.getObject().updateMatrixWorld(true);
                     camera.updateMatrixWorld(true);
                     camera.updateProjectionMatrix();
-                    // CRITICAL: project() uses matrixWorldInverse, must update it manually
                     camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+                    matricesUpdatedThisFrame = true;
+                }
 
-                    // Clone position to avoid modifying original
+                // Helper: project world position to screen space (OPTIMIZED - no matrix updates)
+                function worldToScreen(worldPos) {
                     volumetricTempVec3.copy(worldPos);
                     volumetricTempVec3.project(camera);
 
-                    // Check if behind camera (z > 1 in NDC means behind)
                     if (volumetricTempVec3.z > 1) {
                         return volumetricTempVec2.set(-10, -10);
                     }
 
-                    // X axis needs no negation, Y axis needs negation
-                    const ndcX = volumetricTempVec3.x;  // Keep X as-is
-                    const ndcY = -volumetricTempVec3.y; // Negate Y
+                    const ndcX = volumetricTempVec3.x;
+                    const ndcY = -volumetricTempVec3.y;
 
-                    // Convert NDC [-1,1] to UV [0,1]
-                    // UV:  x=0 left, x=1 right, y=0 top, y=1 bottom
                     return volumetricTempVec2.set(
                         (ndcX + 1) * 0.5,
                         (1 - ndcY) * 0.5
                     );
                 }
 
+                // OPTIMIZATION: Throttle expensive occlusion checks
+                occlusionCheckFrame++;
+                const shouldCheckOcclusion = occlusionCheckFrame >= OCCLUSION_CHECK_INTERVAL;
+                if (shouldCheckOcclusion) {
+                    occlusionCheckFrame = 0;
+                }
+
                 // Sun position and visibility
                 if (sunSprite && sunSprite.visible) {
                     const screenPos = worldToScreen(sunSprite.position);
                     uniforms.sunScreenPos.value.copy(screenPos);
+
                     // Calculate visibility based on if sun is in front of camera
-                    const toSun = volumetricTempVec3.copy(sunSprite.position).sub(camera.position).normalize();
-                    camera.getWorldDirection(volumetricTempVec3);
-                    const dot = toSun.dot(volumetricTempVec3);
+                    _toSunDir.copy(sunSprite.position).sub(camera.position).normalize();
+                    camera.getWorldDirection(_camDir);
+                    const dot = _toSunDir.dot(_camDir);
 
                     // Smooth fade based on how far off-screen the sun is
-                    // God rays should still work when sun is just outside the frame
-                    const distFromCenter = Math.sqrt(Math.pow(screenPos.x - 0.5, 2) + Math.pow(screenPos.y - 0.5, 2));
-                    const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5); // Fade starts at 0.7 from center
+                    const dx = screenPos.x - 0.5, dy = screenPos.y - 0.5;
+                    const distFromCenter = Math.sqrt(dx * dx + dy * dy);
+                    const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5);
 
-                    // Check if sun is blocked by terrain (raycast)
-                    const sunOccluded = isLightOccluded(sunSprite.position);
-                    const occlusionFactor = sunOccluded ? 0 : 1;
+                    // OPTIMIZATION: Only check occlusion every N frames
+                    if (shouldCheckOcclusion) {
+                        lastSunOccluded = isLightOccluded(sunSprite.position);
+                    }
 
-                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade * occlusionFactor;
+                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade * (lastSunOccluded ? 0 : 1);
                 } else {
                     uniforms.sunVisible.value = 0;
                 }
@@ -12851,19 +12877,21 @@
                 if (moonSprite && moonSprite.visible) {
                     const screenPos = worldToScreen(moonSprite.position);
                     uniforms.moonScreenPos.value.copy(screenPos);
-                    const toMoon = volumetricTempVec3.copy(moonSprite.position).sub(camera.position).normalize();
-                    camera.getWorldDirection(volumetricTempVec3);
-                    const dot = toMoon.dot(volumetricTempVec3);
 
-                    // Same smooth fade for moon
-                    const distFromCenter = Math.sqrt(Math.pow(screenPos.x - 0.5, 2) + Math.pow(screenPos.y - 0.5, 2));
+                    _toMoonDir.copy(moonSprite.position).sub(camera.position).normalize();
+                    camera.getWorldDirection(_camDir);
+                    const dot = _toMoonDir.dot(_camDir);
+
+                    const dx = screenPos.x - 0.5, dy = screenPos.y - 0.5;
+                    const distFromCenter = Math.sqrt(dx * dx + dy * dy);
                     const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5);
 
-                    // Check if moon is blocked by terrain (raycast)
-                    const moonOccluded = isLightOccluded(moonSprite.position);
-                    const occlusionFactor = moonOccluded ? 0 : 1;
+                    // OPTIMIZATION: Only check occlusion every N frames
+                    if (shouldCheckOcclusion) {
+                        lastMoonOccluded = isLightOccluded(moonSprite.position);
+                    }
 
-                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade * occlusionFactor;
+                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade * (lastMoonOccluded ? 0 : 1);
                 } else {
                     uniforms.moonVisible.value = 0;
                 }
@@ -13066,6 +13094,7 @@
                 const frameStart = perfMonitor.start("animate");
                 startFrameBudget(); // OPTIMIZATION: Track frame time budget
                 invalidateCameraDir(); // OPTIMIZATION: Invalidate camera direction cache each frame
+                matricesUpdatedThisFrame = false; // OPTIMIZATION: Reset matrix update flag for volumetric lighting
                 perfMetrics.reset();   // OPTIMIZATION: Reset per-frame metrics
                 try {
                     const time = performance.now();
