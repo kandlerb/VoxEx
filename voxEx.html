@@ -6141,16 +6141,10 @@
                 const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker, job.primeColumn);
                 updateBlockLightAt(x, y, z, prevId, nextId, tracker);
 
-                // Recalculate block light for all affected chunks to properly handle light removal
-                // This ensures that when a torch is broken, remaining torches properly fill the space
-                const chunkSize = WORLD_DIMS.chunkSize;
-                const chunkHeight = WORLD_DIMS.chunkHeight;
-                for (const affectedKey of tracker.tracked) {
-                    const chunk = chunks.get(affectedKey);
-                    if (chunk && chunk.blocks) {
-                        calculateBlockLight(chunk, chunkSize, chunkHeight);
-                    }
-                }
+                // NOTE: Removed redundant calculateBlockLight() call here.
+                // updateBlockLightAt() already handles full BFS propagation for block light changes.
+                // Calling calculateBlockLight() would overwrite the propagated values since it
+                // fills the array with 0 and only sets torch positions without propagation.
 
                 if (!sunTask || sunTask.done || sunTask.bailedOut) { finalizeLightTracker(tracker);
                 } else { sunTask.onComplete = () => finalizeLightTracker(tracker); }
@@ -11013,10 +11007,9 @@
                 if (biomeName === "swamp") return d.swamp ?? 0.02;
                 return 0.0;
             }
-            // Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down
-            // OPTIMIZATION: Uses BFS queue with early termination instead of fixed 15 passes
+            // Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down,
+            // then spreads horizontally into caves and overhangs via BFS
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
-                // Basic vertical sunlight propagation only
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
                 // Ensure skyLight array is correct size (handles old cached chunks with different height)
@@ -11024,11 +11017,15 @@
                     chunk.skyLight = new Uint8Array(expectedSize);
                 }
                 const skyLight = chunk.skyLight;
-                skyLight.fill(1); // Underground default
+                skyLight.fill(1); // Underground default (minimum light)
 
                 const cs = chunkSize; // 16
 
-                // Simple vertical propagation from sky downward
+                // BFS queue for horizontal propagation: [lx, ly, lz, level]
+                const queue = [];
+
+                // Phase 1: Vertical propagation from sky downward
+                // This seeds the BFS queue with all blocks that receive direct/attenuated sunlight
                 for (let lx = 0; lx < cs; lx++) {
                     for (let lz = 0; lz < cs; lz++) {
                         let currentLight = 15; // Start with max sunlight
@@ -11042,17 +11039,59 @@
                             // Set light for this block
                             skyLight[idx] = currentLight;
 
-                            // Opaque blocks stop light
+                            // Add to propagation queue if this block can spread light horizontally
+                            // (only transparent blocks with light > 1 can spread)
+                            if (IS_TRANSPARENT[blockId] && currentLight > 1) {
+                                queue.push(lx, ly, lz, currentLight);
+                            }
+
+                            // Opaque blocks stop light completely
                             if (!IS_TRANSPARENT[blockId]) {
                                 currentLight = 1; // Underground gets minimum light
                             }
                         }
                     }
                 }
+
+                // Phase 2: BFS horizontal propagation
+                // Spreads light sideways into caves and overhangs
+                // Note: Only propagates within chunk bounds during initial generation
+                // Cross-chunk propagation happens via updateSunlightAt() when blocks change
+                const neighborOffsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+                let qIdx = 0;
+                while (qIdx < queue.length) {
+                    const lx = queue[qIdx++];
+                    const ly = queue[qIdx++];
+                    const lz = queue[qIdx++];
+                    const level = queue[qIdx++];
+
+                    const propagated = level > 1 ? level - 1 : 1;
+                    if (propagated <= 1) continue; // No point propagating minimum light
+
+                    for (let n = 0; n < neighborOffsets.length; n++) {
+                        const nx = lx + neighborOffsets[n][0];
+                        const ny = ly + neighborOffsets[n][1];
+                        const nz = lz + neighborOffsets[n][2];
+
+                        // Bounds check (stay within chunk)
+                        if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue;
+
+                        const nIdx = nx + (nz << 4) + (ny << 8);
+                        const nBlockId = blocks[nIdx];
+
+                        // Only propagate through transparent blocks
+                        if (!IS_TRANSPARENT[nBlockId]) continue;
+
+                        // Only update if we can provide more light
+                        if (propagated > skyLight[nIdx]) {
+                            skyLight[nIdx] = propagated;
+                            queue.push(nx, ny, nz, propagated);
+                        }
+                    }
+                }
             }
-            // Calculate block light for a chunk - light emitted by torches
+            // Calculate block light for a chunk - light emitted by torches with BFS propagation
             function calculateBlockLight(chunk, chunkSize, chunkHeight) {
-                // Simple torch light - just set light at torch positions
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
                 // Ensure blockLight array is correct size (handles old cached chunks with different height)
@@ -11064,19 +11103,58 @@
 
                 const cs = chunkSize; // 16
                 const torchLevel = getTorchBlockLightLevel();
+                if (torchLevel <= 0) return;
 
-                // Find all torches and set their light level
-                if (torchLevel > 0) {
-                    for (let ly = 0; ly < chunkHeight; ly++) {
-                        const yOff = ly << 8;
-                        for (let lz = 0; lz < cs; lz++) {
-                            const zOff = lz << 4;
-                            for (let lx = 0; lx < cs; lx++) {
-                                const idx = lx + zOff + yOff;
-                                if (blocks[idx] === TORCH) {
-                                    blockLight[idx] = torchLevel;
-                                }
+                // BFS queue for light propagation: [lx, ly, lz, level]
+                const queue = [];
+
+                // Find all torches and seed the propagation queue
+                for (let ly = 0; ly < chunkHeight; ly++) {
+                    const yOff = ly << 8;
+                    for (let lz = 0; lz < cs; lz++) {
+                        const zOff = lz << 4;
+                        for (let lx = 0; lx < cs; lx++) {
+                            const idx = lx + zOff + yOff;
+                            if (blocks[idx] === TORCH) {
+                                blockLight[idx] = torchLevel;
+                                queue.push(lx, ly, lz, torchLevel);
                             }
+                        }
+                    }
+                }
+
+                // BFS propagation within chunk bounds
+                // Note: Light doesn't cross chunk boundaries during initial generation
+                // Cross-chunk propagation happens via updateBlockLightAt() when blocks change
+                const neighborOffsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+                let qIdx = 0;
+                while (qIdx < queue.length) {
+                    const lx = queue[qIdx++];
+                    const ly = queue[qIdx++];
+                    const lz = queue[qIdx++];
+                    const level = queue[qIdx++];
+
+                    const propagated = level > 1 ? level - 1 : 0;
+                    if (propagated <= 0) continue;
+
+                    for (let n = 0; n < neighborOffsets.length; n++) {
+                        const nx = lx + neighborOffsets[n][0];
+                        const ny = ly + neighborOffsets[n][1];
+                        const nz = lz + neighborOffsets[n][2];
+
+                        // Bounds check (stay within chunk)
+                        if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue;
+
+                        const nIdx = nx + (nz << 4) + (ny << 8);
+                        const nBlockId = blocks[nIdx];
+
+                        // Only propagate through transparent blocks
+                        if (!IS_TRANSPARENT[nBlockId]) continue;
+
+                        // Only update if we can provide more light
+                        if (propagated > blockLight[nIdx]) {
+                            blockLight[nIdx] = propagated;
+                            queue.push(nx, ny, nz, propagated);
                         }
                     }
                 }
@@ -12118,9 +12196,10 @@
                 const sky = chunk.skyLight[idx] || 1;
                 const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
                 const maxLight = sky > block ? sky : block;
-                // Minimum light for AO visibility (level 8 = 53% brightness)
-                // Bright enough to clearly show AO darkening in corners
-                const minLight = 8;
+                // Minimum light level 3 (20% brightness base, ~5% with full AO)
+                // Allows caves to feel dark while remaining visible
+                // Matches documented "deep cave" range (2-3) from CLAUDE.md
+                const minLight = 3;
                 return maxLight < minLight ? minLight : maxLight;
             }
             function renderChunk(cx, cz, distSq = 0) {
