@@ -12901,8 +12901,18 @@
                 return getLightVisibility(lightWorldPos) < 0.1; // Occluded if less than 10% visible
             }
 
-            // Raycast from point light to player - returns true if light can reach player
-            function canLightReachPlayer(lightWorldPos, maxRange = 64) {
+            // Broadened raycast from point light to player - returns visibility factor 0.0 to 1.0
+            // Uses cone sampling to allow partial visibility through gaps (like leaves)
+            const _pointLightSampleOffsets = [
+                { x: 0, y: 0, z: 0 },       // Center ray
+                { x: 0.1, y: 0.1, z: 0 },   // Offset rays for cone pattern
+                { x: -0.1, y: 0.1, z: 0 },
+                { x: 0.1, y: -0.1, z: 0 },
+                { x: -0.1, y: -0.1, z: 0 },
+            ];
+            const _pointLightSampleDir = new THREE.Vector3();
+
+            function getPointLightVisibility(lightWorldPos, maxRange = 64) {
                 const camPos = controls ? controls.getObject().position : camera.position;
 
                 // OPTIMIZATION: Calculate distance squared first (avoid sqrt)
@@ -12912,34 +12922,56 @@
                 const distSq = dx * dx + dy * dy + dz * dz;
 
                 // Don't check lights beyond max range
-                if (distSq > maxRange * maxRange) return false;
+                if (distSq > maxRange * maxRange) return 0;
 
                 const totalDist = Math.sqrt(distSq);
 
-                // OPTIMIZATION: Reuse vector
+                // Base direction from light to player
                 _lightReachDir.set(dx / totalDist, dy / totalDist, dz / totalDist);
 
-                // OPTIMIZATION: Increased step size
-                const stepSize = 1.0; // Was 0.5
+                const stepSize = 1.5; // Slightly larger for multi-ray
+                let visibleRays = 0;
+                const totalRays = _pointLightSampleOffsets.length;
 
-                for (let dist = 0.5; dist < totalDist - 0.5; dist += stepSize) {
-                    const checkX = Math.floor(lightWorldPos.x + _lightReachDir.x * dist);
-                    const checkY = Math.floor(lightWorldPos.y + _lightReachDir.y * dist);
-                    const checkZ = Math.floor(lightWorldPos.z + _lightReachDir.z * dist);
+                // Cast multiple rays with slight offsets
+                for (let rayIdx = 0; rayIdx < totalRays; rayIdx++) {
+                    const offset = _pointLightSampleOffsets[rayIdx];
 
-                    // Skip if out of world bounds
-                    if (checkY < 0 || checkY >= WORLD_DIMS.worldHeight) continue;
+                    _pointLightSampleDir.copy(_lightReachDir);
+                    _pointLightSampleDir.x += offset.x;
+                    _pointLightSampleDir.y += offset.y;
+                    _pointLightSampleDir.z += offset.z;
+                    _pointLightSampleDir.normalize();
 
-                    // Check if there's a solid block here
-                    const block = getBlock(checkX, checkY, checkZ);
-                    if (block !== AIR && block !== WATER && block !== LEAVES && block !== TORCH) {
-                        // Hit a solid block - light can't reach player
-                        return false;
+                    let rayBlocked = false;
+
+                    for (let dist = 0.5; dist < totalDist - 0.5; dist += stepSize) {
+                        const checkX = Math.floor(lightWorldPos.x + _pointLightSampleDir.x * dist);
+                        const checkY = Math.floor(lightWorldPos.y + _pointLightSampleDir.y * dist);
+                        const checkZ = Math.floor(lightWorldPos.z + _pointLightSampleDir.z * dist);
+
+                        // Skip if out of world bounds
+                        if (checkY < 0 || checkY >= WORLD_DIMS.worldHeight) continue;
+
+                        // Check if there's a solid block here (leaves/water are transparent)
+                        const block = getBlock(checkX, checkY, checkZ);
+                        if (block !== AIR && block !== WATER && block !== LEAVES && block !== TORCH) {
+                            rayBlocked = true;
+                            break;
+                        }
+                    }
+
+                    if (!rayBlocked) {
+                        visibleRays++;
                     }
                 }
 
-                // Clear line of sight
-                return true;
+                return visibleRays / totalRays;
+            }
+
+            // Legacy boolean version for compatibility
+            function canLightReachPlayer(lightWorldPos, maxRange = 64) {
+                return getPointLightVisibility(lightWorldPos, maxRange) > 0.1;
             }
 
             // OPTIMIZATION: Reusable vectors for volumetric lighting calculations
@@ -13086,7 +13118,7 @@
                     pointLightIndex++;
                 }
 
-                // Placed torches (from chunkTorches map) - use raycast to check line of sight
+                // Placed torches (from chunkTorches map) - use broadened raycast for partial visibility
                 if (chunkTorches && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS) {
                     for (const [chunkKey, torches] of chunkTorches) {
                         if (pointLightIndex >= MAX_VOLUMETRIC_POINT_LIGHTS) break;
@@ -13097,8 +13129,10 @@
                             const distSq = torchPos.distanceToSquared(camPos);
                             if (distSq > maxDistSq) continue;
 
-                            // Raycast from torch to player - if blocked, skip this light
-                            if (!canLightReachPlayer(torchPos)) continue;
+                            // Broadened raycast - get visibility factor (0.0 to 1.0)
+                            // Allows partial glow when light shines through gaps
+                            const visibility = getPointLightVisibility(torchPos);
+                            if (visibility <= 0) continue;
 
                             const screenPos = worldToScreen(torchPos);
                             // Clamp screen position so off-screen lights still contribute
@@ -13108,15 +13142,15 @@
                             );
                             uniforms.pointLightPositions.value[pointLightIndex].copy(clampedPos);
                             uniforms.pointLightColors.value[pointLightIndex].setHex(SETTINGS.torchColor);
-                            // Intensity falls off with distance
-                            const intensity = 1.0 - Math.sqrt(distSq) / 64;
-                            uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.2, intensity);
+                            // Intensity falls off with distance, scaled by visibility
+                            const distIntensity = 1.0 - Math.sqrt(distSq) / 64;
+                            uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.2, distIntensity) * visibility;
                             pointLightIndex++;
                         }
                     }
                 }
 
-                // Zombie eye glows (from mobs array) - use raycast to check line of sight
+                // Zombie eye glows (from mobs array) - use broadened raycast for partial visibility
                 if (mobs && mobs.length > 0 && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS) {
                     for (let i = 0; i < mobs.length && pointLightIndex < MAX_VOLUMETRIC_POINT_LIGHTS; i++) {
                         const mob = mobs[i];
@@ -13129,8 +13163,9 @@
                         const distSq = volumetricTempVec3.distanceToSquared(camPos);
                         if (distSq > maxDistSq) continue;
 
-                        // Raycast from zombie eyes to player - if blocked, skip
-                        if (!canLightReachPlayer(volumetricTempVec3)) continue;
+                        // Broadened raycast - get visibility factor (0.0 to 1.0)
+                        const visibility = getPointLightVisibility(volumetricTempVec3);
+                        if (visibility <= 0) continue;
 
                         const screenPos = worldToScreen(volumetricTempVec3);
                         // Clamp screen position so off-screen zombies still contribute
@@ -13141,8 +13176,8 @@
                         uniforms.pointLightPositions.value[pointLightIndex].copy(clampedPos);
                         // Zombie eye glow color (yellowish-orange)
                         uniforms.pointLightColors.value[pointLightIndex].setHex(0xd9c002);
-                        const intensity = 0.8 - Math.sqrt(distSq) / 80;
-                        uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.3, intensity);
+                        const distIntensity = 0.8 - Math.sqrt(distSq) / 80;
+                        uniforms.pointLightIntensities.value[pointLightIndex] = Math.max(0.3, distIntensity) * visibility;
                         pointLightIndex++;
                     }
                 }
