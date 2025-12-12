@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**VoxEx v3.300+** is a fully-featured, browser-based voxel exploration game inspired by Minecraft. It's a single-file HTML application that runs entirely in the browser without requiring external servers or installations.
+**VoxEx** is a fully-featured, browser-based voxel explo...the browser without requiring external servers or installations.
 
 **Key Characteristics:**
 - **Type**: Browser-based 3D voxel game engine
@@ -45,13 +45,10 @@ These are the core principles that guide all development decisions:
 
 ## Repository Structure
 
-```
 VoxEx/
-├── .git/              # Git repository data
-├── voxEx.html         # Complete application (HTML + CSS + JS)
-└── CLAUDE.md          # This file
-```
-
+├── .git/ # Git repository data
+├── voxEx.html # Complete application (HTML + CSS + JS)
+└── CLAUDE.md # This file
 
 ## Technology Stack
 
@@ -64,16 +61,17 @@ VoxEx/
 | **Canvas API** | Native | Procedural texture generation (Atlas) |
 | **WebGL** | Via Three.js | GPU-accelerated rendering |
 
+...
+
 ## Architecture Overview
 
 VoxEx Architecture: 
 
-```
-┌─────────────────────────────────────────────────────────────┐ 
-│ UI Layer (HTML/CSS)                                         │ 
-│ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │ 
-│ - Menus: Start, Pause, Settings, Controls, Seed Selection   │ 
-└───────────────┬─────────────────────────────────────────────┘ 
+┌─────────────────────────────────────────────────────────────┐
+│ UI Layer (HTML/CSS)                                         │
+│ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │
+│ - Menus: Start, Pause, Settings, Controls, Seed Selection   │
+└───────────────┬─────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ Game Engine (Three.js Renderer)                             │
@@ -88,31 +86,38 @@ VoxEx Architecture:
 │ ├─ Structure Generation (Trees, Caves, Rivers)              │
 │ └─ Block Logic (Optimized Face Culling, AO)                 │
 └───────────────┬─────────────────────────────────────────────┘
-                ↓ 
+                ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ Data Persistence Layer                                      │
 │ ├─ IndexedDB (Chunk Cache with RLE Compression)             │
 │ ├─ LocalStorage (Game Saves & Settings)                     │
 └─────────────────────────────────────────────────────────────┘
 
-```
 ## Version History & Features
 
-**v3.300+ (Current) - Lighting System & Torch Overhaul**
-- **Minecraft-Style Light Levels**: Per-block light system (1-12 range)
-  - Vertical sunlight propagation from sky downward
-  - Horizontal light spreading with natural falloff
-  - Semi-transparent leaves (reduce light by 1 per layer)
-  - Dynamic recalculation when blocks placed/broken
-- **3D Torch Viewmodel**: FPS-style torch rendering
-  - Attached to camera on separate rendering layer
-  - Uses depthTest: false to prevent clipping through walls
-  - Animated flame with flickering effect
-  - Behaves like CoD/Minecraft weapon rendering
-- **Chunk Structure Update**: Changed from Uint8Array to {blocks, skyLight, blockLight}
-- **Camera Clipping Fix**: Near plane adjusted to 0.01 for close-range rendering
-- **Compression Update**: ChunkCompressor handles new light data format with RLE
-- **Bug Fixes**: Block selection, duplicate variable declarations, tree lighting
+**v3.300+ (Current) - Lighting, Atmosphere & Effects**
+
+- **Lighting & Torch**
+  - Minecraft-style per-block light system (vertical sunlight + horizontal falloff, semi-transparent leaves)
+  - Dynamic light recalculation when blocks are placed/removed
+  - 3D FPS-style torch viewmodel on its own layer (no clipping, subtle flicker)
+
+- **World Data & Camera**
+  - Chunk structure now stores `{blocks, skyLight, blockLight}` instead of a single `Uint8Array`
+  - `ChunkCompressor` updated for the new RLE-based format
+  - Camera near plane set to 0.01 to avoid close-range clipping
+
+- **Atmosphere & Post Effects**
+  - Optional volumetric lighting (“god rays”) and volumetric fog with tunable parameters
+  - Water color/opacity and underwater fog distances configurable in Graphics › Water
+  - Zombie scare effects (red vignette + desaturation) configurable in Graphics › Effects
+
+- **Debug & Spawn Pre-Gen**
+  - Debug overlay shows FPS, position, chunk counts, face counts, seed, biome, etc.
+  - Spawn pre-generation with progress UI and a safe “Skip Pre-generation” option
+
+- **Misc Fixes**
+  - Block selection robustness, lighting edge cases, and duplicate variable declarations
 
 **v3.300 - UI Polish Update**
 - Flight Indicator, Movement Indicators (Sprint/Crouch)
@@ -121,7 +126,7 @@ VoxEx Architecture:
 - Texture bleeding fixed (1/12 atlas)
 
 **v3.204 - Previous Major Release**
-- Dynamic render distance, Chunk compression, Pre-generation
+- Dynamic render distance, Chunk compression, ...
 
 ## Key Systems Explained
 
@@ -146,6 +151,7 @@ VoxEx Architecture:
 - **Textures**: Procedurally generated 16x16 pixel art on a canvas (Atlas size: 12 tiles).
 - **Materials**: Lambert material for terrain; Transparent material for water.
 - **Fog**: Custom cylindrical fog shader for smooth horizon blending.
+- **Volumetric Effects**: Optional volumetric lighting (“god rays”) and volumetric fog, configurable via Settings › Graphics.
 - **Layers**: Layer 0 (world geometry), Layer 1 (viewmodels like torch).
 - **Camera**: Near plane 0.01, far plane 800, FOV 75° (80° when sprinting).
 
@@ -155,12 +161,10 @@ VoxEx Architecture:
 - **Structure**:
   - Stick (0.04×0.25×0.04) - brown wood voxel
   - Flame (0.06×0.08×0.06) - orange voxel with 0.5 emissive
-  - Glow (0.04×0.04×0.04) - yellow center, positioned inside flame at (0, 0.165, 0)
+  - Glow (0.04×0.04×0.04) - yellow center, positioned inside flame
 - **Rendering**: Layer 1 with `depthTest: false` and `renderOrder: 1000`
-- **Position**: Attached to camera at (0.35, -0.35, -0.6) with -0.3 rad tilt
-- **Animation**: Very subtle scale pulsing (0.001-0.0015 frequency, 0.03-0.04 amplitude)
-- **Light Range**: 75 units (3x normal range) for extended illumination
-- **Result**: Never clips through world geometry (FPS viewmodel technique)
+- **Position**: Attached to camera with slight tilt; behaves like an FPS weapon
+- **Light Range**: Extended light radius around player for better visibility
 
 ### Persistence
 - **RLE Compression**: Chunk data (blocks + light) is Run-Length Encoded before storing.
@@ -185,7 +189,7 @@ VoxEx Architecture:
 6. **Voxel Aesthetic**: Use BoxGeometry only - no spheres, cylinders, or curved geometry.
 
 ### Common Search Patterns
-- **Config**: `const WORLD_CONFIG`, `const SETTINGS`
+- **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`
 - **Block Types**: `const AIR`, `const GRASS`, `const LEAVES`
 - **Gen**: `function generateChunkData`, `function calculateChunkSunlight`
 - **Render**: `function renderChunk`, `function addFace`
@@ -209,5 +213,48 @@ VoxEx Architecture:
 - Keep render distance reasonable (8-16 chunks for most devices)
 
 ---
-**Last Updated**: 2025-12-02
+
+## Claude Code Guidelines (Concise)
+
+These rules tell Claude Code how to work on this repo (GitHub + HTML/JavaScript) without breaking things.
+
+### Refactoring Scope
+- You may refactor and reorganize code when it clearly improves **correctness**, **readability**, or **performance**.
+- Keep changes focused: avoid unrelated renames or style-only edits that create noisy diffs.
+- Never violate the **single-file rule**: all logic stays in `voxEx.html` (no new files or external assets).
+
+### Bug Prevention & Optimization
+- Before declaring any new `const`/`let`/function:
+  - Quickly search the file for that name; **do not** redeclare an existing identifier in the same scope.
+  - Avoid confusing shadowing of important globals (e.g. `scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`).
+- When adding or changing settings:
+  - Add a sane default in `DEFAULTS`, wire it into `SETTINGS`, and ensure it round-trips via the save/load system.
+  - Make sure any new DOM IDs used in JS exist in the HTML and are updated everywhere they’re referenced.
+- Avoid heavy, deeply nested loops in hot paths (render loop, movement, chunk meshing):
+  - Prefer at most **two** nested loops in per-frame code.
+  - For expensive operations, batch work over time, use existing caches (render distance squared, UV lookup, mesh counts), or limit to nearby chunks.
+
+### Logging & Debug Overlay
+- Prefer `logDebug(...)` over raw `console.log(...)`, especially for:
+  - Chunk cache, pre-generation, streaming/eviction
+  - New systems (volumetric, zombie effects, lighting changes)
+- Keep logs:
+  - **Sparse** (no per-frame spam or per-block logging)
+  - **Tagged** with short prefixes like `[PreGen]`, `[Chunks]`, `[Lighting]`, `[ZombieFX]`, `[Settings]`.
+- The `#debug-overlay` should show concise, high-value info only (FPS, position, chunk/mesh counts, face counts, seed, biome, etc.).
+
+### Change Reporting in GitHub
+When you propose changes (patches/commits/PRs), format your explanation like this:
+
+- **Summary** – 2–5 short bullets of what changed.
+- **Changes** – grouped bullets by subsystem (e.g. “Settings › Graphics › Effects”, “World Pre-Gen”, “Rendering › Volumetric”).
+- **Rationale** – a few sentences on *why* the changes were made (bug fix, performance, clarity).
+- **Safety Checks** – explicitly mention that you:
+  - Checked for duplicate or shadowed identifiers before new declarations.
+  - Verified new DOM IDs and settings are wired correctly.
+  - Avoided adding heavy loops or work to the per-frame/update path.
+
+
+---
+**Last Updated**: 2025-12-12  
 **File Version**: v3.300+
