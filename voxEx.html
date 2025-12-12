@@ -2436,8 +2436,6 @@
                 constructor(materials) {
                     this.materials = materials || {};
                     this.faceVertexCache = new Map();
-                    this.terrainMeshPool = [];
-                    this.waterMeshPool = [];
                 }
 
                 setMaterials(terrain, water) {
@@ -2487,23 +2485,6 @@
                     const corner = getter(lx + offsets.corner[0], ly + offsets.corner[1], lz + offsets.corner[2]) > 0 ? 1 : 0;
                     if (side1 && side2) return 0;
                     return 3 - (side1 + side2 + corner);
-                }
-
-                // --- MESH POOLING ---
-                acquireTerrainMesh() {
-                    return this.terrainMeshPool.pop() || null;
-                }
-
-                acquireWaterMesh() {
-                    return this.waterMeshPool.pop() || null;
-                }
-
-                releaseTerrainMesh(mesh) {
-                    if (mesh) this.terrainMeshPool.push(mesh);
-                }
-
-                releaseWaterMesh(mesh) {
-                    if (mesh) this.waterMeshPool.push(mesh);
                 }
 
                 buildMeshForChunk(chunk, neighbors, uvMap) {
@@ -4069,6 +4050,11 @@
             let isUnderwater = false; // Track if player's eyes are underwater
             let underwaterDepth = 0; // How deep underwater (for fog darkness)
             let savedFogState = null; // Store normal fog settings when going underwater
+            // OPTIMIZATION: Reusable color objects for underwater fog (avoid per-frame allocations)
+            const _underwaterBaseColor = new THREE.Color();
+            const _underwaterDarkColor = new THREE.Color(0x001122);
+            const _underwaterResultColor = new THREE.Color();
+            let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             // --- BLOCK DEFINITIONS ---
             const AIR = 0,
                 GRASS = 1,
@@ -5513,7 +5499,6 @@
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
-            const IS_FLUID = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
@@ -8194,6 +8179,7 @@
                 document.getElementById("btn-reset-graphics-water")?.addEventListener("click", () => {
                     SETTINGS.waterColor = DEFAULTS.waterColor;
                     SETTINGS.waterOpacity = DEFAULTS.waterOpacity;
+                    applyWaterMaterialSettings(); // Apply changes to material immediately
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                 });
@@ -8270,7 +8256,6 @@
             }
             function initBlockOptimization() {
                 IS_TRANSPARENT.fill(0);
-                IS_FLUID.fill(0);
                 BLOCKLIGHT_ATTENUATION.fill(15);
                 // Default sunlight attenuation: treat everything as fully blocking until defined
                 SUNLIGHT_ATTENUATION.fill(15);
@@ -8289,9 +8274,8 @@
                 BLOCKLIGHT_ATTENUATION[LEAVES] = 1; // Torches bleed softly through leaves
                 BLOCKLIGHT_ATTENUATION[WATER] = 2; // Water dims torches slightly
                 BLOCKLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Avoid seams darkening when neighbors are pending
-                // 2. Define Fluids
-                const fluidIds = [WATER];
-                for (const id of fluidIds) IS_FLUID[id] = 1;
+                // Water attenuates sunlight slightly (deeper water = less light)
+                SUNLIGHT_ATTENUATION[WATER] = 1; // Light loses 1 level per water block
                 const atlasTileCount = NUM_TILES;
                 const uvStep = 1 / atlasTileCount;
                 // 3. Initialize UV Map (Texture Coordinates)
@@ -12428,7 +12412,7 @@
                         const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
                         waterMesh.geometry = waterGeo;
-                        waterMesh.frustumCulled = false; // Water doesn't use frustum culling
+                        waterMesh.frustumCulled = SETTINGS.enableFrustumCulling; // OPTIMIZATION: Use frustum culling for water too
                         waterMesh.castShadow = false; // Water doesn't cast shadows
                         waterMesh.receiveShadow = false;
                         waterMesh.updateMatrix();
@@ -13604,6 +13588,7 @@
                 perfMonitor.end("rendering", renderStart);
             }
             // Update underwater fog based on player position
+            // OPTIMIZATION: Uses reusable color objects and caches depth calculation
             function updateUnderwaterFog() {
                 if (!scene.fog || !controls) return;
 
@@ -13619,16 +13604,22 @@
                 isUnderwater = (blockAtEye === WATER);
 
                 if (isUnderwater) {
-                    // Calculate depth below water surface
-                    let surfaceY = eyeBlockY;
-                    for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
-                        const blockAbove = getBlock(eyeX, y, eyeZ);
-                        if (blockAbove !== WATER) {
-                            surfaceY = y;
-                            break;
+                    // OPTIMIZATION: Only recalculate depth when Y position changes significantly
+                    // This avoids the loop running every frame when treading water
+                    const yDelta = Math.abs(eyeY - _lastUnderwaterCheckY);
+                    if (yDelta > 0.25 || !wasUnderwater) {
+                        _lastUnderwaterCheckY = eyeY;
+                        // Calculate depth below water surface
+                        let surfaceY = eyeBlockY;
+                        for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
+                            const blockAbove = getBlock(eyeX, y, eyeZ);
+                            if (blockAbove !== WATER) {
+                                surfaceY = y;
+                                break;
+                            }
                         }
+                        underwaterDepth = Math.max(0, surfaceY - eyeY);
                     }
-                    underwaterDepth = Math.max(0, surfaceY - eyeY);
 
                     // Save normal fog state when entering water
                     if (!wasUnderwater) {
@@ -13639,16 +13630,15 @@
                         };
                     }
 
-                    // Base underwater fog color (water color)
-                    const baseWaterColor = new THREE.Color(SETTINGS.waterColor);
+                    // OPTIMIZATION: Use reusable color objects instead of allocating new ones
+                    _underwaterBaseColor.setHex(SETTINGS.waterColor);
 
                     // Darken based on depth - deeper = darker and shorter visibility
                     const maxDepth = 35; // Maximum depth for full darkness
                     const depthFactor = Math.min(underwaterDepth / maxDepth, 1.0);
 
-                    // Interpolate from light blue to dark blue/black
-                    const darkColor = new THREE.Color(0x001122); // Very dark blue
-                    const underwaterColor = baseWaterColor.clone().lerp(darkColor, depthFactor * 0.9);
+                    // Interpolate from water color to dark blue/black using reusable objects
+                    _underwaterResultColor.copy(_underwaterBaseColor).lerp(_underwaterDarkColor, depthFactor * 0.9);
 
                     // Fog distance decreases with depth (murkier water deeper down)
                     const baseFogFar = SETTINGS.underwaterFogFar;
@@ -13657,7 +13647,7 @@
                     const fogNear = THREE.MathUtils.lerp(baseFogNear, 0.5, depthFactor);
 
                     // Apply underwater fog
-                    scene.fog.color.copy(underwaterColor);
+                    scene.fog.color.copy(_underwaterResultColor);
                     scene.fog.near = fogNear;
                     scene.fog.far = fogFar;
                 } else if (wasUnderwater && savedFogState) {
@@ -13667,6 +13657,7 @@
                     scene.fog.far = savedFogState.far;
                     savedFogState = null;
                     underwaterDepth = 0;
+                    _lastUnderwaterCheckY = -Infinity; // Reset cache when exiting water
                 }
             }
 
