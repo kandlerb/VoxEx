@@ -45,10 +45,10 @@ These are the core principles that guide all development decisions:
 
 ## Repository Structure
 
-VoxEx/
-├── .git/ # Git repository data
-├── voxEx.html # Complete application (HTML + CSS + JS)
-└── CLAUDE.md # This file
+VoxEx/  
+├── .git/ # Git repository data  
+├── voxEx.html # Complete application (HTML + CSS + JS)  
+└── CLAUDE.md # This file  
 
 ## Technology Stack
 
