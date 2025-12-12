@@ -7010,34 +7010,36 @@
 
                         // Atmospheric fog/haze for volumetric scattering
                         vec3 calculateAtmosphericFog(vec3 color, vec2 sunPos, float sunVis, vec2 moonPos, float moonVis) {
-                            // Atmospheric haze is always present, intensifies toward light source
+                            // Light visibility (0 = occluded by terrain, 1 = visible)
+                            // This is set to 0 by raycast when sun/moon is blocked by blocks
+                            float lightVis = max(sunVis, moonVis);
+
+                            // No fog if light source is completely occluded
+                            if (lightVis <= 0.0) {
+                                return color;
+                            }
+
                             // Use sun during day, moon at night
                             vec2 lightPos = sunVis > moonVis ? sunPos : moonPos;
                             vec3 lightColor = sunVis > moonVis ? sunColor : moonColor;
 
-                            // Distance from this pixel to light position (works even if light is off-screen)
+                            // Distance from this pixel to light position
                             float dist = length(vUv - lightPos);
 
                             // Fog is 2x denser at night
                             float nightMultiplier = 1.0 + nightFactor;
 
-                            // Surface factor: 1.0 on surface, 0.0 when underground
-                            // Radial glow should NOT be visible underground (no light from sun/moon through rock)
-                            float surfaceFactor = 1.0 - depthBelowSea;
+                            // Radial glow - scales with light visibility (handles partial occlusion)
+                            float radialGlow = exp(-dist * dist * 1.5) * fogDensity * nightMultiplier * lightVis;
 
-                            // Radial glow - only visible on surface, fades completely underground
-                            float radialGlow = exp(-dist * dist * 1.5) * fogDensity * nightMultiplier * surfaceFactor;
-
-                            // Global atmospheric haze - minimal underground
-                            float globalHaze = fogDensity * 0.15 * nightMultiplier * surfaceFactor;
+                            // Global atmospheric haze - also scales with visibility
+                            float globalHaze = fogDensity * 0.15 * nightMultiplier * lightVis;
 
                             // Combine radial glow and global haze
                             float fogAmount = radialGlow + globalHaze;
 
-                            // Blend fog color from sky-tinted to black based on depth below sea level
-                            vec3 skyFogColor = lightColor * 0.6 + vec3(0.9, 0.92, 0.95) * 0.4;
-                            vec3 caveFogColor = vec3(0.0, 0.0, 0.0); // Black fog underground
-                            vec3 fogColor = mix(skyFogColor, caveFogColor, depthBelowSea);
+                            // Fog color based on light
+                            vec3 fogColor = lightColor * 0.6 + vec3(0.9, 0.92, 0.95) * 0.4;
 
                             // Additive blend for glow effect
                             return color + fogColor * fogAmount;
@@ -12412,6 +12414,44 @@
             const volumetricTempVec3 = new THREE.Vector3();
             const volumetricTempVec2 = new THREE.Vector2();
             const MAX_VOLUMETRIC_POINT_LIGHTS = 16;
+
+            // Raycast to check if sun/moon is occluded by terrain
+            function isLightOccluded(lightWorldPos) {
+                const camPos = controls ? controls.getObject().position : camera.position;
+
+                // Direction from player to light (normalized)
+                const dir = new THREE.Vector3().subVectors(lightWorldPos, camPos).normalize();
+
+                // Raycast from player position toward the light
+                // Check up to 100 blocks or until we exit the world bounds
+                const maxDist = 100;
+                const stepSize = 0.5; // Check every half block for accuracy
+
+                for (let dist = 1; dist < maxDist; dist += stepSize) {
+                    const checkX = Math.floor(camPos.x + dir.x * dist);
+                    const checkY = Math.floor(camPos.y + dir.y * dist);
+                    const checkZ = Math.floor(camPos.z + dir.z * dist);
+
+                    // If we've gone above world height, we have clear sky - not occluded
+                    if (checkY >= WORLD_DIMS.worldHeight) {
+                        return false;
+                    }
+
+                    // If below ground level, keep checking
+                    if (checkY < 0) continue;
+
+                    // Check if there's a solid block here
+                    const block = getBlock(checkX, checkY, checkZ);
+                    if (block !== AIR && block !== WATER && block !== LEAVES) {
+                        // Hit a solid block - sun is occluded
+                        return true;
+                    }
+                }
+
+                // Reached max distance without hitting anything - not occluded
+                return false;
+            }
+
             function updateVolumetricLighting(time) {
                 if (!volumetricLightPass) return;
                 if (!SETTINGS.volumetricLightingEnabled) return;
@@ -12496,7 +12536,11 @@
                     const distFromCenter = Math.sqrt(Math.pow(screenPos.x - 0.5, 2) + Math.pow(screenPos.y - 0.5, 2));
                     const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5); // Fade starts at 0.7 from center
 
-                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade;
+                    // Check if sun is blocked by terrain (raycast)
+                    const sunOccluded = isLightOccluded(sunSprite.position);
+                    const occlusionFactor = sunOccluded ? 0 : 1;
+
+                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade * occlusionFactor;
                 } else {
                     uniforms.sunVisible.value = 0;
                 }
@@ -12513,7 +12557,11 @@
                     const distFromCenter = Math.sqrt(Math.pow(screenPos.x - 0.5, 2) + Math.pow(screenPos.y - 0.5, 2));
                     const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5);
 
-                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade;
+                    // Check if moon is blocked by terrain (raycast)
+                    const moonOccluded = isLightOccluded(moonSprite.position);
+                    const occlusionFactor = moonOccluded ? 0 : 1;
+
+                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade * occlusionFactor;
                 } else {
                     uniforms.moonVisible.value = 0;
                 }
