@@ -1224,7 +1224,7 @@
                 volumetricDensity: 0.015,
                 volumetricDecay: 0.97,
                 volumetricWeight: 0.3,
-                volumetricSamples: 50,
+                volumetricSamples: 25, // OPTIMIZED: Reduced from 50 for better FPS
                 volumetricExposure: 0.25,
                 volumetricFogDensity: 0.5,
             };
@@ -4974,14 +4974,25 @@
                 // Memory estimate
                 const memMB = ((chunkDataCount * 16 * 16 * 320 * 3) / (1024 * 1024)).toFixed(1);
 
+                // Calculate estimated GPU time (frame time minus tracked CPU work)
+                const trackedCpuTime = perfMetrics.physicsTime + perfMetrics.renderTime +
+                                       perfMetrics.chunkBuildTime + perfMetrics.lightingTime +
+                                       perfMetrics.chunkUpdateTime;
+                const estimatedGpuTime = Math.max(0, perfMetrics.frameTimeAvg - trackedCpuTime);
+
+                // Color helper for timing values (green < 4ms, yellow 4-8ms, red > 8ms)
+                const timeColor = (ms) => ms < 4 ? '' : ms < 8 ? 'perf-warn' : 'perf-bad';
+                const gpuColor = estimatedGpuTime < 8 ? '' : estimatedGpuTime < 14 ? 'perf-warn' : 'perf-bad';
+
                 // Build display
                 let html = `<span class="${fpsColor}">FPS: ${fps}</span> (${perfMetrics.frameTimeMin.toFixed(1)}-${perfMetrics.frameTimeMax.toFixed(1)}ms)\n`;
                 html += `Frame: ${perfMetrics.frameTimeAvg.toFixed(2)}ms avg\n`;
                 html += `<span class="perf-section">── Timings ──</span>\n`;
-                html += `Physics: ${perfMetrics.physicsTime.toFixed(2)}ms\n`;
-                html += `Render:  ${perfMetrics.renderTime.toFixed(2)}ms\n`;
-                html += `ChunkBld:${perfMetrics.chunkBuildTime.toFixed(2)}ms\n`;
-                html += `Lighting:${perfMetrics.lightingTime.toFixed(2)}ms\n`;
+                html += `<span class="${timeColor(perfMetrics.physicsTime)}">Physics: ${perfMetrics.physicsTime.toFixed(2)}ms</span>\n`;
+                html += `<span class="${timeColor(perfMetrics.renderTime)}">Render:  ${perfMetrics.renderTime.toFixed(2)}ms</span>\n`;
+                html += `<span class="${timeColor(perfMetrics.chunkBuildTime)}">ChunkBld:${perfMetrics.chunkBuildTime.toFixed(2)}ms</span>\n`;
+                html += `<span class="${timeColor(perfMetrics.lightingTime)}">Lighting:${perfMetrics.lightingTime.toFixed(2)}ms</span>\n`;
+                html += `<span class="${gpuColor}">GPU(est):${estimatedGpuTime.toFixed(2)}ms</span>\n`;
                 html += `<span class="perf-section">── Chunks ──</span>\n`;
                 html += `Data/Mesh: ${chunkDataCount}/${chunkMeshCount}\n`;
                 html += `Build Q: ${buildQueueLen} | Nbr Q: ${neighborQueueLen}\n`;
@@ -7044,7 +7055,7 @@
                 composer.addPass(zombieScarePass);
 
                 // Volumetric Lighting (God Rays) shader
-                const MAX_POINT_LIGHTS = 16; // Max torches + zombie eyes to process
+                const MAX_POINT_LIGHTS = 8; // OPTIMIZED: Reduced from 16 for better FPS
                 const VolumetricLightShader = {
                     uniforms: {
                         tDiffuse: { value: null },
@@ -7106,13 +7117,13 @@
                         uniform float nightFactor;
                         varying vec2 vUv;
 
-                        // God ray calculation for a single light source
+                        // OPTIMIZED: God ray calculation for sun/moon (full samples)
                         vec3 calculateGodRay(vec2 lightPos, vec3 lightColor, float intensity) {
                             vec2 deltaTexCoord = vUv - lightPos;
                             float dist = length(deltaTexCoord);
 
-                            // Skip if too far from light or light is off-screen
-                            if (dist > 1.5 || intensity <= 0.0) return vec3(0.0);
+                            // OPTIMIZED: Tighter early-exit threshold
+                            if (dist > 1.2 || intensity <= 0.0) return vec3(0.0);
 
                             deltaTexCoord *= density / float(samples);
                             vec2 texCoord = vUv;
@@ -7121,19 +7132,43 @@
 
                             for (int i = 0; i < ${SETTINGS.volumetricSamples}; i++) {
                                 texCoord -= deltaTexCoord;
-                                // Clamp to valid UV range
                                 vec2 sampleCoord = clamp(texCoord, 0.001, 0.999);
-                                // Use textureLod to avoid gradient warnings in loops
                                 vec3 sampleColor = textureLod(tDiffuse, sampleCoord, 0.0).rgb;
-                                // Extract brightness
                                 float brightness = dot(sampleColor, vec3(0.2126, 0.7152, 0.0722));
                                 sampleColor *= illuminationDecay * weight * brightness;
                                 godRay += sampleColor;
                                 illuminationDecay *= decay;
                             }
 
-                            // Falloff based on distance from light center
-                            float falloff = 1.0 - smoothstep(0.0, 1.2, dist);
+                            float falloff = 1.0 - smoothstep(0.0, 1.0, dist);
+                            return godRay * lightColor * intensity * exposure * falloff;
+                        }
+
+                        // OPTIMIZED: Faster point light god rays with fewer samples (10 instead of ${SETTINGS.volumetricSamples})
+                        const int POINT_LIGHT_SAMPLES = 10;
+                        vec3 calculatePointLightGodRay(vec2 lightPos, vec3 lightColor, float intensity) {
+                            vec2 deltaTexCoord = vUv - lightPos;
+                            float dist = length(deltaTexCoord);
+
+                            // OPTIMIZED: Tighter threshold for point lights
+                            if (dist > 0.6 || intensity <= 0.0) return vec3(0.0);
+
+                            deltaTexCoord *= density / float(POINT_LIGHT_SAMPLES);
+                            vec2 texCoord = vUv;
+                            float illuminationDecay = 1.0;
+                            vec3 godRay = vec3(0.0);
+
+                            for (int i = 0; i < POINT_LIGHT_SAMPLES; i++) {
+                                texCoord -= deltaTexCoord;
+                                vec2 sampleCoord = clamp(texCoord, 0.001, 0.999);
+                                vec3 sampleColor = textureLod(tDiffuse, sampleCoord, 0.0).rgb;
+                                float brightness = dot(sampleColor, vec3(0.2126, 0.7152, 0.0722));
+                                sampleColor *= illuminationDecay * weight * brightness;
+                                godRay += sampleColor;
+                                illuminationDecay *= decay;
+                            }
+
+                            float falloff = 1.0 - smoothstep(0.0, 0.5, dist);
                             return godRay * lightColor * intensity * exposure * falloff;
                         }
 
@@ -7234,16 +7269,17 @@
                                 totalGodRays += calculateGodRay(safeMoonPos, moonColor, moonVisible * 0.6);
                             }
 
-                            // Point light god rays (torches, handheld torch, zombie eyes)
+                            // OPTIMIZED: Point light god rays with fewer samples (10 vs ${SETTINGS.volumetricSamples})
                             // Use constant iteration to avoid gradient warnings (no break)
                             for (int i = 0; i < ${MAX_POINT_LIGHTS}; i++) {
                                 // Skip inactive lights (intensity 0) instead of breaking
                                 float intensity = pointLightIntensities[i];
                                 if (intensity > 0.0) {
                                     vec2 lightPos = pointLightPositions[i];
-                                    // Only process if on screen
-                                    if (lightPos.x >= -0.5 && lightPos.x <= 1.5 && lightPos.y >= -0.5 && lightPos.y <= 1.5) {
-                                        totalGodRays += calculateGodRay(lightPos, pointLightColors[i], intensity * 0.4);
+                                    // OPTIMIZED: Tighter screen bounds check
+                                    if (lightPos.x >= -0.3 && lightPos.x <= 1.3 && lightPos.y >= -0.3 && lightPos.y <= 1.3) {
+                                        // OPTIMIZED: Use faster point light function with 10 samples
+                                        totalGodRays += calculatePointLightGodRay(lightPos, pointLightColors[i], intensity * 0.4);
                                         // Add atmospheric fog from this point light
                                         color = addPointLightFog(color, lightPos, pointLightColors[i], intensity);
                                     }
@@ -12530,6 +12566,39 @@
                 // Use optimized circular buffer instead of dynamic array
                 pushFPSSample(time, fpsInstant);
                 fpsAvg = getAverageFPS(time, 10000);
+
+                // OPTIMIZATION: Adaptive quality - reduce volumetric intensity when FPS is low
+                updateAdaptiveQuality(fpsAvg);
+            }
+
+            // OPTIMIZATION: Adaptive quality system to maintain smooth FPS
+            let adaptiveQualityState = 1.0; // 1.0 = full quality, 0.5 = reduced
+            let adaptiveQualityLastUpdate = 0;
+            const ADAPTIVE_QUALITY_INTERVAL = 2000; // Check every 2 seconds
+            function updateAdaptiveQuality(avgFps) {
+                const now = performance.now();
+                if (now - adaptiveQualityLastUpdate < ADAPTIVE_QUALITY_INTERVAL) return;
+                adaptiveQualityLastUpdate = now;
+
+                if (!volumetricLightPass) return;
+
+                // Target 45+ FPS for smooth gameplay
+                if (avgFps < 30 && adaptiveQualityState > 0.3) {
+                    // Critical FPS drop - reduce quality significantly
+                    adaptiveQualityState = Math.max(0.3, adaptiveQualityState - 0.2);
+                    volumetricLightPass.uniforms.weight.value = SETTINGS.volumetricWeight * adaptiveQualityState;
+                    volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure * adaptiveQualityState;
+                } else if (avgFps < 45 && adaptiveQualityState > 0.5) {
+                    // Low FPS - reduce quality moderately
+                    adaptiveQualityState = Math.max(0.5, adaptiveQualityState - 0.1);
+                    volumetricLightPass.uniforms.weight.value = SETTINGS.volumetricWeight * adaptiveQualityState;
+                    volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure * adaptiveQualityState;
+                } else if (avgFps > 55 && adaptiveQualityState < 1.0) {
+                    // FPS is good - gradually restore quality
+                    adaptiveQualityState = Math.min(1.0, adaptiveQualityState + 0.1);
+                    volumetricLightPass.uniforms.weight.value = SETTINGS.volumetricWeight * adaptiveQualityState;
+                    volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure * adaptiveQualityState;
+                }
             }
             // Apply player velocity based on input
             function applyPlayerVelocity(dt) {
@@ -12684,7 +12753,7 @@
             // Update volumetric lighting shader uniforms with light positions
             const volumetricTempVec3 = new THREE.Vector3();
             const volumetricTempVec2 = new THREE.Vector2();
-            const MAX_VOLUMETRIC_POINT_LIGHTS = 16;
+            const MAX_VOLUMETRIC_POINT_LIGHTS = 8; // OPTIMIZED: Match MAX_POINT_LIGHTS in shader
 
             // OPTIMIZATION: Reusable vectors to avoid per-frame allocations
             const _occlusionDir = new THREE.Vector3();
