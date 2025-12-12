@@ -1183,40 +1183,45 @@
                     lacunarity: 2.0,
                 },
             };
+            // Biome configuration for terrain generation
+            // weight: Relative probability of biome selection (higher = more common)
+            // roughness: Noise frequency scale (lower = smoother, wider features)
+            // amplitude: Maximum height variation from baseHeight
+            // baseHeight: Average terrain height for this biome
             const BIOME_CONFIG = {
                 plains: {
-                    weight: 4,
-                    roughness: 0.008,  // Lower frequency for wider, gentler slopes
-                    amplitude: 10,
-                    baseHeight: 62, // Slightly higher than sea level (60)
+                    weight: 5,        // Common lowland biome
+                    roughness: 0.006, // Very smooth, gentle rolling terrain
+                    amplitude: 8,     // Subtle height variation
+                    baseHeight: 62,   // Slightly above sea level (60)
                     heightFunc: plainsHeightFunc,
                 },
                 hills: {
-                    weight: 3,
-                    roughness: 0.012,
-                    amplitude: 45,
+                    weight: 4,        // Moderately common transition biome
+                    roughness: 0.010, // Medium-scale features
+                    amplitude: 40,    // Noticeable but not extreme hills
                     baseHeight: 65,
                     heightFunc: hillsHeightFunc,
                 },
                 forests: {
-                    weight: 4,
-                    roughness: 0.02,
-                    amplitude: 15,
-                    baseHeight: 65,
+                    weight: 5,        // Common biome for varied terrain
+                    roughness: 0.015, // Gentle rolling forested hills
+                    amplitude: 12,    // Moderate variation
+                    baseHeight: 64,
                     heightFunc: defaultHeightFunc,
                 },
                 mountains: {
-                    weight: 6, // Much more common - mountains everywhere!
-                    roughness: 0.003,
-                    amplitude: 180,  // Max height ~250-290 with variation
-                    baseHeight: 70,
+                    weight: 4,        // Balanced - creates dramatic features without dominating
+                    roughness: 0.003, // Large-scale mountain ranges
+                    amplitude: 180,   // Max height ~250-290 with regional variation
+                    baseHeight: 70,   // Elevated base for mountain regions
                     heightFunc: mountainsHeightFunc,
                 },
                 swamp: {
-                    weight: 1,
-                    roughness: 0.03,
-                    amplitude: 6,
-                    baseHeight: 59, // Dip slightly below sea level for pools
+                    weight: 2,        // Relatively rare biome
+                    roughness: 0.025, // Small-scale bumpy terrain
+                    amplitude: 5,     // Very flat with small mounds
+                    baseHeight: 58,   // Slightly below sea level for water pools
                     heightFunc: defaultHeightFunc,
                 },
             };
@@ -1750,6 +1755,24 @@
 
             // =====================================================
             // 3. TERRAIN GENERATOR CLASS
+            // =====================================================
+            // NOTE: This class contains methods that DUPLICATE global functions
+            // found later in the codebase (lines ~10700-11200). The global functions
+            // are what generateChunkData() actually uses for terrain generation.
+            //
+            // DUPLICATION LIST:
+            // - noise2D, noise3D, fbm2D, fbmWithDomainWarp (class methods vs global)
+            // - defaultHeightFunc, hillsHeightFunc, plainsHeightFunc, mountainsHeightFunc
+            // - getRiverFactor, getOceanFactor, getRiverDepth, getOceanDepth
+            // - blendedHeight, getBiomeHeightAtCell, continentalHeight
+            // - getBiomeAt/getBiomeParams, getRawBiome/getRawBiomeParams
+            // - getTreeDensityForBiome, treePlacementValue
+            // - generateTreeMaskForChunk, getTreeMaskForChunk, getTreeMaskValueGlobal
+            //
+            // CONSOLIDATION PATH (TODO):
+            // 1. Make generateChunkData() use TerrainGenerator instance methods
+            // 2. Remove the global duplicate functions
+            // 3. Pass terrainGenerator instance to generateChunkData
             // =====================================================
 
             class TerrainGenerator {
@@ -5710,6 +5733,243 @@
             // --- OPTIMIZATION: Modified Chunk Tracking ---
             const modifiedChunks = new Set(); // Tracks chunks modified by player (block place/break)
             const pristineChunks = new Set(); // Tracks unmodified generated chunks (can be safely discarded)
+
+            // --- GENERATION PASS STATE TRACKING ---
+            // Bitmask constants for tracking which generation passes have completed
+            const GEN_PASS = {
+                TERRAIN: 1,       // Base terrain + caves carved
+                WATER: 2,         // Water filled below sea level
+                DECORATIONS: 4,   // Trees and decorations placed
+                SUNLIGHT: 8,      // Sunlight calculated
+                BLOCKLIGHT: 16,   // Block light calculated
+                NEIGHBOR_UPDATE: 32, // Adjacent chunk update pass completed
+                ALL: 63           // All passes complete (sum of above)
+            };
+            // Queue for adjacent chunk updates - chunks that need to be updated after a neighbor is built
+            const adjacentChunkUpdateQueue = new Set();
+            // Track chunks that have been fully generated but not yet had neighbor updates applied
+            const chunksAwaitingNeighborUpdate = new Set();
+
+            // Queue adjacent chunks for update when a new chunk is generated
+            // This ensures cross-chunk features (trees, lighting) are properly applied
+            function queueAdjacentChunksForUpdate(cx, cz, newChunkKey) {
+                const neighbors = [
+                    { dx: -1, dz: 0 },  // West
+                    { dx: 1, dz: 0 },   // East
+                    { dx: 0, dz: -1 },  // North
+                    { dx: 0, dz: 1 },   // South
+                    { dx: -1, dz: -1 }, // Northwest
+                    { dx: 1, dz: -1 },  // Northeast
+                    { dx: -1, dz: 1 },  // Southwest
+                    { dx: 1, dz: 1 },   // Southeast
+                ];
+
+                for (const { dx, dz } of neighbors) {
+                    const ncx = cx + dx;
+                    const ncz = cz + dz;
+                    const nKey = getChunkKey(ncx, ncz);
+
+                    // Only queue existing chunks that need an update
+                    if (chunks.has(nKey)) {
+                        const neighborChunk = chunks.get(nKey);
+                        // Check if the neighbor hasn't had the neighbor update pass yet
+                        if (neighborChunk && !(neighborChunk.genState & GEN_PASS.NEIGHBOR_UPDATE)) {
+                            adjacentChunkUpdateQueue.add(nKey);
+                        }
+                    }
+                }
+
+                // Also mark the new chunk for neighbor updates if all its neighbors exist
+                chunksAwaitingNeighborUpdate.add(newChunkKey);
+            }
+
+            // Process adjacent chunk updates - called from the main game loop
+            // This handles cross-chunk features like trees that extend into neighboring chunks
+            function processAdjacentChunkUpdates(budget = 2) {
+                if (adjacentChunkUpdateQueue.size === 0) return 0;
+
+                let processed = 0;
+                const toProcess = Array.from(adjacentChunkUpdateQueue).slice(0, budget);
+
+                for (const key of toProcess) {
+                    adjacentChunkUpdateQueue.delete(key);
+
+                    if (!chunks.has(key)) continue;
+
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks) continue;
+
+                    const { cx, cz } = parseChunkKeySimple(key);
+
+                    // Check if all 4 cardinal neighbors exist (required for full update)
+                    const hasAllCardinalNeighbors =
+                        chunks.has(getChunkKey(cx - 1, cz)) &&
+                        chunks.has(getChunkKey(cx + 1, cz)) &&
+                        chunks.has(getChunkKey(cx, cz - 1)) &&
+                        chunks.has(getChunkKey(cx, cz + 1));
+
+                    if (!hasAllCardinalNeighbors) {
+                        // Re-queue if not all neighbors are ready
+                        adjacentChunkUpdateQueue.add(key);
+                        continue;
+                    }
+
+                    // Run the neighbor update pass
+                    runNeighborUpdatePass(chunk, cx, cz);
+                    chunk.genState |= GEN_PASS.NEIGHBOR_UPDATE;
+
+                    // Schedule mesh rebuild for updated chunk
+                    if (chunkMeshes.has(key)) {
+                        scheduleChunkUpdate(cx, cz, false, "neighbor-update");
+                    }
+
+                    processed++;
+                }
+
+                return processed;
+            }
+
+            // Run neighbor update pass on a chunk
+            // This handles cross-chunk tree foliage, lighting propagation, etc.
+            function runNeighborUpdatePass(chunk, cx, cz) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                const blocks = chunk.blocks;
+                const seed = worldConfig.seed;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+
+                // Get neighbor chunks for cross-boundary operations
+                const westChunk = chunks.get(getChunkKey(cx - 1, cz));
+                const eastChunk = chunks.get(getChunkKey(cx + 1, cz));
+                const northChunk = chunks.get(getChunkKey(cx, cz - 1));
+                const southChunk = chunks.get(getChunkKey(cx, cz + 1));
+
+                // Check edge columns for trees from neighbors that might extend into this chunk
+                // West edge (lx = 0) - check if trees from west neighbor extend here
+                if (westChunk && westChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, westChunk, cx, cz, cx - 1, cz, 'west', seed);
+                }
+                // East edge (lx = 15) - check if trees from east neighbor extend here
+                if (eastChunk && eastChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, eastChunk, cx, cz, cx + 1, cz, 'east', seed);
+                }
+                // North edge (lz = 0) - check if trees from north neighbor extend here
+                if (northChunk && northChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, northChunk, cx, cz, cx, cz - 1, 'north', seed);
+                }
+                // South edge (lz = 15) - check if trees from south neighbor extend here
+                if (southChunk && southChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, southChunk, cx, cz, cx, cz + 1, 'south', seed);
+                }
+
+                // Recalculate edge lighting to account for neighboring chunks
+                recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
+            }
+
+            // Apply tree canopy overhang from a neighboring chunk
+            function applyTreeOverhangFromNeighbor(targetChunk, sourceChunk, targetCx, targetCz, sourceCx, sourceCz, direction, seed) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                const sourceBlocks = sourceChunk.blocks;
+                const targetBlocks = targetChunk.blocks;
+
+                // Scan the edge of the source chunk for trees
+                const treeRadius = 3; // Max tree canopy radius
+
+                // Determine which edge to scan based on direction
+                let scanLx, scanLz, targetOffset;
+                if (direction === 'west') {
+                    // West neighbor's east edge (lx = 15)
+                    scanLx = chunkSize - 1;
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, 0, lz, treeRadius, chunkSize, chunkHeight, direction);
+                    }
+                } else if (direction === 'east') {
+                    // East neighbor's west edge (lx = 0)
+                    scanLx = 0;
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, chunkSize - 1, lz, treeRadius, chunkSize, chunkHeight, direction);
+                    }
+                } else if (direction === 'north') {
+                    // North neighbor's south edge (lz = 15)
+                    scanLz = chunkSize - 1;
+                    for (let lx = 0; lx < chunkSize; lx++) {
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, 0, treeRadius, chunkSize, chunkHeight, direction);
+                    }
+                } else if (direction === 'south') {
+                    // South neighbor's north edge (lz = 0)
+                    scanLz = 0;
+                    for (let lx = 0; lx < chunkSize; lx++) {
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, chunkSize - 1, treeRadius, chunkSize, chunkHeight, direction);
+                    }
+                }
+            }
+
+            // Scan a column in source chunk and apply tree overhang to target chunk
+            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, tgtLx, tgtLz, radius, chunkSize, chunkHeight, direction) {
+                // Find LOG blocks in the source column
+                for (let y = 0; y < chunkHeight; y++) {
+                    const srcIdx = srcLx + srcLz * chunkSize + y * chunkSize * chunkSize;
+                    if (sourceBlocks[srcIdx] === LOG) {
+                        // Found a tree trunk - check for leaves above it that should extend into target
+                        for (let dy = -2; dy <= 4; dy++) {
+                            const leafY = y + dy;
+                            if (leafY < 0 || leafY >= chunkHeight) continue;
+
+                            // Check nearby columns in source for leaves
+                            for (let dr = 1; dr <= radius; dr++) {
+                                let checkLx, checkLz, targetCheckLx, targetCheckLz;
+
+                                if (direction === 'west' || direction === 'east') {
+                                    // Leaves extend along x-axis
+                                    checkLx = direction === 'west' ? srcLx + dr : srcLx - dr;
+                                    checkLz = srcLz;
+                                    targetCheckLx = direction === 'west' ? dr - 1 : chunkSize - dr;
+                                    targetCheckLz = tgtLz;
+                                } else {
+                                    // Leaves extend along z-axis
+                                    checkLx = srcLx;
+                                    checkLz = direction === 'north' ? srcLz + dr : srcLz - dr;
+                                    targetCheckLx = tgtLx;
+                                    targetCheckLz = direction === 'north' ? dr - 1 : chunkSize - dr;
+                                }
+
+                                // Skip if out of bounds in source
+                                if (checkLx < 0 || checkLx >= chunkSize || checkLz < 0 || checkLz >= chunkSize) {
+                                    // This would be in the target chunk - place leaves if source has leaves nearby
+                                    if (targetCheckLx >= 0 && targetCheckLx < chunkSize &&
+                                        targetCheckLz >= 0 && targetCheckLz < chunkSize) {
+                                        const tgtIdx = targetCheckLx + targetCheckLz * chunkSize + leafY * chunkSize * chunkSize;
+                                        // Only place leaves in air
+                                        if (targetBlocks[tgtIdx] === AIR) {
+                                            // Check if there should be leaves here based on tree shape
+                                            const distFromTrunk = dr;
+                                            if (distFromTrunk <= 2 && Math.random() > 0.3) {
+                                                targetBlocks[tgtIdx] = LEAVES;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Recalculate lighting at chunk edges to account for neighboring chunks
+            function recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight) {
+                // Recalculate sunlight for edge columns
+                calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                calculateBlockLight(chunk, chunkSize, chunkHeight);
+            }
+
+            // Helper to parse chunk key into cx, cz
+            function parseChunkKeySimple(key) {
+                const [cx, cz] = key.split(',').map(Number);
+                return { cx, cz };
+            }
+
             // Bind global state to voxelWorld instance
             voxelWorld.bindState(modifiedChunks, pristineChunks, activeChunks);
             function canEvictChunk(key, { persistModified = false } = {}) {
@@ -5727,6 +5987,9 @@
                 modifiedChunks.delete(key);
                 meshedChunkKeys.delete(key);
                 activeChunks.delete(key);
+                // Clean up from generation state tracking
+                adjacentChunkUpdateQueue.delete(key);
+                chunksAwaitingNeighborUpdate.delete(key);
             }
             const worldConfig = {
                 seed: WORLD_CONFIG.seed,
@@ -10690,6 +10953,16 @@
                 // Zombies now generate unique materials per-instance in buildZombieMesh()
                 // No pre-generated materials needed - each zombie is unique!
             }
+            // =====================================================
+            // TERRAIN GENERATION GLOBAL FUNCTIONS
+            // =====================================================
+            // NOTE: These functions DUPLICATE methods in the TerrainGenerator class
+            // (lines ~1773-2130). These global functions are ACTIVELY USED by
+            // generateChunkData() for actual terrain generation.
+            //
+            // See TerrainGenerator class header for the consolidation plan.
+            // =====================================================
+
             function rebuildBiomeTable() {
                 const biomes = worldConfig.biomes;
                 let total = 0;
@@ -11438,23 +11711,25 @@
 
                 // ============================================================
                 // ELEVATION THRESHOLDS (adjusted for 320 world height)
+                // Based on realistic alpine ecology and mountain terrain
+                // Sea level = 60, typical lowland terrain = 60-80
                 // ============================================================
-                const SNOW_LINE = 190;           // Permanent snow begins
-                const SNOW_PATCHES_LINE = 160;   // Occasional snow patches
-                const HIGH_ROCK_LINE = 140;      // Mostly bare rock
-                const ROCK_LINE = 110;           // Rock/gravel transition
-                const ALPINE_LINE = 85;          // Sparse vegetation begins
-                const TREE_LINE_BASE = 80;       // Base tree line (varies by aspect)
-                const FOREST_LINE = 70;          // Dense forest possible below this
+                const SNOW_LINE = 190;           // ~13k ft equivalent - permanent snowpack year-round
+                const SNOW_PATCHES_LINE = 160;   // ~11k ft - patchy snow on north-facing slopes
+                const HIGH_ROCK_LINE = 140;      // ~10k ft - mostly bare rock, krummholz zone
+                const ROCK_LINE = 110;           // ~8k ft - talus slopes, sparse alpine plants
+                const ALPINE_LINE = 85;          // ~6k ft - alpine meadows, stunted trees
+                const TREE_LINE_BASE = 80;       // ~5.5k ft - treeline (varies by slope aspect)
+                const FOREST_LINE = 70;          // ~4.5k ft - dense forest possible below this
 
-                // Slope thresholds
-                const CLIFF_SLOPE = 8;           // Vertical cliffs - bare rock
-                const STEEP_SLOPE = 5;           // Steep - no snow accumulation
-                const MODERATE_SLOPE = 3;        // Moderate - reduced vegetation
+                // Slope thresholds (in blocks height difference)
+                const CLIFF_SLOPE = 8;           // >60 degrees - vertical cliffs, bare rock only
+                const STEEP_SLOPE = 5;           // ~45 degrees - no snow/soil accumulation
+                const MODERATE_SLOPE = 3;        // ~30 degrees - reduced vegetation, some erosion
 
-                // River/water thresholds
-                const RIVER_MAX_ELEVATION = 75;  // Rivers only below this
-                const LAKE_ELEVATION_MIN = 100;  // Alpine lakes possible above this
+                // River/water thresholds - rivers form in lowland valleys
+                const RIVER_MAX_ELEVATION = 75;  // Rivers only carve below foothills
+                const LAKE_ELEVATION_MIN = 100;  // Alpine/glacial lakes possible in high basins
 
                 for (let lx = 0; lx < chunkSize; lx++) {
                     for (let lz = 0; lz < chunkSize; lz++) {
@@ -11941,11 +12216,17 @@
                         cachedData.cz = cz;
                         cachedData.startX = startX;
                         cachedData.startZ = startZ;
+                        // Ensure cached chunks have genState (for backward compatibility)
+                        if (typeof cachedData.genState === 'undefined') {
+                            cachedData.genState = GEN_PASS.ALL; // Assume fully generated
+                        }
                         // Recalculate lighting for cached chunks to fix any old broken values
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
                         chunks.set(key, cachedData);
-                        return;
+                        // Queue neighbor updates for cached chunks too (may have missed cross-chunk features)
+                        queueAdjacentChunksForUpdate(cx, cz, key);
+                        return cachedData;
                     }
                     // Initialize chunk data and parameters
                     const data = new Uint8Array(chunkSize * chunkSize * chunkHeight);
@@ -11994,13 +12275,23 @@
                     // Pre-calculate all caches
                     const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seed);
                     const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
-                    // Generate terrain with caves
+
+                    // Initialize generation state tracking
+                    let genState = 0;
+
+                    // --- PASS 1: Generate terrain with caves ---
                     generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set);
-                    // Fill water
+                    genState |= GEN_PASS.TERRAIN;
+
+                    // --- PASS 2: Fill water ---
                     fillWaterPass(data, chunkSize, chunkHeight, caches.heightCache);
-                    // Generate decorations (trees, etc.)
+                    genState |= GEN_PASS.WATER;
+
+                    // --- PASS 3: Generate decorations (trees, etc.) ---
                     generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks);
-                    // Create chunk with light data
+                    genState |= GEN_PASS.DECORATIONS;
+
+                    // Create chunk with light data and generation state
                     const size = chunkSize * chunkSize * chunkHeight;
                     const chunk = {
                         blocks: data,
@@ -12010,12 +12301,23 @@
                         cz,
                         startX,
                         startZ,
+                        genState, // Track which generation passes have completed
                     };
-                    // Calculate lighting
+
+                    // --- PASS 4: Calculate sunlight ---
                     calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                    chunk.genState |= GEN_PASS.SUNLIGHT;
+
+                    // --- PASS 5: Calculate block light ---
                     calculateBlockLight(chunk, chunkSize, chunkHeight);
+                    chunk.genState |= GEN_PASS.BLOCKLIGHT;
+
                     chunks.set(key, chunk);
                     pristineChunks.add(key);
+
+                    // Queue adjacent chunks for update (cross-chunk features like trees, lighting)
+                    queueAdjacentChunksForUpdate(cx, cz, key);
+
                     await saveChunkToCache(key, chunk);
                     return chunk;
                 } catch (error) {
@@ -12033,6 +12335,7 @@
                         cz,
                         startX,
                         startZ,
+                        genState: 0, // Error state - no passes completed
                     };
                 }
             }
@@ -13039,6 +13342,13 @@
                         renderChunk(cx, cz, neighborDistSq);
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                     }
+                }
+
+                // Process adjacent chunk generation updates (cross-chunk terrain features)
+                // This runs after neighbors are processed to handle tree overhang, lighting, etc.
+                const adjacentBudget = Math.max(0, CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs));
+                if (adjacentChunkUpdateQueue.size > 0 && adjacentBudget > 1) {
+                    processAdjacentChunkUpdates(2);
                 }
             }
             function updateLocalArea(x, y, z) {
