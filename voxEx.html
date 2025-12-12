@@ -2436,8 +2436,6 @@
                 constructor(materials) {
                     this.materials = materials || {};
                     this.faceVertexCache = new Map();
-                    this.terrainMeshPool = [];
-                    this.waterMeshPool = [];
                 }
 
                 setMaterials(terrain, water) {
@@ -2487,23 +2485,6 @@
                     const corner = getter(lx + offsets.corner[0], ly + offsets.corner[1], lz + offsets.corner[2]) > 0 ? 1 : 0;
                     if (side1 && side2) return 0;
                     return 3 - (side1 + side2 + corner);
-                }
-
-                // --- MESH POOLING ---
-                acquireTerrainMesh() {
-                    return this.terrainMeshPool.pop() || null;
-                }
-
-                acquireWaterMesh() {
-                    return this.waterMeshPool.pop() || null;
-                }
-
-                releaseTerrainMesh(mesh) {
-                    if (mesh) this.terrainMeshPool.push(mesh);
-                }
-
-                releaseWaterMesh(mesh) {
-                    if (mesh) this.waterMeshPool.push(mesh);
                 }
 
                 buildMeshForChunk(chunk, neighbors, uvMap) {
@@ -4069,6 +4050,18 @@
             let isUnderwater = false; // Track if player's eyes are underwater
             let underwaterDepth = 0; // How deep underwater (for fog darkness)
             let savedFogState = null; // Store normal fog settings when going underwater
+            let isUnderground = false; // Track if player is underground (low sky light)
+            // Swimming/treading water state
+            let swimSpaceHoldTime = 0; // How long space has been held while underwater
+            let isTreadingWater = false; // Whether player is floating at surface
+            let waterSurfaceY = 0; // Y position of water surface for treading
+            // OPTIMIZATION: Reusable color objects for underwater fog (avoid per-frame allocations)
+            // Colors matched to water texture: #2389DA (upper), #1B609E (lower), #1565C0 (ripple shadow)
+            const _underwaterBaseColor = new THREE.Color(0x2389DA); // Matches water texture upper half
+            const _underwaterDarkColor = new THREE.Color(0x0A2A40); // Dark cyan-blue (matches texture hue)
+            const _underwaterResultColor = new THREE.Color();
+            const _undergroundFogColor = new THREE.Color(0x000000); // Black fog for underground/caves
+            let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             // --- BLOCK DEFINITIONS ---
             const AIR = 0,
                 GRASS = 1,
@@ -5310,7 +5303,7 @@
             }
 
             let camera, scene, renderer, controls, raycaster;
-            let composer, renderPass, zombieScarePass, volumetricLightPass;
+            let composer, renderPass, zombieScarePass, underwaterPass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
             let moveForward = false;
@@ -5466,11 +5459,8 @@
             function applyWaterMaterialSettings() {
                 if (!waterMaterial) return;
                 let changed = false;
-                if (waterMaterial.color.getHex() !== SETTINGS.waterColor) {
-                    waterMaterial.color.setHex(SETTINGS.waterColor);
-                    materialUpdateState.waterColor = SETTINGS.waterColor;
-                    changed = true;
-                }
+                // Note: Water material color is kept white (0xffffff) to allow vertex colors
+                // to control depth-based tinting. SETTINGS.waterColor is no longer applied here.
                 if (Math.abs(waterMaterial.opacity - SETTINGS.waterOpacity) > 0.0001) {
                     waterMaterial.opacity = SETTINGS.waterOpacity;
                     materialUpdateState.waterOpacity = SETTINGS.waterOpacity;
@@ -5513,7 +5503,6 @@
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
-            const IS_FLUID = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
@@ -7137,6 +7126,7 @@
                 moonSprite.castShadow = false;
                 moonSprite.receiveShadow = false;
                 scene.add(moonSprite);
+
                 // 4. Camera & Lighting
                 camera = new THREE.PerspectiveCamera(SETTINGS.normalFOV, window.innerWidth / window.innerHeight, 0.01, 800); // Fix: Small near plane to render blocks close to camera and prevent clipping
                 camera.layers.enable(0); // World layer
@@ -7350,6 +7340,116 @@
                 zombieScarePass = new ShaderPass(ZombieScareShader);
                 zombieScarePass.enabled = true; // Always enabled, effects controlled by uniforms
                 composer.addPass(zombieScarePass);
+
+                // Underwater effect shader - adds realistic underwater visuals
+                const UnderwaterShader = {
+                    uniforms: {
+                        tDiffuse: { value: null },
+                        time: { value: 0.0 },
+                        isUnderwater: { value: false },
+                        underwaterDepth: { value: 0.0 },
+                        // Underwater tint color (matches water texture #2389DA)
+                        waterColor: { value: new THREE.Color(0x2389DA) },
+                        // Effect intensities
+                        tintStrength: { value: 0.25 },
+                        causticStrength: { value: 0.15 },
+                        distortionStrength: { value: 0.002 },
+                        vignetteStrength: { value: 0.4 }
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform sampler2D tDiffuse;
+                        uniform float time;
+                        uniform bool isUnderwater;
+                        uniform float underwaterDepth;
+                        uniform vec3 waterColor;
+                        uniform float tintStrength;
+                        uniform float causticStrength;
+                        uniform float distortionStrength;
+                        uniform float vignetteStrength;
+                        varying vec2 vUv;
+
+                        // Pseudo-random function for caustics
+                        float hash(vec2 p) {
+                            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+                        }
+
+                        // Smooth noise for caustic pattern
+                        float noise(vec2 p) {
+                            vec2 i = floor(p);
+                            vec2 f = fract(p);
+                            f = f * f * (3.0 - 2.0 * f);
+                            float a = hash(i);
+                            float b = hash(i + vec2(1.0, 0.0));
+                            float c = hash(i + vec2(0.0, 1.0));
+                            float d = hash(i + vec2(1.0, 1.0));
+                            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                        }
+
+                        // Caustic light pattern
+                        float caustic(vec2 uv, float t) {
+                            float c = 0.0;
+                            // Layer multiple noise patterns at different scales and speeds
+                            c += noise(uv * 8.0 + vec2(t * 0.5, t * 0.3)) * 0.5;
+                            c += noise(uv * 12.0 - vec2(t * 0.4, t * 0.6)) * 0.3;
+                            c += noise(uv * 20.0 + vec2(t * 0.7, -t * 0.2)) * 0.2;
+                            return c;
+                        }
+
+                        void main() {
+                            if (!isUnderwater) {
+                                gl_FragColor = texture2D(tDiffuse, vUv);
+                                return;
+                            }
+
+                            // Wavy distortion effect - very slow, gentle ocean sway
+                            vec2 distortedUV = vUv;
+                            float waveX = sin(vUv.y * 10.0 + time * 0.0005) * distortionStrength;
+                            float waveY = cos(vUv.x * 8.0 + time * 0.0003) * distortionStrength * 0.7;
+                            distortedUV += vec2(waveX, waveY);
+
+                            // Sample with distorted UVs
+                            vec4 texel = texture2D(tDiffuse, distortedUV);
+                            vec3 color = texel.rgb;
+
+                            // Depth factor affects all effects (deeper = stronger effects)
+                            float depthFactor = clamp(underwaterDepth / 20.0, 0.0, 1.0);
+
+                            // Caustic light patterns on upper parts of the screen (simulating light from surface)
+                            float causticPattern = caustic(vUv, time * 0.001);
+                            // Caustics stronger near top of screen (where surface light comes from)
+                            float causticMask = smoothstep(0.8, 0.2, vUv.y);
+                            float causticEffect = causticPattern * causticMask * causticStrength * (1.0 - depthFactor * 0.7);
+                            color += vec3(causticEffect * 0.8, causticEffect * 0.9, causticEffect);
+
+                            // Color tint - blend toward water color
+                            float tint = tintStrength * (1.0 + depthFactor * 0.5);
+                            color = mix(color, color * waterColor * 2.0, tint);
+
+                            // Slight desaturation with depth
+                            float gray = dot(color, vec3(0.299, 0.587, 0.114));
+                            color = mix(color, vec3(gray) * waterColor * 1.5, depthFactor * 0.3);
+
+                            // Vignette - darker edges underwater
+                            vec2 centerUV = vUv - 0.5;
+                            float distFromCenter = length(centerUV);
+                            float vignette = smoothstep(0.3, 0.9, distFromCenter);
+                            color *= 1.0 - (vignette * vignetteStrength * (1.0 + depthFactor * 0.5));
+
+                            gl_FragColor = vec4(color, texel.a);
+                        }
+                    `
+                };
+
+                underwaterPass = new ShaderPass(UnderwaterShader);
+                underwaterPass.enabled = true; // Always enabled, controlled by isUnderwater uniform
+                composer.addPass(underwaterPass);
 
                 // Volumetric Lighting (God Rays) shader
                 const MAX_POINT_LIGHTS = 4; // OPTIMIZED: Reduced from 16 for better FPS
@@ -8064,10 +8164,6 @@
                     if (torchIntensityInput) torchIntensityInput.value = SETTINGS.torchIntensity;
                     if (torchRangeInput) torchRangeInput.value = SETTINGS.torchRange;
                     if (ambientIntensityInput) ambientIntensityInput.value = SETTINGS.ambientIntensity;
-                    if (diffuseSkylightToggle) diffuseSkylightToggle.checked = SETTINGS.lighting.diffuseSkylight;
-                    if (ambientSkylightSlider && ambientSkylightVal) { ambientSkylightSlider.value = SETTINGS.lighting.ambientSkylight; ambientSkylightVal.textContent = SETTINGS.lighting.ambientSkylight; }
-                    if (blockFalloffSelect) blockFalloffSelect.value = SETTINGS.lighting.blockFalloff;
-                    if (blockQueueSlider && blockQueueVal) { blockQueueSlider.value = SETTINGS.lighting.blockQueueBudget; blockQueueVal.textContent = SETTINGS.lighting.blockQueueBudget; }
                     // World - Environment
                     if (daySkyTopColor) daySkyTopColor.value = "#" + SETTINGS.daySkyTop.toString(16).padStart(6, "0");
                     if (daySkyBottomColor) daySkyBottomColor.value = "#" + SETTINGS.daySkyBottom.toString(16).padStart(6, "0");
@@ -8117,6 +8213,15 @@
                         });
                         localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                         updateUIFromSettings();
+                        // Apply side effects for all reset settings
+                        applyWaterMaterialSettings();
+                        if (window.updateLightingMaterials) window.updateLightingMaterials();
+                        if (renderer) renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio);
+                        if (zombieScarePass) {
+                            zombieScarePass.uniforms.enableVignette.value = SETTINGS.zombieVignetteEnabled;
+                            zombieScarePass.uniforms.enableDesaturation.value = SETTINGS.zombieDesaturationEnabled;
+                            zombieScarePass.uniforms.vignetteIntensity.value = SETTINGS.zombieVignetteIntensity;
+                        }
                         rebuildSkylightForActiveChunks();
                         rebuildTorchLightingForActiveChunks();
                     }
@@ -8153,10 +8258,12 @@
                 });
                 // Reset Graphics - Lighting
                 document.getElementById("btn-reset-graphics-lighting")?.addEventListener("click", () => {
+                    // Shadows
                     SETTINGS.shadows = DEFAULTS.shadows;
                     SETTINGS.shadowQuality = DEFAULTS.shadowQuality;
                     SETTINGS.shadowBias = DEFAULTS.shadowBias;
                     SETTINGS.shadowRadius = DEFAULTS.shadowRadius;
+                    // Sun/Moon/Torch
                     SETTINGS.sunColor = DEFAULTS.sunColor;
                     SETTINGS.sunIntensity = DEFAULTS.sunIntensity;
                     SETTINGS.moonColor = DEFAULTS.moonColor;
@@ -8164,8 +8271,35 @@
                     SETTINGS.torchColor = DEFAULTS.torchColor;
                     SETTINGS.torchIntensity = DEFAULTS.torchIntensity;
                     SETTINGS.torchRange = DEFAULTS.torchRange;
+                    // Ambient
                     SETTINGS.ambientIntensity = DEFAULTS.ambientIntensity;
                     SETTINGS.lighting = { ...DEFAULTS.lighting };
+                    // Volumetric Lighting
+                    SETTINGS.volumetricLightingEnabled = DEFAULTS.volumetricLightingEnabled;
+                    SETTINGS.volumetricDensity = DEFAULTS.volumetricDensity;
+                    SETTINGS.volumetricDecay = DEFAULTS.volumetricDecay;
+                    SETTINGS.volumetricWeight = DEFAULTS.volumetricWeight;
+                    SETTINGS.volumetricSamples = DEFAULTS.volumetricSamples;
+                    SETTINGS.volumetricExposure = DEFAULTS.volumetricExposure;
+                    SETTINGS.volumetricFogDensity = DEFAULTS.volumetricFogDensity;
+                    // Global Illumination
+                    SETTINGS.giEnabled = DEFAULTS.giEnabled;
+                    SETTINGS.giIntensity = DEFAULTS.giIntensity;
+                    SETTINGS.giBounceIntensity = DEFAULTS.giBounceIntensity;
+                    SETTINGS.giRange = DEFAULTS.giRange;
+                    SETTINGS.giColorBleed = DEFAULTS.giColorBleed;
+                    SETTINGS.giSamples = DEFAULTS.giSamples;
+                    // Diffuse Lighting
+                    SETTINGS.diffuseEnabled = DEFAULTS.diffuseEnabled;
+                    SETTINGS.diffuseIntensity = DEFAULTS.diffuseIntensity;
+                    SETTINGS.diffuseWrap = DEFAULTS.diffuseWrap;
+                    SETTINGS.diffuseSoftness = DEFAULTS.diffuseSoftness;
+                    // Specular Lighting
+                    SETTINGS.specularEnabled = DEFAULTS.specularEnabled;
+                    SETTINGS.specularIntensity = DEFAULTS.specularIntensity;
+                    SETTINGS.specularShininess = DEFAULTS.specularShininess;
+                    SETTINGS.specularFresnel = DEFAULTS.specularFresnel;
+                    SETTINGS.specularRoughness = DEFAULTS.specularRoughness;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                     // Apply shadow settings immediately
@@ -8185,6 +8319,8 @@
                         moon.shadow.map?.dispose();
                         moon.shadow.map = null;
                     }
+                    // Apply specular/lighting materials
+                    if (window.updateLightingMaterials) window.updateLightingMaterials();
                     rebuildSkylightForActiveChunks();
                     rebuildTorchLightingForActiveChunks();
                     const shaderReloadNotice = document.getElementById("shader-reload-notice");
@@ -8194,6 +8330,9 @@
                 document.getElementById("btn-reset-graphics-water")?.addEventListener("click", () => {
                     SETTINGS.waterColor = DEFAULTS.waterColor;
                     SETTINGS.waterOpacity = DEFAULTS.waterOpacity;
+                    SETTINGS.underwaterFogNear = DEFAULTS.underwaterFogNear;
+                    SETTINGS.underwaterFogFar = DEFAULTS.underwaterFogFar;
+                    applyWaterMaterialSettings(); // Apply changes to material immediately
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                 });
@@ -8270,7 +8409,6 @@
             }
             function initBlockOptimization() {
                 IS_TRANSPARENT.fill(0);
-                IS_FLUID.fill(0);
                 BLOCKLIGHT_ATTENUATION.fill(15);
                 // Default sunlight attenuation: treat everything as fully blocking until defined
                 SUNLIGHT_ATTENUATION.fill(15);
@@ -8289,9 +8427,8 @@
                 BLOCKLIGHT_ATTENUATION[LEAVES] = 1; // Torches bleed softly through leaves
                 BLOCKLIGHT_ATTENUATION[WATER] = 2; // Water dims torches slightly
                 BLOCKLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Avoid seams darkening when neighbors are pending
-                // 2. Define Fluids
-                const fluidIds = [WATER];
-                for (const id of fluidIds) IS_FLUID[id] = 1;
+                // Water attenuates sunlight slightly (deeper water = less light)
+                SUNLIGHT_ATTENUATION[WATER] = 1; // Light loses 1 level per water block
                 const atlasTileCount = NUM_TILES;
                 const uvStep = 1 / atlasTileCount;
                 // 3. Initialize UV Map (Texture Coordinates)
@@ -8383,7 +8520,7 @@
                 const knownBlockIds = Object.values(blockIds);
                 for (const id of knownBlockIds) { UV_CACHE[id] = uvMap[id] || uvMap[DIRT]; }
                 if (!blockOptimizationInitialized) {
-                    console.log(`[Blocks] Flags initialized (transparent=${transparentIds.join(",")}; fluids=${fluidIds.join(",")})`);
+                    console.log(`[Blocks] Flags initialized (transparent=${transparentIds.join(",")})`);
                     console.log(`[Blocks] UV cache seeded for ${knownBlockIds.length} block ids using ${atlasTileCount} atlas tiles (uStep=${uvStep.toFixed(4)})`);
                     blockOptimizationInitialized = true;
                     initUVLookupTable(); // OPTIMIZATION: Initialize UV lookup table after uvMap is populated
@@ -8909,13 +9046,54 @@
                 }
                 const tex = new THREE.CanvasTexture(cvs);
                 registerPixelTexture(tex);
+
+                // --- CREATE PER-TEXTURE ROUGHNESS MAP ---
+                // Roughness map uses same dimensions as texture atlas
+                // Grayscale values: 255 = fully rough/matte, 0 = smooth/shiny
+                const roughnessCanvas = document.createElement("canvas");
+                roughnessCanvas.width = cvs.width;
+                roughnessCanvas.height = cvs.height;
+                const roughnessCtx = roughnessCanvas.getContext("2d");
+
+                // Per-tile roughness values (0-255)
+                // All terrain is fully matte (255) - only water has shine (separate material)
+                const tileRoughness = [
+                    255,  // 0: GRASS_TOP - fully matte
+                    255,  // 1: GRASS_SIDE - fully matte
+                    255,  // 2: DIRT - fully matte
+                    255,  // 3: STONE - fully matte
+                    255,  // 4: PLANK - fully matte
+                    255,  // 5: LOG_SIDE - fully matte
+                    255,  // 6: LEAF - fully matte
+                    255,  // 7: BEDROCK - fully matte
+                    255,  // 8: LOG_TOP - fully matte
+                    255,  // 9: SAND - fully matte
+                    255,  // 10: WATER - (uses separate material)
+                    255,  // 11: TORCH - fully matte
+                    255,  // 12: SNOW - fully matte
+                    255,  // 13: GRAVEL - fully matte
+                ];
+
+                // Fill each tile region with its roughness value
+                for (let i = 0; i < NUM_TILES; i++) {
+                    const roughness = tileRoughness[i] !== undefined ? tileRoughness[i] : 255;
+                    const grayValue = roughness;
+                    roughnessCtx.fillStyle = `rgb(${grayValue}, ${grayValue}, ${grayValue})`;
+                    roughnessCtx.fillRect(i * TILE_SIZE, 0, TILE_SIZE, TILE_SIZE);
+                }
+
+                const roughnessMap = new THREE.CanvasTexture(roughnessCanvas);
+                registerPixelTexture(roughnessMap);
+                console.log(`[Textures] Created per-texture roughness map: ${roughnessCanvas.width}x${roughnessCanvas.height}`);
+
                 chunkMaterial = new THREE.MeshStandardMaterial({
                     map: tex,
+                    roughnessMap: roughnessMap,
                     vertexColors: true,
                     side: THREE.FrontSide,
                     alphaTest: 0.1,
-                    roughness: SETTINGS.specularEnabled ? SETTINGS.specularRoughness : 1.0,
-                    metalness: SETTINGS.specularEnabled ? (1.0 - SETTINGS.specularRoughness) * 0.3 : 0.0,
+                    roughness: 1.0, // Base roughness multiplied by roughnessMap
+                    metalness: 0.0,
                 });
                 waterMaterial = new THREE.MeshStandardMaterial({
                     map: tex,
@@ -8923,12 +9101,12 @@
                     side: THREE.DoubleSide, // Render both sides so water surface is visible from below
                     transparent: true,
                     opacity: SETTINGS.waterOpacity,
-                    color: SETTINGS.waterColor,
+                    color: 0xffffff, // White - let vertex colors control the tint for depth effect
                     alphaTest: 0.1,
                     depthWrite: false,
                     depthTest: true,
-                    roughness: 0.1, // Water is shiny
-                    metalness: 0.0,
+                    roughness: 0.3, // Water has shine - only material with specular
+                    metalness: 0.1, // Slight metalness for reflectivity
                 });
                 // Allow built-in fog to run with camera depth for both terrain and water
                 chunkMaterial.fog = true;
@@ -8969,6 +9147,8 @@
                 }
                 // Make function globally accessible for settings event handlers
                 window.updateLightingMaterials = updateLightingMaterials;
+                // Apply initial lighting settings (roughness, metalness based on saved SETTINGS)
+                updateLightingMaterials();
                 // --- HOTBAR ICONS ---
                 const atlasURL = cvs.toDataURL();
                 function setSlotIcon(slotId, tileIndex) {
@@ -12025,6 +12205,34 @@
                 col[cIdx + 12] = c3; col[cIdx + 13] = c3; col[cIdx + 14] = c3;
                 col[cIdx + 15] = c4; col[cIdx + 16] = c4; col[cIdx + 17] = c4;
             }
+            // Write vertex colors for water with depth-based darkening
+            // Deeper water gets darker, creating visual depth effect
+            function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth) {
+                // Water depth darkening: surface is bright, deep is dark
+                // depthFactor: 0 = surface (bright), 1 = max depth (dark)
+                const maxVisualDepth = 8; // Blocks until maximum darkness (reduced for more dramatic effect)
+                const depthFactor = Math.min(waterDepth / maxVisualDepth, 1.0);
+
+                // Color tint for water: bright cyan at surface, very dark blue at depth
+                // Surface: RGB multipliers (1.0, 1.0, 1.0) - full brightness
+                // Deep:    RGB multipliers (0.15, 0.25, 0.4) - very dark blue
+                const rMult = 1.0 - depthFactor * 0.85;  // 1.0 -> 0.15
+                const gMult = 1.0 - depthFactor * 0.75;  // 1.0 -> 0.25
+                const bMult = 1.0 - depthFactor * 0.6;   // 1.0 -> 0.4
+
+                const c1 = ao[0] * lightLevel;
+                const c2 = ao[1] * lightLevel;
+                const c3 = ao[2] * lightLevel;
+                const c4 = ao[3] * lightLevel;
+
+                // Apply depth-based color tinting to each vertex
+                col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
+                col[cIdx + 3] = c2 * rMult; col[cIdx + 4] = c2 * gMult; col[cIdx + 5] = c2 * bMult;
+                col[cIdx + 6] = c4 * rMult; col[cIdx + 7] = c4 * gMult; col[cIdx + 8] = c4 * bMult;
+                col[cIdx + 9] = c2 * rMult; col[cIdx + 10] = c2 * gMult; col[cIdx + 11] = c2 * bMult;
+                col[cIdx + 12] = c3 * rMult; col[cIdx + 13] = c3 * gMult; col[cIdx + 14] = c3 * bMult;
+                col[cIdx + 15] = c4 * rMult; col[cIdx + 16] = c4 * gMult; col[cIdx + 17] = c4 * bMult;
+            }
             // Write UV coordinates to buffer
             function writeFaceUVs(uvs, uvIdx, uv) {
                 const p = 0;
@@ -12052,6 +12260,22 @@
                 const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
                 // Write vertex colors (AO × light)
                 writeFaceColors(col, cIdx, ao, lightLevel);
+                // Write UV coordinates
+                writeFaceUVs(uvs, uvIdx, uv);
+            }
+
+            // Add a water face with depth-based coloring (darker at depth)
+            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth) {
+                // Get cached face vertices
+                const verts = getCachedFaceVertices(nx, ny, nz);
+                // Write vertex positions and normals
+                writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                // Calculate AO for all 4 corners (use solid block position) - pass faceIdx for caching
+                const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
+                // Calculate light level
+                const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+                // Write vertex colors with depth-based darkening
+                writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth);
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
             }
@@ -12369,6 +12593,16 @@
                                         // OPTIMIZATION: Use simplified lighting for distant chunks
                                         if (useDeferredLight) {
                                             addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
+                                        } else if (isWater) {
+                                            // Calculate water depth (search down to find bottom)
+                                            let waterDepth = 0;
+                                            for (let dy = y - 1; dy >= 0; dy--) {
+                                                const belowId = getLocal(x, dy, z);
+                                                if (belowId !== WATER) break;
+                                                waterDepth++;
+                                            }
+                                            // Use water-specific face rendering with depth-based coloring
+                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth);
                                         } else {
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
@@ -12428,7 +12662,7 @@
                         const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
                         waterMesh.geometry = waterGeo;
-                        waterMesh.frustumCulled = false; // Water doesn't use frustum culling
+                        waterMesh.frustumCulled = SETTINGS.enableFrustumCulling; // OPTIMIZATION: Use frustum culling for water too
                         waterMesh.castShadow = false; // Water doesn't cast shadows
                         waterMesh.receiveShadow = false;
                         waterMesh.updateMatrix();
@@ -12925,13 +13159,35 @@
                 moonSprite.position.set(camPos.x - smoothX * 280, camPos.y - smoothH * 280, camPos.z);
                 sunSprite.visible = smoothH > -0.1;
                 moonSprite.visible = smoothH < 0.1;
+
                 // Sky / fog colors
                 const t = THREE.MathUtils.clamp((smoothH + 0.1) / 0.4, 0, 1);
                 if (colorsInitialized) {
+                    // Check if player is underground (sky light at head position is low)
+                    const playerSkyLight = getSkyLight(Math.floor(camPos.x), Math.floor(camPos.y), Math.floor(camPos.z));
+                    isUnderground = playerSkyLight < 8; // Below 8 = likely in a cave/underground
+                    // Calculate underground factor: 0 = full light, 1 = deep underground
+                    // Smooth transition from light level 12 down to 4
+                    const undergroundFactor = THREE.MathUtils.clamp((12 - playerSkyLight) / 8, 0, 1);
+
+                    // Start with day/night lerp based on time
                     skyMaterial.uniforms.topColor.value.lerpColors(nightSkyTop, daySkyTop, t);
                     skyMaterial.uniforms.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
-                    // Fog copies sky bottom color exactly for perfect horizon match (but not when underwater)
-                    if (scene.fog && !isUnderwater) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+
+                    // If underground, lerp sky colors towards night sky
+                    if (undergroundFactor > 0) {
+                        skyMaterial.uniforms.topColor.value.lerp(nightSkyTop, undergroundFactor);
+                        skyMaterial.uniforms.bottomColor.value.lerp(nightSkyBottom, undergroundFactor);
+                    }
+
+                    // Fog color: black when underground, sky color otherwise (but not when underwater)
+                    if (scene.fog && !isUnderwater) {
+                        if (isUnderground) {
+                            scene.fog.color.copy(_undergroundFogColor);
+                        } else {
+                            scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                        }
+                    }
                 }
                 skybox.position.copy(camPos);
                 // --- B. SHADOW LOGIC (Grid-locked) ---
@@ -13057,25 +13313,79 @@
                 if (Math.abs(velocity.x) < 0.001) velocity.x = 0;
                 if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
                 // Apply gravity or flying or swimming
+                // Check if player's feet are in water (for treading water when head is above)
+                const camPos = controls.getObject().position;
+                const feetY = Math.floor(camPos.y - 1.7); // Feet position (eye height ~1.7)
+                const feetInWater = getBlock(Math.floor(camPos.x), feetY, Math.floor(camPos.z)) === WATER;
+                const inWaterBody = isUnderwater || feetInWater || isTreadingWater;
+
                 if (isFlying) {
                     velocity.y = 0;
                     if (flyUp) velocity.y += SETTINGS.playerSpeed * 0.25;
                     if (flyDown) velocity.y -= SETTINGS.playerSpeed * 0.25;
-                } else if (isUnderwater) {
+                } else if (inWaterBody) {
                     // Swimming physics - reduced gravity and ability to swim up
                     const waterGravity = SETTINGS.gravity * 0.15; // 15% of normal gravity (buoyancy)
                     const swimSpeed = SETTINGS.playerSpeed * 0.4; // Swimming speed
-                    velocity.y -= waterGravity * dt;
-                    // Swim up when holding space
-                    if (spacePressed) {
-                        velocity.y += swimSpeed * dt * 2.5; // Swim upward
-                    }
-                    // Swim down when holding shift/crouch
+
+                    // Swim down when holding shift/crouch - cancels treading
                     if (isCrouching) {
                         velocity.y -= swimSpeed * dt * 1.5; // Sink faster
+                        isTreadingWater = false;
+                        swimSpaceHoldTime = 0;
+                    } else if (spacePressed) {
+                        // Track how long space has been held
+                        swimSpaceHoldTime += dt;
+
+                        // Find water surface (search upward for air) - search from feet level
+                        if (swimSpaceHoldTime > 0.1 && !isTreadingWater) {
+                            const px = Math.floor(camPos.x);
+                            const pz = Math.floor(camPos.z);
+                            // Search up from feet to find water surface
+                            const searchStart = Math.floor(camPos.y - 2);
+                            for (let y = searchStart; y < searchStart + 50; y++) {
+                                const blockAt = getBlock(px, y, pz);
+                                if (blockAt !== WATER) {
+                                    waterSurfaceY = y; // First air block above water
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Bobbing phase (first ~0.8 seconds) - swim upward with some oscillation
+                        if (swimSpaceHoldTime < 0.8 && !isTreadingWater) {
+                            velocity.y += swimSpeed * dt * 2.5; // Swim upward
+                            velocity.y -= waterGravity * dt; // Still affected by buoyancy
+                        } else {
+                            // Treading water phase - snap to surface
+                            // waterSurfaceY is the first AIR block above water
+                            // Player eyes need to be above that level to be out of water
+                            const targetY = waterSurfaceY + 0.8; // Eyes well above water surface
+                            const distToSurface = targetY - camPos.y;
+
+                            if (Math.abs(distToSurface) > 0.02) {
+                                // Smoothly move toward surface
+                                velocity.y = distToSurface * 10.0; // Strong pull to surface
+                                isTreadingWater = true; // Mark as treading once we start snapping
+                            } else {
+                                // At surface - gentle bob (small range to stay above water)
+                                isTreadingWater = true;
+                                velocity.y = Math.sin(performance.now() * 0.002) * 0.08; // Very gentle bobbing
+                            }
+                        }
+                    } else {
+                        // Space not pressed - normal sinking with buoyancy
+                        velocity.y -= waterGravity * dt;
+                        swimSpaceHoldTime = 0;
+                        // Only stop treading if feet leave water
+                        if (!feetInWater && !isUnderwater) {
+                            isTreadingWater = false;
+                        }
                     }
-                    // Apply water drag to vertical velocity
-                    velocity.y *= Math.pow(0.92, dt * 60); // Water resistance
+
+                    // Apply water drag to vertical velocity (less when treading)
+                    const dragFactor = isTreadingWater ? 0.98 : 0.92;
+                    velocity.y *= Math.pow(dragFactor, dt * 60); // Water resistance
                     // Also slow horizontal movement in water
                     velocity.x *= Math.pow(0.95, dt * 60);
                     velocity.z *= Math.pow(0.95, dt * 60);
@@ -13604,6 +13914,7 @@
                 perfMonitor.end("rendering", renderStart);
             }
             // Update underwater fog based on player position
+            // OPTIMIZATION: Uses reusable color objects and caches depth calculation
             function updateUnderwaterFog() {
                 if (!scene.fog || !controls) return;
 
@@ -13619,16 +13930,22 @@
                 isUnderwater = (blockAtEye === WATER);
 
                 if (isUnderwater) {
-                    // Calculate depth below water surface
-                    let surfaceY = eyeBlockY;
-                    for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
-                        const blockAbove = getBlock(eyeX, y, eyeZ);
-                        if (blockAbove !== WATER) {
-                            surfaceY = y;
-                            break;
+                    // OPTIMIZATION: Only recalculate depth when Y position changes significantly
+                    // This avoids the loop running every frame when treading water
+                    const yDelta = Math.abs(eyeY - _lastUnderwaterCheckY);
+                    if (yDelta > 0.25 || !wasUnderwater) {
+                        _lastUnderwaterCheckY = eyeY;
+                        // Calculate depth below water surface
+                        let surfaceY = eyeBlockY;
+                        for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
+                            const blockAbove = getBlock(eyeX, y, eyeZ);
+                            if (blockAbove !== WATER) {
+                                surfaceY = y;
+                                break;
+                            }
                         }
+                        underwaterDepth = Math.max(0, surfaceY - eyeY);
                     }
-                    underwaterDepth = Math.max(0, surfaceY - eyeY);
 
                     // Save normal fog state when entering water
                     if (!wasUnderwater) {
@@ -13639,16 +13956,15 @@
                         };
                     }
 
-                    // Base underwater fog color (water color)
-                    const baseWaterColor = new THREE.Color(SETTINGS.waterColor);
+                    // Use texture-matched underwater fog color (0x2389DA matches water texture)
+                    // Don't use SETTINGS.waterColor here - that's for the surface material, not underwater fog
 
                     // Darken based on depth - deeper = darker and shorter visibility
                     const maxDepth = 35; // Maximum depth for full darkness
                     const depthFactor = Math.min(underwaterDepth / maxDepth, 1.0);
 
-                    // Interpolate from light blue to dark blue/black
-                    const darkColor = new THREE.Color(0x001122); // Very dark blue
-                    const underwaterColor = baseWaterColor.clone().lerp(darkColor, depthFactor * 0.9);
+                    // Interpolate from water color to dark blue/black using reusable objects
+                    _underwaterResultColor.copy(_underwaterBaseColor).lerp(_underwaterDarkColor, depthFactor * 0.9);
 
                     // Fog distance decreases with depth (murkier water deeper down)
                     const baseFogFar = SETTINGS.underwaterFogFar;
@@ -13657,9 +13973,16 @@
                     const fogNear = THREE.MathUtils.lerp(baseFogNear, 0.5, depthFactor);
 
                     // Apply underwater fog
-                    scene.fog.color.copy(underwaterColor);
+                    scene.fog.color.copy(_underwaterResultColor);
                     scene.fog.near = fogNear;
                     scene.fog.far = fogFar;
+
+                    // Update underwater shader uniforms
+                    if (underwaterPass) {
+                        underwaterPass.uniforms.isUnderwater.value = true;
+                        underwaterPass.uniforms.underwaterDepth.value = underwaterDepth;
+                        underwaterPass.uniforms.time.value = performance.now();
+                    }
                 } else if (wasUnderwater && savedFogState) {
                     // Restore normal fog when exiting water
                     // Note: updateDayNight will override the color, so just restore distances
@@ -13667,6 +13990,16 @@
                     scene.fog.far = savedFogState.far;
                     savedFogState = null;
                     underwaterDepth = 0;
+                    _lastUnderwaterCheckY = -Infinity; // Reset cache when exiting water
+
+                    // Reset swimming state when exiting water
+                    swimSpaceHoldTime = 0;
+                    isTreadingWater = false;
+
+                    // Disable underwater shader effects
+                    if (underwaterPass) {
+                        underwaterPass.uniforms.isUnderwater.value = false;
+                    }
                 }
             }
 
