@@ -12822,45 +12822,83 @@
 
             // OPTIMIZATION: Throttle occlusion checks - only update every N frames
             let occlusionCheckFrame = 0;
-            let lastSunOccluded = false;
-            let lastMoonOccluded = true;
+            let lastSunVisibility = 1.0;  // 0.0 = fully occluded, 1.0 = fully visible
+            let lastMoonVisibility = 0.0;
             const OCCLUSION_CHECK_INTERVAL = 5; // Check every 5 frames
 
-            // Raycast to check if sun/moon is occluded by terrain (player -> light direction)
-            function isLightOccluded(lightWorldPos) {
+            // Broadened raycast to check light visibility with multiple samples
+            // Returns visibility factor 0.0 (fully occluded) to 1.0 (fully visible)
+            const _sampleOffsets = [
+                { x: 0, y: 0, z: 0 },       // Center ray
+                { x: 0.15, y: 0.15, z: 0 },  // Upper right
+                { x: -0.15, y: 0.15, z: 0 }, // Upper left
+                { x: 0.15, y: -0.15, z: 0 }, // Lower right
+                { x: -0.15, y: -0.15, z: 0 },// Lower left
+                { x: 0, y: 0.2, z: 0.1 },    // Above
+                { x: 0, y: -0.2, z: -0.1 },  // Below
+            ];
+            const _sampleDir = new THREE.Vector3();
+
+            function getLightVisibility(lightWorldPos) {
                 const camPos = controls ? controls.getObject().position : camera.position;
 
                 // OPTIMIZATION: Reuse vector instead of allocating new one
                 _occlusionDir.subVectors(lightWorldPos, camPos).normalize();
 
                 // Raycast from player position toward the light
-                // OPTIMIZATION: Increased step size for better performance (was 0.5)
-                const maxDist = 80; // Reduced from 100
-                const stepSize = 1.0; // Increased from 0.5 - check every block instead of half-block
+                const maxDist = 80;
+                const stepSize = 1.5; // Slightly larger steps for multi-ray check
 
-                for (let dist = 1; dist < maxDist; dist += stepSize) {
-                    const checkX = Math.floor(camPos.x + _occlusionDir.x * dist);
-                    const checkY = Math.floor(camPos.y + _occlusionDir.y * dist);
-                    const checkZ = Math.floor(camPos.z + _occlusionDir.z * dist);
+                let visibleRays = 0;
+                const totalRays = _sampleOffsets.length;
 
-                    // If we've gone above world height, we have clear sky - not occluded
-                    if (checkY >= WORLD_DIMS.worldHeight) {
-                        return false;
+                // Cast multiple rays with slight offsets to create a cone
+                for (let rayIdx = 0; rayIdx < totalRays; rayIdx++) {
+                    const offset = _sampleOffsets[rayIdx];
+
+                    // Apply offset to create spread pattern (perpendicular to main direction)
+                    _sampleDir.copy(_occlusionDir);
+                    _sampleDir.x += offset.x;
+                    _sampleDir.y += offset.y;
+                    _sampleDir.z += offset.z;
+                    _sampleDir.normalize();
+
+                    let rayBlocked = false;
+
+                    for (let dist = 1; dist < maxDist; dist += stepSize) {
+                        const checkX = Math.floor(camPos.x + _sampleDir.x * dist);
+                        const checkY = Math.floor(camPos.y + _sampleDir.y * dist);
+                        const checkZ = Math.floor(camPos.z + _sampleDir.z * dist);
+
+                        // If we've gone above world height, we have clear sky
+                        if (checkY >= WORLD_DIMS.worldHeight) {
+                            break; // This ray is clear
+                        }
+
+                        // If below ground level, keep checking
+                        if (checkY < 0) continue;
+
+                        // Check if there's a solid block here (leaves are semi-transparent)
+                        const block = getBlock(checkX, checkY, checkZ);
+                        if (block !== AIR && block !== WATER && block !== LEAVES) {
+                            // Hit a solid block - this ray is blocked
+                            rayBlocked = true;
+                            break;
+                        }
                     }
 
-                    // If below ground level, keep checking
-                    if (checkY < 0) continue;
-
-                    // Check if there's a solid block here
-                    const block = getBlock(checkX, checkY, checkZ);
-                    if (block !== AIR && block !== WATER && block !== LEAVES) {
-                        // Hit a solid block - sun is occluded
-                        return true;
+                    if (!rayBlocked) {
+                        visibleRays++;
                     }
                 }
 
-                // Reached max distance without hitting anything - not occluded
-                return false;
+                // Return visibility factor (0.0 to 1.0)
+                return visibleRays / totalRays;
+            }
+
+            // Legacy function for compatibility - returns boolean
+            function isLightOccluded(lightWorldPos) {
+                return getLightVisibility(lightWorldPos) < 0.1; // Occluded if less than 10% visible
             }
 
             // Raycast from point light to player - returns true if light can reach player
@@ -12994,11 +13032,12 @@
                     const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5);
 
                     // OPTIMIZATION: Only check occlusion every N frames
+                    // Uses broadened cone raycast for partial visibility through gaps
                     if (shouldCheckOcclusion) {
-                        lastSunOccluded = isLightOccluded(sunSprite.position);
+                        lastSunVisibility = getLightVisibility(sunSprite.position);
                     }
 
-                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade * (lastSunOccluded ? 0 : 1);
+                    uniforms.sunVisible.value = Math.max(0, dot) * screenFade * lastSunVisibility;
                 } else {
                     uniforms.sunVisible.value = 0;
                 }
@@ -13017,11 +13056,12 @@
                     const screenFade = Math.max(0, 1 - (distFromCenter - 0.7) / 1.5);
 
                     // OPTIMIZATION: Only check occlusion every N frames
+                    // Uses broadened cone raycast for partial visibility through gaps
                     if (shouldCheckOcclusion) {
-                        lastMoonOccluded = isLightOccluded(moonSprite.position);
+                        lastMoonVisibility = getLightVisibility(moonSprite.position);
                     }
 
-                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade * (lastMoonOccluded ? 0 : 1);
+                    uniforms.moonVisible.value = Math.max(0, dot) * screenFade * lastMoonVisibility;
                 } else {
                     uniforms.moonVisible.value = 0;
                 }
