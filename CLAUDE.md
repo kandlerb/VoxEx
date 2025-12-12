@@ -253,8 +253,3 @@ When you propose changes (patches/commits/PRs), format your explanation like thi
   - Checked for duplicate or shadowed identifiers before new declarations.
   - Verified new DOM IDs and settings are wired correctly.
   - Avoided adding heavy loops or work to the per-frame/update path.
-
-
----
-**Last Updated**: 2025-12-12  
-**File Version**: v3.300+
