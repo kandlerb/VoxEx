@@ -67,31 +67,31 @@ VoxEx/
 
 VoxEx Architecture: 
 
-┌─────────────────────────────────────────────────────────────┐
-│ UI Layer (HTML/CSS)                                         │
-│ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │
-│ - Menus: Start, Pause, Settings, Controls, Seed Selection   │
-└───────────────┬─────────────────────────────────────────────┘
-                ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Game Engine (Three.js Renderer)                             │
-│ - Camera (First Person), Lighting (Day/Night), Skybox       │
-│ - Voxel Torch Model (BoxGeometry)                           │
-└───────────────┬─────────────────────────────────────────────┘
-                ↓
-┌─────────────────────────────────────────────────────────────┐
-│ World Management System                                     │
-│ ├─ Chunk Generation (16x16x128)                             │
-│ ├─ Biome System (Plains, Hills, Forest, Mountain, Swamp)    │
-│ ├─ Structure Generation (Trees, Caves, Rivers)              │
-│ └─ Block Logic (Optimized Face Culling, AO)                 │
-└───────────────┬─────────────────────────────────────────────┘
-                ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Data Persistence Layer                                      │
-│ ├─ IndexedDB (Chunk Cache with RLE Compression)             │
-│ ├─ LocalStorage (Game Saves & Settings)                     │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐  
+│ UI Layer (HTML/CSS)                                         │  
+│ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │  
+│ - Menus: Start, Pause, Settings, Controls, Seed Selection   │  
+└───────────────┬─────────────────────────────────────────────┘  
+                ↓  
+┌─────────────────────────────────────────────────────────────┐  
+│ Game Engine (Three.js Renderer)                             │  
+│ - Camera (First Person), Lighting (Day/Night), Skybox       │  
+│ - Voxel Torch Model (BoxGeometry)                           │  
+└───────────────┬─────────────────────────────────────────────┘  
+                ↓  
+┌─────────────────────────────────────────────────────────────┐  
+│ World Management System                                     │  
+│ ├─ Chunk Generation (16x16x128)                             │  
+│ ├─ Biome System (Plains, Hills, Forest, Mountain, Swamp)    │  
+│ ├─ Structure Generation (Trees, Caves, Rivers)              │  
+│ └─ Block Logic (Optimized Face Culling, AO)                 │  
+└───────────────┬─────────────────────────────────────────────┘  
+                ↓  
+┌─────────────────────────────────────────────────────────────┐  
+│ Data Persistence Layer                                      │  
+│ ├─ IndexedDB (Chunk Cache with RLE Compression)             │  
+│ ├─ LocalStorage (Game Saves & Settings)                     │  
+└─────────────────────────────────────────────────────────────┘  
 
 ## Version History & Features
 
