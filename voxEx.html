@@ -4349,6 +4349,48 @@
             // LOD transition tracking - for smooth crossfade with hysteresis
             const lodTransitionState = new Map();  // key -> { lastDistance, inLOD, opacity }
 
+            // LOD block type stats - track % of each block type across loaded LOD chunks
+            const lodBlockStats = {
+                grass: 0, stone: 0, sand: 0, dirt: 0, leaves: 0, other: 0, total: 0,
+                lastUpdate: 0
+            };
+
+            // Compute LOD block type stats from loaded chunks (throttled)
+            function updateLODBlockStats() {
+                const now = performance.now();
+                if (now - lodBlockStats.lastUpdate < 2000) return; // Update every 2s max
+                lodBlockStats.lastUpdate = now;
+
+                let grass = 0, stone = 0, sand = 0, dirt = 0, leaves = 0, other = 0, total = 0;
+                for (const [key, data] of lodChunks) {
+                    if (!data || !data.surfaceBlocks) continue;
+                    for (let i = 0; i < data.surfaceBlocks.length; i++) {
+                        const block = data.surfaceBlocks[i];
+                        total++;
+                        if (block === GRASS) grass++;
+                        else if (block === STONE) stone++;
+                        else if (block === SAND) sand++;
+                        else if (block === DIRT) dirt++;
+                        else if (block === LEAVES) leaves++;
+                        else other++;
+                    }
+                }
+                lodBlockStats.grass = grass;
+                lodBlockStats.stone = stone;
+                lodBlockStats.sand = sand;
+                lodBlockStats.dirt = dirt;
+                lodBlockStats.leaves = leaves;
+                lodBlockStats.other = other;
+                lodBlockStats.total = total;
+            }
+
+            // Format LOD block stats for debug display
+            function formatLODBlockStats() {
+                if (lodBlockStats.total === 0) return "";
+                const pct = (n) => ((n / lodBlockStats.total) * 100).toFixed(1);
+                return `LOD Blocks: G${pct(lodBlockStats.grass)}% S${pct(lodBlockStats.stone)}% D${pct(lodBlockStats.sand)}% L${pct(lodBlockStats.leaves)}%`;
+            }
+
             // Calculate LOD opacity for crossfade transition
             // Returns 0-1 opacity based on distance from transition boundary
             function getLODTransitionOpacity(distSq, normalDistSq, playerChunkX, playerChunkZ, cx, cz, key) {
@@ -4549,9 +4591,11 @@
                                         if (sourceChunk.skyLight) {
                                             cellLight = Math.max(1, sourceChunk.skyLight[idx]);
                                         }
+                                        // Water clarity: if surface is below sea level, calculate water depth
+                                        if (maxHeight < WORLD_DIMS.seaLevel) {
+                                            waterDepth = WORLD_DIMS.seaLevel - maxHeight;
+                                        }
                                         break;
-                                    } else if (block === WATER && maxHeight < -500) {
-                                        waterDepth = Math.max(waterDepth, ly - WORLD_DIMS.yOffset - WORLD_DIMS.seaLevel + 1);
                                     }
                                 }
                             } else {
@@ -4577,8 +4621,6 @@
                                                     lightSamples++;
                                                 }
                                                 break;
-                                            } else if (block === WATER && surfaceY < 0) {
-                                                waterDepth = Math.max(waterDepth, ly - WORLD_DIMS.yOffset - WORLD_DIMS.seaLevel + 1);
                                             }
                                         }
 
@@ -4586,6 +4628,10 @@
                                             const worldY = surfaceY - WORLD_DIMS.yOffset;
                                             if (worldY > maxHeight) maxHeight = worldY;
                                             blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                                            // Water clarity: if surface is below sea level, track max water depth
+                                            if (worldY < WORLD_DIMS.seaLevel) {
+                                                waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - worldY);
+                                            }
                                         }
                                     }
                                 }
@@ -4608,6 +4654,7 @@
                                     ? getBiomeParams(gx, gz) : null;
                                 const biome = biomeParams ? biomeParams.name : 'plains';
 
+                                // Match biome->block logic from multi-point path
                                 if (maxHeight < WORLD_DIMS.seaLevel) {
                                     dominantBlock = SAND;
                                     waterDepth = WORLD_DIMS.seaLevel - maxHeight;
@@ -4615,6 +4662,13 @@
                                     dominantBlock = STONE;
                                 } else if (biome === 'hills' && maxHeight > 100) {
                                     dominantBlock = STONE;
+                                } else if (biome === 'forests') {
+                                    // For far tiers, use LEAVES to represent tree canopy coverage
+                                    const treeNoise = Math.abs(Math.sin(gx * 0.5 + gz * 0.3));
+                                    dominantBlock = treeNoise < 0.3 ? LEAVES : GRASS;
+                                } else if (biome === 'swamp' && maxHeight <= WORLD_DIMS.seaLevel + 2) {
+                                    dominantBlock = DIRT;
+                                    waterDepth = Math.max(waterDepth, 1);
                                 } else {
                                     dominantBlock = GRASS;
                                 }
@@ -4657,10 +4711,20 @@
                         }
 
                         // Find dominant block (only if we did multi-point sampling)
+                        // Prefer non-grass blocks on ties: STONE > SAND > DIRT > LEAVES > others > GRASS
                         if (!useSimpleSampling && blockCounts.size > 0) {
                             let maxCount = 0;
+                            const blockPriority = (b) => {
+                                if (b === STONE) return 5;
+                                if (b === SAND) return 4;
+                                if (b === DIRT) return 3;
+                                if (b === LEAVES) return 2;
+                                if (b === GRASS) return 0;
+                                return 1;
+                            };
                             for (const [block, count] of blockCounts) {
-                                if (count > maxCount) {
+                                if (count > maxCount ||
+                                    (count === maxCount && blockPriority(block) > blockPriority(dominantBlock))) {
                                     maxCount = count;
                                     dominantBlock = block;
                                 }
@@ -10493,6 +10557,10 @@
             }
             function updateDebugInfo(currentFps, avgFps) {
                 if (!isDebug) return;
+                // Update LOD block stats if LOD is enabled
+                if (SETTINGS.lodEnabled && typeof updateLODBlockStats === 'function') {
+                    updateLODBlockStats();
+                }
                 const p = controls.getObject().position;
                 const overlay = document.getElementById("debug-overlay");
                 if (!overlay) return;
@@ -10568,6 +10636,7 @@
                     "\n" +
                     (SETTINGS.lodEnabled ? `LOD Chunks: ${lodChunkMeshes.size} (queue: ${lodChunkBuildQueue.length})\n` : "") +
                     (SETTINGS.lodDebugMode && SETTINGS.lodDebugMode !== 'normal' ? `LOD Debug: ${SETTINGS.lodDebugMode} (L to cycle)\n` : "") +
+                    (SETTINGS.lodEnabled && lodBlockStats.total > 0 ? `${formatLODBlockStats()}\n` : "") +
                     "Camera FOV: " +
                     camera.fov.toFixed(0) +
                     "°\n" +
