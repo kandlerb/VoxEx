@@ -4732,28 +4732,48 @@
                 let vIdx = 0, uvIdx = 0, cIdx = 0, faceCount = 0;
                 let wvIdx = 0, wuvIdx = 0, wcIdx = 0, waterFaceCount = 0;
 
+                // World bounds for validation
+                const minHeight = -64;
+                const maxHeight = WORLD_DIMS.chunkHeight + 64;
+
                 // Generate geometry for each cell
                 for (let cellZ = 0; cellZ < cellsPerSide; cellZ++) {
                     for (let cellX = 0; cellX < cellsPerSide; cellX++) {
                         const cellIdx = cellX + cellZ * cellsPerSide;
-                        const height = heightMap[cellIdx];
+                        let height = heightMap[cellIdx];
                         const blockId = surfaceBlocks[cellIdx];
                         const waterDepth = underwaterDepth[cellIdx];
+
+                        // VALIDATION: Clamp height to world bounds, skip invalid cells
+                        if (!Number.isFinite(height) || height < minHeight || height > maxHeight) {
+                            height = WORLD_DIMS.seaLevel; // Safe fallback
+                        }
 
                         // World position of this cell
                         const wx = startX + cellX * mergeSize;
                         const wz = startZ + cellZ * mergeSize;
                         const wy = height - WORLD_DIMS.yOffset;
 
-                        // Get UV coordinates for this block type
-                        const uv = getBlockUV(blockId);
+                        // VALIDATION: Skip cells with invalid world positions
+                        if (!Number.isFinite(wx) || !Number.isFinite(wy) || !Number.isFinite(wz)) {
+                            continue;
+                        }
+
+                        // Get UV coordinates for this block type - ensure valid block ID
+                        const validBlockId = (blockId >= 0 && blockId < 256) ? blockId : GRASS;
+                        const uv = getBlockUV(validBlockId);
+
+                        // VALIDATION: Check UV is valid
+                        if (!uv || !uv.top || !Array.isArray(uv.top)) {
+                            continue;
+                        }
 
                         // Use sampled light if available (lighting parity), else fallback
                         let baseLightLevel;
                         if (lightLevels && lightLevels[cellIdx] !== undefined) {
-                            baseLightLevel = lightLevels[cellIdx] / 15.0;
+                            baseLightLevel = Math.max(0.1, Math.min(1.0, lightLevels[cellIdx] / 15.0));
                         } else {
-                            baseLightLevel = getSimplifiedLight(height, WORLD_DIMS.chunkHeight) / 15.0;
+                            baseLightLevel = Math.max(0.1, getSimplifiedLight(height, WORLD_DIMS.chunkHeight) / 15.0);
                         }
 
                         // Apply day/night scaling to sampled light
@@ -4763,6 +4783,8 @@
                             const dayFactor = Math.max(0, (sunY + 1) * 0.5);
                             lightLevel = baseLightLevel * (0.4 + dayFactor * 0.6);
                         }
+                        // Ensure minimum visibility
+                        lightLevel = Math.max(0.1, Math.min(1.0, lightLevel));
 
                         // Add top face (always visible for LOD)
                         if (faceCount < maxFaces) {
@@ -4960,6 +4982,9 @@
 
             // Add a top face for LOD chunk (scaled by mergeSize)
             function addLODFace(wx, wy, wz, nx, ny, nz, uv, size, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                // VALIDATION: Ensure light is valid
+                const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
+
                 // Top face vertices (scaled quad) - sits on top of the cell
                 // Extend slightly past edges to eliminate seams between cells
                 const topY = wy + 1;
@@ -4992,14 +5017,19 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v0;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v0;
 
-                // Colors (flat lighting)
-                for (let i = 0; i < 18; i++) {
-                    col[cIdx + i] = light;
+                // Colors (RGB triplets for vertex coloring - grayscale lighting)
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = safeLight;     // R
+                    col[cIdx + i*3 + 1] = safeLight; // G
+                    col[cIdx + i*3 + 2] = safeLight; // B
                 }
             }
 
             // Add a water face for LOD chunk (with water color tinting)
             function addLODWaterFace(wx, wy, wz, uv, size, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                // VALIDATION: Ensure light is valid - water needs minimum visibility under fog
+                const safeLight = Number.isFinite(light) ? Math.max(0.3, Math.min(1.0, light)) : 0.6;
+
                 // Water top face vertices - extend edges for seamless connection
                 const x0 = wx - LOD_EDGE_OVERLAP;
                 const x1 = wx + size + LOD_EDGE_OVERLAP;
@@ -5031,9 +5061,10 @@
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v0;
 
                 // Water colors (blue tinted to match regular water)
-                const r = light * 0.4;  // Reduce red
-                const g = light * 0.6;  // Reduce green slightly
-                const b = light * 1.0;  // Full blue
+                // Keep stable base color/opacity for visibility under fog
+                const r = safeLight * 0.3;   // Reduced red for blue tint
+                const g = safeLight * 0.5;   // Reduced green for blue tint
+                const b = safeLight * 0.95;  // Near-full blue for water visibility
                 for (let i = 0; i < 6; i++) {
                     col[cIdx + i*3] = r;
                     col[cIdx + i*3 + 1] = g;
@@ -5050,15 +5081,17 @@
 
             // North face (-Z direction) - faces camera when looking south
             function addLODSideFaceNorth(wx, wy, wz, uv, width, height, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                // VALIDATION: Ensure light is valid
+                const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
+
                 // Extend skirt below AND slightly above to ensure full overlap
                 const h = Math.max(1, height) + LOD_SKIRT_DEPTH;
-                const top = wy + 1 + LOD_EDGE_OVERLAP; // Extend above top face
+                const top = wy + 1 + LOD_EDGE_OVERLAP;
                 const bottom = wy - h + 1;
                 const x0 = wx - LOD_EDGE_OVERLAP;
                 const x1 = wx + width + LOD_EDGE_OVERLAP;
                 const z = wz - LOD_EDGE_OVERLAP;
 
-                // Two triangles forming a quad facing -Z
                 pos[vIdx] = x0; pos[vIdx+1] = bottom; pos[vIdx+2] = z;
                 pos[vIdx+3] = x1; pos[vIdx+4] = bottom; pos[vIdx+5] = z;
                 pos[vIdx+6] = x0; pos[vIdx+7] = top; pos[vIdx+8] = z;
@@ -5066,7 +5099,6 @@
                 pos[vIdx+12] = x1; pos[vIdx+13] = top; pos[vIdx+14] = z;
                 pos[vIdx+15] = x0; pos[vIdx+16] = top; pos[vIdx+17] = z;
 
-                // Normals pointing -Z
                 for (let i = 0; i < 6; i++) {
                     norm[vIdx + i*3] = 0;
                     norm[vIdx + i*3 + 1] = 0;
@@ -5082,19 +5114,24 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
 
-                for (let i = 0; i < 18; i++) col[cIdx + i] = light;
+                // RGB triplets for vertex coloring
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = safeLight;
+                    col[cIdx + i*3 + 1] = safeLight;
+                    col[cIdx + i*3 + 2] = safeLight;
+                }
             }
 
             // South face (+Z direction) - faces camera when looking north
             function addLODSideFaceSouth(wx, wy, wz, uv, width, height, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
                 const h = Math.max(1, height) + LOD_SKIRT_DEPTH;
                 const top = wy + 1 + LOD_EDGE_OVERLAP;
                 const bottom = wy - h + 1;
                 const x0 = wx - LOD_EDGE_OVERLAP;
                 const x1 = wx + width + LOD_EDGE_OVERLAP;
-                const z = wz + width + LOD_EDGE_OVERLAP; // Face is at far edge
+                const z = wz + width + LOD_EDGE_OVERLAP;
 
-                // Two triangles - note reversed winding for correct facing
                 pos[vIdx] = x1; pos[vIdx+1] = bottom; pos[vIdx+2] = z;
                 pos[vIdx+3] = x0; pos[vIdx+4] = bottom; pos[vIdx+5] = z;
                 pos[vIdx+6] = x1; pos[vIdx+7] = top; pos[vIdx+8] = z;
@@ -5102,7 +5139,6 @@
                 pos[vIdx+12] = x0; pos[vIdx+13] = top; pos[vIdx+14] = z;
                 pos[vIdx+15] = x1; pos[vIdx+16] = top; pos[vIdx+17] = z;
 
-                // Normals pointing +Z
                 for (let i = 0; i < 6; i++) {
                     norm[vIdx + i*3] = 0;
                     norm[vIdx + i*3 + 1] = 0;
@@ -5118,15 +5154,20 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
 
-                for (let i = 0; i < 18; i++) col[cIdx + i] = light;
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = safeLight;
+                    col[cIdx + i*3 + 1] = safeLight;
+                    col[cIdx + i*3 + 2] = safeLight;
+                }
             }
 
             // East face (+X direction) - faces camera when looking west
             function addLODSideFaceEast(wx, wy, wz, uv, width, height, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
                 const h = Math.max(1, height) + LOD_SKIRT_DEPTH;
                 const top = wy + 1 + LOD_EDGE_OVERLAP;
                 const bottom = wy - h + 1;
-                const x = wx + width + LOD_EDGE_OVERLAP; // Face is at far edge
+                const x = wx + width + LOD_EDGE_OVERLAP;
                 const z0 = wz - LOD_EDGE_OVERLAP;
                 const z1 = wz + width + LOD_EDGE_OVERLAP;
 
@@ -5137,7 +5178,6 @@
                 pos[vIdx+12] = x; pos[vIdx+13] = top; pos[vIdx+14] = z0;
                 pos[vIdx+15] = x; pos[vIdx+16] = top; pos[vIdx+17] = z1;
 
-                // Normals pointing +X
                 for (let i = 0; i < 6; i++) {
                     norm[vIdx + i*3] = 1;
                     norm[vIdx + i*3 + 1] = 0;
@@ -5153,11 +5193,16 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
 
-                for (let i = 0; i < 18; i++) col[cIdx + i] = light;
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = safeLight;
+                    col[cIdx + i*3 + 1] = safeLight;
+                    col[cIdx + i*3 + 2] = safeLight;
+                }
             }
 
             // West face (-X direction) - faces camera when looking east
             function addLODSideFaceWest(wx, wy, wz, uv, width, height, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
                 const h = Math.max(1, height) + LOD_SKIRT_DEPTH;
                 const top = wy + 1 + LOD_EDGE_OVERLAP;
                 const bottom = wy - h + 1;
@@ -5172,7 +5217,6 @@
                 pos[vIdx+12] = x; pos[vIdx+13] = top; pos[vIdx+14] = z1;
                 pos[vIdx+15] = x; pos[vIdx+16] = top; pos[vIdx+17] = z0;
 
-                // Normals pointing -X
                 for (let i = 0; i < 6; i++) {
                     norm[vIdx + i*3] = -1;
                     norm[vIdx + i*3 + 1] = 0;
@@ -5188,7 +5232,12 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
 
-                for (let i = 0; i < 18; i++) col[cIdx + i] = light;
+                // RGB triplets for vertex coloring
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = safeLight;
+                    col[cIdx + i*3 + 1] = safeLight;
+                    col[cIdx + i*3 + 2] = safeLight;
+                }
             }
 
             // Release a LOD mesh
