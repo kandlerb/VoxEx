@@ -1275,6 +1275,10 @@
                 lodMaxDistance: 2048,                          // Maximum LOD distance
                 lodBuildQueueLimit: savedSettings.lodBuildQueueLimit || 8, // LOD chunks to build per frame
                 lodMaxCachedChunks: savedSettings.lodMaxCachedChunks || 50000, // Max LOD chunks in memory
+                lodDebugMode: savedSettings.lodDebugMode || 'normal',      // Debug: 'normal', 'blockId', 'uvChecker', 'lightOnly'
+                lodTransitionBand: savedSettings.lodTransitionBand ?? 2,   // Crossfade transition band in chunks
+                lodHysteresis: savedSettings.lodHysteresis ?? 0.5,         // Hysteresis to prevent LOD flipping
+                lodUVInset: savedSettings.lodUVInset ?? 0.5,               // UV inset in texels for bleed prevention
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -1371,6 +1375,13 @@
                 lodMaxDistance: 2048,
                 lodBuildQueueLimit: 8,
                 lodMaxCachedChunks: 50000,
+                // LOD Debug Modes: 'normal', 'blockId' (solid color), 'uvChecker', 'lightOnly'
+                lodDebugMode: 'normal',
+                // LOD Transition: crossfade band and hysteresis
+                lodTransitionBand: 2,          // Chunks where both LOD and regular render overlap
+                lodHysteresis: 0.5,            // Chunk distance before switching back (prevents flipping)
+                // LOD UV inset for atlas bleed prevention (in texels)
+                lodUVInset: 0.5,
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -4196,6 +4207,9 @@
                 tex.magFilter = THREE.NearestFilter;
                 tex.minFilter = THREE.NearestMipMapNearestFilter;
                 tex.generateMipmaps = true;
+                // Ensure consistent color space for all atlas textures (sRGB for color data)
+                // This is critical for LOD/near material parity - prevents texture color shift
+                tex.colorSpace = THREE.SRGBColorSpace;
                 tex.needsUpdate = true;
                 tex.anisotropy = Math.max(1, MAX_TEXTURE_ANISOTROPY);
                 pixelTexturesNeedingAniso.add(tex);
@@ -4331,6 +4345,71 @@
 
             // LOD invalidation tracking - marks LOD chunks that need rebuild
             const lodInvalidatedChunks = new Set(); // Keys that need LOD rebuild
+
+            // LOD transition tracking - for smooth crossfade with hysteresis
+            const lodTransitionState = new Map();  // key -> { lastDistance, inLOD, opacity }
+
+            // Calculate LOD opacity for crossfade transition
+            // Returns 0-1 opacity based on distance from transition boundary
+            function getLODTransitionOpacity(distSq, normalDistSq, playerChunkX, playerChunkZ, cx, cz, key) {
+                const transitionBand = SETTINGS.lodTransitionBand || 2;
+                const hysteresis = SETTINGS.lodHysteresis || 0.5;
+
+                // Inner edge of LOD zone (where regular chunks end)
+                const innerEdge = normalDistSq;
+                // Outer edge of transition band
+                const outerEdge = (Math.sqrt(normalDistSq) + transitionBand) ** 2;
+
+                // Get or create transition state for this chunk
+                let state = lodTransitionState.get(key);
+                if (!state) {
+                    state = { lastDistance: distSq, inLOD: distSq > innerEdge, opacity: 1 };
+                    lodTransitionState.set(key, state);
+                }
+
+                // Apply hysteresis - use different thresholds for entering vs exiting LOD
+                const enterThreshold = innerEdge;
+                const exitThreshold = (Math.sqrt(normalDistSq) - hysteresis) ** 2;
+
+                // Update LOD state with hysteresis
+                if (!state.inLOD && distSq > enterThreshold) {
+                    state.inLOD = true;
+                } else if (state.inLOD && distSq < exitThreshold) {
+                    state.inLOD = false;
+                }
+
+                // Calculate crossfade opacity within transition band
+                let targetOpacity;
+                if (distSq <= innerEdge) {
+                    // Inside normal render distance - LOD fully transparent
+                    targetOpacity = 0;
+                } else if (distSq >= outerEdge) {
+                    // Beyond transition band - LOD fully opaque
+                    targetOpacity = 1;
+                } else {
+                    // In transition band - linear interpolation
+                    const innerDist = Math.sqrt(innerEdge);
+                    const outerDist = Math.sqrt(outerEdge);
+                    const currentDist = Math.sqrt(distSq);
+                    targetOpacity = (currentDist - innerDist) / (outerDist - innerDist);
+                }
+
+                // Smooth opacity transition (lerp towards target)
+                const lerpSpeed = 0.15;
+                state.opacity = state.opacity + (targetOpacity - state.opacity) * lerpSpeed;
+                state.lastDistance = distSq;
+
+                return Math.max(0, Math.min(1, state.opacity));
+            }
+
+            // Cleanup stale transition states
+            function cleanupLODTransitionStates(activeKeys) {
+                for (const key of lodTransitionState.keys()) {
+                    if (!activeKeys.has(key)) {
+                        lodTransitionState.delete(key);
+                    }
+                }
+            }
 
             // LOD spiral offsets - pre-computed for efficient iteration
             let LOD_SPIRAL_OFFSETS = [];
@@ -4790,7 +4869,7 @@
                         if (faceCount < maxFaces) {
                             addLODFace(wx, wy, wz, 0, 1, 0, uv.top, mergeSize,
                                       positions, normals, uvs, colors,
-                                      vIdx, uvIdx, cIdx, lightLevel);
+                                      vIdx, uvIdx, cIdx, lightLevel, validBlockId);
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
                         }
 
@@ -4916,6 +4995,10 @@
                     const colArray = new Float32Array(cIdx);
                     colArray.set(colors.subarray(0, cIdx));
 
+                    // Validate geometry in debug modes
+                    validateLODGeometry(faceCount, vIdx, uvIdx, cIdx, key);
+                    validateLODNormals(normArray, faceCount, key);
+
                     const geo = new THREE.BufferGeometry();
                     geo.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
                     geo.setAttribute('normal', new THREE.Float32BufferAttribute(normArray, 3));
@@ -4953,6 +5036,10 @@
                     const wColArray = new Float32Array(wcIdx);
                     wColArray.set(waterColors.subarray(0, wcIdx));
 
+                    // Validate water geometry in debug modes
+                    validateLODGeometry(waterFaceCount, wvIdx, wuvIdx, wcIdx, waterKey);
+                    validateLODNormals(wNormArray, waterFaceCount, waterKey);
+
                     const waterGeo = new THREE.BufferGeometry();
                     waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(wPosArray, 3));
                     waterGeo.setAttribute('normal', new THREE.Float32BufferAttribute(wNormArray, 3));
@@ -4980,8 +5067,136 @@
             // LOD water material (initialized in initTextures)
             let lodWaterMaterial = null;
 
+            // LOD geometry validation - asserts attribute counts match
+            // Used for debugging LOD mesh issues (enable via lodDebugMode)
+            function validateLODGeometry(faceCount, vIdx, uvIdx, cIdx, label) {
+                if (SETTINGS.lodDebugMode === 'normal') return true; // Skip validation in normal mode
+
+                const expectedPositions = faceCount * 18; // 6 vertices × 3 components
+                const expectedUVs = faceCount * 12;       // 6 vertices × 2 components
+                const expectedColors = faceCount * 18;    // 6 vertices × 3 components
+
+                const posValid = vIdx === expectedPositions;
+                const uvValid = uvIdx === expectedUVs;
+                const colValid = cIdx === expectedColors;
+
+                if (!posValid || !uvValid || !colValid) {
+                    console.warn(`[LOD Validate] ${label}: Attribute mismatch!`,
+                        `faces=${faceCount}`,
+                        `pos=${vIdx}/${expectedPositions}`,
+                        `uv=${uvIdx}/${expectedUVs}`,
+                        `col=${cIdx}/${expectedColors}`);
+                    return false;
+                }
+                return true;
+            }
+
+            // Validate that normals are properly set (no NaN, normalized)
+            function validateLODNormals(normArray, faceCount, label) {
+                if (SETTINGS.lodDebugMode === 'normal') return true;
+
+                const count = faceCount * 18;
+                for (let i = 0; i < count; i += 3) {
+                    const nx = normArray[i], ny = normArray[i+1], nz = normArray[i+2];
+                    if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) {
+                        console.warn(`[LOD Validate] ${label}: Invalid normal at ${i/3}:`, nx, ny, nz);
+                        return false;
+                    }
+                    // Check approximately normalized (length should be ~1)
+                    const len = Math.sqrt(nx*nx + ny*ny + nz*nz);
+                    if (len < 0.9 || len > 1.1) {
+                        console.warn(`[LOD Validate] ${label}: Non-unit normal at ${i/3}, length=${len}`);
+                        // Don't fail, just warn - could be zero normal
+                    }
+                }
+                return true;
+            }
+
+            // LOD UV calculation with texel inset to prevent atlas bleed
+            // Atlas is 12 tiles, each tile is textureResolution pixels
+            function computeLODUVs(uv) {
+                const tileCount = 12;
+                const texRes = SETTINGS.textureResolution || 16;
+                const atlasSize = tileCount * texRes;
+                // Inset by half-texel (or configurable) to prevent mipmap bleed
+                const insetTexels = SETTINGS.lodUVInset ?? 0.5;
+                const inset = insetTexels / atlasSize;
+
+                const u0 = uv[0] / tileCount + inset;
+                const v0 = uv[1] / tileCount + inset;
+                const u1 = (uv[0] + 1) / tileCount - inset;
+                const v1 = (uv[1] + 1) / tileCount - inset;
+
+                return { u0, v0, u1, v1 };
+            }
+
+            // Debug color by block ID - deterministic color for each block type
+            const LOD_DEBUG_COLORS = {};
+            function getDebugColorForBlock(blockId) {
+                if (LOD_DEBUG_COLORS[blockId]) return LOD_DEBUG_COLORS[blockId];
+                // Generate consistent color from block ID using golden ratio
+                const hue = (blockId * 0.618033988749895) % 1.0;
+                const sat = 0.7;
+                const val = 0.8;
+                // HSV to RGB
+                const h = hue * 6;
+                const f = h - Math.floor(h);
+                const p = val * (1 - sat);
+                const q = val * (1 - sat * f);
+                const t = val * (1 - sat * (1 - f));
+                let r, g, b;
+                switch (Math.floor(h) % 6) {
+                    case 0: r = val; g = t; b = p; break;
+                    case 1: r = q; g = val; b = p; break;
+                    case 2: r = p; g = val; b = t; break;
+                    case 3: r = p; g = q; b = val; break;
+                    case 4: r = t; g = p; b = val; break;
+                    case 5: r = val; g = p; b = q; break;
+                }
+                LOD_DEBUG_COLORS[blockId] = { r, g, b };
+                return LOD_DEBUG_COLORS[blockId];
+            }
+
+            // UV checker pattern for debug (alternating tiles)
+            function getUVCheckerColor(wx, wz, size) {
+                const checker = ((Math.floor(wx / size) + Math.floor(wz / size)) % 2) === 0;
+                return checker ? { r: 1, g: 0, b: 1 } : { r: 0, g: 1, b: 0 };
+            }
+
+            // Apply debug mode to LOD vertex colors
+            function applyLODDebugColor(col, cIdx, light, blockId, wx, wz, size) {
+                const mode = SETTINGS.lodDebugMode || 'normal';
+                let r, g, b;
+
+                switch (mode) {
+                    case 'blockId': {
+                        const dbgCol = getDebugColorForBlock(blockId);
+                        r = dbgCol.r; g = dbgCol.g; b = dbgCol.b;
+                        break;
+                    }
+                    case 'uvChecker': {
+                        const chkCol = getUVCheckerColor(wx, wz, size);
+                        r = chkCol.r; g = chkCol.g; b = chkCol.b;
+                        break;
+                    }
+                    case 'lightOnly': {
+                        // Show only lighting as grayscale
+                        r = light; g = light; b = light;
+                        break;
+                    }
+                    default: // 'normal'
+                        r = light; g = light; b = light;
+                }
+
+                for (let i = 0; i < 6; i++) {
+                    col[cIdx + i*3] = r;
+                    col[cIdx + i*3 + 1] = g;
+                    col[cIdx + i*3 + 2] = b;
+                }
+            }
+
             // Add a top face for LOD chunk (scaled by mergeSize)
-            function addLODFace(wx, wy, wz, nx, ny, nz, uv, size, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+            function addLODFace(wx, wy, wz, nx, ny, nz, uv, size, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light, blockId) {
                 // VALIDATION: Ensure light is valid
                 const safeLight = Number.isFinite(light) ? Math.max(0.1, Math.min(1.0, light)) : 0.5;
 
@@ -5007,9 +5222,8 @@
                     norm[vIdx + i*3 + 2] = 0;
                 }
 
-                // UVs (tile the texture)
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset to prevent atlas bleed
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v1;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v1;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v0;
@@ -5017,12 +5231,8 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v0;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v0;
 
-                // Colors (RGB triplets for vertex coloring - grayscale lighting)
-                for (let i = 0; i < 6; i++) {
-                    col[cIdx + i*3] = safeLight;     // R
-                    col[cIdx + i*3 + 1] = safeLight; // G
-                    col[cIdx + i*3 + 2] = safeLight; // B
-                }
+                // Colors with debug mode support
+                applyLODDebugColor(col, cIdx, safeLight, blockId || 0, wx, wz, size);
             }
 
             // Add a water face for LOD chunk (with water color tinting)
@@ -5050,9 +5260,8 @@
                     norm[vIdx + i*3 + 2] = 0;
                 }
 
-                // UVs
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset to prevent atlas bleed
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v1;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v1;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v0;
@@ -5105,8 +5314,8 @@
                     norm[vIdx + i*3 + 2] = -1;
                 }
 
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset to prevent atlas bleed
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v1;
@@ -5114,7 +5323,7 @@
                 uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
                 uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
 
-                // RGB triplets for vertex coloring
+                // RGB triplets for vertex coloring (side faces use straight light, not debug)
                 for (let i = 0; i < 6; i++) {
                     col[cIdx + i*3] = safeLight;
                     col[cIdx + i*3 + 1] = safeLight;
@@ -5145,8 +5354,8 @@
                     norm[vIdx + i*3 + 2] = 1;
                 }
 
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v1;
@@ -5184,8 +5393,8 @@
                     norm[vIdx + i*3 + 2] = 0;
                 }
 
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v1;
@@ -5223,8 +5432,8 @@
                     norm[vIdx + i*3 + 2] = 0;
                 }
 
-                const u0 = uv[0] / 12, v0 = uv[1] / 12;
-                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                // UVs with texel inset
+                const { u0, v0, u1, v1 } = computeLODUVs(uv);
                 uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
                 uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
                 uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v1;
@@ -5344,15 +5553,52 @@
                     let prefetchCount = 0;
                     const prefetchDistSq = (normalRenderRadius + LOD_PREFETCH_RING_SIZE) ** 2;
 
+                    // Hysteresis threshold - use slightly smaller distance for exiting LOD
+                    const hysteresis = SETTINGS.lodHysteresis || 0.5;
+                    const transitionBand = SETTINGS.lodTransitionBand || 2;
+                    const exitDistSq = (Math.sqrt(normalDistSq) - hysteresis) ** 2;
+                    const transitionOuterSq = (Math.sqrt(normalDistSq) + transitionBand) ** 2;
+
                     for (const offset of LOD_SPIRAL_OFFSETS) {
-                        // Skip chunks within normal render distance
-                        if (offset.distSq <= normalDistSq) continue;
                         // Stop once we're beyond LOD distance
                         if (offset.distSq > lodDistSq) break;
 
                         const cx = playerChunkX + offset.dx;
                         const cz = playerChunkZ + offset.dz;
                         const key = `LOD_${cx},${cz}`;
+
+                        // Check transition state for hysteresis
+                        let state = lodTransitionState.get(key);
+                        const wasInLOD = state ? state.inLOD : false;
+
+                        // Apply hysteresis: use exitDistSq if already in LOD, else normalDistSq
+                        const threshold = wasInLOD ? exitDistSq : normalDistSq;
+
+                        // Skip chunks within threshold (hysteresis applied)
+                        if (offset.distSq <= threshold) {
+                            // Mark as not in LOD
+                            if (state) state.inLOD = false;
+                            continue;
+                        }
+
+                        // Update transition state
+                        if (!state) {
+                            state = { lastDistance: offset.distSq, inLOD: true, opacity: 1 };
+                            lodTransitionState.set(key, state);
+                        } else {
+                            state.inLOD = true;
+                            state.lastDistance = offset.distSq;
+                        }
+
+                        // Calculate opacity for transition band (for potential future use)
+                        if (offset.distSq < transitionOuterSq) {
+                            const innerDist = Math.sqrt(normalDistSq);
+                            const outerDist = innerDist + transitionBand;
+                            const currentDist = Math.sqrt(offset.distSq);
+                            state.opacity = Math.max(0.2, Math.min(1, (currentDist - innerDist) / transitionBand));
+                        } else {
+                            state.opacity = 1;
+                        }
 
                         neededLODKeys.add(key);
 
@@ -5368,6 +5614,9 @@
                             queuedLODChunkKeys.add(key);
                         }
                     }
+
+                    // Cleanup stale transition states
+                    cleanupLODTransitionStates(neededLODKeys);
 
                     // Sort queue by distance (closest first)
                     if (lodChunkBuildQueue.length > 1) {
@@ -10781,11 +11030,14 @@
                 waterMaterial.fog = true;
 
                 // LOD chunk material - simplified for distant rendering (no roughness map, basic lighting)
+                // Transparent enabled for crossfade transition
                 lodChunkMaterial = new THREE.MeshLambertMaterial({
                     map: tex,
                     vertexColors: true,
                     side: THREE.FrontSide,
                     alphaTest: 0.1,
+                    transparent: true,
+                    opacity: 1.0,
                 });
                 lodChunkMaterial.fog = true;
 
