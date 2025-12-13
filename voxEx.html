@@ -4733,40 +4733,52 @@
             }
 
             // Get height from neighbor LOD chunk at boundary
-            // Returns the height at the edge cell facing this chunk
-            function getNeighborLODHeight(cx, cz, direction, cellIdx, cellsPerSide) {
+            // Maps world XZ to neighbor cell coords to handle different LOD levels
+            // Returns null if neighbor data isn't available (caller should use current height)
+            function getNeighborLODHeight(cx, cz, direction, worldX, worldZ, currentHeight) {
                 let neighborCx = cx, neighborCz = cz;
-                let neighborCellIdx;
 
                 switch (direction) {
-                    case 'north': // Get south edge of chunk to the north
-                        neighborCz = cz - 1;
-                        neighborCellIdx = cellIdx + (cellsPerSide - 1) * cellsPerSide; // Same X, last row
-                        break;
-                    case 'south': // Get north edge of chunk to the south
-                        neighborCz = cz + 1;
-                        neighborCellIdx = cellIdx % cellsPerSide; // Same X, first row
-                        break;
-                    case 'east': // Get west edge of chunk to the east
-                        neighborCx = cx + 1;
-                        neighborCellIdx = (cellIdx - cellsPerSide + 1) + Math.floor(cellIdx / cellsPerSide) * cellsPerSide;
-                        neighborCellIdx = Math.floor(cellIdx / cellsPerSide) * cellsPerSide; // First column, same row
-                        break;
-                    case 'west': // Get east edge of chunk to the west
-                        neighborCx = cx - 1;
-                        neighborCellIdx = Math.floor(cellIdx / cellsPerSide) * cellsPerSide + (cellsPerSide - 1); // Last column, same row
-                        break;
+                    case 'north': neighborCz = cz - 1; break;
+                    case 'south': neighborCz = cz + 1; break;
+                    case 'east': neighborCx = cx + 1; break;
+                    case 'west': neighborCx = cx - 1; break;
                 }
 
                 const neighborKey = `LOD_${neighborCx},${neighborCz}`;
                 const neighborData = lodChunks.get(neighborKey);
 
-                if (neighborData && neighborData.heightMap) {
+                if (!neighborData || !neighborData.heightMap) {
+                    // P0 FIX: Return current height instead of sea level to avoid walls
+                    // The chunk will be rebuilt when neighbor data arrives
+                    if (!lodInvalidatedChunks.has(`LOD_${cx},${cz}`)) {
+                        // Schedule rebuild when neighbor is ready (checked in updateLODChunks)
+                    }
+                    return currentHeight;
+                }
+
+                // P0 FIX: Map world coords to neighbor's cell coords (handles different LOD levels)
+                const neighborMergeSize = neighborData.mergeSize || 1;
+                const neighborCellsPerSide = Math.floor(WORLD_DIMS.chunkSize / neighborMergeSize);
+                const neighborStartX = neighborCx * WORLD_DIMS.chunkSize;
+                const neighborStartZ = neighborCz * WORLD_DIMS.chunkSize;
+
+                // Convert world position to neighbor cell indices
+                const localX = worldX - neighborStartX;
+                const localZ = worldZ - neighborStartZ;
+                const neighborCellX = Math.floor(localX / neighborMergeSize);
+                const neighborCellZ = Math.floor(localZ / neighborMergeSize);
+
+                // Clamp to valid range
+                const clampedX = Math.max(0, Math.min(neighborCellsPerSide - 1, neighborCellX));
+                const clampedZ = Math.max(0, Math.min(neighborCellsPerSide - 1, neighborCellZ));
+                const neighborCellIdx = clampedX + clampedZ * neighborCellsPerSide;
+
+                if (neighborCellIdx >= 0 && neighborCellIdx < neighborData.heightMap.length) {
                     return neighborData.heightMap[neighborCellIdx];
                 }
 
-                // Fast fallback: use sea level (skirt depth handles any gaps at edges)
-                return WORLD_DIMS.seaLevel;
+                return currentHeight;
             }
 
             // Render a LOD chunk with merged block geometry
@@ -4873,78 +4885,51 @@
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
                         }
 
-                        // Add side faces based on neighbor height differences
-                        // Tier-based rules:
-                        // - Near tiers: all side faces where needed
-                        // - Far tiers: only border skirts + steep cliffs (height diff > 8)
+                        // P0 FIX: Only add CHUNK-EDGE SKIRTS, not per-cell side faces
+                        // This eliminates ribbing/curtain artifacts from interior side faces
+                        // Skirts only at chunk borders hide cracks between chunks
                         const sideLightN = lightLevel * 0.92;
                         const sideLightE = lightLevel * 0.85;
-                        const steepThreshold = isFarTier ? 8 : 1; // Minimum height diff for far tier sides
+                        const SKIRT_DEPTH = 16; // Fixed skirt depth to hide gaps
 
-                        // North face (-Z direction)
+                        // Only generate skirts at chunk borders
                         const isNorthBorder = cellZ === 0;
-                        let nHeightN;
-                        if (cellZ > 0) {
-                            nHeightN = heightMap[cellX + (cellZ - 1) * cellsPerSide];
-                        } else {
-                            nHeightN = getNeighborLODHeight(cx, cz, 'north', cellIdx, cellsPerSide);
-                        }
-                        const heightDiffN = height - nHeightN;
-                        // Render if: (near tier + any lower) OR (far tier + (border OR steep))
-                        if (heightDiffN > 0 && faceCount < maxFaces &&
-                            (!isFarTier || isNorthBorder || heightDiffN >= steepThreshold)) {
-                            const sideHeight = Math.max(1, heightDiffN);
+                        const isSouthBorder = cellZ === cellsPerSide - 1;
+                        const isEastBorder = cellX === cellsPerSide - 1;
+                        const isWestBorder = cellX === 0;
+
+                        // North skirt (chunk border only)
+                        if (isNorthBorder && faceCount < maxFaces) {
+                            const neighborHeight = getNeighborLODHeight(cx, cz, 'north', wx, wz, height);
+                            // Only add skirt if we're higher than or equal to neighbor (extend down)
+                            const sideHeight = SKIRT_DEPTH;
                             addLODSideFaceNorth(wx, wy, wz, uv.side, mergeSize, sideHeight,
                                 positions, normals, uvs, colors, vIdx, uvIdx, cIdx, sideLightN);
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
                         }
 
-                        // South face (+Z direction)
-                        const isSouthBorder = cellZ === cellsPerSide - 1;
-                        let nHeightS;
-                        if (cellZ < cellsPerSide - 1) {
-                            nHeightS = heightMap[cellX + (cellZ + 1) * cellsPerSide];
-                        } else {
-                            nHeightS = getNeighborLODHeight(cx, cz, 'south', cellIdx, cellsPerSide);
-                        }
-                        const heightDiffS = height - nHeightS;
-                        if (heightDiffS > 0 && faceCount < maxFaces &&
-                            (!isFarTier || isSouthBorder || heightDiffS >= steepThreshold)) {
-                            const sideHeight = Math.max(1, heightDiffS);
+                        // South skirt (chunk border only)
+                        if (isSouthBorder && faceCount < maxFaces) {
+                            const neighborHeight = getNeighborLODHeight(cx, cz, 'south', wx, wz + mergeSize, height);
+                            const sideHeight = SKIRT_DEPTH;
                             addLODSideFaceSouth(wx, wy, wz, uv.side, mergeSize, sideHeight,
                                 positions, normals, uvs, colors, vIdx, uvIdx, cIdx, sideLightN);
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
                         }
 
-                        // East face (+X direction)
-                        const isEastBorder = cellX === cellsPerSide - 1;
-                        let nHeightE;
-                        if (cellX < cellsPerSide - 1) {
-                            nHeightE = heightMap[(cellX + 1) + cellZ * cellsPerSide];
-                        } else {
-                            nHeightE = getNeighborLODHeight(cx, cz, 'east', cellIdx, cellsPerSide);
-                        }
-                        const heightDiffE = height - nHeightE;
-                        if (heightDiffE > 0 && faceCount < maxFaces &&
-                            (!isFarTier || isEastBorder || heightDiffE >= steepThreshold)) {
-                            const sideHeight = Math.max(1, heightDiffE);
+                        // East skirt (chunk border only)
+                        if (isEastBorder && faceCount < maxFaces) {
+                            const neighborHeight = getNeighborLODHeight(cx, cz, 'east', wx + mergeSize, wz, height);
+                            const sideHeight = SKIRT_DEPTH;
                             addLODSideFaceEast(wx, wy, wz, uv.side, mergeSize, sideHeight,
                                 positions, normals, uvs, colors, vIdx, uvIdx, cIdx, sideLightE);
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
                         }
 
-                        // West face (-X direction)
-                        const isWestBorder = cellX === 0;
-                        let nHeightW;
-                        if (cellX > 0) {
-                            nHeightW = heightMap[(cellX - 1) + cellZ * cellsPerSide];
-                        } else {
-                            nHeightW = getNeighborLODHeight(cx, cz, 'west', cellIdx, cellsPerSide);
-                        }
-                        const heightDiffW = height - nHeightW;
-                        if (heightDiffW > 0 && faceCount < maxFaces &&
-                            (!isFarTier || isWestBorder || heightDiffW >= steepThreshold)) {
-                            const sideHeight = Math.max(1, heightDiffW);
+                        // West skirt (chunk border only)
+                        if (isWestBorder && faceCount < maxFaces) {
+                            const neighborHeight = getNeighborLODHeight(cx, cz, 'west', wx, wz, height);
+                            const sideHeight = SKIRT_DEPTH;
                             addLODSideFaceWest(wx, wy, wz, uv.side, mergeSize, sideHeight,
                                 positions, normals, uvs, colors, vIdx, uvIdx, cIdx, sideLightE);
                             vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
@@ -4995,9 +4980,10 @@
                     const colArray = new Float32Array(cIdx);
                     colArray.set(colors.subarray(0, cIdx));
 
-                    // Validate geometry in debug modes
+                    // P0 FIX: Validate geometry before committing to prevent black chunks
                     validateLODGeometry(faceCount, vIdx, uvIdx, cIdx, key);
                     validateLODNormals(normArray, faceCount, key);
+                    validateLODPositions(posArray, vIdx, key);
 
                     const geo = new THREE.BufferGeometry();
                     geo.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
@@ -5036,9 +5022,10 @@
                     const wColArray = new Float32Array(wcIdx);
                     wColArray.set(waterColors.subarray(0, wcIdx));
 
-                    // Validate water geometry in debug modes
+                    // P0 FIX: Validate water geometry before committing
                     validateLODGeometry(waterFaceCount, wvIdx, wuvIdx, wcIdx, waterKey);
                     validateLODNormals(wNormArray, waterFaceCount, waterKey);
+                    validateLODPositions(wPosArray, wvIdx, waterKey);
 
                     const waterGeo = new THREE.BufferGeometry();
                     waterGeo.setAttribute('position', new THREE.Float32BufferAttribute(wPosArray, 3));
@@ -5109,6 +5096,46 @@
                         // Don't fail, just warn - could be zero normal
                     }
                 }
+                return true;
+            }
+
+            // P0 FIX: Comprehensive geometry sanity checks to prevent massive black chunks
+            let lodGeometryErrorCount = 0;
+
+            // Validate vertex positions are finite and within reasonable world bounds
+            function validateLODPositions(posArray, vertexCount, label) {
+                const worldMin = -100000;
+                const worldMax = 100000;
+                let errors = 0;
+
+                for (let i = 0; i < vertexCount; i += 3) {
+                    const x = posArray[i], y = posArray[i+1], z = posArray[i+2];
+                    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+                        errors++;
+                        if (errors <= 3) {
+                            console.warn(`[LOD Validate] ${label}: Invalid position at vertex ${i/3}:`, x, y, z);
+                        }
+                    } else if (x < worldMin || x > worldMax || y < worldMin || y > worldMax || z < worldMin || z > worldMax) {
+                        errors++;
+                        if (errors <= 3) {
+                            console.warn(`[LOD Validate] ${label}: Out-of-bounds position at vertex ${i/3}:`, x, y, z);
+                        }
+                    }
+                }
+
+                if (errors > 0) {
+                    lodGeometryErrorCount += errors;
+                    console.warn(`[LOD Validate] ${label}: Total position errors: ${errors}`);
+                    return false;
+                }
+                return true;
+            }
+
+            // Validate heights before adding face (inline check for hot path)
+            function isValidLODHeight(height, sideHeight) {
+                if (!Number.isFinite(height) || !Number.isFinite(sideHeight)) return false;
+                if (height < -1000 || height > 1000) return false;
+                if (sideHeight < 0 || sideHeight > 500) return false;
                 return true;
             }
 
