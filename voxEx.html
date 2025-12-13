@@ -613,6 +613,14 @@
                         <label for="frustum-culling-toggle">Frustum Culling</label>
                         <input type="checkbox" id="frustum-culling-toggle" />
                     </div>
+                    <div class="setting-item" style="border-top: 2px solid #4CAF50; padding-top: 15px; margin-top: 10px">
+                        <label for="lod-toggle" style="color: #4CAF50">Level of Detail (Distant Horizons)</label>
+                        <input type="checkbox" id="lod-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="lod-dist-slider">LOD Distance: <span id="lod-dist-val">48</span> chunks</label>
+                        <input type="range" id="lod-dist-slider" min="16" max="100" step="4" />
+                    </div>
                     <div class="setting-item">
                         <label for="lower-fps-slider">Min FPS Threshold: <span id="lower-fps-val">30</span></label>
                         <input type="range" id="lower-fps-slider" min="20" max="60" step="5" />
@@ -1260,6 +1268,13 @@
                 targetFPS: 60,
                 frameUpdateInterval: 5,
                 enableFrustumCulling: savedSettings.enableFrustumCulling !== undefined ? savedSettings.enableFrustumCulling : true,
+                // LOD (Level of Detail) System - Distant Horizons style
+                lodEnabled: savedSettings.lodEnabled !== undefined ? savedSettings.lodEnabled : true,
+                lodDistance: savedSettings.lodDistance || 48,  // Total LOD render distance in chunks (up to 100)
+                lodMinDistance: 16,                            // Minimum LOD distance (must be >= renderDistance)
+                lodMaxDistance: 100,                           // Maximum LOD distance
+                lodBuildQueueLimit: savedSettings.lodBuildQueueLimit || 4, // LOD chunks to build per frame
+                lodMaxCachedChunks: savedSettings.lodMaxCachedChunks || 2000, // Max LOD chunks in memory
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -1349,6 +1364,13 @@
                 lowerBoundFPS: 30,
                 upperBoundFPS: 50,
                 enableFrustumCulling: true,
+                // LOD (Level of Detail) System
+                lodEnabled: true,
+                lodDistance: 48,
+                lodMinDistance: 16,
+                lodMaxDistance: 100,
+                lodBuildQueueLimit: 4,
+                lodMaxCachedChunks: 2000,
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -4242,14 +4264,40 @@
             const chunkDataPool = new Uint8ArrayPool();
 
             // --- OPTIMIZATION 4: LOD System Configuration ---
+            // Enhanced LOD system similar to Distant Horizons mod
             const LOD_CONFIG = {
                 enabled: true,
+                // Full-detail chunk LOD levels (used in normal chunk rendering)
                 levels: [
                     { maxDistance: 4, skipFaces: 0 },       // Full detail within 4 chunks
                     { maxDistance: 8, skipFaces: 0.1 },    // Skip 10% of internal faces at 4-8 chunks
                     { maxDistance: 12, skipFaces: 0.25 },  // Skip 25% at 8-12 chunks
                     { maxDistance: 999, skipFaces: 0.4 }   // Skip 40% at far distance
+                ],
+                // Extended LOD levels for distant chunk rendering (block merging)
+                // These are used for LOD chunks beyond the normal render distance
+                distantLevels: [
+                    { maxDistance: 24, mergeSize: 2, skipY: 1, name: 'high' },     // 2x2 merging (16-24 chunks)
+                    { maxDistance: 40, mergeSize: 4, skipY: 2, name: 'medium' },   // 4x4 merging (24-40 chunks)
+                    { maxDistance: 64, mergeSize: 8, skipY: 4, name: 'low' },      // 8x8 merging (40-64 chunks)
+                    { maxDistance: 100, mergeSize: 16, skipY: 8, name: 'ultra' }   // 16x16 merging (64-100 chunks)
                 ]
+            };
+
+            // LOD chunk data storage - stores simplified heightmap-based chunk data
+            const lodChunks = new Map();         // key -> LOD chunk data
+            const lodChunkMeshes = new Map();    // key -> THREE.Mesh
+            const lodChunkBuildQueue = [];       // Queue for building LOD chunks
+            const queuedLODChunkKeys = new Set(); // Keys currently in queue
+            let lodChunkMeshCount = 0;           // Track LOD mesh count
+            let lodChunkMaterial = null;         // Material for LOD chunks (created in init)
+
+            // LOD statistics for debug overlay
+            const lodStats = {
+                chunksRendered: 0,
+                chunksInQueue: 0,
+                totalFaces: 0,
+                lastUpdateTime: 0
             };
 
             function getLODSkipFactor(distSq) {
@@ -4259,6 +4307,433 @@
                     if (dist <= level.maxDistance) return level.skipFaces;
                 }
                 return 0.4;
+            }
+
+            // Get the LOD level for a given distance (for distant LOD chunks)
+            function getLODLevelForDistance(dist) {
+                for (const level of LOD_CONFIG.distantLevels) {
+                    if (dist <= level.maxDistance) return level;
+                }
+                return LOD_CONFIG.distantLevels[LOD_CONFIG.distantLevels.length - 1];
+            }
+
+            // Generate simplified LOD chunk data using heightmap and dominant block sampling
+            function generateLODChunkData(cx, cz, lodLevel) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const mergeSize = lodLevel.mergeSize;
+                const skipY = lodLevel.skipY;
+                const cellsPerSide = chunkSize / mergeSize;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+
+                // LOD chunk stores: heightmap + dominant surface block per cell
+                const heightMap = new Int16Array(cellsPerSide * cellsPerSide);
+                const surfaceBlocks = new Uint8Array(cellsPerSide * cellsPerSide);
+                const underwaterDepth = new Uint8Array(cellsPerSide * cellsPerSide);
+
+                // Sample terrain at cell centers and find max heights
+                for (let cellZ = 0; cellZ < cellsPerSide; cellZ++) {
+                    for (let cellX = 0; cellX < cellsPerSide; cellX++) {
+                        const cellIdx = cellX + cellZ * cellsPerSide;
+                        let maxHeight = -1000;
+                        let dominantBlock = GRASS;
+                        let waterDepth = 0;
+                        const blockCounts = new Map();
+
+                        // Sample multiple points within the cell
+                        for (let dz = 0; dz < mergeSize; dz += Math.max(1, Math.floor(mergeSize / 2))) {
+                            for (let dx = 0; dx < mergeSize; dx += Math.max(1, Math.floor(mergeSize / 2))) {
+                                const gx = startX + cellX * mergeSize + dx;
+                                const gz = startZ + cellZ * mergeSize + dz;
+
+                                // Use height calculation function if available
+                                const height = typeof blendedHeight === 'function'
+                                    ? blendedHeight(gx, gz, worldConfig.seed)
+                                    : 64; // Fallback
+
+                                if (height > maxHeight) maxHeight = height;
+
+                                // Determine surface block based on biome/height
+                                const biomeParams = typeof getBiomeParams === 'function'
+                                    ? getBiomeParams(gx, gz)
+                                    : null;
+                                const biome = biomeParams ? biomeParams.name : 'plains';
+
+                                let surfaceBlock = GRASS;
+                                if (height < WORLD_DIMS.seaLevel) {
+                                    surfaceBlock = SAND;
+                                    waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - height);
+                                } else if (biome === 'mountains' && height > 120) {
+                                    surfaceBlock = STONE;
+                                } else if (biome === 'swamp') {
+                                    surfaceBlock = DIRT;
+                                }
+
+                                // Track block frequency
+                                blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                            }
+                        }
+
+                        // Find dominant block
+                        let maxCount = 0;
+                        for (const [block, count] of blockCounts) {
+                            if (count > maxCount) {
+                                maxCount = count;
+                                dominantBlock = block;
+                            }
+                        }
+
+                        heightMap[cellIdx] = Math.round(maxHeight);
+                        surfaceBlocks[cellIdx] = dominantBlock;
+                        underwaterDepth[cellIdx] = waterDepth;
+                    }
+                }
+
+                return {
+                    cx, cz,
+                    lodLevel: lodLevel.name,
+                    mergeSize,
+                    skipY,
+                    cellsPerSide,
+                    heightMap,
+                    surfaceBlocks,
+                    underwaterDepth,
+                    timestamp: performance.now()
+                };
+            }
+
+            // Render a LOD chunk with merged block geometry
+            function renderLODChunk(cx, cz, distSq = 0) {
+                const key = `LOD_${cx},${cz}`;
+                const dist = Math.sqrt(distSq);
+                const lodLevel = getLODLevelForDistance(dist);
+
+                // Check if we already have this LOD chunk data
+                let lodData = lodChunks.get(key);
+                if (!lodData || lodData.lodLevel !== lodLevel.name) {
+                    // Generate new LOD data for this level
+                    lodData = generateLODChunkData(cx, cz, lodLevel);
+                    lodChunks.set(key, lodData);
+                }
+
+                const { mergeSize, cellsPerSide, heightMap, surfaceBlocks, underwaterDepth } = lodData;
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+
+                // Estimate max faces: top + sides for each cell
+                const maxFaces = cellsPerSide * cellsPerSide * 5;
+                const positions = new Float32Array(maxFaces * 18);
+                const normals = new Float32Array(maxFaces * 18);
+                const uvs = new Float32Array(maxFaces * 12);
+                const colors = new Float32Array(maxFaces * 18);
+
+                let vIdx = 0, uvIdx = 0, cIdx = 0, faceCount = 0;
+
+                // Generate geometry for each cell
+                for (let cellZ = 0; cellZ < cellsPerSide; cellZ++) {
+                    for (let cellX = 0; cellX < cellsPerSide; cellX++) {
+                        const cellIdx = cellX + cellZ * cellsPerSide;
+                        const height = heightMap[cellIdx];
+                        const blockId = surfaceBlocks[cellIdx];
+                        const waterDepth = underwaterDepth[cellIdx];
+
+                        // World position of this cell
+                        const wx = startX + cellX * mergeSize;
+                        const wz = startZ + cellZ * mergeSize;
+                        const wy = height - WORLD_DIMS.yOffset;
+
+                        // Get UV coordinates for this block type
+                        const uv = getBlockUV(blockId);
+
+                        // Calculate simplified lighting based on height
+                        const lightLevel = getSimplifiedLight(height, WORLD_DIMS.chunkHeight) / 15.0;
+
+                        // Add top face (always visible for LOD)
+                        if (faceCount < maxFaces) {
+                            addLODFace(wx, wy, wz, 0, 1, 0, uv.top, mergeSize,
+                                      positions, normals, uvs, colors,
+                                      vIdx, uvIdx, cIdx, lightLevel);
+                            vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                        }
+
+                        // Add side faces based on neighbor height differences
+                        // North face (check neighbor to north)
+                        const nIdxN = cellZ > 0 ? cellX + (cellZ - 1) * cellsPerSide : -1;
+                        if (nIdxN < 0 || heightMap[nIdxN] < height - mergeSize) {
+                            if (faceCount < maxFaces) {
+                                const sideHeight = nIdxN >= 0 ? height - heightMap[nIdxN] : height - WORLD_DIMS.seaLevel;
+                                addLODSideFace(wx, wy, wz, 0, 0, -1, uv.side, mergeSize, Math.min(sideHeight, mergeSize * 4),
+                                              positions, normals, uvs, colors, vIdx, uvIdx, cIdx, lightLevel * 0.8);
+                                vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                            }
+                        }
+
+                        // South face
+                        const nIdxS = cellZ < cellsPerSide - 1 ? cellX + (cellZ + 1) * cellsPerSide : -1;
+                        if (nIdxS < 0 || heightMap[nIdxS] < height - mergeSize) {
+                            if (faceCount < maxFaces) {
+                                const sideHeight = nIdxS >= 0 ? height - heightMap[nIdxS] : height - WORLD_DIMS.seaLevel;
+                                addLODSideFace(wx, wy, wz + mergeSize, 0, 0, 1, uv.side, mergeSize, Math.min(sideHeight, mergeSize * 4),
+                                              positions, normals, uvs, colors, vIdx, uvIdx, cIdx, lightLevel * 0.8);
+                                vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                            }
+                        }
+
+                        // East face
+                        const nIdxE = cellX < cellsPerSide - 1 ? (cellX + 1) + cellZ * cellsPerSide : -1;
+                        if (nIdxE < 0 || heightMap[nIdxE] < height - mergeSize) {
+                            if (faceCount < maxFaces) {
+                                const sideHeight = nIdxE >= 0 ? height - heightMap[nIdxE] : height - WORLD_DIMS.seaLevel;
+                                addLODSideFace(wx + mergeSize, wy, wz, 1, 0, 0, uv.side, mergeSize, Math.min(sideHeight, mergeSize * 4),
+                                              positions, normals, uvs, colors, vIdx, uvIdx, cIdx, lightLevel * 0.7);
+                                vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                            }
+                        }
+
+                        // West face
+                        const nIdxW = cellX > 0 ? (cellX - 1) + cellZ * cellsPerSide : -1;
+                        if (nIdxW < 0 || heightMap[nIdxW] < height - mergeSize) {
+                            if (faceCount < maxFaces) {
+                                const sideHeight = nIdxW >= 0 ? height - heightMap[nIdxW] : height - WORLD_DIMS.seaLevel;
+                                addLODSideFace(wx, wy, wz, -1, 0, 0, uv.side, mergeSize, Math.min(sideHeight, mergeSize * 4),
+                                              positions, normals, uvs, colors, vIdx, uvIdx, cIdx, lightLevel * 0.7);
+                                vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                            }
+                        }
+
+                        // Add water surface if underwater
+                        if (waterDepth > 0 && faceCount < maxFaces) {
+                            const waterY = WORLD_DIMS.seaLevel - WORLD_DIMS.yOffset;
+                            const waterUV = getBlockUV(WATER);
+                            const waterLight = 0.9; // Water is always fairly bright
+                            addLODFace(wx, waterY, wz, 0, 1, 0, waterUV.top, mergeSize,
+                                      positions, normals, uvs, colors, vIdx, uvIdx, cIdx, waterLight);
+                            vIdx += 18; uvIdx += 12; cIdx += 18; faceCount++;
+                        }
+                    }
+                }
+
+                // Create geometry and mesh if we have faces
+                if (faceCount > 0) {
+                    // Release old mesh if exists
+                    if (lodChunkMeshes.has(key)) {
+                        releaseLODMesh(key);
+                    }
+
+                    const posArray = new Float32Array(vIdx);
+                    posArray.set(positions.subarray(0, vIdx));
+                    const normArray = new Float32Array(vIdx);
+                    normArray.set(normals.subarray(0, vIdx));
+                    const uvArray = new Float32Array(uvIdx);
+                    uvArray.set(uvs.subarray(0, uvIdx));
+                    const colArray = new Float32Array(cIdx);
+                    colArray.set(colors.subarray(0, cIdx));
+
+                    const geo = new THREE.BufferGeometry();
+                    geo.setAttribute('position', new THREE.Float32BufferAttribute(posArray, 3));
+                    geo.setAttribute('normal', new THREE.Float32BufferAttribute(normArray, 3));
+                    geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvArray, 2));
+                    geo.setAttribute('color', new THREE.Float32BufferAttribute(colArray, 3));
+                    geo.computeBoundingSphere();
+
+                    // Use the main chunk material (will be set during init)
+                    const mesh = new THREE.Mesh(geo, lodChunkMaterial || chunkMaterial);
+                    mesh.name = key;
+                    mesh.matrixAutoUpdate = false;
+                    mesh.frustumCulled = true;
+                    mesh.updateMatrix();
+
+                    scene.add(mesh);
+                    lodChunkMeshes.set(key, mesh);
+                    lodChunkMeshCount++;
+                    lodStats.totalFaces += faceCount;
+                }
+
+                return faceCount;
+            }
+
+            // Add a top face for LOD chunk (scaled by mergeSize)
+            function addLODFace(wx, wy, wz, nx, ny, nz, uv, size, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                // Top face vertices (scaled quad)
+                // Triangle 1: v1, v2, v4
+                // Triangle 2: v2, v3, v4
+                // v1 = (0, 1, size), v2 = (size, 1, size), v3 = (size, 1, 0), v4 = (0, 1, 0)
+
+                pos[vIdx] = wx; pos[vIdx+1] = wy + 1; pos[vIdx+2] = wz + size;
+                pos[vIdx+3] = wx + size; pos[vIdx+4] = wy + 1; pos[vIdx+5] = wz + size;
+                pos[vIdx+6] = wx; pos[vIdx+7] = wy + 1; pos[vIdx+8] = wz;
+                pos[vIdx+9] = wx + size; pos[vIdx+10] = wy + 1; pos[vIdx+11] = wz + size;
+                pos[vIdx+12] = wx + size; pos[vIdx+13] = wy + 1; pos[vIdx+14] = wz;
+                pos[vIdx+15] = wx; pos[vIdx+16] = wy + 1; pos[vIdx+17] = wz;
+
+                // Normals (pointing up)
+                for (let i = 0; i < 6; i++) {
+                    norm[vIdx + i*3] = 0;
+                    norm[vIdx + i*3 + 1] = 1;
+                    norm[vIdx + i*3 + 2] = 0;
+                }
+
+                // UVs (tile the texture)
+                const u0 = uv[0] / 12, v0 = uv[1] / 12;
+                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                uvs[uvIdx] = u0; uvs[uvIdx+1] = v1;
+                uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v1;
+                uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v0;
+                uvs[uvIdx+6] = u1; uvs[uvIdx+7] = v1;
+                uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v0;
+                uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v0;
+
+                // Colors (flat lighting)
+                for (let i = 0; i < 18; i++) {
+                    col[cIdx + i] = light;
+                }
+            }
+
+            // Add a side face for LOD chunk (vertical face with height)
+            function addLODSideFace(wx, wy, wz, nx, ny, nz, uv, width, height, pos, norm, uvs, col, vIdx, uvIdx, cIdx, light) {
+                const h = Math.max(1, height);
+
+                // Determine face orientation and vertices
+                if (nz !== 0) { // North/South face
+                    // Triangle 1, 2 for Z-facing face
+                    pos[vIdx] = wx; pos[vIdx+1] = wy - h + 1; pos[vIdx+2] = wz;
+                    pos[vIdx+3] = wx + width; pos[vIdx+4] = wy - h + 1; pos[vIdx+5] = wz;
+                    pos[vIdx+6] = wx; pos[vIdx+7] = wy + 1; pos[vIdx+8] = wz;
+                    pos[vIdx+9] = wx + width; pos[vIdx+10] = wy - h + 1; pos[vIdx+11] = wz;
+                    pos[vIdx+12] = wx + width; pos[vIdx+13] = wy + 1; pos[vIdx+14] = wz;
+                    pos[vIdx+15] = wx; pos[vIdx+16] = wy + 1; pos[vIdx+17] = wz;
+                } else { // East/West face
+                    pos[vIdx] = wx; pos[vIdx+1] = wy - h + 1; pos[vIdx+2] = wz;
+                    pos[vIdx+3] = wx; pos[vIdx+4] = wy - h + 1; pos[vIdx+5] = wz + width;
+                    pos[vIdx+6] = wx; pos[vIdx+7] = wy + 1; pos[vIdx+8] = wz;
+                    pos[vIdx+9] = wx; pos[vIdx+10] = wy - h + 1; pos[vIdx+11] = wz + width;
+                    pos[vIdx+12] = wx; pos[vIdx+13] = wy + 1; pos[vIdx+14] = wz + width;
+                    pos[vIdx+15] = wx; pos[vIdx+16] = wy + 1; pos[vIdx+17] = wz;
+                }
+
+                // Normals
+                for (let i = 0; i < 6; i++) {
+                    norm[vIdx + i*3] = nx;
+                    norm[vIdx + i*3 + 1] = 0;
+                    norm[vIdx + i*3 + 2] = nz;
+                }
+
+                // UVs
+                const u0 = uv[0] / 12, v0 = uv[1] / 12;
+                const u1 = (uv[0] + 1) / 12, v1 = (uv[1] + 1) / 12;
+                uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
+                uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
+                uvs[uvIdx+4] = u0; uvs[uvIdx+5] = v1;
+                uvs[uvIdx+6] = u1; uvs[uvIdx+7] = v0;
+                uvs[uvIdx+8] = u1; uvs[uvIdx+9] = v1;
+                uvs[uvIdx+10] = u0; uvs[uvIdx+11] = v1;
+
+                // Colors
+                for (let i = 0; i < 18; i++) {
+                    col[cIdx + i] = light;
+                }
+            }
+
+            // Release a LOD mesh
+            function releaseLODMesh(key) {
+                const mesh = lodChunkMeshes.get(key);
+                if (!mesh) return;
+
+                if (mesh.parent) mesh.parent.remove(mesh);
+                if (mesh.geometry) mesh.geometry.dispose();
+                lodChunkMeshes.delete(key);
+                lodChunkMeshCount--;
+            }
+
+            // Process LOD chunk build queue
+            function processLODChunkQueue() {
+                if (!SETTINGS.lodEnabled || lodChunkBuildQueue.length === 0) return 0;
+
+                const startTime = performance.now();
+                const LOD_BUILD_BUDGET_MS = 4; // Lower budget than regular chunks
+                let builds = 0;
+
+                while (builds < SETTINGS.lodBuildQueueLimit && lodChunkBuildQueue.length > 0) {
+                    if ((performance.now() - startTime) > LOD_BUILD_BUDGET_MS) break;
+
+                    const job = lodChunkBuildQueue.shift();
+                    if (!job) break;
+
+                    queuedLODChunkKeys.delete(job.key);
+                    renderLODChunk(job.cx, job.cz, job.dist);
+                    builds++;
+                }
+
+                lodStats.chunksInQueue = lodChunkBuildQueue.length;
+                return builds;
+            }
+
+            // Update LOD chunks based on player position
+            function updateLODChunks(playerChunkX, playerChunkZ, normalRenderRadius) {
+                if (!SETTINGS.lodEnabled) return;
+
+                const lodDistance = Math.min(SETTINGS.lodDistance, SETTINGS.lodMaxDistance);
+                const lodDistSq = lodDistance * lodDistance;
+                const normalDistSq = normalRenderRadius * normalRenderRadius;
+
+                const neededLODKeys = new Set();
+
+                // Iterate through LOD range (beyond normal render distance)
+                for (let dx = -lodDistance; dx <= lodDistance; dx++) {
+                    for (let dz = -lodDistance; dz <= lodDistance; dz++) {
+                        const distSq = dx * dx + dz * dz;
+
+                        // Skip chunks within normal render distance (they use full detail)
+                        if (distSq <= normalDistSq) continue;
+
+                        // Skip chunks beyond LOD distance
+                        if (distSq > lodDistSq) continue;
+
+                        const cx = playerChunkX + dx;
+                        const cz = playerChunkZ + dz;
+                        const key = `LOD_${cx},${cz}`;
+
+                        neededLODKeys.add(key);
+
+                        // Queue for building if not already rendered or queued
+                        if (!lodChunkMeshes.has(key) && !queuedLODChunkKeys.has(key)) {
+                            lodChunkBuildQueue.push({ key, cx, cz, dist: distSq });
+                            queuedLODChunkKeys.add(key);
+                        }
+                    }
+                }
+
+                // Sort queue by distance (closest first)
+                lodChunkBuildQueue.sort((a, b) => a.dist - b.dist);
+
+                // Remove LOD chunks that are no longer needed
+                const keysToRemove = [];
+                for (const key of lodChunkMeshes.keys()) {
+                    if (!neededLODKeys.has(key)) {
+                        keysToRemove.push(key);
+                    }
+                }
+                for (const key of keysToRemove) {
+                    releaseLODMesh(key);
+                    lodChunks.delete(key);
+                }
+
+                // Prune LOD data cache if too large
+                if (lodChunks.size > SETTINGS.lodMaxCachedChunks) {
+                    const entries = Array.from(lodChunks.entries());
+                    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+                    const toRemove = lodChunks.size - SETTINGS.lodMaxCachedChunks;
+                    for (let i = 0; i < toRemove; i++) {
+                        const key = entries[i][0];
+                        if (!neededLODKeys.has(key)) {
+                            lodChunks.delete(key);
+                        }
+                    }
+                }
+
+                lodStats.chunksRendered = lodChunkMeshes.size;
+                lodStats.lastUpdateTime = performance.now();
             }
 
             // --- OPTIMIZATION 5: Greedy meshing helper - combines adjacent same-type faces ---
@@ -8256,6 +8731,12 @@
                 const pregenDistSlider = document.getElementById("pregen-dist-slider");
                 const pregenDistVal = document.getElementById("pregen-dist-val");
                 if (frustumToggle) frustumToggle.checked = SETTINGS.enableFrustumCulling;
+                // INITIALIZE UI VALUES - LOD (Level of Detail)
+                const lodToggle = document.getElementById("lod-toggle");
+                const lodDistSlider = document.getElementById("lod-dist-slider");
+                const lodDistVal = document.getElementById("lod-dist-val");
+                if (lodToggle) lodToggle.checked = SETTINGS.lodEnabled;
+                if (lodDistSlider && lodDistVal) { lodDistSlider.value = SETTINGS.lodDistance; lodDistVal.textContent = SETTINGS.lodDistance; }
                 if (lowerFpsSlider && lowerFpsVal) { lowerFpsSlider.value = SETTINGS.lowerBoundFPS; lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; }
                 if (upperFpsSlider && upperFpsVal) { upperFpsSlider.value = SETTINGS.upperBoundFPS; upperFpsVal.textContent = SETTINGS.upperBoundFPS; }
                 if (buildQueueSlider && buildQueueVal) { buildQueueSlider.value = SETTINGS.buildQueueLimit; buildQueueVal.textContent = SETTINGS.buildQueueLimit; }
@@ -8405,6 +8886,26 @@
                 if (pixelRatioSlider && pixelRatioVal) { pixelRatioSlider.value = SETTINGS.pixelRatio; pixelRatioVal.textContent = SETTINGS.pixelRatio.toFixed(1); }
                 // EVENT HANDLERS - Performance
                 frustumToggle?.addEventListener("change", () => { SETTINGS.enableFrustumCulling = frustumToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); invalidateFrustumCache(); });
+                // EVENT HANDLERS - LOD (Level of Detail)
+                lodToggle?.addEventListener("change", () => {
+                    SETTINGS.lodEnabled = lodToggle.checked;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    // Clear LOD chunks when disabled
+                    if (!SETTINGS.lodEnabled) {
+                        for (const key of lodChunkMeshes.keys()) { releaseLODMesh(key); }
+                        lodChunks.clear();
+                        lodChunkBuildQueue.length = 0;
+                        queuedLODChunkKeys.clear();
+                    }
+                    lastFogFar = -1; // Force fog update
+                });
+                lodDistSlider?.addEventListener("input", () => {
+                    const val = parseInt(lodDistSlider.value);
+                    SETTINGS.lodDistance = val;
+                    lodDistVal.textContent = val;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    lastFogFar = -1; // Force fog update
+                });
                 lowerFpsSlider?.addEventListener("input", () => { SETTINGS.lowerBoundFPS = parseInt(lowerFpsSlider.value); lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 upperFpsSlider?.addEventListener("input", () => { SETTINGS.upperBoundFPS = parseInt(upperFpsSlider.value); upperFpsVal.textContent = SETTINGS.upperBoundFPS; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 buildQueueSlider?.addEventListener("input", () => { SETTINGS.buildQueueLimit = parseInt(buildQueueSlider.value); buildQueueVal.textContent = SETTINGS.buildQueueLimit; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
@@ -8604,6 +9105,9 @@
                 function updateUIFromSettings() {
                     // Performance
                     if (frustumToggle) frustumToggle.checked = SETTINGS.enableFrustumCulling;
+                    // LOD (Level of Detail)
+                    if (lodToggle) lodToggle.checked = SETTINGS.lodEnabled;
+                    if (lodDistSlider && lodDistVal) { lodDistSlider.value = SETTINGS.lodDistance; lodDistVal.textContent = SETTINGS.lodDistance; }
                     if (lowerFpsSlider && lowerFpsVal) { lowerFpsSlider.value = SETTINGS.lowerBoundFPS; lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; }
                     if (upperFpsSlider && upperFpsVal) { upperFpsSlider.value = SETTINGS.upperBoundFPS; upperFpsVal.textContent = SETTINGS.upperBoundFPS; }
                     if (buildQueueSlider && buildQueueVal) { buildQueueSlider.value = SETTINGS.buildQueueLimit; buildQueueVal.textContent = SETTINGS.buildQueueLimit; }
@@ -8694,9 +9198,12 @@
                     SETTINGS.upperBoundFPS = DEFAULTS.upperBoundFPS;
                     SETTINGS.enableFrustumCulling = DEFAULTS.enableFrustumCulling;
                     SETTINGS.pixelRatio = DEFAULTS.pixelRatio;
+                    SETTINGS.lodEnabled = DEFAULTS.lodEnabled;
+                    SETTINGS.lodDistance = DEFAULTS.lodDistance;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                     if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); }
+                    lastFogFar = -1; // Force fog update for LOD changes
                 });
                 // Reset Performance - Streaming
                 document.getElementById("btn-reset-performance-streaming")?.addEventListener("click", () => {
@@ -9069,6 +9576,10 @@
                     "Frustum Culling: " +
                     (culled ? `${culled} chunks hidden` : "OFF") +
                     "\n" +
+                    "LOD: " +
+                    (SETTINGS.lodEnabled ? `ON (${SETTINGS.lodDistance} chunks)` : "OFF") +
+                    "\n" +
+                    (SETTINGS.lodEnabled ? `LOD Chunks: ${lodChunkMeshes.size} (queue: ${lodChunkBuildQueue.length})\n` : "") +
                     "Camera FOV: " +
                     camera.fov.toFixed(0) +
                     "°\n" +
@@ -9571,6 +10082,15 @@
                 // Allow built-in fog to run with camera depth for both terrain and water
                 chunkMaterial.fog = true;
                 waterMaterial.fog = true;
+
+                // LOD chunk material - simplified for distant rendering (no roughness map, basic lighting)
+                lodChunkMaterial = new THREE.MeshLambertMaterial({
+                    map: tex,
+                    vertexColors: true,
+                    side: THREE.FrontSide,
+                    alphaTest: 0.1,
+                });
+                lodChunkMaterial.fog = true;
 
                 // Function to update lighting materials based on settings
                 function updateLightingMaterials() {
@@ -13279,7 +13799,11 @@
                 // --- 4. Efficient Fog Update ---
                 // Don't create 'new Fog' every frame. Update properties instead.
                 // Skip fog distance updates when underwater (underwater fog handles its own distances)
-                const fogDistance = currentRenderRadius * WORLD_DIMS.chunkSize;
+                // When LOD is enabled, extend fog to cover the full LOD distance
+                const effectiveRenderDistance = SETTINGS.lodEnabled
+                    ? Math.min(SETTINGS.lodDistance, SETTINGS.lodMaxDistance)
+                    : currentRenderRadius;
+                const fogDistance = effectiveRenderDistance * WORLD_DIMS.chunkSize;
                 if (fogDistance !== lastFogFar && !isUnderwater) {
                     lastFogFar = fogDistance;
                     fogFar = fogDistance;
@@ -13287,7 +13811,9 @@
                     // This ensures the outermost ring of chunks fades to complete opacity
                     const chunkSize = WORLD_DIMS.chunkSize;
                     const fogFarActual = fogDistance - chunkSize; // End fog 1 chunk before edge
-                    const fogNear = fogFarActual * 0.5; // Start fade at 50% for smooth gradient
+                    // For LOD distances, start fog fade later (75%) to show more terrain
+                    const fogNearRatio = SETTINGS.lodEnabled && effectiveRenderDistance > 24 ? 0.7 : 0.5;
+                    const fogNear = fogFarActual * fogNearRatio;
                     if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogNear;
                     } else { scene.fog = new THREE.Fog(SETTINGS.daySkyBottom, fogNear, fogFarActual); }
                 }
@@ -13467,6 +13993,12 @@
                         // Keep cells within ~20 units (multiply by BIOME_CELL_SIZE for real distance)
                         if (Math.abs(cx - playerCellX) > 20 || Math.abs(cz - playerCellZ) > 20) { biomeCellCache.delete(key); }
                     }
+                }
+
+                // --- LOD CHUNK UPDATE ---
+                // Update LOD chunks for distant terrain rendering
+                if (SETTINGS.lodEnabled) {
+                    updateLODChunks(chunkX, chunkZ, currentRenderRadius);
                 }
             }
             async function processChunkQueue() {
@@ -13806,6 +14338,10 @@
                     const chunkBuildStart = perfMonitor.start("chunkBuild");
                     processChunkQueue();
                     perfMonitor.end("chunkBuild", chunkBuildStart);
+                }
+                // Process LOD chunk build queue (lower priority than normal chunks)
+                if (SETTINGS.lodEnabled && lodChunkBuildQueue.length > 0 && (time - prevTime < 24)) {
+                    processLODChunkQueue();
                 }
                 // Run chunk updates every 200ms
                 if (time - lastChunkUpdate > 200) {
