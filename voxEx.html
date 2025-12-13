@@ -4425,6 +4425,12 @@
                 const cachedChunk = chunks.get(chunkKey);
                 const useCachedData = cachedChunk && cachedChunk.blocks;
 
+                // Distance-aware sampling: fewer samples at extreme distances
+                // For ultra/extreme/horizon (mergeSize 16), sample only center point
+                // For low (mergeSize 8), sample 2 points; for medium/high, sample 4 points
+                const useSimpleSampling = mergeSize >= 8; // Only sample center for large cells
+                const sampleStep = useSimpleSampling ? mergeSize : Math.max(1, Math.floor(mergeSize / 2));
+
                 // Sample terrain at cell centers and find max heights
                 for (let cellZ = 0; cellZ < cellsPerSide; cellZ++) {
                     for (let cellX = 0; cellX < cellsPerSide; cellX++) {
@@ -4436,93 +4442,135 @@
 
                         if (useCachedData) {
                             // Sample from actual cached chunk data (more accurate)
-                            const sampleStep = Math.max(1, Math.floor(mergeSize / 2));
                             // Start height scan from 256 (most terrain is below this) for better performance
                             const maxScanY = Math.min(256, WORLD_DIMS.chunkHeight - 1);
-                            for (let dz = 0; dz < mergeSize; dz += sampleStep) {
-                                for (let dx = 0; dx < mergeSize; dx += sampleStep) {
-                                    const lx = cellX * mergeSize + dx;
-                                    const lz = cellZ * mergeSize + dz;
 
-                                    // Find surface height by scanning down from reasonable max
-                                    let surfaceY = -1;
-                                    let surfaceBlock = AIR;
-                                    for (let ly = maxScanY; ly >= 0; ly--) {
-                                        const idx = lx + (lz << 4) + (ly << 8);
-                                        const block = cachedChunk.blocks[idx];
-                                        if (block !== AIR && block !== WATER) {
-                                            surfaceY = ly;
-                                            surfaceBlock = block;
-                                            break;
-                                        } else if (block === WATER && surfaceY < 0) {
-                                            // Track water level
-                                            waterDepth = Math.max(waterDepth, ly - WORLD_DIMS.yOffset - WORLD_DIMS.seaLevel + 1);
-                                        }
+                            if (useSimpleSampling) {
+                                // Single center sample for distant LOD (mergeSize >= 8)
+                                const lx = cellX * mergeSize + Math.floor(mergeSize / 2);
+                                const lz = cellZ * mergeSize + Math.floor(mergeSize / 2);
+
+                                for (let ly = maxScanY; ly >= 0; ly--) {
+                                    const idx = lx + (lz << 4) + (ly << 8);
+                                    const block = cachedChunk.blocks[idx];
+                                    if (block !== AIR && block !== WATER) {
+                                        maxHeight = ly - WORLD_DIMS.yOffset;
+                                        dominantBlock = block;
+                                        break;
+                                    } else if (block === WATER && maxHeight < -500) {
+                                        waterDepth = Math.max(waterDepth, ly - WORLD_DIMS.yOffset - WORLD_DIMS.seaLevel + 1);
                                     }
+                                }
+                            } else {
+                                // Multi-point sampling for closer LOD
+                                for (let dz = 0; dz < mergeSize; dz += sampleStep) {
+                                    for (let dx = 0; dx < mergeSize; dx += sampleStep) {
+                                        const lx = cellX * mergeSize + dx;
+                                        const lz = cellZ * mergeSize + dz;
 
-                                    if (surfaceY >= 0) {
-                                        const worldY = surfaceY - WORLD_DIMS.yOffset;
-                                        if (worldY > maxHeight) maxHeight = worldY;
-                                        blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                                        let surfaceY = -1;
+                                        let surfaceBlock = AIR;
+                                        for (let ly = maxScanY; ly >= 0; ly--) {
+                                            const idx = lx + (lz << 4) + (ly << 8);
+                                            const block = cachedChunk.blocks[idx];
+                                            if (block !== AIR && block !== WATER) {
+                                                surfaceY = ly;
+                                                surfaceBlock = block;
+                                                break;
+                                            } else if (block === WATER && surfaceY < 0) {
+                                                waterDepth = Math.max(waterDepth, ly - WORLD_DIMS.yOffset - WORLD_DIMS.seaLevel + 1);
+                                            }
+                                        }
+
+                                        if (surfaceY >= 0) {
+                                            const worldY = surfaceY - WORLD_DIMS.yOffset;
+                                            if (worldY > maxHeight) maxHeight = worldY;
+                                            blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                                        }
                                     }
                                 }
                             }
                         } else {
                             // Fall back to terrain generation sampling
-                            const sampleStep = Math.max(1, Math.floor(mergeSize / 2));
-                            for (let dz = 0; dz < mergeSize; dz += sampleStep) {
-                                for (let dx = 0; dx < mergeSize; dx += sampleStep) {
-                                    const gx = startX + cellX * mergeSize + dx;
-                                    const gz = startZ + cellZ * mergeSize + dz;
+                            if (useSimpleSampling) {
+                                // Single center sample for distant LOD
+                                const gx = startX + cellX * mergeSize + Math.floor(mergeSize / 2);
+                                const gz = startZ + cellZ * mergeSize + Math.floor(mergeSize / 2);
 
-                                    // Use height calculation function if available
-                                    const height = typeof blendedHeight === 'function'
-                                        ? blendedHeight(gx, gz, worldConfig.seed)
-                                        : 64; // Fallback
+                                maxHeight = typeof blendedHeight === 'function'
+                                    ? blendedHeight(gx, gz, worldConfig.seed)
+                                    : 64;
 
-                                    if (height > maxHeight) maxHeight = height;
+                                const biomeParams = typeof getBiomeParams === 'function'
+                                    ? getBiomeParams(gx, gz)
+                                    : null;
+                                const biome = biomeParams ? biomeParams.name : 'plains';
 
-                                    // Determine surface block based on biome/height
-                                    const biomeParams = typeof getBiomeParams === 'function'
-                                        ? getBiomeParams(gx, gz)
-                                        : null;
-                                    const biome = biomeParams ? biomeParams.name : 'plains';
+                                if (maxHeight < WORLD_DIMS.seaLevel) {
+                                    dominantBlock = SAND;
+                                    waterDepth = WORLD_DIMS.seaLevel - maxHeight;
+                                } else if (biome === 'mountains' && maxHeight > 110) {
+                                    dominantBlock = STONE;
+                                } else if (biome === 'hills' && maxHeight > 100) {
+                                    dominantBlock = STONE;
+                                } else {
+                                    dominantBlock = GRASS;
+                                }
+                            } else {
+                                // Multi-point sampling for closer LOD
+                                for (let dz = 0; dz < mergeSize; dz += sampleStep) {
+                                    for (let dx = 0; dx < mergeSize; dx += sampleStep) {
+                                        const gx = startX + cellX * mergeSize + dx;
+                                        const gz = startZ + cellZ * mergeSize + dz;
 
-                                    let surfaceBlock = GRASS;
-                                    if (height < WORLD_DIMS.seaLevel) {
-                                        surfaceBlock = SAND;
-                                        waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - height);
-                                    } else if (biome === 'mountains') {
-                                        if (height > 140) surfaceBlock = STONE;
-                                        else if (height > 110) surfaceBlock = STONE; // Snow line
-                                        else surfaceBlock = GRASS;
-                                    } else if (biome === 'forests') {
-                                        // Forest areas sometimes show leaves (tree canopy)
-                                        const treeDensity = TREE_CONFIG?.density?.forests || 0.35;
-                                        const treeNoise = Math.abs(Math.sin(gx * 0.5 + gz * 0.3));
-                                        if (treeNoise < treeDensity * 0.3) {
-                                            surfaceBlock = LEAVES; // Tree canopy visible from distance
+                                        const height = typeof blendedHeight === 'function'
+                                            ? blendedHeight(gx, gz, worldConfig.seed)
+                                            : 64;
+
+                                        if (height > maxHeight) maxHeight = height;
+
+                                        const biomeParams = typeof getBiomeParams === 'function'
+                                            ? getBiomeParams(gx, gz)
+                                            : null;
+                                        const biome = biomeParams ? biomeParams.name : 'plains';
+
+                                        let surfaceBlock = GRASS;
+                                        if (height < WORLD_DIMS.seaLevel) {
+                                            surfaceBlock = SAND;
+                                            waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - height);
+                                        } else if (biome === 'mountains') {
+                                            if (height > 140) surfaceBlock = STONE;
+                                            else if (height > 110) surfaceBlock = STONE;
+                                            else surfaceBlock = GRASS;
+                                        } else if (biome === 'forests') {
+                                            const treeDensity = TREE_CONFIG?.density?.forests || 0.35;
+                                            const treeNoise = Math.abs(Math.sin(gx * 0.5 + gz * 0.3));
+                                            if (treeNoise < treeDensity * 0.3) {
+                                                surfaceBlock = LEAVES;
+                                            }
+                                        } else if (biome === 'swamp') {
+                                            if (height <= WORLD_DIMS.seaLevel + 2) {
+                                                surfaceBlock = DIRT;
+                                                waterDepth = Math.max(waterDepth, 1);
+                                            }
+                                        } else if (biome === 'hills') {
+                                            if (height > 100) surfaceBlock = STONE;
                                         }
-                                    } else if (biome === 'swamp') {
-                                        if (height <= WORLD_DIMS.seaLevel + 2) {
-                                            surfaceBlock = DIRT;
-                                            waterDepth = Math.max(waterDepth, 1);
-                                        }
-                                    } else if (biome === 'hills') {
-                                        if (height > 100) surfaceBlock = STONE;
+
+                                        blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
                                     }
-
-                                    blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
                                 }
                             }
                         }
 
-                        // Find dominant block
-                        let maxCount = 0;
-                        for (const [block, count] of blockCounts) {
-                            if (count > maxCount) {
-                                maxCount = count;
-                                dominantBlock = block;
+                        // Find dominant block (only if we did multi-point sampling)
+                        if (!useSimpleSampling) {
+                            let maxCount = 0;
+                            for (const [block, count] of blockCounts) {
+                                if (count > maxCount) {
+                                    maxCount = count;
+                                    dominantBlock = block;
+                                }
                             }
                         }
 
@@ -5053,15 +5101,24 @@
                 lodChunkMeshCount--;
             }
 
-            // Process LOD chunk build queue
+            // Process LOD chunk build queue with dynamic scaling
             function processLODChunkQueue() {
                 if (!SETTINGS.lodEnabled || lodChunkBuildQueue.length === 0) return 0;
 
                 const startTime = performance.now();
-                const LOD_BUILD_BUDGET_MS = 8; // Budget for LOD building per frame
+                // Dynamic time budget: more time when queue is large (catch-up mode)
+                const queueSize = lodChunkBuildQueue.length;
+                const baseBudget = 8;
+                const maxBudget = 16;
+                const LOD_BUILD_BUDGET_MS = queueSize > 100 ? maxBudget : baseBudget;
+
+                // Dynamic build limit: more builds per frame when queue is backed up
+                const baseLimit = SETTINGS.lodBuildQueueLimit;
+                const buildLimit = queueSize > 50 ? Math.min(baseLimit * 2, 16) : baseLimit;
+
                 let builds = 0;
 
-                while (builds < SETTINGS.lodBuildQueueLimit && lodChunkBuildQueue.length > 0) {
+                while (builds < buildLimit && lodChunkBuildQueue.length > 0) {
                     if ((performance.now() - startTime) > LOD_BUILD_BUDGET_MS) break;
 
                     const job = lodChunkBuildQueue.shift();
@@ -5076,6 +5133,18 @@
 
                 lodStats.chunksInQueue = lodChunkBuildQueue.length;
                 return builds;
+            }
+
+            // Calculate optimal LOD cache size based on distance setting
+            function getOptimalLODCacheSize() {
+                const lodDist = Math.min(SETTINGS.lodDistance, SETTINGS.lodMaxDistance);
+                // Cache needs to hold all visible LOD chunks plus some buffer
+                // Approximate: (2*dist+1)^2 for a square minus inner render distance
+                const renderDist = SETTINGS.renderDistance || 8;
+                const lodChunks = (lodDist * 2 + 1) * (lodDist * 2 + 1);
+                const normalChunks = (renderDist * 2 + 1) * (renderDist * 2 + 1);
+                // Add 50% buffer for movement and transitions
+                return Math.min(Math.ceil((lodChunks - normalChunks) * 1.5), SETTINGS.lodMaxCachedChunks);
             }
 
             // Update LOD chunks based on player position
@@ -5136,8 +5205,9 @@
                         }
                     }
 
-                    // Prune LOD data cache if too large - prioritize keeping nearby chunks
-                    if (lodChunks.size > SETTINGS.lodMaxCachedChunks) {
+                    // Prune LOD data cache if too large - use dynamic cache sizing
+                    const optimalCacheSize = getOptimalLODCacheSize();
+                    if (lodChunks.size > optimalCacheSize) {
                         const entries = Array.from(lodChunks.entries());
                         // Sort by distance from player (furthest first for removal)
                         entries.sort((a, b) => {
@@ -5145,7 +5215,7 @@
                             const distB = (b[1].cx - playerChunkX) ** 2 + (b[1].cz - playerChunkZ) ** 2;
                             return distB - distA; // Furthest first
                         });
-                        const toRemove = Math.min(50, lodChunks.size - SETTINGS.lodMaxCachedChunks);
+                        const toRemove = Math.min(100, lodChunks.size - optimalCacheSize);
                         let removed = 0;
                         for (const [key, data] of entries) {
                             if (removed >= toRemove) break;
@@ -5291,21 +5361,34 @@
             }
 
             function getSimplifiedLight(ly, chunkHeight) {
-                // Height-based lighting for distant chunks
-                // LOD chunks should match regular terrain brightness
+                // Height-based lighting for distant chunks with day/night support
                 // ly is the world height (already in world coords)
                 const worldY = ly;
                 const surfaceY = WORLD_DIMS.seaLevel + 10; // Approximate surface level
 
-                // For surface terrain, always use full brightness (15)
-                // Underground would be darker, but LOD only shows surface
+                // Base light level based on height
+                let baseLight;
                 if (worldY >= surfaceY - 5) {
-                    return 15; // Full brightness for surface
+                    baseLight = 15; // Full brightness for surface
                 } else if (worldY > surfaceY - 20) {
-                    return 14; // Slightly shaded
+                    baseLight = 14; // Slightly shaded
                 } else {
-                    return 12; // Deeper areas (shouldn't happen much for LOD)
+                    baseLight = 12; // Deeper areas (shouldn't happen much for LOD)
                 }
+
+                // Apply day/night cycle if enabled
+                // dayNightTime: 0 = midnight, 0.25 = noon, 0.5 = midnight, 0.75 = noon
+                if (typeof dayNightTime !== 'undefined') {
+                    // Calculate sun position: sunY ranges from -1 (night) to 1 (day)
+                    const sunY = Math.sin(dayNightTime * Math.PI * 2);
+                    // dayFactor: 0 at night, 1 at noon
+                    const dayFactor = Math.max(0, (sunY + 1) * 0.5);
+                    // Scale light: at night minimum 40% brightness, at day 100%
+                    const lightScale = 0.4 + dayFactor * 0.6;
+                    return Math.round(baseLight * lightScale);
+                }
+
+                return baseLight;
             }
 
             // --- OPTIMIZATION 10: Block face visibility pre-check cache ---
