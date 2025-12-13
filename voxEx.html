@@ -4293,6 +4293,37 @@
             let lodChunkMeshCount = 0;           // Track LOD mesh count
             let lodChunkMaterial = null;         // Material for LOD chunks (created in init)
 
+            // LOD spiral offsets - pre-computed for efficient iteration
+            let LOD_SPIRAL_OFFSETS = [];
+            let lodSpiralMaxRadius = 0;
+            let lastLODPlayerChunkX = null;
+            let lastLODPlayerChunkZ = null;
+
+            function generateLODSpiralOffsets(maxRadius) {
+                if (maxRadius === lodSpiralMaxRadius && LOD_SPIRAL_OFFSETS.length > 0) return;
+                lodSpiralMaxRadius = maxRadius;
+                LOD_SPIRAL_OFFSETS = [];
+
+                for (let r = 0; r <= maxRadius; r++) {
+                    if (r === 0) {
+                        LOD_SPIRAL_OFFSETS.push({ dx: 0, dz: 0, distSq: 0 });
+                    } else {
+                        for (let i = -r; i <= r; i++) {
+                            if (Math.abs(i) === r) {
+                                for (let j = -r; j <= r; j++) {
+                                    LOD_SPIRAL_OFFSETS.push({ dx: j, dz: i, distSq: j*j + i*i });
+                                }
+                            } else {
+                                LOD_SPIRAL_OFFSETS.push({ dx: -r, dz: i, distSq: r*r + i*i });
+                                LOD_SPIRAL_OFFSETS.push({ dx: r, dz: i, distSq: r*r + i*i });
+                            }
+                        }
+                    }
+                }
+                LOD_SPIRAL_OFFSETS.sort((a, b) => a.distSq - b.distSq);
+                logDebug(`[LOD] Generated ${LOD_SPIRAL_OFFSETS.length} spiral offsets for radius ${maxRadius}`);
+            }
+
             // LOD statistics for debug overlay
             const lodStats = {
                 chunksRendered: 0,
@@ -4854,6 +4885,7 @@
             }
 
             // Update LOD chunks based on player position
+            // Uses pre-computed spiral offsets to avoid O(n²) iteration
             function updateLODChunks(playerChunkX, playerChunkZ, normalRenderRadius) {
                 if (!SETTINGS.lodEnabled) return;
 
@@ -4861,57 +4893,65 @@
                 const lodDistSq = lodDistance * lodDistance;
                 const normalDistSq = normalRenderRadius * normalRenderRadius;
 
-                const neededLODKeys = new Set();
+                // Only regenerate spiral offsets if distance changed
+                generateLODSpiralOffsets(lodDistance);
 
-                // Iterate through LOD range (beyond normal render distance)
-                for (let dx = -lodDistance; dx <= lodDistance; dx++) {
-                    for (let dz = -lodDistance; dz <= lodDistance; dz++) {
-                        const distSq = dx * dx + dz * dz;
+                // Check if player moved to new chunk - only rebuild queue then
+                const playerMoved = (lastLODPlayerChunkX !== playerChunkX || lastLODPlayerChunkZ !== playerChunkZ);
 
-                        // Skip chunks within normal render distance (they use full detail)
-                        if (distSq <= normalDistSq) continue;
+                if (playerMoved) {
+                    lastLODPlayerChunkX = playerChunkX;
+                    lastLODPlayerChunkZ = playerChunkZ;
 
-                        // Skip chunks beyond LOD distance
-                        if (distSq > lodDistSq) continue;
+                    // Use spiral offsets to find needed LOD chunks efficiently
+                    const neededLODKeys = new Set();
 
-                        const cx = playerChunkX + dx;
-                        const cz = playerChunkZ + dz;
+                    for (const offset of LOD_SPIRAL_OFFSETS) {
+                        // Skip chunks within normal render distance
+                        if (offset.distSq <= normalDistSq) continue;
+                        // Stop once we're beyond LOD distance
+                        if (offset.distSq > lodDistSq) break;
+
+                        const cx = playerChunkX + offset.dx;
+                        const cz = playerChunkZ + offset.dz;
                         const key = `LOD_${cx},${cz}`;
 
                         neededLODKeys.add(key);
 
                         // Queue for building if not already rendered or queued
                         if (!lodChunkMeshes.has(key) && !queuedLODChunkKeys.has(key)) {
-                            lodChunkBuildQueue.push({ key, cx, cz, dist: distSq });
+                            lodChunkBuildQueue.push({ key, cx, cz, dist: offset.distSq });
                             queuedLODChunkKeys.add(key);
                         }
                     }
-                }
 
-                // Sort queue by distance (closest first)
-                lodChunkBuildQueue.sort((a, b) => a.dist - b.dist);
-
-                // Remove LOD chunks that are no longer needed
-                const keysToRemove = [];
-                for (const key of lodChunkMeshes.keys()) {
-                    if (!neededLODKeys.has(key)) {
-                        keysToRemove.push(key);
+                    // Sort queue by distance (closest first)
+                    if (lodChunkBuildQueue.length > 1) {
+                        lodChunkBuildQueue.sort((a, b) => a.dist - b.dist);
                     }
-                }
-                for (const key of keysToRemove) {
-                    releaseLODMesh(key);
-                    lodChunks.delete(key);
-                }
 
-                // Prune LOD data cache if too large
-                if (lodChunks.size > SETTINGS.lodMaxCachedChunks) {
-                    const entries = Array.from(lodChunks.entries());
-                    entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
-                    const toRemove = lodChunks.size - SETTINGS.lodMaxCachedChunks;
-                    for (let i = 0; i < toRemove; i++) {
-                        const key = entries[i][0];
+                    // Remove LOD chunks that are no longer needed (limit per frame)
+                    const MAX_REMOVALS_PER_FRAME = 50;
+                    let removals = 0;
+                    for (const key of lodChunkMeshes.keys()) {
                         if (!neededLODKeys.has(key)) {
+                            releaseLODMesh(key);
                             lodChunks.delete(key);
+                            removals++;
+                            if (removals >= MAX_REMOVALS_PER_FRAME) break;
+                        }
+                    }
+
+                    // Prune LOD data cache if too large (limit per frame)
+                    if (lodChunks.size > SETTINGS.lodMaxCachedChunks) {
+                        const entries = Array.from(lodChunks.entries());
+                        entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+                        const toRemove = Math.min(50, lodChunks.size - SETTINGS.lodMaxCachedChunks);
+                        for (let i = 0; i < toRemove; i++) {
+                            const key = entries[i][0];
+                            if (!neededLODKeys.has(key)) {
+                                lodChunks.delete(key);
+                            }
                         }
                     }
                 }
