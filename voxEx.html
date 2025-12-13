@@ -1354,15 +1354,19 @@
                 shadows: true,
                 textureResolution: 16,
                 // Graphics - Lighting
-                sunColor: 0xfce7bb,
-                sunIntensity: 0.8,
-                moonColor: 0x8899ff,
-                moonIntensity: 0.15,
-                ambientIntensity: 1.0,
-                lighting: {}, // Basic lighting only
-                torchColor: 0xffaa33,
-                torchIntensity: 3.0, // Increased from 2.5 for brighter torch light
-                torchRange: 48, // Increased from 32 for better cave illumination
+                // Realistic lighting model:
+                // - Light levels range from 1-15 (1 = minimum visibility, 15 = full sunlight)
+                // - Light propagates through transparent blocks with -1 attenuation per block
+                // - Cross-chunk lighting ensures seamless transitions at chunk boundaries
+                sunColor: 0xfce7bb,      // Warm sunlight color (slightly orange)
+                sunIntensity: 0.8,       // Base sun intensity (0-1)
+                moonColor: 0x8899ff,     // Cool moonlight color (blue-ish)
+                moonIntensity: 0.15,     // Moon is much dimmer than sun
+                ambientIntensity: 1.0,   // Global ambient fill light
+                lighting: {},            // Extended lighting settings
+                torchColor: 0xffaa33,    // Warm torch glow (orange)
+                torchIntensity: 3.0,     // Torch brightness multiplier (affects block light level 15)
+                torchRange: 48,          // Torch light radius in blocks (affects point light)
                 // Graphics - Sky & Fog
                 daySkyTop: 0x87ceeb,
                 daySkyBottom: 0xb3d9ff, // Lighter blue - also used for day fog
@@ -5745,6 +5749,21 @@
                 NEIGHBOR_UPDATE: 32, // Adjacent chunk update pass completed
                 ALL: 63           // All passes complete (sum of above)
             };
+
+            // --- RENDER PASS STATE TRACKING ---
+            // Bitmask constants for tracking which render-related passes have completed
+            const RENDER_PASS = {
+                INITIAL_MESH: 1,           // First mesh render completed
+                EDGE_LIGHTING: 2,          // Cross-chunk edge lighting propagated
+                NEIGHBOR_LIGHTING: 4,      // Neighbor chunks have been lit
+                FULL_QUALITY: 8,           // Full quality render with all neighbors present
+                ALL: 15                    // All render passes complete
+            };
+
+            // Queue for chunks needing edge lighting updates after neighbors generate
+            const edgeLightingUpdateQueue = new Set();
+            // Track chunks that have been rendered but need lighting updates
+            const chunksNeedingLightingUpdate = new Set();
             // Queue for adjacent chunk updates - chunks that need to be updated after a neighbor is built
             const adjacentChunkUpdateQueue = new Set();
             // Track chunks that have been fully generated but not yet had neighbor updates applied
@@ -5776,11 +5795,20 @@
                         if (neighborChunk && !(neighborChunk.genState & GEN_PASS.NEIGHBOR_UPDATE)) {
                             adjacentChunkUpdateQueue.add(nKey);
                         }
+                        // Also queue for lighting update if not already processed
+                        if (neighborChunk && neighborChunk.skyLight) {
+                            const hasEdgeLighting = neighborChunk.renderState && (neighborChunk.renderState & RENDER_PASS.EDGE_LIGHTING);
+                            if (!hasEdgeLighting) {
+                                queueChunkForLightingUpdate(ncx, ncz, nKey);
+                            }
+                        }
                     }
                 }
 
                 // Also mark the new chunk for neighbor updates if all its neighbors exist
                 chunksAwaitingNeighborUpdate.add(newChunkKey);
+                // And queue the new chunk for lighting updates
+                queueChunkForLightingUpdate(cx, cz, newChunkKey);
             }
 
             // Process adjacent chunk updates - called from the main game loop
@@ -5958,10 +5986,176 @@
             }
 
             // Recalculate lighting at chunk edges to account for neighboring chunks
+            // This propagates light from neighboring chunks into edge blocks
             function recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight) {
-                // Recalculate sunlight for edge columns
+                // First recalculate internal lighting
                 calculateChunkSunlight(chunk, chunkSize, chunkHeight);
                 calculateBlockLight(chunk, chunkSize, chunkHeight);
+
+                // Then propagate light from neighboring chunks into this chunk's edges
+                propagateLightFromNeighbors(chunk, cx, cz, chunkSize, chunkHeight);
+
+                // Mark chunk as having completed edge lighting
+                if (!chunk.renderState) chunk.renderState = 0;
+                chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
+            }
+
+            // Propagate light from neighboring chunks into this chunk's edge blocks
+            // This ensures smooth lighting transitions at chunk boundaries
+            function propagateLightFromNeighbors(chunk, cx, cz, chunkSize, chunkHeight) {
+                const skyLight = chunk.skyLight;
+                const blockLight = chunk.blockLight;
+                const blocks = chunk.blocks;
+
+                // Get all 4 cardinal neighbors
+                const neighbors = {
+                    west: chunks.get(getChunkKey(cx - 1, cz)),
+                    east: chunks.get(getChunkKey(cx + 1, cz)),
+                    north: chunks.get(getChunkKey(cx, cz - 1)),
+                    south: chunks.get(getChunkKey(cx, cz + 1))
+                };
+
+                // Process west edge (lx = 0) - receive light from west neighbor's lx = 15
+                if (neighbors.west && neighbors.west.skyLight && neighbors.west.blockLight) {
+                    propagateEdgeLighting(chunk, neighbors.west, 0, 15, 'x', chunkSize, chunkHeight);
+                }
+
+                // Process east edge (lx = 15) - receive light from east neighbor's lx = 0
+                if (neighbors.east && neighbors.east.skyLight && neighbors.east.blockLight) {
+                    propagateEdgeLighting(chunk, neighbors.east, 15, 0, 'x', chunkSize, chunkHeight);
+                }
+
+                // Process north edge (lz = 0) - receive light from north neighbor's lz = 15
+                if (neighbors.north && neighbors.north.skyLight && neighbors.north.blockLight) {
+                    propagateEdgeLighting(chunk, neighbors.north, 0, 15, 'z', chunkSize, chunkHeight);
+                }
+
+                // Process south edge (lz = 15) - receive light from south neighbor's lz = 0
+                if (neighbors.south && neighbors.south.skyLight && neighbors.south.blockLight) {
+                    propagateEdgeLighting(chunk, neighbors.south, 15, 0, 'z', chunkSize, chunkHeight);
+                }
+            }
+
+            // Propagate light from one chunk edge to another
+            // targetEdge: the edge index in target chunk (0 or 15)
+            // sourceEdge: the edge index in source chunk (0 or 15)
+            // axis: 'x' or 'z' - which axis the edge runs along
+            function propagateEdgeLighting(targetChunk, sourceChunk, targetEdge, sourceEdge, axis, chunkSize, chunkHeight) {
+                const targetSkyLight = targetChunk.skyLight;
+                const targetBlockLight = targetChunk.blockLight;
+                const targetBlocks = targetChunk.blocks;
+                const sourceSkyLight = sourceChunk.skyLight;
+                const sourceBlockLight = sourceChunk.blockLight;
+
+                // Iterate along the edge
+                for (let i = 0; i < chunkSize; i++) {
+                    for (let y = 0; y < chunkHeight; y++) {
+                        // Calculate indices based on axis
+                        let targetIdx, sourceIdx;
+                        if (axis === 'x') {
+                            // Edge runs along Z axis
+                            targetIdx = targetEdge + i * chunkSize + y * chunkSize * chunkSize;
+                            sourceIdx = sourceEdge + i * chunkSize + y * chunkSize * chunkSize;
+                        } else {
+                            // Edge runs along X axis
+                            targetIdx = i + targetEdge * chunkSize + y * chunkSize * chunkSize;
+                            sourceIdx = i + sourceEdge * chunkSize + y * chunkSize * chunkSize;
+                        }
+
+                        // Only propagate through transparent blocks
+                        if (!IS_TRANSPARENT[targetBlocks[targetIdx]]) continue;
+
+                        // Propagate skylight (light - 1 for crossing boundary)
+                        const sourceSky = sourceSkyLight[sourceIdx];
+                        const propagatedSky = sourceSky > 1 ? sourceSky - 1 : 1;
+                        if (propagatedSky > targetSkyLight[targetIdx]) {
+                            targetSkyLight[targetIdx] = propagatedSky;
+                        }
+
+                        // Propagate block light
+                        const sourceBlock = sourceBlockLight[sourceIdx];
+                        const propagatedBlock = sourceBlock > 1 ? sourceBlock - 1 : 0;
+                        if (propagatedBlock > targetBlockLight[targetIdx]) {
+                            targetBlockLight[targetIdx] = propagatedBlock;
+                        }
+                    }
+                }
+            }
+
+            // Queue chunks for lighting update when neighbors are built
+            function queueChunkForLightingUpdate(cx, cz, key) {
+                const chunk = chunks.get(key);
+                if (!chunk) return;
+
+                // Check if all cardinal neighbors exist and have lighting
+                const hasAllNeighborsWithLighting =
+                    hasNeighborWithLighting(cx - 1, cz) &&
+                    hasNeighborWithLighting(cx + 1, cz) &&
+                    hasNeighborWithLighting(cx, cz - 1) &&
+                    hasNeighborWithLighting(cx, cz + 1);
+
+                if (hasAllNeighborsWithLighting) {
+                    edgeLightingUpdateQueue.add(key);
+                } else {
+                    chunksNeedingLightingUpdate.add(key);
+                }
+            }
+
+            // Check if a neighbor chunk exists and has lighting calculated
+            function hasNeighborWithLighting(cx, cz) {
+                const key = getChunkKey(cx, cz);
+                const chunk = chunks.get(key);
+                return chunk && chunk.skyLight && chunk.genState && (chunk.genState & GEN_PASS.SUNLIGHT);
+            }
+
+            // Process edge lighting updates - called from the main game loop
+            function processEdgeLightingUpdates(budget = 2) {
+                if (edgeLightingUpdateQueue.size === 0) return 0;
+
+                let processed = 0;
+                const toProcess = Array.from(edgeLightingUpdateQueue).slice(0, budget);
+
+                for (const key of toProcess) {
+                    edgeLightingUpdateQueue.delete(key);
+
+                    if (!chunks.has(key)) continue;
+
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks || !chunk.skyLight) continue;
+
+                    const { cx, cz } = parseChunkKeySimple(key);
+
+                    // Propagate light from neighbors
+                    propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+
+                    // Mark as having edge lighting
+                    if (!chunk.renderState) chunk.renderState = 0;
+                    chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
+
+                    // Schedule mesh rebuild to apply new lighting
+                    if (chunkMeshes.has(key)) {
+                        scheduleChunkUpdate(cx, cz, false, "edge-lighting");
+                    }
+
+                    processed++;
+                }
+
+                // Check chunks waiting for neighbors and move them to the active queue if ready
+                for (const key of chunksNeedingLightingUpdate) {
+                    const { cx, cz } = parseChunkKeySimple(key);
+                    const hasAllNeighbors =
+                        hasNeighborWithLighting(cx - 1, cz) &&
+                        hasNeighborWithLighting(cx + 1, cz) &&
+                        hasNeighborWithLighting(cx, cz - 1) &&
+                        hasNeighborWithLighting(cx, cz + 1);
+
+                    if (hasAllNeighbors) {
+                        chunksNeedingLightingUpdate.delete(key);
+                        edgeLightingUpdateQueue.add(key);
+                    }
+                }
+
+                return processed;
             }
 
             // Helper to parse chunk key into cx, cz
@@ -5990,6 +6184,9 @@
                 // Clean up from generation state tracking
                 adjacentChunkUpdateQueue.delete(key);
                 chunksAwaitingNeighborUpdate.delete(key);
+                // Clean up from render state tracking
+                edgeLightingUpdateQueue.delete(key);
+                chunksNeedingLightingUpdate.delete(key);
             }
             const worldConfig = {
                 seed: WORLD_CONFIG.seed,
@@ -11464,8 +11661,19 @@
                 if (biomeName === "swamp") return d.swamp ?? 0.02;
                 return 0.0;
             }
-            // Calculate sunlight for a chunk - sunlight starts at 15 at top and propagates down,
-            // then spreads horizontally into caves and overhangs via BFS
+            // =====================================================
+            // SUNLIGHT CALCULATION (Per-Chunk)
+            // =====================================================
+            // Sunlight propagation follows a two-phase approach:
+            // Phase 1: Vertical propagation from sky (y = max) downward
+            //   - Starts at level 15 (full sunlight)
+            //   - Attenuated by transparent blocks (leaves reduce by 1)
+            //   - Blocked completely by opaque blocks (falls to level 1)
+            // Phase 2: Horizontal BFS propagation
+            //   - Light spreads from lit blocks to neighboring air/transparent blocks
+            //   - Reduces by 1 per block traveled
+            //   - Fills caves, overhangs, and shaded areas
+            // Note: Cross-chunk propagation happens in propagateLightFromNeighbors()
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
@@ -11547,7 +11755,15 @@
                     }
                 }
             }
-            // Calculate block light for a chunk - light emitted by torches with BFS propagation
+            // =====================================================
+            // BLOCK LIGHT CALCULATION (Per-Chunk)
+            // =====================================================
+            // Block light is emitted by light-emitting blocks (torches) and propagates via BFS:
+            // - Torches emit light at level determined by getTorchBlockLightLevel() (typically 15)
+            // - Light spreads to all 6 neighboring transparent blocks
+            // - Light level decreases by 1 per block traveled
+            // - Light stops at opaque blocks or when level reaches 0
+            // Combined with skyLight using max() for final light level in extractLightFromChunk()
             function calculateBlockLight(chunk, chunkSize, chunkHeight) {
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
@@ -13349,6 +13565,13 @@
                 const adjacentBudget = Math.max(0, CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs));
                 if (adjacentChunkUpdateQueue.size > 0 && adjacentBudget > 1) {
                     processAdjacentChunkUpdates(2);
+                }
+
+                // Process edge lighting updates (cross-chunk light propagation)
+                // This runs after adjacent updates to ensure proper light seams
+                const lightingBudget = Math.max(0, CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs));
+                if ((edgeLightingUpdateQueue.size > 0 || chunksNeedingLightingUpdate.size > 0) && lightingBudget > 1) {
+                    processEdgeLightingUpdates(2);
                 }
             }
             function updateLocalArea(x, y, z) {
