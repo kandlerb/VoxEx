@@ -4750,7 +4750,7 @@
                     }
                 }
 
-                return {
+                const lodData = {
                     cx, cz,
                     lodLevel: lodLevel.name,
                     mergeSize,
@@ -4763,6 +4763,14 @@
                     fromCache: useCachedData,
                     timestamp: performance.now()
                 };
+
+                // Queue for DB persistence if generated from real chunk data
+                // This ensures LOD data is available when re-entering the world
+                if (useCachedData && typeof queueLODChunkSave === 'function') {
+                    queueLODChunkSave(`LOD_${cx},${cz}`, lodData);
+                }
+
+                return lodData;
             }
 
             // Queue chunk for prefetch (async DB load)
@@ -4803,6 +4811,54 @@
                 lodInvalidatedChunks.add(key);
                 // Also invalidate the data cache
                 lodChunks.delete(key);
+            }
+
+            // --- LOD DB PREFETCH SYSTEM ---
+            // Prefetches LOD data from IndexedDB ahead of player movement
+            // Works in parallel with chunk prefetch but loads LOD-specific data
+            const lodDBPrefetchQueue = [];         // Keys to load from LOD DB
+            const lodDBPrefetchPending = new Set(); // Keys currently being fetched
+            const LOD_DB_PREFETCH_BATCH = 10;      // Max DB loads per frame
+
+            // Queue LOD chunk for DB prefetch
+            function queueLODDBPrefetch(cx, cz, lodLevel) {
+                const key = `LOD_${cx},${cz}`;
+                // Skip if already have data, already pending, or DB not ready
+                if (lodChunks.has(key) || lodDBPrefetchPending.has(key) || !db) return;
+                lodDBPrefetchQueue.push({ cx, cz, key, lodLevel });
+                lodDBPrefetchPending.add(key);
+            }
+
+            // Process LOD DB prefetch queue (call each frame, non-blocking)
+            async function processLODDBPrefetchQueue() {
+                if (lodDBPrefetchQueue.length === 0 || !db) return;
+
+                const batch = lodDBPrefetchQueue.splice(0, LOD_DB_PREFETCH_BATCH);
+                const keysToLoad = batch.map(j => j.key);
+
+                try {
+                    // Batch load from DB
+                    const loaded = await batchLoadLODChunksFromCache(keysToLoad);
+
+                    for (const job of batch) {
+                        if (loaded.has(job.key)) {
+                            // Found in DB - use it
+                            const lodData = loaded.get(job.key);
+                            // Check if LOD level matches what we need
+                            if (lodData.lodLevel === job.lodLevel) {
+                                lodChunks.set(job.key, lodData);
+                                logDebug(`[LOD] Loaded ${job.key} from DB (${lodData.lodLevel})`);
+                            }
+                            // If level mismatch, we'll regenerate with correct level
+                        }
+                        lodDBPrefetchPending.delete(job.key);
+                    }
+                } catch (e) {
+                    // Clear pending flags on error
+                    for (const job of batch) {
+                        lodDBPrefetchPending.delete(job.key);
+                    }
+                }
             }
 
             // Get height from neighbor LOD chunk at boundary
@@ -5779,6 +5835,13 @@
                         if (offset.distSq <= prefetchDistSq && prefetchCount < LOD_PREFETCH_RING_SIZE * 8) {
                             queueLODPrefetch(cx, cz);
                             prefetchCount++;
+                        }
+
+                        // Queue LOD DB prefetch if we don't have data yet
+                        // This loads persisted LOD data before we need to regenerate
+                        const lodLevel = getLODLevelForDistance(Math.sqrt(offset.distSq));
+                        if (!lodChunks.has(key) && typeof queueLODDBPrefetch === 'function') {
+                            queueLODDBPrefetch(cx, cz, lodLevel.name);
                         }
 
                         // Queue for building if not already rendered or queued
@@ -8845,7 +8908,7 @@
                 worldConfig.seed = savePacket.seed;
                 rng = new SeededRandom(worldConfig.seed.toString());
                 rebuildBiomeTable();
-                // 2. Clear Scene
+                // 2. Clear Scene (including LOD data)
                 if (typeof scene !== "undefined") {
                     chunkBuildQueue.length = 0;
                     // queuedChunkKeys.clear(); // Uncomment if you have this variable
@@ -8856,6 +8919,16 @@
                     chunkRenderedFaces.clear();
                     chunkRenderDiagnostics.clear();
                     lastChunkUpdate = -Infinity; // Force refresh
+
+                    // Clear LOD data (will be reloaded from DB or regenerated)
+                    for (const key of lodChunkMeshes.keys()) { releaseLODMesh(key); }
+                    lodChunks.clear();
+                    lodChunkBuildQueue.length = 0;
+                    queuedLODChunkKeys.clear();
+                    lodDBPrefetchQueue.length = 0;
+                    lodDBPrefetchPending.clear();
+                    lodSaveQueue.length = 0;
+                    logDebug("[LOD] Cleared LOD data for world load");
                 }
                 // 3. WE NO LONGER PRE-LOAD CHUNKS FROM JSON
                 // The standard updateChunks() loop will detect we are at the new position
@@ -8885,18 +8958,24 @@
             SaveManager.getStyles();
             // --- CHUNK DATA PERSISTENCE SYSTEM ---
             const DB_NAME = "VoxExWorldData";
-            const DB_VERSION = 2;
+            const DB_VERSION = 3; // Bumped for LOD store
             const STORE_NAME = "chunks";
+            const LOD_STORE_NAME = "lodChunks"; // Separate store for LOD data persistence
             let db = null;
             async function initDatabase() {
                 return new Promise((resolve, reject) => { const request = indexedDB.open(DB_NAME, DB_VERSION);
                     request.onerror = () => reject(request.error);
-                    request.onsuccess = () => { db = request.result; logDebug("IndexedDB initialized"); resolve(db); };
+                    request.onsuccess = () => { db = request.result; logDebug("IndexedDB initialized (v3 with LOD store)"); resolve(db); };
                     request.onupgradeneeded = (event) => {     const database = event.target.result;
-                        // If the store exists (from Version 1), delete it because the data format has changed
+                        // If the chunks store exists (from Version 1), delete it because the data format has changed
                         if (database.objectStoreNames.contains(STORE_NAME)) { database.deleteObjectStore(STORE_NAME); }
-                        // Create fresh store
+                        // Create fresh chunks store
                         database.createObjectStore(STORE_NAME, { keyPath: "key" });
+                        // Create LOD chunks store (new in v3) for persistent LOD data
+                        if (!database.objectStoreNames.contains(LOD_STORE_NAME)) {
+                            database.createObjectStore(LOD_STORE_NAME, { keyPath: "key" });
+                            logDebug("[LOD] Created LOD persistence store");
+                        }
                     };
                 });
             }
@@ -8994,6 +9073,185 @@
                     transaction.onerror = () => { if (!hasError) { hasError = true; reject(transaction.error); }};
                 });
             }
+            // --- LOD DATA PERSISTENCE SYSTEM ---
+            // Separate from chunk data to allow independent management and space optimization
+            // LOD data is lighter (heightmap + surface blocks) and can be regenerated if missing
+
+            // Compress LOD data for storage (simple RLE for typed arrays)
+            function compressLODData(lodData) {
+                return {
+                    cx: lodData.cx,
+                    cz: lodData.cz,
+                    lodLevel: lodData.lodLevel,
+                    mergeSize: lodData.mergeSize,
+                    skipY: lodData.skipY,
+                    cellsPerSide: lodData.cellsPerSide,
+                    heightMap: Array.from(lodData.heightMap),     // Int16Array to array
+                    surfaceBlocks: Array.from(lodData.surfaceBlocks), // Uint8Array to array
+                    underwaterDepth: Array.from(lodData.underwaterDepth),
+                    lightLevels: Array.from(lodData.lightLevels),
+                    fromCache: lodData.fromCache
+                };
+            }
+
+            // Decompress LOD data from storage
+            function decompressLODData(stored) {
+                return {
+                    cx: stored.cx,
+                    cz: stored.cz,
+                    lodLevel: stored.lodLevel,
+                    mergeSize: stored.mergeSize,
+                    skipY: stored.skipY,
+                    cellsPerSide: stored.cellsPerSide,
+                    heightMap: new Int16Array(stored.heightMap),
+                    surfaceBlocks: new Uint8Array(stored.surfaceBlocks),
+                    underwaterDepth: new Uint8Array(stored.underwaterDepth),
+                    lightLevels: new Uint8Array(stored.lightLevels),
+                    fromCache: true, // Mark as loaded from DB
+                    timestamp: performance.now()
+                };
+            }
+
+            // Save LOD chunk data to IndexedDB
+            async function saveLODChunkToCache(lodKey, lodData) {
+                if (!db || !lodData) return;
+                return new Promise((resolve, reject) => {
+                    try {
+                        const transaction = db.transaction([LOD_STORE_NAME], "readwrite");
+                        const store = transaction.objectStore(LOD_STORE_NAME);
+                        const record = {
+                            key: lodKey,
+                            data: compressLODData(lodData),
+                            timestamp: Date.now(),
+                            seed: finalSeedDisplay,
+                            lodLevel: lodData.lodLevel
+                        };
+                        const request = store.put(record);
+                        request.onsuccess = () => resolve();
+                        request.onerror = () => reject(request.error);
+                    } catch (e) {
+                        // Store may not exist yet (first run), ignore
+                        resolve();
+                    }
+                });
+            }
+
+            // Load LOD chunk data from IndexedDB
+            async function loadLODChunkFromCache(lodKey) {
+                if (!db) return null;
+                return new Promise((resolve) => {
+                    try {
+                        const transaction = db.transaction([LOD_STORE_NAME], "readonly");
+                        const store = transaction.objectStore(LOD_STORE_NAME);
+                        const request = store.get(lodKey);
+                        request.onsuccess = () => {
+                            const record = request.result;
+                            if (record && record.seed === finalSeedDisplay && record.data) {
+                                logDebug(`[LOD] Cache HIT for ${lodKey}`);
+                                resolve(decompressLODData(record.data));
+                            } else {
+                                resolve(null);
+                            }
+                        };
+                        request.onerror = () => resolve(null);
+                    } catch (e) {
+                        resolve(null);
+                    }
+                });
+            }
+
+            // Batch load multiple LOD chunks (faster than individual loads)
+            async function batchLoadLODChunksFromCache(lodKeys) {
+                if (!db || !lodKeys || lodKeys.length === 0) return new Map();
+                return new Promise((resolve) => {
+                    try {
+                        const transaction = db.transaction([LOD_STORE_NAME], "readonly");
+                        const store = transaction.objectStore(LOD_STORE_NAME);
+                        const results = new Map();
+                        let pending = lodKeys.length;
+                        if (pending === 0) { resolve(results); return; }
+
+                        lodKeys.forEach((key) => {
+                            const request = store.get(key);
+                            request.onsuccess = () => {
+                                const record = request.result;
+                                if (record && record.seed === finalSeedDisplay && record.data) {
+                                    results.set(key, decompressLODData(record.data));
+                                }
+                                pending--;
+                                if (pending === 0) resolve(results);
+                            };
+                            request.onerror = () => {
+                                pending--;
+                                if (pending === 0) resolve(results);
+                            };
+                        });
+                    } catch (e) {
+                        resolve(new Map());
+                    }
+                });
+            }
+
+            // Batch save multiple LOD chunks (time-sliced to avoid frame hitches)
+            const lodSaveQueue = [];
+            let lodSaveInProgress = false;
+
+            function queueLODChunkSave(lodKey, lodData) {
+                // Don't save procedural-only data (no real chunk backing)
+                if (!lodData.fromCache) return;
+                lodSaveQueue.push({ key: lodKey, data: lodData });
+            }
+
+            async function processLODSaveQueue() {
+                if (lodSaveInProgress || lodSaveQueue.length === 0 || !db) return;
+                lodSaveInProgress = true;
+
+                const BATCH_SIZE = 5; // Save 5 LOD chunks per frame max
+                const batch = lodSaveQueue.splice(0, BATCH_SIZE);
+
+                try {
+                    const transaction = db.transaction([LOD_STORE_NAME], "readwrite");
+                    const store = transaction.objectStore(LOD_STORE_NAME);
+
+                    for (const job of batch) {
+                        const record = {
+                            key: job.key,
+                            data: compressLODData(job.data),
+                            timestamp: Date.now(),
+                            seed: finalSeedDisplay,
+                            lodLevel: job.data.lodLevel
+                        };
+                        store.put(record);
+                    }
+
+                    transaction.oncomplete = () => {
+                        lodSaveInProgress = false;
+                        if (batch.length > 0) {
+                            logDebug(`[LOD] Saved ${batch.length} LOD chunks to DB`);
+                        }
+                    };
+                    transaction.onerror = () => { lodSaveInProgress = false; };
+                } catch (e) {
+                    lodSaveInProgress = false;
+                }
+            }
+
+            // Clear LOD cache (called when world changes)
+            async function clearLODCache() {
+                if (!db) return;
+                return new Promise((resolve) => {
+                    try {
+                        const transaction = db.transaction([LOD_STORE_NAME], "readwrite");
+                        const store = transaction.objectStore(LOD_STORE_NAME);
+                        const request = store.clear();
+                        request.onsuccess = () => { logDebug("[LOD] LOD cache cleared"); resolve(); };
+                        request.onerror = () => resolve();
+                    } catch (e) {
+                        resolve();
+                    }
+                });
+            }
+
             // --- SPAWN CHUNK PRE-GENERATION ---
             async function preGenerateSpawnChunks(spawnX, spawnZ, radius = SETTINGS.preGenRenderDistance) {
                 const totalChunks = Math.ceil(Math.PI * radius * radius);
@@ -10709,6 +10967,7 @@
                     (SETTINGS.lodEnabled ? `ON (${SETTINGS.lodDistance} chunks)` : "OFF") +
                     "\n" +
                     (SETTINGS.lodEnabled ? `LOD Chunks: ${lodChunkMeshes.size} (queue: ${lodChunkBuildQueue.length})\n` : "") +
+                    (SETTINGS.lodEnabled ? `LOD DB: save ${lodSaveQueue.length}, load ${lodDBPrefetchQueue.length}\n` : "") +
                     (SETTINGS.lodDebugMode && SETTINGS.lodDebugMode !== 'normal' ? `LOD Debug: ${SETTINGS.lodDebugMode} (L to cycle)\n` : "") +
                     (SETTINGS.lodEnabled && lodBlockStats.total > 0 ? `${formatLODBlockStats()}\n` : "") +
                     "Camera FOV: " +
@@ -15492,6 +15751,14 @@
                 // Process LOD prefetch queue (async DB loads for fast-path LOD generation)
                 if (SETTINGS.lodEnabled && lodPrefetchQueue.length > 0) {
                     processLODPrefetchQueue();
+                }
+                // Process LOD DB prefetch queue (loads LOD data from IndexedDB)
+                if (SETTINGS.lodEnabled && lodDBPrefetchQueue.length > 0) {
+                    processLODDBPrefetchQueue();
+                }
+                // Process LOD save queue (persists LOD data to IndexedDB, time-sliced)
+                if (SETTINGS.lodEnabled && lodSaveQueue.length > 0 && (time - prevTime < 20)) {
+                    processLODSaveQueue();
                 }
                 // Run chunk updates every 200ms
                 if (time - lastChunkUpdate > 200) {
