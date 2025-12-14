@@ -4572,6 +4572,7 @@
                         let dominantBlock = GRASS;
                         let waterDepth = 0;
                         let cellLight = 15; // Default to full brightness
+                        const blockCounts = new Map(); // Track weighted block counts
 
                         if (useCachedData) {
                             // Sample from cached chunk data (accurate path)
@@ -4599,10 +4600,9 @@
                                 }
                             } else {
                                 // Multi-point sampling for closer LOD
-                                // Track block at maxHeight position (preserves cliffs/beaches better)
+                                // Use weighted block counts (sand/stone weighted higher than grass)
                                 let totalLight = 0;
                                 let lightSamples = 0;
-                                let maxHeightBlock = GRASS; // Block at the highest sample point
                                 for (let dz = 0; dz < mergeSize; dz += sampleStep) {
                                     for (let dx = 0; dx < mergeSize; dx += sampleStep) {
                                         const lx = cellX * mergeSize + dx;
@@ -4627,11 +4627,10 @@
 
                                         if (surfaceY >= 0) {
                                             const worldY = surfaceY - WORLD_DIMS.yOffset;
-                                            // Track block at maxHeight (preserves cliffs/beaches)
-                                            if (worldY > maxHeight) {
-                                                maxHeight = worldY;
-                                                maxHeightBlock = surfaceBlock;
-                                            }
+                                            if (worldY > maxHeight) maxHeight = worldY;
+                                            // Weighted counts: sand/stone get 2x weight to prevent grass dominance
+                                            const weight = (surfaceBlock === SAND || surfaceBlock === STONE) ? 2 : 1;
+                                            blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + weight);
                                             // Water clarity: if surface is below sea level, track max water depth
                                             if (worldY < WORLD_DIMS.seaLevel) {
                                                 waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - worldY);
@@ -4639,8 +4638,6 @@
                                         }
                                     }
                                 }
-                                // Use block from maxHeight sample (better for terrain features)
-                                dominantBlock = maxHeightBlock;
                                 // Average light across samples
                                 if (lightSamples > 0) {
                                     cellLight = Math.max(1, Math.round(totalLight / lightSamples));
@@ -4679,9 +4676,7 @@
                                     dominantBlock = GRASS;
                                 }
                             } else {
-                                // Multi-point procedural sampling
-                                // Track block at maxHeight position (preserves cliffs/beaches better)
-                                let maxHeightBlock = GRASS;
+                                // Multi-point procedural sampling with weighted counts
                                 for (let dz = 0; dz < mergeSize; dz += sampleStep) {
                                     for (let dx = 0; dx < mergeSize; dx += sampleStep) {
                                         const gx = startX + cellX * mergeSize + dx;
@@ -4689,6 +4684,8 @@
 
                                         const height = typeof blendedHeight === 'function'
                                             ? blendedHeight(gx, gz, worldConfig.seed) : 64;
+
+                                        if (height > maxHeight) maxHeight = height;
 
                                         const biomeParams = typeof getBiomeParams === 'function'
                                             ? getBiomeParams(gx, gz) : null;
@@ -4710,15 +4707,22 @@
                                             surfaceBlock = STONE;
                                         }
 
-                                        // Track block at maxHeight (preserves cliffs/beaches)
-                                        if (height > maxHeight) {
-                                            maxHeight = height;
-                                            maxHeightBlock = surfaceBlock;
-                                        }
+                                        // Weighted counts: sand/stone get 2x weight
+                                        const weight = (surfaceBlock === SAND || surfaceBlock === STONE) ? 2 : 1;
+                                        blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + weight);
                                     }
                                 }
-                                // Use block from maxHeight sample
-                                dominantBlock = maxHeightBlock;
+                            }
+                        }
+
+                        // Find dominant block from weighted counts (for multi-point sampling)
+                        if (blockCounts.size > 0) {
+                            let maxWeight = 0;
+                            for (const [block, weight] of blockCounts) {
+                                if (weight > maxWeight) {
+                                    maxWeight = weight;
+                                    dominantBlock = block;
+                                }
                             }
                         }
 
@@ -5211,41 +5215,15 @@
             // Per-chunk validation error tracking (log once per chunk, not per cell)
             const lodChunkValidationErrors = new Map(); // key -> {heights: n, lights: n, blocks: n}
 
-            // Validate LOD cell data and track errors per chunk (logs once per chunk)
+            // Validate LOD cell data - only reject NaN/Infinity (truly bad data)
+            // Out-of-range values are clamped by rendering code, not rejected here
             function validateLODCell(key, cellIdx, height, light, blockId) {
-                let errors = lodChunkValidationErrors.get(key);
-                if (!errors) {
-                    errors = { heights: 0, lights: 0, blocks: 0, logged: false };
-                    lodChunkValidationErrors.set(key, errors);
-                }
-
-                let valid = true;
-
-                // Validate height
+                // Only reject truly invalid data (NaN/Infinity)
                 if (!Number.isFinite(height)) {
-                    errors.heights++;
-                    valid = false;
+                    return false;
                 }
-
-                // Validate light
-                if (!Number.isFinite(light) || light < 0 || light > 15) {
-                    errors.lights++;
-                    valid = false;
-                }
-
-                // Validate block ID
-                if (!Number.isFinite(blockId) || blockId < 0 || blockId > 255) {
-                    errors.blocks++;
-                    valid = false;
-                }
-
-                // Log once per chunk when errors occur
-                if (!valid && !errors.logged && (errors.heights + errors.lights + errors.blocks) >= 1) {
-                    console.warn(`[LOD Validate] ${key}: Cell data errors - heights:${errors.heights} lights:${errors.lights} blocks:${errors.blocks}`);
-                    errors.logged = true;
-                }
-
-                return valid;
+                // Light and blockId can be clamped, don't reject
+                return true;
             }
 
             // Cleanup old validation error tracking (call periodically)
@@ -5773,28 +5751,8 @@
                         cleanupLODValidationErrors(neededLODKeys);
                     }
 
-                    // Apply crossfade opacity to LOD meshes in transition band
-                    for (const [key, mesh] of lodChunkMeshes) {
-                        const state = lodTransitionState.get(key);
-                        if (!state) continue;
-
-                        const targetOpacity = state.opacity;
-
-                        // Only process if opacity isn't fully opaque
-                        if (targetOpacity < 0.99) {
-                            // Need per-mesh material for transition - clone if using shared
-                            if (mesh.material === lodChunkMaterial) {
-                                mesh.material = lodChunkMaterial.clone();
-                                mesh.material._isTransitionClone = true;
-                            }
-                            mesh.material.opacity = targetOpacity;
-                            mesh.material.needsUpdate = true;
-                        } else if (mesh.material._isTransitionClone) {
-                            // Transition complete - restore shared material to save memory
-                            mesh.material.dispose();
-                            mesh.material = lodChunkMaterial;
-                        }
-                    }
+                    // NOTE: Crossfade transitions disabled for now - material cloning caused visual issues
+                    // Future: implement via vertex alpha or shader-based dithering instead
 
                     // Sort queue by distance (closest first)
                     if (lodChunkBuildQueue.length > 1) {
