@@ -4572,7 +4572,6 @@
                         let dominantBlock = GRASS;
                         let waterDepth = 0;
                         let cellLight = 15; // Default to full brightness
-                        const blockCounts = new Map();
 
                         if (useCachedData) {
                             // Sample from cached chunk data (accurate path)
@@ -4600,8 +4599,10 @@
                                 }
                             } else {
                                 // Multi-point sampling for closer LOD
+                                // Track block at maxHeight position (preserves cliffs/beaches better)
                                 let totalLight = 0;
                                 let lightSamples = 0;
+                                let maxHeightBlock = GRASS; // Block at the highest sample point
                                 for (let dz = 0; dz < mergeSize; dz += sampleStep) {
                                     for (let dx = 0; dx < mergeSize; dx += sampleStep) {
                                         const lx = cellX * mergeSize + dx;
@@ -4626,8 +4627,11 @@
 
                                         if (surfaceY >= 0) {
                                             const worldY = surfaceY - WORLD_DIMS.yOffset;
-                                            if (worldY > maxHeight) maxHeight = worldY;
-                                            blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                                            // Track block at maxHeight (preserves cliffs/beaches)
+                                            if (worldY > maxHeight) {
+                                                maxHeight = worldY;
+                                                maxHeightBlock = surfaceBlock;
+                                            }
                                             // Water clarity: if surface is below sea level, track max water depth
                                             if (worldY < WORLD_DIMS.seaLevel) {
                                                 waterDepth = Math.max(waterDepth, WORLD_DIMS.seaLevel - worldY);
@@ -4635,6 +4639,8 @@
                                         }
                                     }
                                 }
+                                // Use block from maxHeight sample (better for terrain features)
+                                dominantBlock = maxHeightBlock;
                                 // Average light across samples
                                 if (lightSamples > 0) {
                                     cellLight = Math.max(1, Math.round(totalLight / lightSamples));
@@ -4674,6 +4680,8 @@
                                 }
                             } else {
                                 // Multi-point procedural sampling
+                                // Track block at maxHeight position (preserves cliffs/beaches better)
+                                let maxHeightBlock = GRASS;
                                 for (let dz = 0; dz < mergeSize; dz += sampleStep) {
                                     for (let dx = 0; dx < mergeSize; dx += sampleStep) {
                                         const gx = startX + cellX * mergeSize + dx;
@@ -4681,8 +4689,6 @@
 
                                         const height = typeof blendedHeight === 'function'
                                             ? blendedHeight(gx, gz, worldConfig.seed) : 64;
-
-                                        if (height > maxHeight) maxHeight = height;
 
                                         const biomeParams = typeof getBiomeParams === 'function'
                                             ? getBiomeParams(gx, gz) : null;
@@ -4704,30 +4710,15 @@
                                             surfaceBlock = STONE;
                                         }
 
-                                        blockCounts.set(surfaceBlock, (blockCounts.get(surfaceBlock) || 0) + 1);
+                                        // Track block at maxHeight (preserves cliffs/beaches)
+                                        if (height > maxHeight) {
+                                            maxHeight = height;
+                                            maxHeightBlock = surfaceBlock;
+                                        }
                                     }
                                 }
-                            }
-                        }
-
-                        // Find dominant block (only if we did multi-point sampling)
-                        // Prefer non-grass blocks on ties: STONE > SAND > DIRT > LEAVES > others > GRASS
-                        if (!useSimpleSampling && blockCounts.size > 0) {
-                            let maxCount = 0;
-                            const blockPriority = (b) => {
-                                if (b === STONE) return 5;
-                                if (b === SAND) return 4;
-                                if (b === DIRT) return 3;
-                                if (b === LEAVES) return 2;
-                                if (b === GRASS) return 0;
-                                return 1;
-                            };
-                            for (const [block, count] of blockCounts) {
-                                if (count > maxCount ||
-                                    (count === maxCount && blockPriority(block) > blockPriority(dominantBlock))) {
-                                    maxCount = count;
-                                    dominantBlock = block;
-                                }
+                                // Use block from maxHeight sample
+                                dominantBlock = maxHeightBlock;
                             }
                         }
 
@@ -4898,9 +4889,16 @@
                         let height = heightMap[cellIdx];
                         const blockId = surfaceBlocks[cellIdx];
                         const waterDepth = underwaterDepth[cellIdx];
+                        const cellLight = lightLevels ? lightLevels[cellIdx] : 15;
 
-                        // VALIDATION: Clamp height to world bounds, skip invalid cells
-                        if (!Number.isFinite(height) || height < minHeight || height > maxHeight) {
+                        // VALIDATION: Check for bad data (NaN/Infinity) and log once per chunk
+                        if (!validateLODCell(key, cellIdx, height, cellLight, blockId)) {
+                            // Skip this cell entirely to prevent mystery spikes
+                            continue;
+                        }
+
+                        // VALIDATION: Clamp height to world bounds
+                        if (height < minHeight || height > maxHeight) {
                             height = WORLD_DIMS.seaLevel; // Safe fallback
                         }
 
@@ -5110,7 +5108,7 @@
                     waterMesh.name = waterKey;
                     waterMesh.matrixAutoUpdate = false;
                     waterMesh.frustumCulled = true;
-                    waterMesh.renderOrder = 1; // Render after terrain
+                    waterMesh.renderOrder = 10; // Render after all terrain (LOD terrain at -1, regular at 0)
                     waterMesh.updateMatrix();
 
                     scene.add(waterMesh);
@@ -5208,6 +5206,55 @@
                 if (height < -1000 || height > 1000) return false;
                 if (sideHeight < 0 || sideHeight > 500) return false;
                 return true;
+            }
+
+            // Per-chunk validation error tracking (log once per chunk, not per cell)
+            const lodChunkValidationErrors = new Map(); // key -> {heights: n, lights: n, blocks: n}
+
+            // Validate LOD cell data and track errors per chunk (logs once per chunk)
+            function validateLODCell(key, cellIdx, height, light, blockId) {
+                let errors = lodChunkValidationErrors.get(key);
+                if (!errors) {
+                    errors = { heights: 0, lights: 0, blocks: 0, logged: false };
+                    lodChunkValidationErrors.set(key, errors);
+                }
+
+                let valid = true;
+
+                // Validate height
+                if (!Number.isFinite(height)) {
+                    errors.heights++;
+                    valid = false;
+                }
+
+                // Validate light
+                if (!Number.isFinite(light) || light < 0 || light > 15) {
+                    errors.lights++;
+                    valid = false;
+                }
+
+                // Validate block ID
+                if (!Number.isFinite(blockId) || blockId < 0 || blockId > 255) {
+                    errors.blocks++;
+                    valid = false;
+                }
+
+                // Log once per chunk when errors occur
+                if (!valid && !errors.logged && (errors.heights + errors.lights + errors.blocks) >= 1) {
+                    console.warn(`[LOD Validate] ${key}: Cell data errors - heights:${errors.heights} lights:${errors.lights} blocks:${errors.blocks}`);
+                    errors.logged = true;
+                }
+
+                return valid;
+            }
+
+            // Cleanup old validation error tracking (call periodically)
+            function cleanupLODValidationErrors(activeKeys) {
+                for (const key of lodChunkValidationErrors.keys()) {
+                    if (!activeKeys.has(key)) {
+                        lodChunkValidationErrors.delete(key);
+                    }
+                }
             }
 
             // LOD UV calculation with texel inset to prevent atlas bleed
@@ -5720,8 +5767,34 @@
                         }
                     }
 
-                    // Cleanup stale transition states
+                    // Cleanup stale transition states and validation error tracking
                     cleanupLODTransitionStates(neededLODKeys);
+                    if (typeof cleanupLODValidationErrors === 'function') {
+                        cleanupLODValidationErrors(neededLODKeys);
+                    }
+
+                    // Apply crossfade opacity to LOD meshes in transition band
+                    for (const [key, mesh] of lodChunkMeshes) {
+                        const state = lodTransitionState.get(key);
+                        if (!state) continue;
+
+                        const targetOpacity = state.opacity;
+
+                        // Only process if opacity isn't fully opaque
+                        if (targetOpacity < 0.99) {
+                            // Need per-mesh material for transition - clone if using shared
+                            if (mesh.material === lodChunkMaterial) {
+                                mesh.material = lodChunkMaterial.clone();
+                                mesh.material._isTransitionClone = true;
+                            }
+                            mesh.material.opacity = targetOpacity;
+                            mesh.material.needsUpdate = true;
+                        } else if (mesh.material._isTransitionClone) {
+                            // Transition complete - restore shared material to save memory
+                            mesh.material.dispose();
+                            mesh.material = lodChunkMaterial;
+                        }
+                    }
 
                     // Sort queue by distance (closest first)
                     if (lodChunkBuildQueue.length > 1) {
@@ -11153,6 +11226,7 @@
                 lodChunkMaterial.fog = true;
 
                 // LOD water material - transparent, simplified for distant water rendering
+                // polygonOffset pushes water slightly forward to prevent disappearing under terrain at distance
                 lodWaterMaterial = new THREE.MeshLambertMaterial({
                     map: tex,
                     vertexColors: true,
@@ -11161,6 +11235,9 @@
                     opacity: SETTINGS.waterOpacity,
                     depthWrite: false,
                     depthTest: true,
+                    polygonOffset: true,
+                    polygonOffsetFactor: -1,
+                    polygonOffsetUnits: -1,
                 });
                 lodWaterMaterial.fog = true;
 
