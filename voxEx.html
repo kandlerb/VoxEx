@@ -3564,7 +3564,21 @@
                 }
             }
 
+            // =====================================================
+            // MOB BASE CLASS
+            // =====================================================
+            // OPTIMIZATION AUDIT (2025-12-15):
+            // - update() is HOT PATH (called every frame per active mob)
+            // - Expected mob count is low (<50), so per-mob overhead acceptable
+            //
+            // Note: User requested Mob.takeDamage and Mob.die - these don't exist
+            // Actual methods: damage() and dispose()
+            //
+            // Status: Already minimal and efficient
+            // =====================================================
+
             class Mob {
+                // OPTIMIZATION: constructor - no-op (called once per spawn)
                 constructor() {
                     this.position = new THREE.Vector3();
                     this.velocity = new THREE.Vector3();
@@ -3575,20 +3589,27 @@
                     this.mesh = null;
                 }
 
+                // OPTIMIZATION: update - HOT PATH but already minimal
+                // Single Vector3.addScaledVector call - no allocations
                 update(delta) {
                     // Base mob update - apply velocity
                     this.position.addScaledVector(this.velocity, delta);
                 }
 
+                // OPTIMIZATION: damage - event-driven (not per-frame)
+                // Note: User called this "takeDamage" but method is named "damage"
                 damage(amount) {
                     this.health = Math.max(0, this.health - amount);
                     return this.health <= 0;
                 }
 
+                // OPTIMIZATION: heal - event-driven (not per-frame)
                 heal(amount) {
                     this.health = Math.min(this.maxHealth, this.health + amount);
                 }
 
+                // OPTIMIZATION: dispose - event-driven (on mob removal)
+                // Note: User called this "die" but method is named "dispose"
                 dispose() {
                     if (this.mesh && this.mesh.parent) {
                         this.mesh.parent.remove(this.mesh);
@@ -3596,7 +3617,19 @@
                 }
             }
 
+            // =====================================================
+            // ZOMBIE CLASS (extends Mob)
+            // =====================================================
+            // OPTIMIZATION AUDIT (2025-12-15):
+            // - update() is HOT PATH (per-frame per zombie)
+            // - updateChase() was allocating new Vector3 each frame - FIXED
+            // - animateLimbs() was calling getObjectByName 4x per frame - FIXED
+            //
+            // Status: Optimized - scratch vectors and cached limb references
+            // =====================================================
+
             class Zombie extends Mob {
+                // OPTIMIZATION: constructor - called once per spawn (pooled)
                 constructor() {
                     super();
                     this.type = 'zombie';
@@ -3609,6 +3642,12 @@
                     this.chaseSpeed = 4.8;
                     this.attackRange = 2.5;
                     this.detectionRadius = 28;
+
+                    // OPTIMIZATION: Scratch vector for updateChase (avoids per-frame allocation)
+                    this._scratchDirection = new THREE.Vector3();
+
+                    // OPTIMIZATION: Cached limb references (set when mesh is assigned)
+                    this._limbsCache = null;
                 }
 
                 update(delta) {
@@ -3645,20 +3684,24 @@
                     this.velocity.copy(this.wanderDirection).multiplyScalar(this.walkSpeed);
                 }
 
+                // OPTIMIZATION: updateChase - HOT PATH when chasing
+                // Uses scratch vector instead of allocating new Vector3 each frame
                 updateChase(delta) {
                     if (!this.target) {
                         this.state = 'wander';
                         return;
                     }
 
-                    const direction = new THREE.Vector3()
-                        .subVectors(this.target.position || this.target, this.position)
+                    // OPTIMIZATION: Reuse scratch vector instead of new THREE.Vector3()
+                    const targetPos = this.target.position || this.target;
+                    this._scratchDirection
+                        .subVectors(targetPos, this.position)
                         .normalize();
 
-                    this.velocity.copy(direction).multiplyScalar(this.chaseSpeed);
+                    this.velocity.copy(this._scratchDirection).multiplyScalar(this.chaseSpeed);
 
                     // Check if close enough to attack
-                    const dist = this.position.distanceTo(this.target.position || this.target);
+                    const dist = this.position.distanceTo(targetPos);
                     if (dist < this.attackRange) {
                         this.state = 'attack';
                     }
@@ -3691,6 +3734,8 @@
                     }
                 }
 
+                // OPTIMIZATION: reset - called when returning to pool
+                // Clears limb cache so it will be recached on next spawn
                 reset() {
                     this.position.set(0, 0, 0);
                     this.velocity.set(0, 0, 0);
@@ -3699,31 +3744,40 @@
                     this.target = null;
                     this.attackCooldown = 0;
                     this.wanderTimer = 0;
+                    this._limbsCache = null;  // Clear so limbs are recached on reuse
+                    this._animTime = 0;
                 }
 
                 // --- LIMB ANIMATION ---
+                // OPTIMIZATION: animateLimbs - HOT PATH (per-frame per zombie)
+                // Uses cached limb references instead of getObjectByName 4x per frame
                 animateLimbs(dt, moveSpeed = 0) {
                     if (!this.mesh) return;
+
+                    // OPTIMIZATION: Cache limb references on first call
+                    if (!this._limbsCache) {
+                        this._limbsCache = {
+                            leftArm: this.mesh.getObjectByName('leftArm'),
+                            rightArm: this.mesh.getObjectByName('rightArm'),
+                            leftLeg: this.mesh.getObjectByName('leftLeg'),
+                            rightLeg: this.mesh.getObjectByName('rightLeg')
+                        };
+                    }
 
                     const isMoving = moveSpeed > 0.1;
                     const swingSpeed = isMoving ? moveSpeed * 2.5 : 0;
                     const swingAmplitude = isMoving ? 0.6 : 0;
 
-                    // Find limb parts
-                    const leftArm = this.mesh.getObjectByName('leftArm');
-                    const rightArm = this.mesh.getObjectByName('rightArm');
-                    const leftLeg = this.mesh.getObjectByName('leftLeg');
-                    const rightLeg = this.mesh.getObjectByName('rightLeg');
-
                     if (!this._animTime) this._animTime = 0;
                     this._animTime += dt * swingSpeed;
 
                     const swing = Math.sin(this._animTime) * swingAmplitude;
+                    const limbs = this._limbsCache;
 
-                    if (leftArm) leftArm.rotation.x = swing;
-                    if (rightArm) rightArm.rotation.x = -swing;
-                    if (leftLeg) leftLeg.rotation.x = -swing;
-                    if (rightLeg) rightLeg.rotation.x = swing;
+                    if (limbs.leftArm) limbs.leftArm.rotation.x = swing;
+                    if (limbs.rightArm) limbs.rightArm.rotation.x = -swing;
+                    if (limbs.leftLeg) limbs.leftLeg.rotation.x = -swing;
+                    if (limbs.rightLeg) limbs.rightLeg.rotation.x = swing;
                 }
 
                 // --- COLLISION ---
