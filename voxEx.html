@@ -6942,7 +6942,18 @@
                 recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
             }
 
-            // Apply tree canopy overhang from a neighboring chunk
+            // OPTIMIZATION AUDIT: applyTreeOverhangFromNeighbor
+            //   - PER-CHUNK: Called up to 4x per chunk when neighbors exist
+            //   - Scans edge columns (16 per edge) for tree trunks
+            //   - Calls scanTreeColumnForOverhang which has O(height) loop
+            //   - No allocations in hot path - uses existing block arrays
+            //   - No-op: Already optimal, necessary for cross-chunk trees
+            //
+            // OPTIMIZATION AUDIT: scanTreeColumnForOverhang
+            //   - PER-CHUNK EDGE: Called 16x per edge (64x max per chunk)
+            //   - O(chunkHeight × leafY range × radius) iterations
+            //   - Uses Math.random() which is fast
+            //   - No-op: Necessary complexity for tree overhang
             function applyTreeOverhangFromNeighbor(targetChunk, sourceChunk, targetCx, targetCz, sourceCx, sourceCz, direction, seed) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
@@ -12584,6 +12595,49 @@
             //
             // See TerrainGenerator class header for the consolidation plan.
             // =====================================================
+            //
+            // OPTIMIZATION AUDIT:
+            //
+            // rebuildBiomeTable():
+            //   - NOT HOT: Called once on seed change/world load
+            //   - Uses Array.map() which allocates, but only runs once
+            //   - No-op: Already optimal for initialization code
+            //
+            // generateTreeMaskForChunk(cx, cz, seed):
+            //   - HOT PATH: Called once per chunk during terrain generation
+            //   - Allocates 2x Uint8Array(256) per call - acceptable for per-chunk
+            //   - Has O(n²) cellular automata loops (3 iterations × 16×16)
+            //   - Acceptable: ~768 iterations per chunk is reasonable
+            //   - Potential: Could pool the tmp array, but minor gain
+            //
+            // getTreeMaskForChunk(cx, cz, seed):
+            //   - CACHE WRAPPER: O(1) lookup via treeMaskCache Map
+            //   - No-op: Already optimal
+            //
+            // getTreeMaskValueGlobal(gx, gz, seed):
+            //   - HOT PATH: Called per-block during decoration pass
+            //   - O(1) via cache lookup + array index
+            //   - No-op: Already optimal
+            //
+            // getBiomeParams(gx, gz):
+            //   - HOT PATH: Called per-block during terrain generation
+            //   - ⚠️ ISSUE: Creates new Map() on every cache miss (9-sample voting)
+            //   - OPTIMIZED: Uses biomeCellCache to avoid recomputation
+            //   - Acceptable: Cache hit rate is very high (same cell = same biome)
+            //
+            // getRawBiomeParams(gx, gz):
+            //   - HOT PATH: Called by getBiomeParams for cache misses
+            //   - Uses destructuring but V8 optimizes this well
+            //   - Linear scan through biomeTable.cumulative (5-6 biomes max)
+            //   - No-op: Already optimal for small array
+            //
+            // blendedHeight(gx, gz, seed):
+            //   - HOT PATH: Called per-block during terrain generation
+            //   - Samples 4 biome heights + ocean + river factors
+            //   - Uses THREE.MathUtils.lerp (inlined by V8)
+            //   - No-op: Necessary complexity for smooth terrain
+            //
+            // =====================================================
 
             function rebuildBiomeTable() {
                 const biomes = worldConfig.biomes;
@@ -13841,6 +13895,26 @@
                     }
                 }
             }
+            // OPTIMIZATION AUDIT: generateChunkData
+            //   - HOT PATH: Called once per chunk (16×16×128 = 32,768 blocks)
+            //   - CACHE-FIRST: Loads from IndexedDB if available (async)
+            //   - Allocations per new chunk:
+            //     * 1× Uint8Array(32768) for blocks
+            //     * 2× Uint8Array(32768) for skyLight/blockLight
+            //     * Helper closures (set, get, setAcrossChunks) - acceptable
+            //   - Multi-pass generation: terrain → water → decorations → lighting
+            //   - Uses precalculateTerrainCaches() to batch noise calculations
+            //   - Uses precalculateCaveNoise() to batch cave noise
+            //   - Saves to IndexedDB on completion (async, non-blocking)
+            //   - No-op: Already well-optimized with caching and batched noise
+            //
+            // OPTIMIZATION AUDIT: preGenerateSpawnChunks
+            //   - INITIALIZATION: Called once on new world creation
+            //   - Batches chunk generation (10 chunks per batch)
+            //   - Yields to browser between batches (setTimeout(0))
+            //   - Renders all chunks after generation completes
+            //   - Has skip button for user control
+            //   - No-op: Already optimal for initialization
             async function generateChunkData(cx, cz) {
                 try {
                     const key = getChunkKey(cx, cz);
