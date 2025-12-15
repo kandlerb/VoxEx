@@ -5167,7 +5167,33 @@
             }
 
             // --- OPTIMIZATION 11: Vector3 Object Pool ---
-            // Avoids creating new Vector3 objects in hot paths
+            /**
+             * Vector3Pool - Optimization Audit
+             * =================================
+             * Hot Path: PER-FRAME / PER-RAYCAST (acquire called during pickVoxel, physics)
+             *
+             * constructor(initialSize):
+             *   - NO-OP: Pre-allocates pool, runs once at startup
+             *   - ADDED: Debug call counters for instrumentation
+             *
+             * acquire():
+             *   - OPTIMIZED: Reuses pooled Vector3 to avoid GC pressure
+             *   - TRADEOFF: .set(0,0,0) call is cheap O(1)
+             *   - NOTE: Pool grows dynamically if exhausted (rare after warmup)
+             *   - INSTRUMENTED: Tracks hits vs grows for tuning initial size
+             *
+             * release(v):
+             *   - NO-OP by design: Pool uses sequential reuse via releaseAll()
+             *   - NOTE: Individual release not needed for frame-batch patterns
+             *
+             * releaseAll():
+             *   - OPTIMIZED: O(1) reset via counter, no iteration
+             *   - Called once per frame to recycle all vectors
+             *
+             * stats():
+             *   - ADDED: Returns pool statistics for debugging
+             *   - NOT a hot path - called only for debugging
+             */
             class Vector3Pool {
                 constructor(initialSize = 32) {
                     this.pool = [];
@@ -5175,21 +5201,77 @@
                     for (let i = 0; i < initialSize; i++) {
                         this.pool.push(new THREE.Vector3());
                     }
+
+                    // Debug call counters
+                    this._callCounts = {
+                        acquire: 0,
+                        acquireHit: 0,
+                        acquireGrow: 0,
+                        release: 0,
+                        releaseAll: 0,
+                        peakActive: 0
+                    };
                 }
+
                 acquire() {
+                    this._callCounts.acquire++;
                     if (this.active < this.pool.length) {
-                        return this.pool[this.active++].set(0, 0, 0);
+                        this._callCounts.acquireHit++;
+                        const v = this.pool[this.active++];
+                        if (this.active > this._callCounts.peakActive) {
+                            this._callCounts.peakActive = this.active;
+                        }
+                        return v.set(0, 0, 0);
                     }
+                    this._callCounts.acquireGrow++;
                     const v = new THREE.Vector3();
                     this.pool.push(v);
                     this.active++;
+                    if (this.active > this._callCounts.peakActive) {
+                        this._callCounts.peakActive = this.active;
+                    }
                     return v;
                 }
+
                 release(v) {
+                    this._callCounts.release++;
                     // Just decrement active count - pool is reused in order
                 }
+
                 releaseAll() {
+                    this._callCounts.releaseAll++;
                     this.active = 0;
+                }
+
+                /**
+                 * Returns pool statistics for debugging
+                 * @returns {Object} Pool stats including size, active count, and hit rates
+                 */
+                stats() {
+                    const hitRate = this._callCounts.acquire > 0
+                        ? (this._callCounts.acquireHit / this._callCounts.acquire * 100).toFixed(1)
+                        : 0;
+
+                    return {
+                        poolSize: this.pool.length,
+                        active: this.active,
+                        peakActive: this._callCounts.peakActive,
+                        hitRate: `${hitRate}%`,
+                        growCount: this._callCounts.acquireGrow,
+                        calls: { ...this._callCounts }
+                    };
+                }
+
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        if (key !== 'peakActive') {
+                            this._callCounts[key] = 0;
+                        }
+                    }
                 }
             }
             const vec3Pool = new Vector3Pool(64);
