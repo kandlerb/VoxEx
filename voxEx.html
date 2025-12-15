@@ -3122,13 +3122,17 @@
             // OPTIMIZATION AUDIT (2025-12-15):
             // - NOT A HOT PATH: All methods are event-driven (UI clicks, block actions, footsteps)
             // - No per-frame audio processing occurs
-            // - Web Audio API requires new BufferSource nodes per sound (one-shot by design)
             //
-            // POTENTIAL MICRO-OPTIMIZATIONS (not implemented - complexity not justified):
-            //   * Cache noise buffer in playClick() - but clicks are infrequent
-            //   * Pool GainNode objects - but event frequency doesn't warrant it
+            // IMPLEMENTED OPTIMIZATIONS:
+            //   * Cached noise buffer for playClick() - avoids AudioBuffer allocation + fill loop per click
+            //   * Helper method _playSimpleOsc() - reduces code duplication, easy to extend
             //
-            // Status: All methods are no-op or event-driven (not performance critical)
+            // WHY NODE POOLING ISN'T USED:
+            //   * OscillatorNode/BufferSourceNode are one-shot by Web Audio API design
+            //   * GainNode automation curves persist, requiring cancelScheduledValues() + reset
+            //   * Browser handles cleanup efficiently for short-lived audio nodes
+            //
+            // Status: Optimized for a strong base; all methods event-driven (not hot paths)
             // =====================================================
 
             class AudioManager {
@@ -3141,6 +3145,10 @@
                     this.sounds = new Map();
                     this.bufferCache = new Map();
 
+                    // OPTIMIZATION: Cached noise buffer for click sounds (avoids per-call allocation)
+                    this._clickNoiseBuffer = null;
+                    this._clickNoiseDuration = 0.04;
+
                     // DEBUG: Call counters for verification
                     this._callCounts = { playClick: 0, playFootstep: 0, playBlockPlace: 0, playBlockBreak: 0 };
                 }
@@ -3151,6 +3159,47 @@
                         this.ctx = new (window.AudioContext || window.webkitAudioContext)();
                     }
                     return this.ctx;
+                }
+
+                // OPTIMIZATION: Lazily create and cache the click noise buffer
+                // Avoids creating a new AudioBuffer + filling loop on every click
+                _getClickNoiseBuffer() {
+                    if (!this._clickNoiseBuffer) {
+                        const ctx = this.initContext();
+                        const sampleCount = Math.ceil(ctx.sampleRate * this._clickNoiseDuration);
+                        this._clickNoiseBuffer = ctx.createBuffer(1, sampleCount, ctx.sampleRate);
+                        const noiseData = this._clickNoiseBuffer.getChannelData(0);
+                        for (let i = 0; i < noiseData.length; i++) {
+                            noiseData[i] = (Math.random() * 2 - 1) * 0.6;
+                        }
+                    }
+                    return this._clickNoiseBuffer;
+                }
+
+                // OPTIMIZATION: Helper for simple oscillator sounds
+                // Reduces code duplication, provides consistent pattern for extension
+                // @param {string} type - oscillator type ('sine', 'triangle', 'sawtooth', 'square')
+                // @param {number} startFreq - starting frequency in Hz
+                // @param {number} endFreq - ending frequency in Hz (for pitch bend)
+                // @param {number} duration - sound duration in seconds
+                // @param {number} volume - volume multiplier (0-1), multiplied by masterVolume
+                _playSimpleOsc(type, startFreq, endFreq, duration, volume) {
+                    const ctx = this.ctx;
+                    const now = ctx.currentTime;
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
+
+                    osc.type = type;
+                    osc.frequency.setValueAtTime(startFreq, now);
+                    osc.frequency.exponentialRampToValueAtTime(Math.max(endFreq, 1), now + duration);
+
+                    gain.gain.setValueAtTime(this.masterVolume * volume, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + duration);
+
+                    osc.connect(gain);
+                    gain.connect(ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + duration);
                 }
 
                 // OPTIMIZATION: loadSound - no-op (called once per sound at startup, uses cache)
@@ -3202,7 +3251,7 @@
                 }
 
                 // OPTIMIZATION: playClick - event-driven (UI button clicks only)
-                // Noise buffer recreated each call - could cache but clicks are infrequent
+                // Uses cached noise buffer to avoid per-call allocation
                 playClick() {
                     if (isDebug) this._callCounts.playClick++;
                     // Generate and play a rich UI click sound (clink)
@@ -3226,19 +3275,13 @@
                     osc2.frequency.setValueAtTime(baseFreq * 1.5, now);
                     osc2.frequency.exponentialRampToValueAtTime(baseFreq, now + 0.08);
 
-                    // Very short noise burst for the "mechanical" click transient
-                    const noiseDuration = 0.04;
-                    const noiseBuffer = ctx.createBuffer(1, ctx.sampleRate * noiseDuration, ctx.sampleRate);
-                    const noiseData = noiseBuffer.getChannelData(0);
-                    for (let i = 0; i < noiseData.length; i++) {
-                        noiseData[i] = (Math.random() * 2 - 1) * 0.6;
-                    }
+                    // OPTIMIZATION: Use cached noise buffer instead of creating new one each call
                     const noiseSource = ctx.createBufferSource();
-                    noiseSource.buffer = noiseBuffer;
+                    noiseSource.buffer = this._getClickNoiseBuffer();
 
                     const noiseGain = ctx.createGain();
                     noiseGain.gain.setValueAtTime(this.masterVolume * 0.35, now);
-                    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + noiseDuration);
+                    noiseGain.gain.exponentialRampToValueAtTime(0.001, now + this._clickNoiseDuration);
 
                     // Shared gain envelope (final amplitude)
                     const gainNode = ctx.createGain();
@@ -3271,111 +3314,68 @@
                     noiseSource.stop(stopTime);
                 }
 
-                // OPTIMIZATION: playBlockPlace - event-driven (on block placement action)
+                // OPTIMIZATION: playBlockPlace - uses _playSimpleOsc helper
                 playBlockPlace() {
                     if (isDebug) this._callCounts.playBlockPlace++;
                     if (!this.enabled) return;
                     this.initContext();
-                    // Wood-like thunk sound
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
-                    osc.type = 'triangle';
-                    osc.frequency.setValueAtTime(150, this.ctx.currentTime);
-                    osc.frequency.exponentialRampToValueAtTime(80, this.ctx.currentTime + 0.08);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.08);
-                    osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.08);
+                    // Wood-like thunk sound: triangle 150->80 Hz, 80ms
+                    this._playSimpleOsc('triangle', 150, 80, 0.08, 0.4);
                 }
 
-                // OPTIMIZATION: playBlockBreak - event-driven (on block break action)
+                // OPTIMIZATION: playBlockBreak - uses _playSimpleOsc helper
                 playBlockBreak() {
                     if (isDebug) this._callCounts.playBlockBreak++;
                     if (!this.enabled) return;
                     this.initContext();
-                    // Breaking/crumble sound
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
-                    osc.type = 'sawtooth';
-                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
-                    osc.frequency.exponentialRampToValueAtTime(50, this.ctx.currentTime + 0.1);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.3, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
-                    osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.1);
+                    // Breaking/crumble sound: sawtooth 200->50 Hz, 100ms
+                    this._playSimpleOsc('sawtooth', 200, 50, 0.1, 0.3);
                 }
 
-                // OPTIMIZATION: playFootstep - event-driven (on movement, throttled by game)
-                // Most frequent sound but still not per-frame
+                // OPTIMIZATION: playFootstep - uses _playSimpleOsc helper
+                // Most frequent sound but still event-driven (not per-frame)
                 playFootstep() {
                     if (isDebug) this._callCounts.playFootstep++;
                     if (!this.enabled) return;
                     this.initContext();
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
-                    osc.type = 'sine';
-                    osc.frequency.setValueAtTime(100 + Math.random() * 50, this.ctx.currentTime);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.15, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.05);
-                    osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.05);
+                    // Soft thud: sine at random 100-150 Hz, 50ms
+                    const freq = 100 + Math.random() * 50;
+                    this._playSimpleOsc('sine', freq, freq, 0.05, 0.15);
                 }
 
-                // OPTIMIZATION: playZombieGrowl - event-driven (zombie behavior, infrequent)
+                // OPTIMIZATION: playZombieGrowl - uses linearRamp (not exponential), kept manual
                 playZombieGrowl() {
                     if (!this.enabled) return;
                     this.initContext();
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
+                    const ctx = this.ctx;
+                    const now = ctx.currentTime;
+                    const osc = ctx.createOscillator();
+                    const gain = ctx.createGain();
                     osc.type = 'sawtooth';
-                    osc.frequency.setValueAtTime(80 + Math.random() * 40, this.ctx.currentTime);
-                    osc.frequency.linearRampToValueAtTime(60 + Math.random() * 30, this.ctx.currentTime + 0.3);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.25, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.3);
+                    osc.frequency.setValueAtTime(80 + Math.random() * 40, now);
+                    osc.frequency.linearRampToValueAtTime(60 + Math.random() * 30, now + 0.3);
+                    gain.gain.setValueAtTime(this.masterVolume * 0.25, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
                     osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.3);
+                    gain.connect(ctx.destination);
+                    osc.start(now);
+                    osc.stop(now + 0.3);
                 }
 
-                // OPTIMIZATION: playZombieHurt - event-driven (on zombie damage, infrequent)
+                // OPTIMIZATION: playZombieHurt - uses _playSimpleOsc helper
                 playZombieHurt() {
                     if (!this.enabled) return;
                     this.initContext();
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
-                    osc.type = 'square';
-                    osc.frequency.setValueAtTime(200, this.ctx.currentTime);
-                    osc.frequency.exponentialRampToValueAtTime(100, this.ctx.currentTime + 0.15);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.35, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.15);
-                    osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.15);
+                    // Hurt sound: square 200->100 Hz, 150ms
+                    this._playSimpleOsc('square', 200, 100, 0.15, 0.35);
                 }
 
-                // OPTIMIZATION: playPlayerHurt - event-driven (on player damage, infrequent)
+                // OPTIMIZATION: playPlayerHurt - uses _playSimpleOsc helper
                 playPlayerHurt() {
                     if (!this.enabled) return;
                     this.initContext();
-                    const osc = this.ctx.createOscillator();
-                    const gain = this.ctx.createGain();
-                    osc.type = 'sine';
-                    osc.frequency.setValueAtTime(400, this.ctx.currentTime);
-                    osc.frequency.exponentialRampToValueAtTime(200, this.ctx.currentTime + 0.1);
-                    gain.gain.setValueAtTime(this.masterVolume * 0.4, this.ctx.currentTime);
-                    gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.1);
-                    osc.connect(gain);
-                    gain.connect(this.ctx.destination);
-                    osc.start();
-                    osc.stop(this.ctx.currentTime + 0.1);
+                    // Player hurt: sine 400->200 Hz, 100ms
+                    this._playSimpleOsc('sine', 400, 200, 0.1, 0.4);
                 }
 
                 // OPTIMIZATION: setEnabled - no-op (called on settings change)
