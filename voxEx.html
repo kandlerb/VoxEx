@@ -8263,10 +8263,48 @@
                 });
                 rebuildAllVisibleChunks();
             }
+            /**
+             * ChunkCompressor - Optimization Audit
+             * =====================================
+             * Hot Path: CACHE I/O (save/load operations, not per-frame)
+             *
+             * _compressArray(uint8Data):
+             *   - OPTIMIZED: Two-pass RLE for exact allocation (no array growth)
+             *   - OPTIMIZED: Uses Uint16Array for output (cache-friendly)
+             *   - TRADEOFF: Two passes needed to avoid reallocation
+             *
+             * _decompressArray(compressedData):
+             *   - OPTIMIZED: Unrolled loop for small counts (<=4) avoids .fill() overhead
+             *   - OPTIMIZED: Uses .fill() for larger runs (native optimization)
+             *   - OPTIMIZED: Pre-calculated total size for single allocation
+             *
+             * compress(chunkData):
+             *   - TRADEOFF: Array.from() needed for JSON serialization
+             *   - NOTE: Handles both old (Uint8Array) and new (object) formats
+             *
+             * decompress(compressedData):
+             *   - OPTIMIZED: Creates typed arrays directly from compressed data
+             *   - NOTE: Handles both v1 and v2 formats for backward compatibility
+             *
+             * INSTRUMENTATION: Call counters added for cache monitoring
+             */
             // --- OPTIMIZED RLE COMPRESSION HELPER (Uses Uint16Array) ---
             const ChunkCompressor = {
+                // Debug call counters
+                _callCounts: {
+                    compressArray: 0,
+                    decompressArray: 0,
+                    compress: 0,
+                    decompress: 0,
+                    bytesCompressed: 0,
+                    bytesDecompressed: 0
+                },
+
                 // Helper to compress a single Uint8Array
-                _compressArray: (uint8Data) => { if (!uint8Data || uint8Data.length === 0) return new Uint16Array(0);
+                _compressArray(uint8Data) {
+                    this._callCounts.compressArray++;
+                    if (!uint8Data || uint8Data.length === 0) return new Uint16Array(0);
+                    this._callCounts.bytesCompressed += uint8Data.length;
                     // First pass: count runs to allocate exact size
                     let runCount = 1;
                     let prev = uint8Data[0];
@@ -8292,11 +8330,15 @@
                     result[writeIdx] = prev;
                     return result;
                 },
+
                 // Helper to decompress a single array
-                _decompressArray: (compressedData) => { if (!compressedData || compressedData.length === 0) return new Uint8Array(0);
+                _decompressArray(compressedData) {
+                    this._callCounts.decompressArray++;
+                    if (!compressedData || compressedData.length === 0) return new Uint8Array(0);
                     // Calculate total size
                     let totalSize = 0;
                     for (let i = 0; i < compressedData.length; i += 2) { totalSize += compressedData[i]; }
+                    this._callCounts.bytesDecompressed += totalSize;
                     const data = new Uint8Array(totalSize);
                     let writeIdx = 0;
                     // Manual fill loop (faster than .fill() for this pattern)
@@ -8311,29 +8353,59 @@
                     }
                     return data;
                 },
-                compress: (chunkData) => { // Compresses chunk data (handles both old and new format)
+
+                compress(chunkData) { // Compresses chunk data (handles both old and new format)
+                    this._callCounts.compress++;
                     if (!chunkData) return null;
                     if (chunkData.blocks && chunkData.skyLight) { // New format: {blocks, skyLight, blockLight}
                         return {
                             version: 2, // Mark as new format
-                            blocks: Array.from(ChunkCompressor._compressArray(chunkData.blocks)),
-                            skyLight: Array.from(ChunkCompressor._compressArray(chunkData.skyLight)),
-                            blockLight: chunkData.blockLight ? Array.from(ChunkCompressor._compressArray(chunkData.blockLight)) : null,
+                            blocks: Array.from(this._compressArray(chunkData.blocks)),
+                            skyLight: Array.from(this._compressArray(chunkData.skyLight)),
+                            blockLight: chunkData.blockLight ? Array.from(this._compressArray(chunkData.blockLight)) : null,
                         };
                     }
-                    return Array.from(ChunkCompressor._compressArray(chunkData)); // Old format: Uint8Array
+                    return Array.from(this._compressArray(chunkData)); // Old format: Uint8Array
                 },
-                decompress: (compressedData) => { // Decompresses chunk data (handles both old and new format)
+
+                decompress(compressedData) { // Decompresses chunk data (handles both old and new format)
+                    this._callCounts.decompress++;
                     if (!compressedData) return null;
                     if (compressedData.version === 2) { // New format
-                        const blocks = ChunkCompressor._decompressArray(new Uint16Array(compressedData.blocks));
-                        const skyLight = ChunkCompressor._decompressArray(new Uint16Array(compressedData.skyLight));
+                        const blocks = this._decompressArray(new Uint16Array(compressedData.blocks));
+                        const skyLight = this._decompressArray(new Uint16Array(compressedData.skyLight));
                         // Initialize blockLight with proper size (16 * 16 * 128) instead of empty array
-                        const blockLight = compressedData.blockLight ? ChunkCompressor._decompressArray(new Uint16Array(compressedData.blockLight)) : new Uint8Array(blocks.length);
+                        const blockLight = compressedData.blockLight ? this._decompressArray(new Uint16Array(compressedData.blockLight)) : new Uint8Array(blocks.length);
                         return { blocks, skyLight, blockLight };
                     }
-                    return ChunkCompressor._decompressArray(new Uint16Array(compressedData)); // Old format: just a Uint16Array
+                    return this._decompressArray(new Uint16Array(compressedData)); // Old format: just a Uint16Array
                 },
+
+                /**
+                 * Returns compression statistics for debugging
+                 * @returns {Object} Stats including call counts and bytes processed
+                 */
+                stats() {
+                    const ratio = this._callCounts.bytesCompressed > 0
+                        ? (this._callCounts.bytesDecompressed / this._callCounts.bytesCompressed).toFixed(2)
+                        : 'N/A';
+                    return {
+                        calls: { ...this._callCounts },
+                        bytesCompressedMB: (this._callCounts.bytesCompressed / (1024 * 1024)).toFixed(2),
+                        bytesDecompressedMB: (this._callCounts.bytesDecompressed / (1024 * 1024)).toFixed(2),
+                        ratio
+                    };
+                },
+
+                getCallStats() {
+                    return { ...this._callCounts };
+                },
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
+                }
             };
             async function saveWorld() {
                 const nameInput = document.getElementById("save-name-input");
