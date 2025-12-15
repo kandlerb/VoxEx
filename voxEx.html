@@ -6214,6 +6214,12 @@
                 chunkBuildTime: 0,
                 chunkUpdateTime: 0,
                 lightingTime: 0,
+                // Effect timing (for verifying disabled settings skip work)
+                shadowUpdateTime: 0,
+                volumetricTime: 0,
+                zombiePassTime: 0,
+                underwaterTime: 0,
+                composerUsed: false, // Track if composer was used vs direct render
                 // Counters
                 chunksRendered: 0,
                 chunksBuilt: 0,
@@ -6277,6 +6283,12 @@
                     this.chunkBuildTime = 0;
                     this.chunkUpdateTime = 0;
                     this.lightingTime = 0;
+                    // Reset effect timing
+                    this.shadowUpdateTime = 0;
+                    this.volumetricTime = 0;
+                    this.zombiePassTime = 0;
+                    this.underwaterTime = 0;
+                    this.composerUsed = false;
                 }
             };
             // Expose for debugging
@@ -6331,6 +6343,12 @@
                 html += `<span class="${timeColor(perfMetrics.chunkBuildTime)}">ChunkBld:${perfMetrics.chunkBuildTime.toFixed(2)}ms</span>\n`;
                 html += `<span class="${timeColor(perfMetrics.lightingTime)}">Lighting:${perfMetrics.lightingTime.toFixed(2)}ms</span>\n`;
                 html += `<span class="${gpuColor}">GPU(est):${estimatedGpuTime.toFixed(2)}ms</span>\n`;
+                html += `<span class="perf-section">── Effects ──</span>\n`;
+                html += `Shadow:  ${perfMetrics.shadowUpdateTime.toFixed(3)}ms ${SETTINGS.shadows ? '' : '(off)'}\n`;
+                html += `Volum:   ${perfMetrics.volumetricTime.toFixed(3)}ms ${SETTINGS.volumetricLightingEnabled ? '' : '(off)'}\n`;
+                html += `Zombie:  ${perfMetrics.zombiePassTime.toFixed(3)}ms ${(SETTINGS.zombieVignetteEnabled || SETTINGS.zombieDesaturationEnabled) ? '' : '(off)'}\n`;
+                html += `Water:   ${perfMetrics.underwaterTime.toFixed(3)}ms\n`;
+                html += `Composer:${perfMetrics.composerUsed ? 'yes' : 'no (direct)'}\n`;
                 html += `<span class="perf-section">── Chunks ──</span>\n`;
                 html += `Data/Mesh: ${chunkDataCount}/${chunkMeshCount}\n`;
                 html += `Build Q: ${buildQueueLen} | Nbr Q: ${neighborQueueLen}\n`;
@@ -8400,6 +8418,78 @@
                 }
             }
             /**
+             * applyShadowSettings - Dynamically toggle GPU shadow rendering
+             * ============================================================
+             * NOT HOT: Called only when shadow setting changes (user-triggered)
+             * Toggles renderer.shadowMap.enabled and autoUpdate to skip GPU shadow map rendering
+             * Also updates castShadow on all relevant lights
+             */
+            function applyShadowSettings() {
+                const shadowsEnabled = SETTINGS.shadows;
+
+                // Toggle renderer shadow map
+                if (renderer) {
+                    renderer.shadowMap.enabled = shadowsEnabled;
+                    renderer.shadowMap.autoUpdate = shadowsEnabled; // Stop GPU shadow updates when disabled
+                    if (shadowsEnabled) {
+                        // Force shadow map update on next frame when re-enabling
+                        renderer.shadowMap.needsUpdate = true;
+                    }
+                }
+
+                // Update main directional lights
+                if (sun) {
+                    sun.castShadow = shadowsEnabled;
+                    if (shadowsEnabled && sun.shadow) {
+                        sun.shadow.needsUpdate = true;
+                    }
+                }
+                if (moon) {
+                    moon.castShadow = shadowsEnabled;
+                    if (shadowsEnabled && moon.shadow) {
+                        moon.shadow.needsUpdate = true;
+                    }
+                }
+
+                // Update handheld torch light
+                if (torchLight) {
+                    torchLight.castShadow = shadowsEnabled;
+                    if (shadowsEnabled && torchLight.shadow) {
+                        torchLight.shadow.needsUpdate = true;
+                    }
+                }
+
+                // Update all placed torch lights
+                chunkTorches.forEach((torches) => {
+                    for (const torch of torches) {
+                        torch.traverse((node) => {
+                            if (!node.isPointLight) return;
+                            node.castShadow = shadowsEnabled;
+                            if (shadowsEnabled && node.shadow) {
+                                node.shadow.needsUpdate = true;
+                            }
+                        });
+                    }
+                });
+
+                // Update all chunk meshes
+                activeChunks.forEach((chunk) => {
+                    if (chunk.terrainMesh) {
+                        chunk.terrainMesh.castShadow = shadowsEnabled;
+                        chunk.terrainMesh.receiveShadow = shadowsEnabled;
+                    }
+                    if (chunk.waterMesh) {
+                        // Water doesn't cast shadows but can receive them
+                        chunk.waterMesh.receiveShadow = shadowsEnabled;
+                    }
+                });
+
+                logDebug("[Shadows] Shadow rendering " + (shadowsEnabled ? "enabled" : "disabled (GPU skip)"));
+            }
+            // Make function globally accessible for settings event handlers
+            window.applyShadowSettings = applyShadowSettings;
+
+            /**
              * applyTorchSettingsToLights - Optimization Audit
              * ================================================
              * NOT HOT: Called on settings changes only (user-triggered)
@@ -9682,8 +9772,8 @@
                 if (btnSettings && mainPauseMenu && settingsMenu) { btnSettings.addEventListener("click", () => { mainPauseMenu.style.display = "none"; settingsMenu.style.display = "block"; }); }
                 // Toggle AO
                 if (aoToggle) { aoToggle.addEventListener("change", () => { SETTINGS.AO = aoToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); rebuildAllVisibleChunks(); }); }
-                // Toggle Shadows
-                if (shadowsToggle) { shadowsToggle.addEventListener("change", () => { SETTINGS.shadows = shadowsToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); if (reloadNotice) reloadNotice.style.display = "block"; }); }
+                // Toggle Shadows - now dynamic, no reload required
+                if (shadowsToggle) { shadowsToggle.addEventListener("change", () => { SETTINGS.shadows = shadowsToggle.checked; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); if (window.applyShadowSettings) window.applyShadowSettings(); }); }
                 // Change Resolution
                 if (textureResSelect) { textureResSelect.addEventListener("change", () => { SETTINGS.textureResolution = parseInt(textureResSelect.value, 10); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); if (reloadNotice) reloadNotice.style.display = "block"; }); }
                 // NOTE: Settings navigation is now set up in DOMContentLoaded (early script block) so it works from start menu
@@ -15314,6 +15404,8 @@
                 }
                 skybox.position.copy(camPos);
                 // --- B. SHADOW LOGIC (Grid-locked) ---
+                // INSTRUMENTATION: Track shadow update time
+                const shadowStartMs = performance.now();
                 // OPTIMIZATION: Skip shadow calculations entirely when shadows are disabled
                 if (SETTINGS.shadows) {
                     // OPTIMIZATION: Only update shadows when position or angle changes significantly
@@ -15371,6 +15463,7 @@
                         lastShadowState.sunAngle = sunAngle;
                     }
                 }
+                perfMetrics.shadowUpdateTime = performance.now() - shadowStartMs;
                 // --- C. LIGHTING INTENSITY (smooth, unchanged) ---
                 const surfaceLevel = 60;
                 const caveTransitionDepth = 10;
@@ -16008,15 +16101,20 @@
             function renderFrame() {
                 const renderStart = perfMonitor.start("rendering");
 
+                // INSTRUMENTATION: Track volumetric lighting time
+                const volumetricStartMs = performance.now();
                 // OPTIMIZATION: Only update volumetric lighting when enabled
                 if (SETTINGS.volumetricLightingEnabled) {
                     updateVolumetricLighting(performance.now());
                 }
+                perfMetrics.volumetricTime = performance.now() - volumetricStartMs;
 
+                // INSTRUMENTATION: Track zombie pass time
+                const zombieStartMs = performance.now();
                 // OPTIMIZATION: Only update zombie scare effects when at least one effect is enabled
                 // Also disable the pass entirely when both effects are off to skip shader execution
+                const zombieEffectsEnabled = SETTINGS.zombieVignetteEnabled || SETTINGS.zombieDesaturationEnabled;
                 if (zombieScarePass) {
-                    const zombieEffectsEnabled = SETTINGS.zombieVignetteEnabled || SETTINGS.zombieDesaturationEnabled;
                     zombieScarePass.enabled = zombieEffectsEnabled;
                     if (zombieEffectsEnabled) {
                         // TODO: Add zombie proximity detection here when zombies are implemented
@@ -16024,12 +16122,27 @@
                         zombieScarePass.uniforms.zombieProximity.value = 0.0;
                     }
                 }
+                perfMetrics.zombiePassTime = performance.now() - zombieStartMs;
+
+                // OPTIMIZATION: Check if any post-processing effects are active
+                // If not, bypass EffectComposer entirely and render directly (composer adds overhead)
+                const volumetricEnabled = SETTINGS.volumetricLightingEnabled && volumetricLightPass && volumetricLightPass.enabled;
+                const underwaterEnabled = underwaterPass && underwaterPass.enabled;
+                const anyPostEffectsActive = volumetricEnabled || underwaterEnabled || zombieEffectsEnabled;
+
+                // INSTRUMENTATION: Track if composer is used
+                perfMetrics.composerUsed = anyPostEffectsActive;
 
                 // Two-pass rendering for torch viewmodel
                 if (torchActive && window.torchModel) {
                     // Pass 1: Render world (Layer 0)
                     camera.layers.set(0);
-                    composer.render();
+                    if (anyPostEffectsActive) {
+                        composer.render();
+                    } else {
+                        // OPTIMIZATION: Direct render when no post effects active
+                        renderer.render(scene, camera);
+                    }
                     // Pass 2: Render viewmodel (Layer 1) on top
                     camera.layers.set(1);
                     renderer.autoClear = false;
@@ -16042,7 +16155,12 @@
                 } else {
                     // Single-pass rendering
                     camera.layers.enableAll();
-                    composer.render();
+                    if (anyPostEffectsActive) {
+                        composer.render();
+                    } else {
+                        // OPTIMIZATION: Direct render when no post effects active
+                        renderer.render(scene, camera);
+                    }
                 }
                 perfMonitor.end("rendering", renderStart);
             }
@@ -16171,7 +16289,10 @@
                     // Game active updates
                     if (controls.isLocked) {
                         updateDayNight(clampedDt);
+                        // INSTRUMENTATION: Track underwater update time
+                        const underwaterStartMs = performance.now();
                         updateUnderwaterFog(); // Apply underwater fog after day/night (overrides when underwater)
+                        perfMetrics.underwaterTime = performance.now() - underwaterStartMs;
                         updateFPSTracking(time, rawDt, clampedDt);
                         // Track physics timing
                         const physicsStartMs = performance.now();
