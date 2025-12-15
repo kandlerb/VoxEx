@@ -7670,6 +7670,36 @@
                 if (anyChange) { const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize)); tracker?.mark(chunkKey); task?.ensureQueued(); }
                 return anyChange;
             }
+            /**
+             * SunlightTask - Optimization Audit
+             * ==================================
+             * Hot Path: LIGHTING (called on block changes, processes many blocks)
+             *
+             * constructor(x, y, z, oldId, newId, tracker):
+             *   - NOT per-frame: Created once per block change event
+             *   - TRADEOFF: Allocates queues/Maps/Set per task (acceptable - task-scoped)
+             *   - NOTE: WORLD_DIMS cached as instance props to avoid repeated lookups
+             *
+             * enqueueRemove(qx, qy, qz, level) / enqueueAdd(...):
+             *   - HOT PATH: Called per neighbor during propagation
+             *   - OPTIMIZED: Uses flat array queue (4 values per entry) for cache locality
+             *   - OPTIMIZED: Early bailout checks prevent wasted work
+             *
+             * resolveVisit(visitMap, qx, qy, qz):
+             *   - HOT PATH: Called on every enqueue to prevent revisits
+             *   - TRADEOFF: Creates Uint8Array per chunk (acceptable - needed for tracking)
+             *   - OPTIMIZED: Uses index-based lookup, not coordinate objects
+             *
+             * checkPressure():
+             *   - HOT PATH: Called after each enqueue
+             *   - OPTIMIZED: Bitshift for fast division (>> 2 = / 4)
+             *   - NOTE: Implements adaptive caps to prevent runaway propagation
+             *
+             * NOTE: Methods 'run' and 'apply' do not exist.
+             *       Actual execution is via external stepSunlightTask() function.
+             *
+             * INSTRUMENTATION: Built-in stats (totalEnqueued, peakEntries, touchedChunks.size)
+             */
             // SunlightTask class - Encapsulates sunlight update state and operations
             // Extracted from updateSunlightAt for clarity and maintainability
             class SunlightTask {
@@ -7680,11 +7710,11 @@
                     this.z = z;
                     this.oldId = oldId;
                     this.newId = newId;
-                    // World dimensions
+                    // World dimensions (cached to avoid repeated WORLD_DIMS lookups)
                     this.chunkSize = WORLD_DIMS.chunkSize;
                     this.chunkHeight = WORLD_DIMS.chunkHeight;
                     this.chunkVolume = this.chunkSize * this.chunkSize * this.chunkHeight;
-                    // Queues for light propagation
+                    // Queues for light propagation (flat arrays: x, y, z, level per entry)
                     this.addQueue = [];
                     this.removeQueue = [];
                     this.addVisited = new Map();
@@ -7710,9 +7740,11 @@
                     this.done = false;
                     this.inQueue = false;
                     this.softWarned = false;
-                    // Statistics
+                    // Statistics (built-in instrumentation)
                     this.totalEnqueued = 0;
                     this.peakEntries = 0;
+                    this.resolveVisitCalls = 0;
+                    this.pressureChecks = 0;
                     // Keep tracker reference for later use
                     this.tracker = tracker;
                 }
@@ -7724,6 +7756,7 @@
                 }
                 // Resolve world coordinates to chunk/local coords and track visits
                 resolveVisit(visitMap, qx, qy, qz) {
+                    this.resolveVisitCalls++;
                     const ly = qy + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= this.chunkHeight) return null;
                     const cx = Math.floor(qx / this.chunkSize);
@@ -7771,6 +7804,7 @@
                 }
                 // Check queue pressure and trigger bailout if needed
                 checkPressure() {
+                    this.pressureChecks++;
                     if (this.bailedOut) return true;
                     const dynamicHardCap = this.getDynamicHardCap();
                     const dynamicSoftCap = this.SOFT_CAP_BASE * Math.max(1, this.touchedChunks.size / 4);
@@ -7906,6 +7940,40 @@
                     this.addQueue.push(qx, qy, qz, level);
                     this.totalEnqueued++;
                     this.checkPressure();
+                }
+
+                /**
+                 * Returns task statistics for debugging
+                 * @returns {Object} Task stats including queue sizes, chunks touched, etc.
+                 */
+                stats() {
+                    return {
+                        position: { x: this.x, y: this.y, z: this.z },
+                        state: {
+                            done: this.done,
+                            bailedOut: this.bailedOut,
+                            enqueueBlocked: this.enqueueBlocked
+                        },
+                        queues: {
+                            addQueueSize: this.addQueue.length >> 2,
+                            removeQueueSize: this.removeQueue.length >> 2,
+                            addIndex: this.addIndex >> 2,
+                            removeIndex: this.removeIndex >> 2,
+                            blockedAdd: this.blockedAddBuffer.length >> 2,
+                            blockedRemove: this.blockedRemoveBuffer.length >> 2
+                        },
+                        chunks: {
+                            touched: this.touchedChunks.size,
+                            visitMapsAdd: this.addVisited.size,
+                            visitMapsRemove: this.removeVisited.size
+                        },
+                        counters: {
+                            totalEnqueued: this.totalEnqueued,
+                            peakEntries: this.peakEntries,
+                            resolveVisitCalls: this.resolveVisitCalls,
+                            pressureChecks: this.pressureChecks
+                        }
+                    };
                 }
             }
             // Update sunlight at a specific position (simplified orchestrator)
