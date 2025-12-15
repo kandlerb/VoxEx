@@ -5931,19 +5931,58 @@
             };
 
             // --- OPTIMIZATION 48: Chunk Neighbor Cache ---
-            // Cache neighbor references to avoid repeated Map lookups
+            /**
+             * ChunkNeighborCache - Optimization Audit
+             * ========================================
+             * Hot Path: PER-CHUNK (getNeighbors called during mesh building)
+             *
+             * constructor():
+             *   - NO-OP: Initializes empty Map, runs once at startup
+             *   - ADDED: Debug call counters for instrumentation
+             *
+             * getNeighbors(cx, cz, chunks):
+             *   - OPTIMIZED: Caches all 8 neighbor refs to avoid repeated Map lookups
+             *   - TRADEOFF: Creates neighbors object on cache miss (acceptable - cached)
+             *   - NOTE: String key creation is unavoidable for Map lookup
+             *   - INSTRUMENTED: Tracks hits vs misses for cache efficiency
+             *
+             * invalidate(cx, cz):
+             *   - NOT HOT: Called on block changes (event-driven)
+             *   - NOTE: Invalidates 9 entries (center + 8 neighbors) - correct behavior
+             *
+             * clear():
+             *   - NOT HOT: Called on world reset only
+             *   - NO-OP: Simple Map.clear()
+             *
+             * NOTE: Methods getNeighborChunk, getNeighborBlock, getNeighborLight do not exist.
+             *       Use getNeighbors() to get all neighbor refs, then access blocks/light directly.
+             */
             class ChunkNeighborCache {
                 constructor() {
                     this.cache = new Map();
                     this.maxSize = 64;
+
+                    // Debug call counters
+                    this._callCounts = {
+                        getNeighbors: 0,
+                        getNeighborsHit: 0,
+                        getNeighborsMiss: 0,
+                        invalidate: 0,
+                        invalidateDeletes: 0,
+                        clear: 0,
+                        evictions: 0
+                    };
                 }
 
                 getNeighbors(cx, cz, chunks) {
+                    this._callCounts.getNeighbors++;
                     const key = `${cx},${cz}`;
                     if (this.cache.has(key)) {
+                        this._callCounts.getNeighborsHit++;
                         return this.cache.get(key);
                     }
 
+                    this._callCounts.getNeighborsMiss++;
                     const neighbors = {
                         north: chunks.get(`${cx},${cz-1}`),
                         south: chunks.get(`${cx},${cz+1}`),
@@ -5956,6 +5995,7 @@
                     };
 
                     if (this.cache.size >= this.maxSize) {
+                        this._callCounts.evictions++;
                         const firstKey = this.cache.keys().next().value;
                         this.cache.delete(firstKey);
                     }
@@ -5964,16 +6004,48 @@
                 }
 
                 invalidate(cx, cz) {
+                    this._callCounts.invalidate++;
                     // Invalidate this chunk and all neighbors
                     for (let dx = -1; dx <= 1; dx++) {
                         for (let dz = -1; dz <= 1; dz++) {
-                            this.cache.delete(`${cx+dx},${cz+dz}`);
+                            if (this.cache.delete(`${cx+dx},${cz+dz}`)) {
+                                this._callCounts.invalidateDeletes++;
+                            }
                         }
                     }
                 }
 
                 clear() {
+                    this._callCounts.clear++;
                     this.cache.clear();
+                }
+
+                /**
+                 * Returns cache statistics for debugging
+                 * @returns {Object} Cache stats including size, hit rate, evictions
+                 */
+                stats() {
+                    const hitRate = this._callCounts.getNeighbors > 0
+                        ? (this._callCounts.getNeighborsHit / this._callCounts.getNeighbors * 100).toFixed(1)
+                        : 0;
+
+                    return {
+                        cacheSize: this.cache.size,
+                        maxSize: this.maxSize,
+                        hitRate: `${hitRate}%`,
+                        evictions: this._callCounts.evictions,
+                        calls: { ...this._callCounts }
+                    };
+                }
+
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
                 }
             }
             const chunkNeighborCache = new ChunkNeighborCache();
