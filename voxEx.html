@@ -4881,25 +4881,112 @@
             }
 
             // --- OPTIMIZATION 3: Uint8Array pool for chunk data allocation ---
+            /**
+             * Uint8ArrayPool - Optimization Audit
+             * ====================================
+             * Hot Path: PER-CHUNK (acquire/release called during chunk generation/disposal)
+             *
+             * constructor():
+             *   - NO-OP: Initializes empty Map, no hot path concern
+             *   - ADDED: Debug call counters for instrumentation
+             *
+             * acquire(size):
+             *   - OPTIMIZED: Reuses pooled arrays to avoid GC pressure
+             *   - TRADEOFF: arr.fill(0) is O(n) but necessary for correctness
+             *   - NOTE: Pool hit avoids new Uint8Array allocation (expensive)
+             *   - INSTRUMENTED: Tracks hits vs misses for tuning pool limits
+             *
+             * release(arr):
+             *   - OPTIMIZED: Guards against oversized arrays (>2MB)
+             *   - OPTIMIZED: Limits pool size to 32 per size bucket
+             *   - NOTE: Prevents unbounded memory growth
+             *
+             * stats():
+             *   - ADDED: Returns pool statistics for debugging
+             *   - NOT a hot path - called only for debugging
+             */
             class Uint8ArrayPool {
                 constructor() {
                     this.pools = new Map(); // size -> array of buffers
+
+                    // Debug call counters
+                    this._callCounts = {
+                        acquire: 0,
+                        acquireHit: 0,
+                        acquireMiss: 0,
+                        release: 0,
+                        releaseAccepted: 0,
+                        releaseRejected: 0
+                    };
                 }
+
                 acquire(size) {
+                    this._callCounts.acquire++;
                     const pool = this.pools.get(size);
                     if (pool && pool.length > 0) {
+                        this._callCounts.acquireHit++;
                         const arr = pool.pop();
                         arr.fill(0); // Reset to zeros
                         return arr;
                     }
+                    this._callCounts.acquireMiss++;
                     return new Uint8Array(size);
                 }
+
                 release(arr) {
-                    if (!arr || arr.length > 2000000) return; // Don't pool very large arrays
+                    this._callCounts.release++;
+                    if (!arr || arr.length > 2000000) {
+                        this._callCounts.releaseRejected++;
+                        return; // Don't pool very large arrays
+                    }
                     const size = arr.length;
                     if (!this.pools.has(size)) this.pools.set(size, []);
                     const pool = this.pools.get(size);
-                    if (pool.length < 32) pool.push(arr); // Limit pool size
+                    if (pool.length < 32) {
+                        this._callCounts.releaseAccepted++;
+                        pool.push(arr); // Limit pool size
+                    } else {
+                        this._callCounts.releaseRejected++;
+                    }
+                }
+
+                /**
+                 * Returns pool statistics for debugging
+                 * @returns {Object} Pool stats including sizes, counts, and hit rates
+                 */
+                stats() {
+                    const poolStats = {};
+                    let totalPooled = 0;
+                    let totalBytes = 0;
+
+                    for (const [size, pool] of this.pools) {
+                        poolStats[size] = pool.length;
+                        totalPooled += pool.length;
+                        totalBytes += size * pool.length;
+                    }
+
+                    const hitRate = this._callCounts.acquire > 0
+                        ? (this._callCounts.acquireHit / this._callCounts.acquire * 100).toFixed(1)
+                        : 0;
+
+                    return {
+                        pools: poolStats,
+                        totalPooled,
+                        totalBytes,
+                        totalBytesMB: (totalBytes / (1024 * 1024)).toFixed(2),
+                        hitRate: `${hitRate}%`,
+                        calls: { ...this._callCounts }
+                    };
+                }
+
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
                 }
             }
             const chunkDataPool = new Uint8ArrayPool();
