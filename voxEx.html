@@ -3410,20 +3410,46 @@
             // =====================================================
             // 8. ENTITY MANAGER & MOB CLASSES
             // =====================================================
+            // OPTIMIZATION AUDIT (2025-12-15):
+            // - update() is HOT PATH (called every frame from GameEngine.loop)
+            // - Currently zombie system not fully integrated (TODO at line ~14813)
+            // - When active, entity count expected to be low (<50)
+            //
+            // ISSUES FOUND & FIXED:
+            //   * getZombieCount() created array just to count - now iterates directly
+            //   * getClosestZombie() allocated return object - now uses scratch object
+            //   * getByType() allocated array each call - kept as-is (infrequent)
+            //
+            // EXISTING OPTIMIZATIONS:
+            //   * Object pooling for zombies (acquireZombie/zombiePool)
+            //   * Set for O(1) add/remove
+            //
+            // Status: update() is hot path but optimized; helper methods improved
+            // =====================================================
 
             class EntityManager {
+                // OPTIMIZATION: constructor - no-op (called once at startup)
                 constructor() {
                     this.entities = new Set();
                     this.pools = new Map();
                     this.zombiePool = [];
                     this.maxZombies = 10;
+
+                    // OPTIMIZATION: Scratch object for getClosestZombie to avoid allocation
+                    this._closestZombieResult = { zombie: null, distance: Infinity };
+
+                    // DEBUG: Call counters for verification
+                    this._callCounts = { update: 0, getClosestZombie: 0, getZombieCount: 0 };
                 }
 
+                // OPTIMIZATION: add - no-op (event-driven, O(1) Set.add)
                 add(entity) {
                     this.entities.add(entity);
                     return entity;
                 }
 
+                // OPTIMIZATION: remove - no-op (event-driven, O(1) Set.delete)
+                // Uses object pooling for zombies
                 remove(entity) {
                     this.entities.delete(entity);
                     // Return to pool if it's a zombie
@@ -3433,7 +3459,10 @@
                     }
                 }
 
+                // OPTIMIZATION: update - HOT PATH (called every frame)
+                // Simple iteration over Set - efficient for expected entity counts (<50)
                 update(delta) {
+                    if (isDebug) this._callCounts.update++;
                     for (const entity of this.entities) {
                         if (entity.update) {
                             entity.update(delta);
@@ -3441,6 +3470,8 @@
                     }
                 }
 
+                // OPTIMIZATION: getByType - allocates array (kept as-is, called infrequently)
+                // Could cache by type if called frequently in future
                 getByType(type) {
                     const result = [];
                     for (const entity of this.entities) {
@@ -3451,11 +3482,13 @@
                     return result;
                 }
 
+                // OPTIMIZATION: clear - no-op (called on game reset)
                 clear() {
                     this.entities.clear();
                 }
 
                 // --- ZOMBIE MANAGEMENT ---
+                // OPTIMIZATION: acquireZombie - uses object pooling (already optimal)
                 acquireZombie() {
                     if (this.zombiePool.length > 0) {
                         return this.zombiePool.pop();
@@ -3463,30 +3496,42 @@
                     return new Zombie();
                 }
 
+                // OPTIMIZATION: getZombies - allocates array (use getZombieCount for count only)
                 getZombies() {
                     return this.getByType(Zombie);
                 }
 
+                // OPTIMIZATION: getZombieCount - now iterates directly instead of creating array
+                // Before: return this.getZombies().length (allocated array just to count!)
                 getZombieCount() {
-                    return this.getZombies().length;
+                    if (isDebug) this._callCounts.getZombieCount++;
+                    let count = 0;
+                    for (const entity of this.entities) {
+                        if (entity instanceof Zombie) count++;
+                    }
+                    return count;
                 }
 
+                // OPTIMIZATION: getClosestZombie - uses scratch object to avoid allocation
+                // May be called per-frame for zombie scare effects
                 getClosestZombie(position) {
-                    let closest = null;
-                    let closestDist = Infinity;
+                    if (isDebug) this._callCounts.getClosestZombie++;
+                    this._closestZombieResult.zombie = null;
+                    this._closestZombieResult.distance = Infinity;
                     for (const entity of this.entities) {
                         if (entity instanceof Zombie) {
                             const dist = entity.position.distanceTo(position);
-                            if (dist < closestDist) {
-                                closestDist = dist;
-                                closest = entity;
+                            if (dist < this._closestZombieResult.distance) {
+                                this._closestZombieResult.distance = dist;
+                                this._closestZombieResult.zombie = entity;
                             }
                         }
                     }
-                    return { zombie: closest, distance: closestDist };
+                    return this._closestZombieResult;
                 }
 
                 // --- SPAWN HELPERS ---
+                // OPTIMIZATION: spawnZombie - event-driven, uses pooling
                 spawnZombie(position, scene) {
                     if (this.getZombieCount() >= this.maxZombies) return null;
                     const zombie = this.acquireZombie();
@@ -3499,11 +3544,23 @@
                     return zombie;
                 }
 
+                // OPTIMIZATION: despawnZombie - event-driven, returns to pool
                 despawnZombie(zombie, scene) {
                     if (scene && zombie.mesh) {
                         scene.remove(zombie.mesh);
                     }
                     this.remove(zombie);
+                }
+
+                // DEBUG: Call statistics for optimization verification
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
                 }
             }
 
