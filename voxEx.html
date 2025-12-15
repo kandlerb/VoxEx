@@ -7226,13 +7226,105 @@
             // Global UI manager instance (initialized after DOM ready)
             const uiManager = new UIManager(null, audioManager, null);
 
+            /**
+             * Float32ArrayPool - Optimization Audit
+             * ======================================
+             * Hot Path: PER-CHUNK (acquire/release called during mesh building)
+             *
+             * constructor(initialSize):
+             *   - NO-OP: Initializes empty pool, runs once at startup
+             *   - ADDED: Debug call counters for instrumentation
+             *
+             * acquire(minLength):
+             *   - HOT PATH: Called per chunk during mesh build (pos, norm, uv, col)
+             *   - OPTIMIZED: Replaced splice() with swap-and-pop for O(1) removal
+             *   - NOTE: Linear search is acceptable for small pools (<100 items)
+             *   - INSTRUMENTED: Tracks hits vs misses for tuning
+             *
+             * release(arr):
+             *   - HOT PATH: Called when chunk mesh rebuilt/disposed
+             *   - OPTIMIZED: Guards against oversized arrays (>1MB)
+             *   - ADDED: Pool size limit to prevent unbounded growth
+             *
+             * stats():
+             *   - ADDED: Returns pool statistics for debugging
+             */
             class Float32ArrayPool { // --- POOLING & NOISE ---
-                constructor(initialSize = 10000) { this.pool = []; this.initialSize = initialSize; }
+                constructor(initialSize = 10000) {
+                    this.pool = [];
+                    this.initialSize = initialSize;
+                    this.maxPoolSize = 64; // Limit pool growth
+
+                    // Debug call counters
+                    this._callCounts = {
+                        acquire: 0,
+                        acquireHit: 0,
+                        acquireMiss: 0,
+                        release: 0,
+                        releaseAccepted: 0,
+                        releaseRejected: 0
+                    };
+                }
+
                 acquire(minLength) {
-                    for (let i = 0; i < this.pool.length; i++) { if (this.pool[i].length >= minLength) return this.pool.splice(i, 1)[0]; }
+                    this._callCounts.acquire++;
+                    const pool = this.pool;
+                    for (let i = 0; i < pool.length; i++) {
+                        if (pool[i].length >= minLength) {
+                            this._callCounts.acquireHit++;
+                            // Swap-and-pop: O(1) removal instead of splice O(n)
+                            const arr = pool[i];
+                            pool[i] = pool[pool.length - 1];
+                            pool.pop();
+                            return arr;
+                        }
+                    }
+                    this._callCounts.acquireMiss++;
                     return new Float32Array(Math.max(this.initialSize, minLength));
                 }
-                release(arr) { if (arr.length <= 1000000) this.pool.push(arr); }
+
+                release(arr) {
+                    this._callCounts.release++;
+                    if (arr.length > 1000000 || this.pool.length >= this.maxPoolSize) {
+                        this._callCounts.releaseRejected++;
+                        return; // Don't pool very large arrays or exceed pool limit
+                    }
+                    this._callCounts.releaseAccepted++;
+                    this.pool.push(arr);
+                }
+
+                /**
+                 * Returns pool statistics for debugging
+                 * @returns {Object} Pool stats including sizes, counts, and hit rates
+                 */
+                stats() {
+                    const hitRate = this._callCounts.acquire > 0
+                        ? (this._callCounts.acquireHit / this._callCounts.acquire * 100).toFixed(1)
+                        : 0;
+
+                    let totalBytes = 0;
+                    for (let i = 0; i < this.pool.length; i++) {
+                        totalBytes += this.pool[i].byteLength;
+                    }
+
+                    return {
+                        poolSize: this.pool.length,
+                        maxPoolSize: this.maxPoolSize,
+                        totalBytesMB: (totalBytes / (1024 * 1024)).toFixed(2),
+                        hitRate: `${hitRate}%`,
+                        calls: { ...this._callCounts }
+                    };
+                }
+
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
+                }
             }
             const posPool = new Float32ArrayPool();
             const normPool = new Float32ArrayPool();
