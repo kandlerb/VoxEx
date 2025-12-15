@@ -2322,8 +2322,16 @@
             // =====================================================
             // 4. VOXEL WORLD CLASS
             // =====================================================
+            // OPTIMIZATION AUDIT (2025-12-15):
+            // - HOT PATH: getBlock, getSkyLight, getBlockLight called frequently
+            //   during lighting propagation, collision detection, and rendering
+            // - Global functions delegate to this class (lines ~6646-6650)
+            // - Chunk cache (_lastChunk) reduces Map lookups for sequential access
+            // - Uses bitwise ops for index calculation (& 15, << 4, << 8)
+            // =====================================================
 
             class VoxelWorld {
+                // OPTIMIZATION: constructor - no-op (called once at startup)
                 constructor(terrainGenerator, settingsManager, externalChunks = null) {
                     this.terrainGenerator = terrainGenerator;
                     this.settings = settingsManager;
@@ -2335,50 +2343,72 @@
                     this.pristineChunks = new Set();
                     this.chunkBuildQueue = [];
                     this.queuedChunkKeys = new Set();
-                    // Cache for optimized lookups
+                    // OPTIMIZATION: Cache for repeated lookups in same chunk (reduces Map.get calls)
                     this._lastChunkKey = null;
                     this._lastChunk = null;
+                    // OPTIMIZATION: Scratch objects for coordinate conversion (avoids per-call allocation)
+                    this._scratchWorldToChunk = { cx: 0, cz: 0, lx: 0, ly: 0, lz: 0 };
+                    this._scratchChunkToWorld = { x: 0, y: 0, z: 0 };
+                    this._scratchParseKey = { cx: 0, cz: 0 };
+                    // DEBUG: Call counters for hot-path verification
+                    this._callCounts = {
+                        getBlock: 0, setBlock: 0, getSkyLight: 0, setSkyLight: 0,
+                        getBlockLight: 0, setBlockLight: 0, getChunkKey: 0
+                    };
                 }
 
-                // Bind to external chunks Map (for existing code integration)
+                // OPTIMIZATION: bindChunks - no-op (called once during setup)
                 bindChunks(chunksMap) {
                     this.chunks = chunksMap;
                 }
 
-                // Bind to external state sets (for existing code integration)
+                // OPTIMIZATION: bindState - no-op (called once during setup)
                 bindState(modifiedChunks, pristineChunks, activeChunks) {
                     if (modifiedChunks) this.modifiedChunks = modifiedChunks;
                     if (pristineChunks) this.pristineChunks = pristineChunks;
                     if (activeChunks) this.activeChunks = activeChunks;
                 }
 
+                // OPTIMIZATION: getChunkKey - string concat is GC pressure but required for Map keys
+                // NOTE: Chunk Maps use string keys throughout codebase; switching to numeric would
+                // require extensive refactoring. String keys are cached by _lastChunkKey for hot paths.
                 getChunkKey(cx, cz) {
+                    if (isDebug) this._callCounts.getChunkKey++;
                     return `${cx},${cz}`;
                 }
 
+                // OPTIMIZATION: parseChunkKey - OPTIMIZED (reuses scratch object)
+                // Avoids split().map() array allocations
                 parseChunkKey(key) {
-                    const [cx, cz] = key.split(',').map(Number);
-                    return { cx, cz };
+                    const comma = key.indexOf(',');
+                    this._scratchParseKey.cx = +key.slice(0, comma);
+                    this._scratchParseKey.cz = +key.slice(comma + 1);
+                    return this._scratchParseKey;
                 }
 
+                // OPTIMIZATION: worldToChunkCoords - OPTIMIZED (reuses scratch object)
+                // Avoids per-call object allocation
                 worldToChunkCoords(x, y, z) {
                     const chunkSize = WORLD_DIMS.chunkSize;
                     const cx = Math.floor(x / chunkSize);
                     const cz = Math.floor(z / chunkSize);
-                    const lx = ((x % chunkSize) + chunkSize) % chunkSize;
-                    const ly = y + WORLD_DIMS.yOffset;
-                    const lz = ((z % chunkSize) + chunkSize) % chunkSize;
-                    return { cx, cz, lx: Math.floor(lx), ly: Math.floor(ly), lz: Math.floor(lz) };
+                    this._scratchWorldToChunk.cx = cx;
+                    this._scratchWorldToChunk.cz = cz;
+                    this._scratchWorldToChunk.lx = ((x % chunkSize) + chunkSize) % chunkSize | 0;
+                    this._scratchWorldToChunk.ly = (y + WORLD_DIMS.yOffset) | 0;
+                    this._scratchWorldToChunk.lz = ((z % chunkSize) + chunkSize) % chunkSize | 0;
+                    return this._scratchWorldToChunk;
                 }
 
+                // OPTIMIZATION: chunkToWorldCoords - OPTIMIZED (reuses scratch object)
                 chunkToWorldCoords(cx, cz, lx, ly, lz) {
-                    return {
-                        x: cx * WORLD_DIMS.chunkSize + lx,
-                        y: ly - WORLD_DIMS.yOffset,
-                        z: cz * WORLD_DIMS.chunkSize + lz
-                    };
+                    this._scratchChunkToWorld.x = cx * WORLD_DIMS.chunkSize + lx;
+                    this._scratchChunkToWorld.y = ly - WORLD_DIMS.yOffset;
+                    this._scratchChunkToWorld.z = cz * WORLD_DIMS.chunkSize + lz;
+                    return this._scratchChunkToWorld;
                 }
 
+                // OPTIMIZATION: ensureChunk - not hot path (called during chunk streaming)
                 ensureChunk(cx, cz) {
                     const key = this.getChunkKey(cx, cz);
                     if (this.chunks.has(key)) {
@@ -2392,29 +2422,39 @@
                     return null;
                 }
 
+                // OPTIMIZATION: getBlock - HOT PATH (called during lighting, collision, rendering)
+                // Already optimized: chunk cache, bitwise index calculation
+                // String key is required for Map compatibility; cache reduces impact
                 getBlock(x, y, z) {
+                    if (isDebug) this._callCounts.getBlock++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
-                    // Use cache for repeated lookups in same chunk
+                    // OPTIMIZATION: Inline chunk coord calculation (avoids function call overhead)
+                    const cx = (x >> 4) | 0;  // Fast divide by 16 for positive, works for negative too via floor behavior
+                    const cz = (z >> 4) | 0;
+                    const key = `${cx},${cz}`;  // Inline to avoid getChunkKey function call
+                    // OPTIMIZATION: Chunk cache for sequential block access in same chunk
                     const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
                     if (!chunk) return undefined;
                     this._lastChunkKey = key;
                     this._lastChunk = chunk;
+                    // OPTIMIZATION: Bitwise ops for local coords and index
                     const lx = x & 15;
                     const lz = z & 15;
                     const idx = lx + (lz << 4) + (ly << 8);
                     return chunk.blocks ? chunk.blocks[idx] : chunk[idx];
                 }
 
+                // OPTIMIZATION: setBlock - not as hot as getBlock (user edits are infrequent)
+                // But still optimized with bitwise ops for local coords
                 setBlock(x, y, z, blockId, createIfMissing = true) {
+                    if (isDebug) this._callCounts.setBlock++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return false;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
+                    // OPTIMIZATION: Bitwise divide by 16 (chunk size)
+                    const cx = x >> 4;
+                    const cz = z >> 4;
+                    const key = `${cx},${cz}`;  // Inline key generation
                     let chunk = this.chunks.get(key);
 
                     if (!chunk) {
@@ -2447,9 +2487,10 @@
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
                     }
 
-                    const lx = ((x % 16) + 16) % 16;
-                    const lz = ((z % 16) + 16) % 16;
-                    const idx = lx + lz * 16 + ly * 256;
+                    // OPTIMIZATION: Bitwise for local coords and index
+                    const lx = x & 15;
+                    const lz = z & 15;
+                    const idx = lx + (lz << 4) + (ly << 8);
                     const oldId = chunk.blocks ? chunk.blocks[idx] : chunk[idx];
                     if (oldId === blockId) return false;
 
@@ -2519,69 +2560,82 @@
                 }
 
                 // --- LIGHTING FUNCTIONS ---
+                // OPTIMIZATION: getSkyLight - HOT PATH (called during lighting propagation)
+                // Uses bitwise ops and chunk cache
                 getSkyLight(x, y, z) {
+                    if (isDebug) this._callCounts.getSkyLight++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0) return 1;
                     if (ly >= WORLD_DIMS.chunkHeight) return 15;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
+                    // OPTIMIZATION: Bitwise divide by 16
+                    const cx = x >> 4;
+                    const cz = z >> 4;
+                    const key = `${cx},${cz}`;
+                    // OPTIMIZATION: Chunk cache for sequential light access
                     const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
                     if (!chunk || !chunk.skyLight) return 15;
                     this._lastChunkKey = key;
                     this._lastChunk = chunk;
-                    const lx = x & 15;
-                    const lz = z & 15;
-                    return chunk.skyLight[lx + (lz << 4) + (ly << 8)];
+                    // OPTIMIZATION: Bitwise for local coords and index
+                    return chunk.skyLight[(x & 15) + ((z & 15) << 4) + (ly << 8)];
                 }
 
+                // OPTIMIZATION: setSkyLight - HOT PATH (called during lighting updates)
                 setSkyLight(x, y, z, level) {
+                    if (isDebug) this._callCounts.setSkyLight++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
+                    // OPTIMIZATION: Bitwise divide by 16
+                    const cx = x >> 4;
+                    const cz = z >> 4;
+                    const key = `${cx},${cz}`;
                     const chunk = this.chunks.get(key);
                     if (!chunk || !chunk.skyLight) return;
-                    const lx = x & 15;
-                    const lz = z & 15;
+                    // OPTIMIZATION: Inline clamp (avoids Math.min/max function calls)
                     const clamped = level < 1 ? 1 : level > 15 ? 15 : level;
-                    chunk.skyLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                    chunk.skyLight[(x & 15) + ((z & 15) << 4) + (ly << 8)] = clamped;
                 }
 
+                // OPTIMIZATION: getBlockLight - HOT PATH (called during lighting propagation)
                 getBlockLight(x, y, z) {
+                    if (isDebug) this._callCounts.getBlockLight++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
+                    // OPTIMIZATION: Bitwise divide by 16
+                    const cx = x >> 4;
+                    const cz = z >> 4;
+                    const key = `${cx},${cz}`;
+                    // OPTIMIZATION: Chunk cache for sequential light access
                     const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
                     if (!chunk || !chunk.blockLight) return 0;
                     this._lastChunkKey = key;
                     this._lastChunk = chunk;
-                    const lx = x & 15;
-                    const lz = z & 15;
-                    return chunk.blockLight[lx + (lz << 4) + (ly << 8)];
+                    // OPTIMIZATION: Bitwise for local coords and index
+                    return chunk.blockLight[(x & 15) + ((z & 15) << 4) + (ly << 8)];
                 }
 
+                // OPTIMIZATION: setBlockLight - HOT PATH (called during lighting updates)
                 setBlockLight(x, y, z, level) {
+                    if (isDebug) this._callCounts.setBlockLight++;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return;
-                    const cx = Math.floor(x / WORLD_DIMS.chunkSize);
-                    const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                    const key = this.getChunkKey(cx, cz);
+                    // OPTIMIZATION: Bitwise divide by 16
+                    const cx = x >> 4;
+                    const cz = z >> 4;
+                    const key = `${cx},${cz}`;
                     const chunk = this.chunks.get(key);
                     if (!chunk || !chunk.blockLight) return;
-                    const lx = x & 15;
-                    const lz = z & 15;
+                    // OPTIMIZATION: Inline clamp
                     const clamped = level < 0 ? 0 : level > 15 ? 15 : level;
-                    chunk.blockLight[lx + (lz << 4) + (ly << 8)] = clamped;
+                    chunk.blockLight[(x & 15) + ((z & 15) << 4) + (ly << 8)] = clamped;
                 }
 
+                // OPTIMIZATION: getLocalLight - combines sky and block light
+                // Inlined max avoids Math.max function call overhead
                 getLocalLight(x, y, z) {
                     const sky = this.getSkyLight(x, y, z);
                     const block = this.getBlockLight(x, y, z);
-                    return Math.max(sky, block);
+                    return sky > block ? sky : block;  // Inline max
                 }
 
                 // --- CHUNK SCHEDULING ---
@@ -2627,6 +2681,18 @@
                     this.modifiedChunks.delete(key);
                     this.activeChunks.delete(key);
                     this.queuedChunkKeys.delete(key);
+                }
+
+                // DEBUG: Get call statistics for hot-path verification
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                // DEBUG: Reset call counters (call at start of frame to measure per-frame calls)
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
                 }
             }
 
