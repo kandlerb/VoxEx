@@ -1732,6 +1732,8 @@
                         mouseup: [],
                         wheel: []
                     };
+                    // OPTIMIZATION: Reusable scratch object for consumeMouseDelta to avoid per-call allocation
+                    this._scratchDelta = { x: 0, y: 0 };
                     // DEBUG: Call counters for hot-path verification
                     this._callCounts = { consumeMouse: 0, consumeWheel: 0, isKeyDown: 0, on: 0, off: 0 };
                 }
@@ -1780,15 +1782,15 @@
                     });
                 }
 
-                // OPTIMIZATION: consumeMouseDelta - no-op (NEVER CALLED in main codebase)
-                // NOTE: If this were called per-frame, the object allocation would cause GC pressure.
-                // Would need to use a reusable scratch object. But since it's never called, no-op.
+                // OPTIMIZATION: consumeMouseDelta - OPTIMIZED (reuses scratch object)
+                // Uses _scratchDelta to avoid per-call object allocation (GC pressure)
                 consumeMouseDelta() {
                     if (isDebug) this._callCounts.consumeMouse++;
-                    const delta = { x: this.mouseDelta.x, y: this.mouseDelta.y };
+                    this._scratchDelta.x = this.mouseDelta.x;
+                    this._scratchDelta.y = this.mouseDelta.y;
                     this.mouseDelta.x = 0;
                     this.mouseDelta.y = 0;
-                    return delta;
+                    return this._scratchDelta;
                 }
 
                 // OPTIMIZATION: consumeWheelDelta - no-op (NEVER CALLED in main codebase)
@@ -1879,6 +1881,12 @@
                     this.treeMaskCache = new Map();
                     this.biomeTable = null;
                     this.BIOME_CELL_SIZE = 64;
+                    // OPTIMIZATION: Hoisted densityMap to avoid per-call object creation
+                    // Will be populated in init() when treeConfig is fully available
+                    this._densityMap = null;
+                    // OPTIMIZATION: Constant for numeric key calculation (avoids string concatenation)
+                    // Using 2^20 (1048576) allows coords from -524288 to +524287 without collision
+                    this._KEY_MULTIPLIER = 1048576;
                     // DEBUG: Call counters for hot-path verification
                     this._callCounts = {
                         noise2D: 0, fbm2D: 0, getBiomeAt: 0, getHeightAt: 0,
@@ -1903,6 +1911,15 @@
                     }
                     // Build biome table
                     this.buildBiomeTable();
+                    // OPTIMIZATION: Build densityMap once at init (hoisted from getTreeDensityForBiome)
+                    this._densityMap = {
+                        'forests': this.treeConfig.density?.forests ?? 0.15,
+                        'plains': this.treeConfig.density?.plains ?? 0.02,
+                        'hills': this.treeConfig.density?.hills ?? 0.05,
+                        'mountains': this.treeConfig.density?.mountains ?? 0.01,
+                        'swamp': this.treeConfig.density?.swamp ?? 0.08
+                    };
+                    this._defaultDensity = 0.03;
                 }
 
                 // OPTIMIZATION: buildBiomeTable - no-op (called once at init)
@@ -1918,13 +1935,15 @@
                 }
 
                 // --- NOISE FUNCTIONS ---
-                // OPTIMIZATION: noise3D - no-op (not called, global version used)
-                // LATENT: Multiple Math.floor calls could use bitwise | 0
+                // OPTIMIZATION: noise3D - OPTIMIZED (reduced Math.floor calls)
+                // Caches Math.floor result to avoid calling it twice per coordinate
                 noise3D(x, y, z) {
-                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
-                    x -= Math.floor(x);
-                    y -= Math.floor(y);
-                    z -= Math.floor(z);
+                    // OPTIMIZED: Cache floor values to avoid double computation
+                    const floorX = Math.floor(x), floorY = Math.floor(y), floorZ = Math.floor(z);
+                    const X = floorX & 255, Y = floorY & 255, Z = floorZ & 255;
+                    x -= floorX;
+                    y -= floorY;
+                    z -= floorZ;
                     const u = this.fade(x), v = this.fade(y), w = this.fade(z);
                     const A = this.perm[X] + Y, AA = this.perm[A] + Z, AB = this.perm[A + 1] + Z;
                     const B = this.perm[X + 1] + Y, BA = this.perm[B] + Z, BB = this.perm[B + 1] + Z;
@@ -2123,24 +2142,19 @@
                     return h;
                 }
 
-                // OPTIMIZATION: getTreeDensityForBiome - no-op (not called)
-                // LATENT: Creates new densityMap object on every call - should hoist to class property
+                // OPTIMIZATION: getTreeDensityForBiome - OPTIMIZED (uses hoisted _densityMap)
+                // densityMap is now built once in init() instead of per-call
                 getTreeDensityForBiome(biomeName) {
-                    const densityMap = {
-                        'forests': this.treeConfig.density?.forests ?? 0.15,
-                        'plains': this.treeConfig.density?.plains ?? 0.02,
-                        'hills': this.treeConfig.density?.hills ?? 0.05,
-                        'mountains': this.treeConfig.density?.mountains ?? 0.01,
-                        'swamp': this.treeConfig.density?.swamp ?? 0.08
-                    };
-                    return densityMap[biomeName] ?? 0.03;
+                    return this._densityMap?.[biomeName] ?? this._defaultDensity ?? 0.03;
                 }
 
                 // --- TREE MASK ---
-                // OPTIMIZATION: getTreeMaskKey - no-op (not called)
-                // LATENT: String concatenation creates GC pressure if called frequently
+                // OPTIMIZATION: getTreeMaskKey - OPTIMIZED (numeric key instead of string)
+                // Uses numeric key to avoid string concatenation GC pressure
                 getTreeMaskKey(cx, cz) {
-                    return `${cx},${cz}`;
+                    // Numeric key: offset coords to positive range, then combine
+                    // Supports coords from -524288 to +524287 (±32768 chunks from origin)
+                    return (cx + 524288) * this._KEY_MULTIPLIER + (cz + 524288);
                 }
 
                 // OPTIMIZATION: generateTreeMaskForChunk - no-op (not called)
@@ -2188,14 +2202,15 @@
                     return mask[lx + lz * cs] === 1;
                 }
 
-                // OPTIMIZATION: getBiomeAt - no-op (not called)
-                // LATENT: String key concatenation - should use numeric key for hot path
+                // OPTIMIZATION: getBiomeAt - OPTIMIZED (numeric key instead of string)
+                // Uses numeric key to avoid string concatenation GC pressure
                 getBiomeAt(x, z) {
                     if (isDebug) this._callCounts.getBiomeAt++;
                     const cellSize = this.BIOME_CELL_SIZE;
-                    const cellX = Math.floor(x / cellSize);
-                    const cellZ = Math.floor(z / cellSize);
-                    const key = `${cellX},${cellZ}`;
+                    const cellX = (x / cellSize) | 0;  // OPTIMIZED: | 0 instead of Math.floor
+                    const cellZ = (z / cellSize) | 0;
+                    // OPTIMIZED: Numeric key instead of string concatenation
+                    const key = (cellX + 524288) * this._KEY_MULTIPLIER + (cellZ + 524288);
 
                     if (this.biomeCellCache.has(key)) {
                         return this.biomeCellCache.get(key);
@@ -2252,13 +2267,15 @@
                     return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
                 }
 
-                // OPTIMIZATION: noise2D - no-op (not called in hot path)
-                // LATENT: Multiple Math.floor calls - could use | 0 for integers
+                // OPTIMIZATION: noise2D - OPTIMIZED (reduced Math.floor calls)
+                // Caches Math.floor result to avoid calling it twice per coordinate
                 noise2D(x, y) {
                     if (isDebug) this._callCounts.noise2D++;
-                    const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
-                    x -= Math.floor(x);
-                    y -= Math.floor(y);
+                    // OPTIMIZED: Cache floor values to avoid double computation
+                    const floorX = Math.floor(x), floorY = Math.floor(y);
+                    const X = floorX & 255, Y = floorY & 255;
+                    x -= floorX;
+                    y -= floorY;
                     const u = this.fade(x), v = this.fade(y);
                     const A = this.perm[X] + Y, B = this.perm[X + 1] + Y;
                     return this.lerp(v,
