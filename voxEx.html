@@ -3828,8 +3828,22 @@
             // =====================================================
             // 9. PLAYER CONTROLLER CLASS
             // =====================================================
+            // OPTIMIZATION AUDIT (2025-12-15):
+            // - update() is HOT PATH (called every frame)
+            // - handleMovement() was allocating 3+ Vector3 and 1+ Euler per frame - FIXED
+            // - pickVoxel() was allocating Vector3s and objects in loop - FIXED
+            //
+            // Note: User requested methods that don't exist:
+            // - init: No init method (initialization in constructor)
+            // - applyMovement: Method is named "handleMovement"
+            // - applyGravity: Gravity is inline in handleMovement
+            // - jump: Jump is inline in handleMovement
+            //
+            // Status: Optimized with scratch vectors/euler for per-frame operations
+            // =====================================================
 
             class PlayerController {
+                // OPTIMIZATION: constructor - no-op (called once at game start)
                 constructor(camera, inputManager, voxelWorld, settingsManager) {
                     this.camera = camera;
                     this.input = inputManager;
@@ -3866,14 +3880,36 @@
 
                     // Raycaster for block interaction
                     this.raycaster = new THREE.Raycaster();
+
+                    // OPTIMIZATION: Scratch objects for handleMovement (avoids per-frame allocation)
+                    this._scratchDirection = new THREE.Vector3();
+                    this._scratchForward = new THREE.Vector3();
+                    this._scratchRight = new THREE.Vector3();
+                    this._scratchEuler = new THREE.Euler();
+
+                    // OPTIMIZATION: Scratch objects for pickVoxel
+                    this._scratchOrigin = new THREE.Vector3();
+                    this._scratchRayDir = new THREE.Vector3();
+                    this._scratchLastAir = { x: 0, y: 0, z: 0 };
+
+                    // DEBUG: Call counters for verification
+                    this._callCounts = { update: 0, handleMovement: 0, pickVoxel: 0, collide: 0 };
                 }
 
+                // OPTIMIZATION: update - HOT PATH (called every frame)
                 update(delta) {
+                    if (isDebug) this._callCounts.update++;
                     this.handleMovement(delta);
                     this.updateCamera();
                 }
 
+                // OPTIMIZATION: handleMovement - HOT PATH (per-frame)
+                // Uses scratch vectors/euler instead of allocating new ones each frame
+                // Note: User called this "applyMovement" but method is named "handleMovement"
+                // Gravity and jump are inline here (no separate applyGravity/jump methods)
                 handleMovement(delta) {
+                    if (isDebug) this._callCounts.handleMovement++;
+
                     const speed = this.settings.get('playerSpeed') || 50;
                     const sprintMult = this.settings.get('sprintMultiplier') || 2.0;
                     const crouchMult = this.settings.get('crouchMultiplier') || 0.5;
@@ -3881,11 +3917,12 @@
                     const gravity = this.settings.get('gravity') || 30;
                     const jumpForce = this.settings.get('jumpForce') || 10;
 
-                    // Calculate movement direction
-                    const direction = new THREE.Vector3();
+                    // OPTIMIZATION: Reuse scratch vectors instead of allocating new ones
+                    const direction = this._scratchDirection.set(0, 0, 0);
+                    const euler = this._scratchEuler.set(0, this.yaw, 0);
 
-                    const forward = new THREE.Vector3(0, 0, -1).applyEuler(new THREE.Euler(0, this.yaw, 0));
-                    const right = new THREE.Vector3(1, 0, 0).applyEuler(new THREE.Euler(0, this.yaw, 0));
+                    const forward = this._scratchForward.set(0, 0, -1).applyEuler(euler);
+                    const right = this._scratchRight.set(1, 0, 0).applyEuler(euler);
 
                     if (this.input.isKeyDown('KeyW') || this.input.isKeyDown('ArrowUp')) direction.add(forward);
                     if (this.input.isKeyDown('KeyS') || this.input.isKeyDown('ArrowDown')) direction.sub(forward);
@@ -3906,7 +3943,7 @@
                     this.velocity.x = direction.x / delta;
                     this.velocity.z = direction.z / delta;
 
-                    // Vertical movement
+                    // Vertical movement (gravity inline - no separate applyGravity method)
                     if (this.isFlying) {
                         if (this.flyUp) this.velocity.y = speed * flyMult;
                         else if (this.flyDown) this.velocity.y = -speed * flyMult;
@@ -3915,7 +3952,7 @@
                         // Apply gravity
                         this.velocity.y -= gravity * delta;
 
-                        // Jump
+                        // Jump (inline - no separate jump method)
                         if (this.canJump && this.input.isKeyDown('Space')) {
                             this.velocity.y = jumpForce;
                             this.canJump = false;
@@ -4000,7 +4037,10 @@
                 }
 
                 // --- COLLISION DETECTION ---
+                // OPTIMIZATION: collide - HOT PATH (per-frame)
+                // Uses Math.floor extensively but no allocations - already efficient
                 collide(pos) {
+                    if (isDebug) this._callCounts.collide++;
                     if (!this.world) return pos;
 
                     const halfWidth = 0.4;
@@ -4062,14 +4102,19 @@
                 }
 
                 // --- VOXEL PICKING (Raycasting) ---
+                // OPTIMIZATION: pickVoxel - may be called per-frame for crosshair highlighting
+                // Uses scratch vectors and reuses lastAir object instead of allocating in loop
                 pickVoxel(range = 5) {
+                    if (isDebug) this._callCounts.pickVoxel++;
                     if (!this.camera || !this.world) return null;
 
-                    const origin = this.camera.position.clone();
-                    const direction = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+                    // OPTIMIZATION: Reuse scratch vectors instead of clone/new
+                    const origin = this._scratchOrigin.copy(this.camera.position);
+                    const direction = this._scratchRayDir.set(0, 0, -1).applyQuaternion(this.camera.quaternion);
 
                     const step = 0.05;
-                    let lastAir = null;
+                    const lastAir = this._scratchLastAir;
+                    let hasLastAir = false;
 
                     for (let t = 0; t < range; t += step) {
                         const x = Math.floor(origin.x + direction.x * t);
@@ -4080,12 +4125,16 @@
                         if (block !== BLOCKS.AIR && block !== undefined) {
                             // Calculate face normal
                             let face = [0, 0, 0];
-                            if (lastAir) {
+                            if (hasLastAir) {
                                 face = [lastAir.x - x, lastAir.y - y, lastAir.z - z];
                             }
                             return { x, y, z, blockId: block, face };
                         }
-                        lastAir = { x, y, z };
+                        // OPTIMIZATION: Reuse lastAir object instead of creating new one each iteration
+                        lastAir.x = x;
+                        lastAir.y = y;
+                        lastAir.z = z;
+                        hasLastAir = true;
                     }
                     return null;
                 }
@@ -4118,6 +4167,17 @@
                     if (this.spawnPoint) {
                         this.position.copy(this.spawnPoint);
                         this.velocity.set(0, 0, 0);
+                    }
+                }
+
+                // DEBUG: Call statistics for optimization verification
+                getCallStats() {
+                    return { ...this._callCounts };
+                }
+
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
                     }
                 }
             }
