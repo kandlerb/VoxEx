@@ -7282,6 +7282,13 @@
                 faceVertexCache.set(key, verts);
                 return verts;
             }
+            // OPTIMIZATION AUDIT: scheduleChunkUpdate
+            //   - EVENT-DRIVEN: Called on block changes, not per-frame
+            //   - Uses debounce (50ms timeout) to batch rapid updates
+            //   - Defers chunks with pending lighting to avoid redundant rebuilds
+            //   - Adds to pendingChunkUpdates Set (O(1) insertion)
+            //   - Uses string key concatenation (acceptable - event-driven)
+            //   - No-op: Already well-optimized with debouncing and deferral
             function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false } = {}) {
                 const key = `${cx},${cz}`;
                 if (bypassLighting) { forceLightingBypassKeys.add(key); }
@@ -8427,6 +8434,24 @@
                     }
                 });
             }
+            // OPTIMIZATION AUDIT: rebuildAllVisibleChunks
+            //   - NOT HOT: Called on settings changes (user-triggered)
+            //   - Releases all active chunk meshes and re-queues for building
+            //   - Uses Array.from to copy activeChunks (acceptable - infrequent)
+            //   - Uses chunkBuildQueue.some() linear scan (acceptable - infrequent)
+            //   - No-op: Already optimal for settings-change use case
+            //
+            // OPTIMIZATION AUDIT: rebuildTorchLightingForActiveChunks
+            //   - NOT HOT: Called on torch light setting changes (user-triggered)
+            //   - Recalculates block light for all active chunks
+            //   - Triggers rebuildAllVisibleChunks to apply new lighting
+            //   - No-op: Already optimal for settings-change use case
+            //
+            // OPTIMIZATION AUDIT: rebuildSkylightForActiveChunks
+            //   - NOT HOT: Called on skylight setting changes (user-triggered)
+            //   - Recalculates sunlight for all active chunks
+            //   - Triggers rebuildAllVisibleChunks to apply new lighting
+            //   - No-op: Already optimal for settings-change use case
             function rebuildAllVisibleChunks() {
                 logDebug("Rebuilding all visible chunks for settings change...");
                 const chunksToRebuild = [...activeChunks];
@@ -13143,6 +13168,38 @@
             // =====================================================
             // SUNLIGHT CALCULATION (Per-Chunk)
             // =====================================================
+            // OPTIMIZATION AUDIT: calculateChunkSunlight
+            //   - HOT PATH: Called once per chunk during generation (LIGHTING)
+            //   - Two-phase approach: vertical propagation + BFS horizontal spread
+            //   - Uses flat array queue (4 values per entry) for cache locality
+            //   - Uses bitshift for fast index calculation (lz << 4, ly << 8)
+            //   - Uses IS_TRANSPARENT lookup table instead of function calls
+            //   - Allocates queue array - grows dynamically but only per-chunk
+            //   - No-op: Already well-optimized with bitshifts and lookup tables
+            //
+            // OPTIMIZATION AUDIT: calculateBlockLight
+            //   - HOT PATH: Called once per chunk during generation (LIGHTING)
+            //   - BFS propagation from torch light sources
+            //   - Same optimization pattern as calculateChunkSunlight
+            //   - No-op: Already well-optimized
+            //
+            // OPTIMIZATION AUDIT: updateSunlightAt / updateBlockLightAt
+            //   - LIGHTING: Called on block changes (event-driven)
+            //   - Creates SunlightTask for incremental updates
+            //   - Uses BFS remove/add queues for efficient propagation
+            //   - Spreads work across frames via processSunlightQueue
+            //   - No-op: Already optimized with task-based spreading
+            //
+            // NOTE: floodFillBlockLight, decayBlockLight, propagateBlockLight
+            //   - These don't exist as standalone functions
+            //   - Logic is inline in calculateChunkSunlight/calculateBlockLight
+            //   - Cross-chunk propagation via updateSunlightAt/updateBlockLightAt
+            //
+            // NOTE: getLocalLight
+            //   - Defined as closure inside renderChunk (line ~14498)
+            //   - Uses hoisted extractLightFromChunk to avoid allocation
+            //   - Also exists as VoxelWorld.getLocalLight method
+            // =====================================================
             // Sunlight propagation follows a two-phase approach:
             // Phase 1: Vertical propagation from sky (y = max) downward
             //   - Starts at level 15 (full sunlight)
@@ -14416,6 +14473,13 @@
                 }
                 chunkTorches.delete(baseKey);
             }
+            // OPTIMIZATION AUDIT: releaseMeshForKey
+            //   - EVENT-DRIVEN: Called when chunk mesh needs disposal
+            //   - Releases mesh to pool via releaseChunkMesh()
+            //   - Clears torch instances for the chunk
+            //   - Updates mesh counts for debug overlay
+            //   - No allocations - only deletions and counter updates
+            //   - No-op: Already optimal
             function releaseMeshForKey(key) {
                 const isWater = key.includes("_WATER");
                 const baseKey = key.replace("_WATER", "");
@@ -14435,6 +14499,28 @@
                 meshLifecycleStats.detached.set(baseKey, now);
                 meshLifecycleStats.detached.set(key, now);
             }
+            // OPTIMIZATION AUDIT: renderChunk
+            //   - HOT PATH: Called per-chunk during mesh building (MESH BUILD)
+            //   - Processes up to 32,768 blocks per chunk (16×16×128)
+            //   - ⚠️ HEAVY: Triple-nested loop over all blocks
+            //   - OPTIMIZED: Uses typed array pools (posPool, normPool, uvPool, colPool)
+            //   - OPTIMIZED: getLocal/getLocalLight closures avoid allocation via hoisted extractLightFromChunk
+            //   - OPTIMIZED: Pre-fetches all 8 neighbor chunks to avoid Map lookups per block
+            //   - OPTIMIZED: LOD skip factor reduces faces at distance
+            //   - OPTIMIZED: maxY scan skips empty sky layers
+            //   - OPTIMIZED: AO cache reuses calculations for adjacent faces
+            //   - OPTIMIZED: Frame budget (8ms) limits builds per frame
+            //   - No-op: Already heavily optimized with pools, caching, and LOD
+            //
+            // OPTIMIZATION AUDIT: processChunkQueue
+            //   - PER-FRAME: Called once per frame to process chunk build queue
+            //   - Sorts queue by distance (closest chunks first)
+            //   - Respects frame budget (8ms) to avoid frame drops
+            //   - Awaits generateChunkData for missing chunks (async)
+            //   - Releases old meshes for dirty chunks before rebuild
+            //   - Processes neighbor updates with remaining budget
+            //   - No-op: Already well-optimized with distance sorting and budgeting
+            //
             // OPTIMIZATION: Hoist light lookup helper outside of renderChunk to avoid creating closures
             // This function is called thousands of times per chunk, so avoiding closure creation saves significant GC pressure
             function extractLightFromChunk(chunk, idx) {
