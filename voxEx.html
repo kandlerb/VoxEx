@@ -6869,6 +6869,9 @@
 
             // Queue for chunks needing edge lighting updates after neighbors generate
             const edgeLightingUpdateQueue = new Set();
+            // Track how many edge lighting passes each chunk has had (to prevent infinite reprocessing)
+            const edgeLightingPassCount = new Map();
+            const MAX_EDGE_LIGHTING_PASSES = 3; // Maximum number of edge lighting passes per chunk
             // Track chunks that have been rendered but need lighting updates
             const chunksNeedingLightingUpdate = new Set();
             // Queue for adjacent chunk updates - chunks that need to be updated after a neighbor is built
@@ -7339,6 +7342,11 @@
                     const chunk = chunks.get(key);
                     if (!chunk || !chunk.blocks || !chunk.skyLight) continue;
 
+                    // Track and limit edge lighting passes to prevent infinite reprocessing
+                    const passCount = (edgeLightingPassCount.get(key) || 0) + 1;
+                    edgeLightingPassCount.set(key, passCount);
+                    if (passCount > MAX_EDGE_LIGHTING_PASSES) continue; // Skip if already processed enough times
+
                     const { cx, cz } = parseChunkKeySimple(key);
 
                     // Recalculate full chunk lighting to fix any issues
@@ -7366,6 +7374,45 @@
                     const hasWaterMesh = chunkMeshes.has(key + "_WATER");
                     if (hasTerrainMesh || hasWaterMesh) {
                         scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
+                    }
+
+                    // CRITICAL: Re-queue cardinal neighbors for edge lighting
+                    // This chunk now has updated edge values that neighbors can benefit from
+                    // Without this, light doesn't propagate properly across multiple chunks
+                    // because neighbors were processed before this chunk had correct values
+                    // Only re-queue if this chunk has meaningful light to propagate (value > 2)
+                    const skyLight = chunk.skyLight;
+                    const cs = WORLD_DIMS.chunkSize;
+                    const ch = WORLD_DIMS.chunkHeight;
+                    const edgeInfo = [
+                        { dx: -1, dz: 0, edge: 0, axis: 'x' },   // West: check lx=0
+                        { dx: 1, dz: 0, edge: 15, axis: 'x' },   // East: check lx=15
+                        { dx: 0, dz: -1, edge: 0, axis: 'z' },   // North: check lz=0
+                        { dx: 0, dz: 1, edge: 15, axis: 'z' }    // South: check lz=15
+                    ];
+                    for (const { dx, dz, edge, axis } of edgeInfo) {
+                        const ncx = cx + dx;
+                        const ncz = cz + dz;
+                        const nKey = getChunkKey(ncx, ncz);
+                        const neighborChunk = chunks.get(nKey);
+                        // Only re-queue if neighbor exists, has lighting, and hasn't exceeded pass limit
+                        const neighborPassCount = edgeLightingPassCount.get(nKey) || 0;
+                        if (neighborChunk && neighborChunk.skyLight && !toProcess.includes(nKey) && neighborPassCount < MAX_EDGE_LIGHTING_PASSES) {
+                            // Check if this chunk's edge has propagatable light (value > 2)
+                            // We only re-queue if there's meaningful light to propagate
+                            let hasLight = false;
+                            for (let i = 0; i < cs && !hasLight; i++) {
+                                for (let y = 0; y < ch && !hasLight; y++) {
+                                    const idx = axis === 'x'
+                                        ? edge + i * cs + y * cs * cs
+                                        : i + edge * cs + y * cs * cs;
+                                    if (skyLight[idx] > 2) hasLight = true;
+                                }
+                            }
+                            if (hasLight && !edgeLightingUpdateQueue.has(nKey)) {
+                                edgeLightingUpdateQueue.add(nKey);
+                            }
+                        }
                     }
 
                     processed++;
@@ -7403,6 +7450,7 @@
                 // Clean up from render state tracking
                 edgeLightingUpdateQueue.delete(key);
                 chunksNeedingLightingUpdate.delete(key);
+                edgeLightingPassCount.delete(key);
             }
             const worldConfig = {
                 seed: WORLD_CONFIG.seed,
@@ -15008,13 +15056,13 @@
                                         if (useDeferredLight) {
                                             addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
                                         } else if (isWater) {
-                                            // Calculate water depth (search UP to find surface)
-                                            // This gives distance from surface: 0 at surface, higher = deeper
-                                            // Deeper water should be foggier/darker
+                                            // Calculate water depth (search DOWN to find bottom)
+                                            // Surface water has high depth (far from bottom) = more fog
+                                            // Bottom water has low depth (near bottom) = less fog
                                             let waterDepth = 0;
-                                            for (let dy = y + 1; dy < height; dy++) {
-                                                const aboveId = getLocal(x, dy, z);
-                                                if (aboveId !== WATER) break;
+                                            for (let dy = y - 1; dy >= 0; dy--) {
+                                                const belowId = getLocal(x, dy, z);
+                                                if (belowId !== WATER) break;
                                                 waterDepth++;
                                             }
                                             // Use water-specific face rendering with depth-based coloring
