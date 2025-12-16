@@ -11445,13 +11445,16 @@
                         fogFar: { value: 400.0 }
                     },
                     vertexShader: `
+                        attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
                         varying vec2 vUv;
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
+                        varying float vShoreDist;
                         void main() {
                             vUv = uv;
                             vColor = color;
+                            vShoreDist = shoreDist;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -11474,6 +11477,7 @@
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
+                        varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
 
                         // Simple noise function for wave distortion
                         float hash(vec2 p) {
@@ -11495,13 +11499,17 @@
                             vec2 screenUV = (vScreenPos.xy / vScreenPos.w) * 0.5 + 0.5;
 
                             // Wave-based UV distortion using world position
+                            // Scale by shore distance: calm near shores, wavy far from shores
                             float t = time * 0.001;
                             vec2 waveOffset;
                             waveOffset.x = noise(vWorldPosition.xz * 0.5 + vec2(t * 0.5, t * 0.3)) * 2.0 - 1.0;
                             waveOffset.y = noise(vWorldPosition.xz * 0.5 + vec2(t * 0.3, -t * 0.4)) * 2.0 - 1.0;
 
+                            // Apply shore distance scaling: 0.1 at shore, 1.0 far from shore
+                            float waveScale = mix(0.1, 1.0, vShoreDist);
+
                             // Apply distortion to screen UV
-                            vec2 distortedUV = screenUV + waveOffset * refractionStrength;
+                            vec2 distortedUV = screenUV + waveOffset * refractionStrength * waveScale;
                             distortedUV = clamp(distortedUV, 0.001, 0.999); // Prevent edge artifacts
 
                             // Sample refracted scene
@@ -14964,7 +14972,7 @@
             }
 
             // Add a water face with depth-based coloring (darker at depth)
-            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth) {
+            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist) {
                 // Get cached face vertices
                 const verts = getCachedFaceVertices(nx, ny, nz);
                 // Write vertex positions and normals
@@ -14978,6 +14986,14 @@
                 writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
+                // Write shore distance for all 6 vertices (normalized: 0 = at shore, 1 = far from shore)
+                const shoreNorm = Math.min(shoreDist / 4.0, 1.0); // Normalize to 0-1 range
+                shoreBuffer[shoreIdx] = shoreNorm;
+                shoreBuffer[shoreIdx + 1] = shoreNorm;
+                shoreBuffer[shoreIdx + 2] = shoreNorm;
+                shoreBuffer[shoreIdx + 3] = shoreNorm;
+                shoreBuffer[shoreIdx + 4] = shoreNorm;
+                shoreBuffer[shoreIdx + 5] = shoreNorm;
             }
 
             // OPTIMIZATION: Simplified face rendering for distant chunks
@@ -15242,8 +15258,9 @@
                     const waterNorm = normPool.acquire(maxFaces * 18);
                     const waterUvs = uvPool.acquire(maxFaces * 12);
                     const waterCols = colPool.acquire(maxFaces * 18);
+                    const waterShore = new Float32Array(maxFaces * 6); // Shore distance per vertex (1 float per vertex, 6 vertices per face)
                     let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
-                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wFaceCount = 0; // Water
+                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wFaceCount = 0; // Water (added wSIdx for shore)
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
@@ -15335,22 +15352,44 @@
                                             addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
                                         } else if (isWater) {
                                             // Calculate water depth (search DOWN to find bottom)
-                                            // Surface water has high depth (far from bottom) = more fog
-                                            // Bottom water has low depth (near bottom) = less fog
                                             let waterDepth = 0;
                                             for (let dy = y - 1; dy >= 0; dy--) {
                                                 const belowId = getLocal(x, dy, z);
                                                 if (belowId !== WATER) break;
                                                 waterDepth++;
                                             }
+                                            // Calculate shore distance - check horizontal neighbors for solid blocks
+                                            // Shore distance: 0 = at shore, 1 = 1 block away, etc.
+                                            // Check if this water has air above (surface water)
+                                            const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                            let shoreDist = 4; // Default: far from shore (max waves)
+                                            if (hasAirAbove) {
+                                                // Check in 4 horizontal directions for solid ground
+                                                const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                for (const [dx, dz] of directions) {
+                                                    for (let d = 1; d <= 4; d++) {
+                                                        const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                        // If solid block found, this is our shore distance in that direction
+                                                        if (checkId !== WATER && checkId !== AIR && checkId !== LEAVES) {
+                                                            shoreDist = Math.min(shoreDist, d);
+                                                            break;
+                                                        }
+                                                        // If air (edge of water), also counts as shore
+                                                        if (checkId === AIR) {
+                                                            shoreDist = Math.min(shoreDist, d);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             // Use water-specific face rendering with depth-based coloring
-                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth);
+                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist);
                                         } else {
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
                                         }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
+                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
                                     }
                                 }
@@ -15395,11 +15434,14 @@
                         wUvArray.set(waterUvs.subarray(0, wUvIdx));
                         const wColArray = new Float32Array(wCIdx);
                         wColArray.set(waterCols.subarray(0, wCIdx));
+                        const wShoreArray = new Float32Array(wSIdx);
+                        wShoreArray.set(waterShore.subarray(0, wSIdx));
                         const waterGeo = new THREE.BufferGeometry();
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
+                        waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1)); // Shore distance per vertex
                         applyChunkBounds(waterGeo, startX, startZ);
                         optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
