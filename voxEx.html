@@ -1327,9 +1327,6 @@
                 waterColor: savedSettings.waterColor || 0x4488ff,
                 waterOpacity: savedSettings.waterOpacity !== undefined ? savedSettings.waterOpacity : 0.7,
                 waterFogDensity: savedSettings.waterFogDensity !== undefined ? savedSettings.waterFogDensity : 0.5, // How quickly water becomes opaque with depth (0-1)
-                // Underwater fog settings
-                underwaterFogNear: savedSettings.underwaterFogNear || 1,
-                underwaterFogFar: savedSettings.underwaterFogFar || 30,
                 // Beer-Lambert per-channel absorption (red absorbs fastest, blue slowest)
                 // Higher values = faster absorption. Effect visible immediately underwater.
                 waterAbsorptionR: savedSettings.waterAbsorptionR !== undefined ? savedSettings.waterAbsorptionR : 0.7,
@@ -1426,9 +1423,6 @@
                 waterColor: 0x4488ff,
                 waterOpacity: 0.7,
                 waterFogDensity: 0.5, // How quickly water becomes opaque with depth (0-1)
-                // Underwater fog settings
-                underwaterFogNear: 1,
-                underwaterFogFar: 30,
                 // Beer-Lambert per-channel absorption (red absorbs fastest, blue slowest)
                 // Higher values = faster absorption. Effect visible immediately underwater.
                 waterAbsorptionR: 0.7,   // Red absorbs fastest (clearly gone by depth 5)
@@ -4809,18 +4803,12 @@
             let lastSpaceTime = 0;
             let spacePressed = false; // Track if space is physically held
             let isUnderwater = false; // Track if player's eyes are underwater
-            let underwaterDepth = 0; // How deep underwater (for fog darkness)
-            let savedFogState = null; // Store normal fog settings when going underwater
+            let underwaterDepth = 0; // How deep underwater (for shader effects)
             let isUnderground = false; // Track if player is underground (low sky light)
             // Swimming/treading water state
             let swimSpaceHoldTime = 0; // How long space has been held while underwater
             let isTreadingWater = false; // Whether player is floating at surface
             let waterSurfaceY = 0; // Y position of water surface for treading
-            // OPTIMIZATION: Reusable color objects for underwater fog (avoid per-frame allocations)
-            // Colors matched to water texture: #2389DA (upper), #1B609E (lower), #1565C0 (ripple shadow)
-            const _underwaterBaseColor = new THREE.Color(0x2389DA); // Matches water texture upper half
-            const _underwaterDarkColor = new THREE.Color(0x0A2A40); // Dark cyan-blue (matches texture hue)
-            const _underwaterResultColor = new THREE.Color();
             const _undergroundFogColor = new THREE.Color(0x000000); // Black fog for underground/caves
             let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             // --- BLOCK DEFINITIONS ---
@@ -10613,8 +10601,6 @@
                     SETTINGS.waterColor = DEFAULTS.waterColor;
                     SETTINGS.waterOpacity = DEFAULTS.waterOpacity;
                     SETTINGS.waterFogDensity = DEFAULTS.waterFogDensity;
-                    SETTINGS.underwaterFogNear = DEFAULTS.underwaterFogNear;
-                    SETTINGS.underwaterFogFar = DEFAULTS.underwaterFogFar;
                     SETTINGS.waterAbsorptionR = DEFAULTS.waterAbsorptionR;
                     SETTINGS.waterAbsorptionG = DEFAULTS.waterAbsorptionG;
                     SETTINGS.waterAbsorptionB = DEFAULTS.waterAbsorptionB;
@@ -16731,7 +16717,7 @@
                 // If not, bypass EffectComposer entirely and render directly (composer adds overhead)
                 // Use settings/state directly rather than pass.enabled which may be out of sync
                 const volumetricActive = SETTINGS.volumetricLightingEnabled;
-                const underwaterActive = isUnderwater; // Global state set by updateUnderwaterFog
+                const underwaterActive = isUnderwater; // Global state set by updateUnderwaterState
                 const anyPostEffectsActive = volumetricActive || underwaterActive || zombieEffectsEnabled;
 
                 // NOTE: Keep ALL passes enabled when using the composer to maintain
@@ -16777,10 +16763,9 @@
                 }
                 perfMonitor.end("rendering", renderStart);
             }
-            // Update underwater fog based on player position
-            // OPTIMIZATION: Uses reusable color objects and caches depth calculation
-            function updateUnderwaterFog() {
-                if (!scene.fog || !controls) return;
+            // Update underwater state and shader uniforms
+            function updateUnderwaterState() {
+                if (!controls) return;
 
                 const camPos = controls.getObject().position;
                 const eyeY = camPos.y;
@@ -16795,7 +16780,6 @@
 
                 if (isUnderwater) {
                     // OPTIMIZATION: Only recalculate depth when Y position changes significantly
-                    // This avoids the loop running every frame when treading water
                     const yDelta = Math.abs(eyeY - _lastUnderwaterCheckY);
                     if (yDelta > 0.25 || !wasUnderwater) {
                         _lastUnderwaterCheckY = eyeY;
@@ -16811,37 +16795,7 @@
                         underwaterDepth = Math.max(0, surfaceY - eyeY);
                     }
 
-                    // Save normal fog state when entering water
-                    if (!wasUnderwater) {
-                        savedFogState = {
-                            near: scene.fog.near,
-                            far: scene.fog.far,
-                            color: scene.fog.color.clone()
-                        };
-                    }
-
-                    // Use texture-matched underwater fog color (0x2389DA matches water texture)
-                    // Don't use SETTINGS.waterColor here - that's for the surface material, not underwater fog
-
-                    // Darken based on depth - deeper = darker and shorter visibility
-                    const maxDepth = 35; // Maximum depth for full darkness
-                    const depthFactor = Math.min(underwaterDepth / maxDepth, 1.0);
-
-                    // Interpolate from water color to dark blue/black using reusable objects
-                    _underwaterResultColor.copy(_underwaterBaseColor).lerp(_underwaterDarkColor, depthFactor * 0.9);
-
-                    // Fog distance decreases with depth (murkier water deeper down)
-                    const baseFogFar = SETTINGS.underwaterFogFar;
-                    const baseFogNear = SETTINGS.underwaterFogNear;
-                    const fogFar = THREE.MathUtils.lerp(baseFogFar, 8, depthFactor);
-                    const fogNear = THREE.MathUtils.lerp(baseFogNear, 0.5, depthFactor);
-
-                    // Apply underwater fog
-                    scene.fog.color.copy(_underwaterResultColor);
-                    scene.fog.near = fogNear;
-                    scene.fog.far = fogFar;
-
-                    // Update underwater shader uniforms (pass enabled state is synced in renderFrame)
+                    // Update underwater shader uniforms
                     if (underwaterPass) {
                         underwaterPass.uniforms.isUnderwater.value = true;
                         underwaterPass.uniforms.underwaterDepth.value = underwaterDepth;
@@ -16851,20 +16805,16 @@
                         underwaterPass.uniforms.absorptionG.value = SETTINGS.waterAbsorptionG;
                         underwaterPass.uniforms.absorptionB.value = SETTINGS.waterAbsorptionB;
                     }
-                } else if (wasUnderwater && savedFogState) {
-                    // Restore normal fog when exiting water
-                    // Note: updateDayNight will override the color, so just restore distances
-                    scene.fog.near = savedFogState.near;
-                    scene.fog.far = savedFogState.far;
-                    savedFogState = null;
+                } else if (wasUnderwater) {
+                    // Reset state when exiting water
                     underwaterDepth = 0;
-                    _lastUnderwaterCheckY = -Infinity; // Reset cache when exiting water
+                    _lastUnderwaterCheckY = -Infinity;
 
-                    // Reset swimming state when exiting water
+                    // Reset swimming state
                     swimSpaceHoldTime = 0;
                     isTreadingWater = false;
 
-                    // Reset underwater shader uniforms (pass enabled state is synced in renderFrame)
+                    // Reset underwater shader uniforms
                     if (underwaterPass) {
                         underwaterPass.uniforms.isUnderwater.value = false;
                     }
@@ -16904,7 +16854,7 @@
                         updateDayNight(clampedDt);
                         // INSTRUMENTATION: Track underwater update time
                         const underwaterStartMs = performance.now();
-                        updateUnderwaterFog(); // Apply underwater fog after day/night (overrides when underwater)
+                        updateUnderwaterState(); // Update underwater state and shader uniforms
                         perfMetrics.underwaterTime = performance.now() - underwaterStartMs;
                         updateFPSTracking(time, rawDt, clampedDt);
                         // Track physics timing
