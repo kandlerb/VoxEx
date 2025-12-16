@@ -14636,14 +14636,29 @@
                 return ((h ^ (h >> 16)) & 0x7FFFFFFF) / 0x7FFFFFFF; // 0-1 range
             }
 
-            // Write vertex colors for water with depth-based fog effect and visual variation
+            // Write vertex colors for water with depth-based fog effect, visual variation, and transparency
             // Creates a foggy, more substantial look for water with caustics and foam
+            // Uses exponential transmittance: T = e^(-k*d), opacity α = 1 - T
             function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
                 // Water fog: makes water look more like a substance, less like clear glass
                 // fogDensity controls how quickly water becomes opaque (0 = clear, 1 = very foggy)
                 const fogDensity = SETTINGS.waterFogDensity;
                 const maxVisualDepth = 6 + (1 - fogDensity) * 10; // 6-16 blocks based on density
                 const depthFactor = Math.min(waterDepth / maxVisualDepth, 1.0);
+
+                // === EXPONENTIAL DEPTH-BASED TRANSPARENCY ===
+                // Physical transmittance: T = e^(-k*d), opacity α = 1 - T
+                // k = absorption coefficient (scaled from fogDensity)
+                // d = water depth (blocks of water below this face)
+                // Result: shallow water is clear, deep water is heavy/opaque
+                // Note: This vertex alpha is MULTIPLIED by material opacity (SETTINGS.waterOpacity)
+                //       Vertex alpha provides depth variation, material opacity provides user control
+                const k = 0.15 + fogDensity * 0.35; // Range 0.15-0.5 absorption coefficient
+                const transmittance = Math.exp(-k * waterDepth);
+                // Vertex alpha: ranges from minAlpha (surface) to 1.0 (deep)
+                // Material opacity then scales this for final transparency
+                const minAlpha = 0.3; // Minimum visibility at water surface
+                const alpha = minAlpha + (1.0 - minAlpha) * (1.0 - transmittance);
 
                 // Apply fog density to enhance the depth effect
                 const fogEffect = depthFactor * (0.5 + fogDensity * 0.5); // 50-100% based on density
@@ -14678,12 +14693,14 @@
                 // Top faces (ny = 1) get lighter, foamier appearance at shallow depths
                 const isTopFace = ny > 0.5;
                 let foamBoost = 1.0;
+                let foamAlphaBoost = 1.0; // Foam is more opaque
                 if (isTopFace && waterDepth <= 2) {
                     // Foam pattern based on position
                     const foamNoise = waterHash(wx * 3 + 7, wy, wz * 3 + 11);
                     // Some spots have foam (white-ish), others don't
                     if (foamNoise > 0.6) {
                         foamBoost = 1.0 + (foamNoise - 0.6) * 0.5; // Up to 20% brighter
+                        foamAlphaBoost = 1.0 + (foamNoise - 0.6) * 0.3; // Foam is more opaque
                         // Foam is whiter (reduce blue tint)
                         rMult = Math.min(1.0, rMult * 1.1);
                         gMult = Math.min(1.0, gMult * 1.05);
@@ -14705,6 +14722,9 @@
                 gMult = Math.min(1.2, Math.max(0.0, gMult));
                 bMult = Math.min(1.2, Math.max(0.0, bMult));
 
+                // Final alpha with foam boost, clamped to valid range
+                const finalAlpha = Math.min(1.0, alpha * foamAlphaBoost);
+
                 // === PER-VERTEX VARIATION ===
                 // Each vertex gets slight unique tint for organic look
                 const v1Var = 1.0 + (waterHash(wx, wy, wz) - 0.5) * 0.05;
@@ -14717,13 +14737,13 @@
                 const c3 = ao[2] * lightLevel * v3Var;
                 const c4 = ao[3] * lightLevel * v4Var;
 
-                // Apply depth-based color tinting to each vertex
-                col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
-                col[cIdx + 3] = c2 * rMult; col[cIdx + 4] = c2 * gMult; col[cIdx + 5] = c2 * bMult;
-                col[cIdx + 6] = c4 * rMult; col[cIdx + 7] = c4 * gMult; col[cIdx + 8] = c4 * bMult;
-                col[cIdx + 9] = c2 * rMult; col[cIdx + 10] = c2 * gMult; col[cIdx + 11] = c2 * bMult;
-                col[cIdx + 12] = c3 * rMult; col[cIdx + 13] = c3 * gMult; col[cIdx + 14] = c3 * bMult;
-                col[cIdx + 15] = c4 * rMult; col[cIdx + 16] = c4 * gMult; col[cIdx + 17] = c4 * bMult;
+                // Apply depth-based color tinting to each vertex (RGBA format - 24 values per face)
+                col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult; col[cIdx + 3] = finalAlpha;
+                col[cIdx + 4] = c2 * rMult; col[cIdx + 5] = c2 * gMult; col[cIdx + 6] = c2 * bMult; col[cIdx + 7] = finalAlpha;
+                col[cIdx + 8] = c4 * rMult; col[cIdx + 9] = c4 * gMult; col[cIdx + 10] = c4 * bMult; col[cIdx + 11] = finalAlpha;
+                col[cIdx + 12] = c2 * rMult; col[cIdx + 13] = c2 * gMult; col[cIdx + 14] = c2 * bMult; col[cIdx + 15] = finalAlpha;
+                col[cIdx + 16] = c3 * rMult; col[cIdx + 17] = c3 * gMult; col[cIdx + 18] = c3 * bMult; col[cIdx + 19] = finalAlpha;
+                col[cIdx + 20] = c4 * rMult; col[cIdx + 21] = c4 * gMult; col[cIdx + 22] = c4 * bMult; col[cIdx + 23] = finalAlpha;
             }
             // Write UV coordinates to buffer
             function writeFaceUVs(uvs, uvIdx, uv) {
@@ -15034,7 +15054,7 @@
                     const waterPos = posPool.acquire(maxFaces * 18);
                     const waterNorm = normPool.acquire(maxFaces * 18);
                     const waterUvs = uvPool.acquire(maxFaces * 12);
-                    const waterCols = colPool.acquire(maxFaces * 18);
+                    const waterCols = colPool.acquire(maxFaces * 24); // RGBA (4 components) for depth-based transparency
                     let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
                     let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wFaceCount = 0; // Water
                     const startX = cx * WORLD_DIMS.chunkSize;
@@ -15142,9 +15162,14 @@
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
                                         }
-                                        vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
-                                        } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
+                                        vIdx += 18; uvIdx += 12;
+                                        if (isWater) {
+                                            cIdx += 24; // Water uses RGBA (4 components) for depth transparency
+                                            wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
+                                        } else {
+                                            cIdx += 18; // Terrain uses RGB (3 components)
+                                            tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++;
+                                        }
                                     }
                                 }
                             }
@@ -15192,7 +15217,7 @@
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
-                        waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
+                        waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 4)); // RGBA for depth transparency
                         applyChunkBounds(waterGeo, startX, startZ);
                         optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
