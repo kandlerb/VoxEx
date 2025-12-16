@@ -14629,9 +14629,16 @@
                 col[cIdx + 12] = c3; col[cIdx + 13] = c3; col[cIdx + 14] = c3;
                 col[cIdx + 15] = c4; col[cIdx + 16] = c4; col[cIdx + 17] = c4;
             }
-            // Write vertex colors for water with depth-based fog effect
-            // Creates a foggy, more substantial look for water at depth
-            function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth) {
+            // Simple hash function for position-based variation (deterministic noise)
+            function waterHash(x, y, z) {
+                let h = (x * 374761393 + y * 668265263 + z * 1274126177) | 0;
+                h = ((h ^ (h >> 13)) * 1274126177) | 0;
+                return ((h ^ (h >> 16)) & 0x7FFFFFFF) / 0x7FFFFFFF; // 0-1 range
+            }
+
+            // Write vertex colors for water with depth-based fog effect and visual variation
+            // Creates a foggy, more substantial look for water with caustics and foam
+            function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
                 // Water fog: makes water look more like a substance, less like clear glass
                 // fogDensity controls how quickly water becomes opaque (0 = clear, 1 = very foggy)
                 const fogDensity = SETTINGS.waterFogDensity;
@@ -14644,19 +14651,71 @@
                 // Water fog color: blend toward a murky blue-green at depth
                 // Surface: RGB multipliers (1.0, 1.0, 1.0) - clear
                 // Deep:    RGB multipliers blend toward fog color based on density
-                // More fog = more tint toward murky blue-green
                 const fogR = 0.1 + (1 - fogDensity) * 0.15;   // 0.1-0.25 (darker with more fog)
                 const fogG = 0.25 + (1 - fogDensity) * 0.15;  // 0.25-0.4
                 const fogB = 0.4 + (1 - fogDensity) * 0.1;    // 0.4-0.5 (stays blueish)
 
-                const rMult = 1.0 - fogEffect * (1.0 - fogR);
-                const gMult = 1.0 - fogEffect * (1.0 - fogG);
-                const bMult = 1.0 - fogEffect * (1.0 - fogB);
+                // Base color multipliers from depth fog
+                let rMult = 1.0 - fogEffect * (1.0 - fogR);
+                let gMult = 1.0 - fogEffect * (1.0 - fogG);
+                let bMult = 1.0 - fogEffect * (1.0 - fogB);
 
-                const c1 = ao[0] * lightLevel;
-                const c2 = ao[1] * lightLevel;
-                const c3 = ao[2] * lightLevel;
-                const c4 = ao[3] * lightLevel;
+                // === CAUSTICS EFFECT ===
+                // Position-based variation simulates light patterns from surface ripples
+                // More pronounced at shallow depths, fades at deep water
+                const shallowFactor = 1.0 - depthFactor; // Stronger effect near surface
+                const causticStrength = shallowFactor * 0.15; // Max 15% brightness variation
+
+                // Use multiple hash frequencies for more organic pattern
+                const caustic1 = waterHash(wx * 2, wy * 3, wz * 2);
+                const caustic2 = waterHash(wx * 5 + 17, wy * 7 + 31, wz * 5 + 23);
+                const causticPattern = (caustic1 * 0.6 + caustic2 * 0.4); // Combined pattern
+
+                // Apply caustics as brightness variation
+                const causticBoost = 1.0 + (causticPattern - 0.5) * 2 * causticStrength;
+
+                // === SURFACE FOAM EFFECT ===
+                // Top faces (ny = 1) get lighter, foamier appearance at shallow depths
+                const isTopFace = ny > 0.5;
+                let foamBoost = 1.0;
+                if (isTopFace && waterDepth <= 2) {
+                    // Foam pattern based on position
+                    const foamNoise = waterHash(wx * 3 + 7, wy, wz * 3 + 11);
+                    // Some spots have foam (white-ish), others don't
+                    if (foamNoise > 0.6) {
+                        foamBoost = 1.0 + (foamNoise - 0.6) * 0.5; // Up to 20% brighter
+                        // Foam is whiter (reduce blue tint)
+                        rMult = Math.min(1.0, rMult * 1.1);
+                        gMult = Math.min(1.0, gMult * 1.05);
+                    }
+                }
+
+                // === DEPTH GRADIENT VARIATION ===
+                // Add subtle variation to depth coloring based on position
+                const depthVariation = waterHash(wx + 101, wy * 2 + 53, wz + 79);
+                const depthMod = 1.0 + (depthVariation - 0.5) * 0.1 * depthFactor; // Up to 5% at max depth
+
+                // Combine all effects
+                rMult *= causticBoost * foamBoost * depthMod;
+                gMult *= causticBoost * foamBoost * depthMod;
+                bMult *= causticBoost * foamBoost;  // Blue doesn't get depth mod (stays blue)
+
+                // Clamp to valid range
+                rMult = Math.min(1.2, Math.max(0.0, rMult));
+                gMult = Math.min(1.2, Math.max(0.0, gMult));
+                bMult = Math.min(1.2, Math.max(0.0, bMult));
+
+                // === PER-VERTEX VARIATION ===
+                // Each vertex gets slight unique tint for organic look
+                const v1Var = 1.0 + (waterHash(wx, wy, wz) - 0.5) * 0.05;
+                const v2Var = 1.0 + (waterHash(wx + 1, wy, wz) - 0.5) * 0.05;
+                const v3Var = 1.0 + (waterHash(wx + 1, wy, wz + 1) - 0.5) * 0.05;
+                const v4Var = 1.0 + (waterHash(wx, wy, wz + 1) - 0.5) * 0.05;
+
+                const c1 = ao[0] * lightLevel * v1Var;
+                const c2 = ao[1] * lightLevel * v2Var;
+                const c3 = ao[2] * lightLevel * v3Var;
+                const c4 = ao[3] * lightLevel * v4Var;
 
                 // Apply depth-based color tinting to each vertex
                 col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
@@ -14707,8 +14766,9 @@
                 const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
                 // Calculate light level
                 const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
-                // Write vertex colors with depth-based darkening
-                writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth);
+                // Write vertex colors with depth-based darkening, caustics, and foam effects
+                // Pass world position and face normal for position-based visual variation
+                writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
             }
@@ -14897,6 +14957,17 @@
                     const cKey = getChunkKey(cx, cz);
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
+
+                    // CRITICAL: Release any existing meshes before creating new ones
+                    // This prevents duplicate meshes from accumulating in the scene
+                    // (which causes visual artifacts like darker water from z-fighting)
+                    if (chunkMeshes.has(cKey)) {
+                        releaseMeshForKey(cKey);
+                    }
+                    if (chunkMeshes.has(cKey + "_WATER")) {
+                        releaseMeshForKey(cKey + "_WATER");
+                    }
+
                     const firstMeshForChunk = !meshedChunkKeys.has(cKey);
                     let missingNeighbor = false; // Tracks whether we treated any neighbor as solid due to being unloaded
 
