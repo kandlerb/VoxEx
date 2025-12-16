@@ -9843,12 +9843,22 @@
                 document.body.appendChild(renderer.domElement);
 
                 // Water refraction render target - stores opaque scene for water to sample
+                // OPTIMIZATION: Render at 1/2 resolution - blur is barely noticeable through water distortion
+                const REFRACTION_SCALE = 0.5; // 1/2 resolution (use 0.33 for 1/3)
+                const REFRACTION_UPDATE_FRAMES = 2; // Update every N frames (1 = every frame)
+                const REFRACTION_MOVE_THRESHOLD = 0.5; // Force update if camera moves this far
+                const REFRACTION_ROTATE_THRESHOLD = 0.1; // Force update if camera rotates this much (radians)
                 let refractionRenderTarget = new THREE.WebGLRenderTarget(
-                    window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio),
-                    window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio),
+                    Math.floor(window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
+                    Math.floor(window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
                     { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat }
                 );
                 window.refractionRenderTarget = refractionRenderTarget; // Expose for resize handling
+                window.REFRACTION_SCALE = REFRACTION_SCALE; // Expose for resize handling
+                // Refraction temporal caching state
+                let refractionFrameCounter = 0;
+                let lastRefractionCamPos = new THREE.Vector3();
+                let lastRefractionCamQuat = new THREE.Quaternion();
                 // Fix z-index layering: canvas should be below all HUD elements
                 renderer.domElement.style.position = "fixed";
                 renderer.domElement.style.top = "0";
@@ -17221,29 +17231,54 @@
                 // Keep updating even when underwater so water surface is visible from below
                 const refractionEnabled = SETTINGS.waterRefractionEnabled && !SETTINGS.waterFastMode;
                 if (refractionEnabled && window.refractionRenderTarget && window.waterMaterialRefraction) {
-                    // Temporarily hide all water meshes
-                    const hiddenWaterMeshes = [];
-                    if (chunkMeshes) {
-                        for (const [key, mesh] of chunkMeshes.entries()) {
-                            if (key.endsWith("_WATER") && mesh && mesh.visible) {
-                                mesh.visible = false;
-                                hiddenWaterMeshes.push(mesh);
+                    // OPTIMIZATION: Temporal caching - skip refraction update if camera hasn't moved much
+                    refractionFrameCounter++;
+                    const camPos = camera.position;
+                    const camQuat = camera.quaternion;
+                    const posDelta = lastRefractionCamPos.distanceTo(camPos);
+                    const quatDot = Math.abs(lastRefractionCamQuat.dot(camQuat));
+                    const rotDelta = quatDot < 1 ? Math.acos(Math.min(1, quatDot)) * 2 : 0;
+                    const needsUpdate = refractionFrameCounter >= REFRACTION_UPDATE_FRAMES ||
+                                        posDelta > REFRACTION_MOVE_THRESHOLD ||
+                                        rotDelta > REFRACTION_ROTATE_THRESHOLD;
+
+                    if (needsUpdate) {
+                        refractionFrameCounter = 0;
+                        lastRefractionCamPos.copy(camPos);
+                        lastRefractionCamQuat.copy(camQuat);
+
+                        // Temporarily hide all water meshes
+                        const hiddenWaterMeshes = [];
+                        if (chunkMeshes) {
+                            for (const [key, mesh] of chunkMeshes.entries()) {
+                                if (key.endsWith("_WATER") && mesh && mesh.visible) {
+                                    mesh.visible = false;
+                                    hiddenWaterMeshes.push(mesh);
+                                }
                             }
+                        }
+
+                        // OPTIMIZATION: Exclude viewmodel layer from refraction render
+                        // Prevents torch/hands from appearing weirdly in water refraction
+                        camera.layers.set(0); // Only render world layer
+
+                        // Render opaque scene to refraction target
+                        renderer.setRenderTarget(window.refractionRenderTarget);
+                        renderer.clear();
+                        renderer.render(scene, camera);
+                        renderer.setRenderTarget(null);
+
+                        // Restore camera layers
+                        camera.layers.enable(0);
+                        camera.layers.enable(1);
+
+                        // Restore water mesh visibility
+                        for (const mesh of hiddenWaterMeshes) {
+                            mesh.visible = true;
                         }
                     }
 
-                    // Render opaque scene to refraction target
-                    renderer.setRenderTarget(window.refractionRenderTarget);
-                    renderer.clear();
-                    renderer.render(scene, camera);
-                    renderer.setRenderTarget(null);
-
-                    // Restore water mesh visibility
-                    for (const mesh of hiddenWaterMeshes) {
-                        mesh.visible = true;
-                    }
-
-                    // Update refraction shader uniforms
+                    // Always update shader uniforms (cheap, keeps things in sync)
                     const mat = window.waterMaterialRefraction;
                     mat.uniforms.tRefraction.value = window.refractionRenderTarget.texture;
                     mat.uniforms.time.value = performance.now();
@@ -17602,12 +17637,13 @@
                 if (volumetricLightPass) {
                     volumetricLightPass.uniforms.aspectRatio.value = window.innerWidth / window.innerHeight;
                 }
-                // Update refraction render target size
+                // Update refraction render target size (at reduced resolution)
                 if (window.refractionRenderTarget) {
                     const pixelRatio = window.devicePixelRatio * SETTINGS.pixelRatio;
+                    const scale = window.REFRACTION_SCALE || 0.5;
                     window.refractionRenderTarget.setSize(
-                        window.innerWidth * pixelRatio,
-                        window.innerHeight * pixelRatio
+                        Math.floor(window.innerWidth * pixelRatio * scale),
+                        Math.floor(window.innerHeight * pixelRatio * scale)
                     );
                 }
             }
