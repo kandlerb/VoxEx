@@ -921,6 +921,30 @@
                         <label for="water-fog-slider">Water Fog Density: <span id="water-fog-val">0.5</span></label>
                         <input type="range" id="water-fog-slider" min="0" max="1.0" step="0.1" />
                     </div>
+                    <div style="font-weight: 600; margin: 16px 0 6px 0">Beer-Lambert Absorption</div>
+                    <p style="font-size: 11px; color: #888; margin: 0 0 8px 0">Per-channel light absorption (higher = absorbs faster). Red absorbs fastest in real water.</p>
+                    <div class="setting-item">
+                        <label for="water-absorption-r-slider" style="color: #ff6666">Red Absorption: <span id="water-absorption-r-val">0.45</span></label>
+                        <input type="range" id="water-absorption-r-slider" min="0" max="1.0" step="0.01" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-absorption-g-slider" style="color: #66ff66">Green Absorption: <span id="water-absorption-g-val">0.08</span></label>
+                        <input type="range" id="water-absorption-g-slider" min="0" max="1.0" step="0.01" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-absorption-b-slider" style="color: #6666ff">Blue Absorption: <span id="water-absorption-b-val">0.04</span></label>
+                        <input type="range" id="water-absorption-b-slider" min="0" max="1.0" step="0.01" />
+                    </div>
+                    <div style="font-weight: 600; margin: 16px 0 6px 0">Surface Refraction</div>
+                    <p style="font-size: 11px; color: #888; margin: 0 0 8px 0">Distorts view through water surface (above water only). Disabled in Fast mode.</p>
+                    <div class="setting-item">
+                        <label for="water-refraction-toggle">Enable Refraction</label>
+                        <input type="checkbox" id="water-refraction-toggle" checked />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-refraction-strength-slider">Refraction Strength: <span id="water-refraction-strength-val">0.02</span></label>
+                        <input type="range" id="water-refraction-strength-slider" min="0" max="0.1" step="0.005" />
+                    </div>
                     <button class="menu-btn" id="btn-reset-graphics-water" style="margin-top: 20px; background: #884400; border-color: #aa5500">Reset to Default</button>
                     <button class="menu-btn" id="btn-back-from-graphics-water">Back</button>
                 </div>
@@ -1303,9 +1327,14 @@
                 waterColor: savedSettings.waterColor || 0x4488ff,
                 waterOpacity: savedSettings.waterOpacity !== undefined ? savedSettings.waterOpacity : 0.7,
                 waterFogDensity: savedSettings.waterFogDensity !== undefined ? savedSettings.waterFogDensity : 0.5, // How quickly water becomes opaque with depth (0-1)
-                // Underwater fog settings
-                underwaterFogNear: savedSettings.underwaterFogNear || 1,
-                underwaterFogFar: savedSettings.underwaterFogFar || 30,
+                // Beer-Lambert per-channel absorption (red absorbs fastest, blue slowest)
+                // Lower values = slower/subtler absorption for gradual color shift
+                waterAbsorptionR: savedSettings.waterAbsorptionR !== undefined ? savedSettings.waterAbsorptionR : 0.25,
+                waterAbsorptionG: savedSettings.waterAbsorptionG !== undefined ? savedSettings.waterAbsorptionG : 0.06,
+                waterAbsorptionB: savedSettings.waterAbsorptionB !== undefined ? savedSettings.waterAbsorptionB : 0.01,
+                // Water surface refraction (distortion when looking through water from above)
+                waterRefractionEnabled: savedSettings.waterRefractionEnabled !== undefined ? savedSettings.waterRefractionEnabled : true,
+                waterRefractionStrength: savedSettings.waterRefractionStrength !== undefined ? savedSettings.waterRefractionStrength : 0.02,
                 // Gameplay - Movement
                 playerSpeed: savedSettings.playerSpeed || 50.0,
                 sprintMultiplier: savedSettings.sprintMultiplier || 2.0,
@@ -1394,9 +1423,14 @@
                 waterColor: 0x4488ff,
                 waterOpacity: 0.7,
                 waterFogDensity: 0.5, // How quickly water becomes opaque with depth (0-1)
-                // Underwater fog settings
-                underwaterFogNear: 1,
-                underwaterFogFar: 30,
+                // Beer-Lambert per-channel absorption (red absorbs fastest, blue slowest)
+                // Lower values = slower/subtler absorption for gradual color shift
+                waterAbsorptionR: 0.25,  // Red absorbs fastest (gradual shift over 10+ blocks)
+                waterAbsorptionG: 0.06,  // Green absorbs medium
+                waterAbsorptionB: 0.01,  // Blue absorbs slowest (deep water looks blue)
+                // Water surface refraction (distortion when looking through water from above)
+                waterRefractionEnabled: true,
+                waterRefractionStrength: 0.02,  // UV distortion strength (0.01-0.05 typical)
                 // Gameplay - Movement
                 playerSpeed: 50.0,
                 sprintMultiplier: 2.0,
@@ -4769,18 +4803,12 @@
             let lastSpaceTime = 0;
             let spacePressed = false; // Track if space is physically held
             let isUnderwater = false; // Track if player's eyes are underwater
-            let underwaterDepth = 0; // How deep underwater (for fog darkness)
-            let savedFogState = null; // Store normal fog settings when going underwater
+            let underwaterDepth = 0; // How deep underwater (for shader effects)
             let isUnderground = false; // Track if player is underground (low sky light)
             // Swimming/treading water state
             let swimSpaceHoldTime = 0; // How long space has been held while underwater
             let isTreadingWater = false; // Whether player is floating at surface
             let waterSurfaceY = 0; // Y position of water surface for treading
-            // OPTIMIZATION: Reusable color objects for underwater fog (avoid per-frame allocations)
-            // Colors matched to water texture: #2389DA (upper), #1B609E (lower), #1565C0 (ripple shadow)
-            const _underwaterBaseColor = new THREE.Color(0x2389DA); // Matches water texture upper half
-            const _underwaterDarkColor = new THREE.Color(0x0A2A40); // Dark cyan-blue (matches texture hue)
-            const _underwaterResultColor = new THREE.Color();
             const _undergroundFogColor = new THREE.Color(0x000000); // Black fog for underground/caves
             let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             // --- BLOCK DEFINITIONS ---
@@ -9451,6 +9479,14 @@
                 if (SETTINGS.shadows) { renderer.shadowMap.type = THREE.PCFShadowMap; }
                 refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
+
+                // Water refraction render target - stores opaque scene for water to sample
+                let refractionRenderTarget = new THREE.WebGLRenderTarget(
+                    window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio),
+                    window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio),
+                    { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat }
+                );
+                window.refractionRenderTarget = refractionRenderTarget; // Expose for resize handling
                 // Fix z-index layering: canvas should be below all HUD elements
                 renderer.domElement.style.position = "fixed";
                 renderer.domElement.style.top = "0";
@@ -9529,6 +9565,10 @@
                         underwaterDepth: { value: 0.0 },
                         // Underwater tint color (matches water texture #2389DA)
                         waterColor: { value: new THREE.Color(0x2389DA) },
+                        // Beer-Lambert per-channel absorption coefficients
+                        absorptionR: { value: SETTINGS.waterAbsorptionR },
+                        absorptionG: { value: SETTINGS.waterAbsorptionG },
+                        absorptionB: { value: SETTINGS.waterAbsorptionB },
                         // Effect intensities
                         tintStrength: { value: 0.25 },
                         causticStrength: { value: 0.15 },
@@ -9548,6 +9588,10 @@
                         uniform bool isUnderwater;
                         uniform float underwaterDepth;
                         uniform vec3 waterColor;
+                        // Beer-Lambert per-channel absorption coefficients
+                        uniform float absorptionR;
+                        uniform float absorptionG;
+                        uniform float absorptionB;
                         uniform float tintStrength;
                         uniform float causticStrength;
                         uniform float distortionStrength;
@@ -9597,6 +9641,14 @@
                             vec4 texel = texture2D(tDiffuse, distortedUV);
                             vec3 color = texel.rgb;
 
+                            // Beer-Lambert per-channel absorption: T_rgb = e^(-σ_rgb * d)
+                            // Red absorbs fastest in real water, making deep water look blue/green
+                            // Gradual absorption based on actual depth (no artificial base)
+                            vec3 absorption = vec3(absorptionR, absorptionG, absorptionB);
+                            float effectiveDepth = underwaterDepth + 0.5; // Minimal base for subtle effect at surface
+                            vec3 transmittance = exp(-absorption * effectiveDepth);
+                            color *= transmittance;
+
                             // Depth factor affects all effects (deeper = stronger effects)
                             float depthFactor = clamp(underwaterDepth / 20.0, 0.0, 1.0);
 
@@ -9607,13 +9659,13 @@
                             float causticEffect = causticPattern * causticMask * causticStrength * (1.0 - depthFactor * 0.7);
                             color += vec3(causticEffect * 0.8, causticEffect * 0.9, causticEffect);
 
-                            // Color tint - blend toward water color
-                            float tint = tintStrength * (1.0 + depthFactor * 0.5);
-                            color = mix(color, color * waterColor * 2.0, tint);
+                            // Color tint - subtle blend toward water color (reduced to let Beer-Lambert dominate)
+                            float tint = tintStrength * 0.5 * (1.0 + depthFactor * 0.3);
+                            color = mix(color, color * waterColor * 1.5, tint);
 
-                            // Slight desaturation with depth
+                            // Slight desaturation with depth (reduced - Beer-Lambert handles color shift)
                             float gray = dot(color, vec3(0.299, 0.587, 0.114));
-                            color = mix(color, vec3(gray) * waterColor * 1.5, depthFactor * 0.3);
+                            color = mix(color, vec3(gray) * waterColor * 1.2, depthFactor * 0.15);
 
                             // Vignette - darker edges underwater
                             vec2 centerUV = vUv - 0.5;
@@ -10076,11 +10128,25 @@
                 const waterOpacityVal = document.getElementById("water-opacity-val");
                 const waterFogSlider = document.getElementById("water-fog-slider");
                 const waterFogVal = document.getElementById("water-fog-val");
+                const waterAbsorptionRSlider = document.getElementById("water-absorption-r-slider");
+                const waterAbsorptionRVal = document.getElementById("water-absorption-r-val");
+                const waterAbsorptionGSlider = document.getElementById("water-absorption-g-slider");
+                const waterAbsorptionGVal = document.getElementById("water-absorption-g-val");
+                const waterAbsorptionBSlider = document.getElementById("water-absorption-b-slider");
+                const waterAbsorptionBVal = document.getElementById("water-absorption-b-val");
                 // NOTE: queueMaterialUpdate, applyWaterMaterialSettings, flushMaterialUpdates are defined at module scope
                 if (waterFastToggle) waterFastToggle.checked = SETTINGS.waterFastMode;
                 if (waterColorInput) waterColorInput.value = "#" + SETTINGS.waterColor.toString(16).padStart(6, "0");
                 if (waterOpacitySlider && waterOpacityVal) { waterOpacitySlider.value = SETTINGS.waterOpacity; waterOpacityVal.textContent = SETTINGS.waterOpacity; }
                 if (waterFogSlider && waterFogVal) { waterFogSlider.value = SETTINGS.waterFogDensity; waterFogVal.textContent = SETTINGS.waterFogDensity; }
+                if (waterAbsorptionRSlider && waterAbsorptionRVal) { waterAbsorptionRSlider.value = SETTINGS.waterAbsorptionR; waterAbsorptionRVal.textContent = SETTINGS.waterAbsorptionR; }
+                if (waterAbsorptionGSlider && waterAbsorptionGVal) { waterAbsorptionGSlider.value = SETTINGS.waterAbsorptionG; waterAbsorptionGVal.textContent = SETTINGS.waterAbsorptionG; }
+                if (waterAbsorptionBSlider && waterAbsorptionBVal) { waterAbsorptionBSlider.value = SETTINGS.waterAbsorptionB; waterAbsorptionBVal.textContent = SETTINGS.waterAbsorptionB; }
+                const waterRefractionToggle = document.getElementById("water-refraction-toggle");
+                const waterRefractionStrengthSlider = document.getElementById("water-refraction-strength-slider");
+                const waterRefractionStrengthVal = document.getElementById("water-refraction-strength-val");
+                if (waterRefractionToggle) waterRefractionToggle.checked = SETTINGS.waterRefractionEnabled;
+                if (waterRefractionStrengthSlider && waterRefractionStrengthVal) { waterRefractionStrengthSlider.value = SETTINGS.waterRefractionStrength; waterRefractionStrengthVal.textContent = SETTINGS.waterRefractionStrength; }
                 // INITIALIZE UI VALUES - Graphics > Effects
                 const zombieVignetteToggle = document.getElementById("zombie-vignette-toggle");
                 const zombieVignetteIntensitySlider = document.getElementById("zombie-vignette-intensity-slider");
@@ -10286,6 +10352,13 @@
                 waterColorInput?.addEventListener("input", () => { SETTINGS.waterColor = parseInt(waterColorInput.value.substring(1), 16); applyWaterMaterialSettings(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 waterOpacitySlider?.addEventListener("input", () => { SETTINGS.waterOpacity = parseFloat(waterOpacitySlider.value); waterOpacityVal.textContent = SETTINGS.waterOpacity; applyWaterMaterialSettings(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 waterFogSlider?.addEventListener("input", () => { SETTINGS.waterFogDensity = parseFloat(waterFogSlider.value); waterFogVal.textContent = SETTINGS.waterFogDensity; rebuildAllVisibleChunks(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                // Beer-Lambert absorption sliders - update shader uniforms in real-time
+                waterAbsorptionRSlider?.addEventListener("input", () => { SETTINGS.waterAbsorptionR = parseFloat(waterAbsorptionRSlider.value); waterAbsorptionRVal.textContent = SETTINGS.waterAbsorptionR; if (underwaterPass) underwaterPass.uniforms.absorptionR.value = SETTINGS.waterAbsorptionR; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                waterAbsorptionGSlider?.addEventListener("input", () => { SETTINGS.waterAbsorptionG = parseFloat(waterAbsorptionGSlider.value); waterAbsorptionGVal.textContent = SETTINGS.waterAbsorptionG; if (underwaterPass) underwaterPass.uniforms.absorptionG.value = SETTINGS.waterAbsorptionG; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                waterAbsorptionBSlider?.addEventListener("input", () => { SETTINGS.waterAbsorptionB = parseFloat(waterAbsorptionBSlider.value); waterAbsorptionBVal.textContent = SETTINGS.waterAbsorptionB; if (underwaterPass) underwaterPass.uniforms.absorptionB.value = SETTINGS.waterAbsorptionB; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                // Water refraction controls
+                waterRefractionToggle?.addEventListener("change", () => { SETTINGS.waterRefractionEnabled = waterRefractionToggle.checked; if (window.applyWaterFastMode) window.applyWaterFastMode(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                waterRefractionStrengthSlider?.addEventListener("input", () => { SETTINGS.waterRefractionStrength = parseFloat(waterRefractionStrengthSlider.value); waterRefractionStrengthVal.textContent = SETTINGS.waterRefractionStrength; if (window.waterMaterialRefraction) window.waterMaterialRefraction.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 // EVENT HANDLERS - Graphics > Effects
                 zombieVignetteToggle?.addEventListener("change", () => { SETTINGS.zombieVignetteEnabled = zombieVignetteToggle.checked; if (zombieScarePass) zombieScarePass.uniforms.enableVignette.value = SETTINGS.zombieVignetteEnabled; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 zombieVignetteIntensitySlider?.addEventListener("input", () => { SETTINGS.zombieVignetteIntensity = parseFloat(zombieVignetteIntensitySlider.value); zombieVignetteIntensityVal.textContent = SETTINGS.zombieVignetteIntensity; if (zombieScarePass) zombieScarePass.uniforms.vignetteIntensity.value = SETTINGS.zombieVignetteIntensity; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
@@ -10364,6 +10437,11 @@
                     if (waterColorInput) waterColorInput.value = "#" + SETTINGS.waterColor.toString(16).padStart(6, "0");
                     if (waterOpacitySlider && waterOpacityVal) { waterOpacitySlider.value = SETTINGS.waterOpacity; waterOpacityVal.textContent = SETTINGS.waterOpacity; }
                     if (waterFogSlider && waterFogVal) { waterFogSlider.value = SETTINGS.waterFogDensity; waterFogVal.textContent = SETTINGS.waterFogDensity; }
+                    if (waterAbsorptionRSlider && waterAbsorptionRVal) { waterAbsorptionRSlider.value = SETTINGS.waterAbsorptionR; waterAbsorptionRVal.textContent = SETTINGS.waterAbsorptionR; }
+                    if (waterAbsorptionGSlider && waterAbsorptionGVal) { waterAbsorptionGSlider.value = SETTINGS.waterAbsorptionG; waterAbsorptionGVal.textContent = SETTINGS.waterAbsorptionG; }
+                    if (waterAbsorptionBSlider && waterAbsorptionBVal) { waterAbsorptionBSlider.value = SETTINGS.waterAbsorptionB; waterAbsorptionBVal.textContent = SETTINGS.waterAbsorptionB; }
+                    if (waterRefractionToggle) waterRefractionToggle.checked = SETTINGS.waterRefractionEnabled;
+                    if (waterRefractionStrengthSlider && waterRefractionStrengthVal) { waterRefractionStrengthSlider.value = SETTINGS.waterRefractionStrength; waterRefractionStrengthVal.textContent = SETTINGS.waterRefractionStrength; }
                     // Gameplay
                     if (playerSpeedSlider && playerSpeedVal) { playerSpeedSlider.value = SETTINGS.playerSpeed; playerSpeedVal.textContent = SETTINGS.playerSpeed; }
                     if (sprintMultSlider && sprintMultVal) { sprintMultSlider.value = SETTINGS.sprintMultiplier; sprintMultVal.textContent = SETTINGS.sprintMultiplier; }
@@ -10523,8 +10601,21 @@
                     SETTINGS.waterColor = DEFAULTS.waterColor;
                     SETTINGS.waterOpacity = DEFAULTS.waterOpacity;
                     SETTINGS.waterFogDensity = DEFAULTS.waterFogDensity;
-                    SETTINGS.underwaterFogNear = DEFAULTS.underwaterFogNear;
-                    SETTINGS.underwaterFogFar = DEFAULTS.underwaterFogFar;
+                    SETTINGS.waterAbsorptionR = DEFAULTS.waterAbsorptionR;
+                    SETTINGS.waterAbsorptionG = DEFAULTS.waterAbsorptionG;
+                    SETTINGS.waterAbsorptionB = DEFAULTS.waterAbsorptionB;
+                    SETTINGS.waterRefractionEnabled = DEFAULTS.waterRefractionEnabled;
+                    SETTINGS.waterRefractionStrength = DEFAULTS.waterRefractionStrength;
+                    // Update shader uniforms for Beer-Lambert absorption
+                    if (underwaterPass) {
+                        underwaterPass.uniforms.absorptionR.value = SETTINGS.waterAbsorptionR;
+                        underwaterPass.uniforms.absorptionG.value = SETTINGS.waterAbsorptionG;
+                        underwaterPass.uniforms.absorptionB.value = SETTINGS.waterAbsorptionB;
+                    }
+                    // Update refraction shader uniforms
+                    if (window.waterMaterialRefraction) {
+                        window.waterMaterialRefraction.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength;
+                    }
                     if (window.applyWaterFastMode) window.applyWaterFastMode(); // Switch material mode
                     applyWaterMaterialSettings(); // Apply changes to material immediately
                     rebuildAllVisibleChunks(); // Rebuild to apply new fog density
@@ -11340,8 +11431,123 @@
                     depthWrite: false,
                     depthTest: true,
                 });
+                // Refraction water material - ShaderMaterial that samples opaque scene with UV distortion
+                const waterMaterialRefraction = new THREE.ShaderMaterial({
+                    uniforms: {
+                        tRefraction: { value: null }, // Set to refractionRenderTarget.texture in render loop
+                        tWater: { value: tex },
+                        time: { value: 0.0 },
+                        opacity: { value: SETTINGS.waterOpacity },
+                        refractionStrength: { value: SETTINGS.waterRefractionStrength },
+                        waterColor: { value: new THREE.Color(0x2389DA) }, // Water tint
+                        fogColor: { value: new THREE.Color(0xb3d9ff) },
+                        fogNear: { value: 1.0 },
+                        fogFar: { value: 400.0 }
+                    },
+                    vertexShader: `
+                        attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
+                        varying vec2 vUv;
+                        varying vec3 vWorldPosition;
+                        varying vec4 vScreenPos;
+                        varying vec3 vColor;
+                        varying float vShoreDist;
+                        void main() {
+                            vUv = uv;
+                            vColor = color;
+                            vShoreDist = shoreDist;
+                            vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                            vWorldPosition = worldPos.xyz;
+                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            gl_Position = projectionMatrix * mvPosition;
+                            // Screen space position for sampling refraction texture
+                            vScreenPos = gl_Position;
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform sampler2D tRefraction;
+                        uniform sampler2D tWater;
+                        uniform float time;
+                        uniform float opacity;
+                        uniform float refractionStrength;
+                        uniform vec3 waterColor;
+                        uniform vec3 fogColor;
+                        uniform float fogNear;
+                        uniform float fogFar;
+                        varying vec2 vUv;
+                        varying vec3 vWorldPosition;
+                        varying vec4 vScreenPos;
+                        varying vec3 vColor;
+                        varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
+
+                        // Simple noise function for wave distortion
+                        float hash(vec2 p) {
+                            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+                        }
+                        float noise(vec2 p) {
+                            vec2 i = floor(p);
+                            vec2 f = fract(p);
+                            f = f * f * (3.0 - 2.0 * f);
+                            float a = hash(i);
+                            float b = hash(i + vec2(1.0, 0.0));
+                            float c = hash(i + vec2(0.0, 1.0));
+                            float d = hash(i + vec2(1.0, 1.0));
+                            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                        }
+
+                        void main() {
+                            // Convert clip space to screen UV (0-1 range)
+                            vec2 screenUV = (vScreenPos.xy / vScreenPos.w) * 0.5 + 0.5;
+
+                            // Wave-based UV distortion using world position
+                            // Scale by shore distance: calm near shores, wavy far from shores
+                            float t = time * 0.001;
+                            vec2 waveOffset;
+                            waveOffset.x = noise(vWorldPosition.xz * 0.5 + vec2(t * 0.5, t * 0.3)) * 2.0 - 1.0;
+                            waveOffset.y = noise(vWorldPosition.xz * 0.5 + vec2(t * 0.3, -t * 0.4)) * 2.0 - 1.0;
+
+                            // Apply shore distance scaling: 0.1 at shore, 1.0 far from shore
+                            float waveScale = mix(0.1, 1.0, vShoreDist);
+
+                            // Apply distortion to screen UV
+                            vec2 distortedUV = screenUV + waveOffset * refractionStrength * waveScale;
+                            distortedUV = clamp(distortedUV, 0.001, 0.999); // Prevent edge artifacts
+
+                            // Sample refracted scene
+                            vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
+
+                            // Sample water texture for surface detail
+                            vec4 waterTex = texture2D(tWater, vUv);
+
+                            // Mix refracted scene with water tint (subtle to match underwater appearance)
+                            vec3 tintedRefraction = refractedColor * waterColor * 1.3;
+
+                            // Blend based on water texture alpha and vertex color (reduced to match underwater tint)
+                            vec3 finalColor = mix(refractedColor, tintedRefraction, 0.15);
+
+                            // Blend in water texture for surface detail
+                            finalColor = mix(finalColor, waterTex.rgb * waterColor, waterTex.a * 0.35);
+
+                            finalColor *= vColor; // Apply vertex colors (depth fog, AO)
+
+                            // Apply fog
+                            float fogDepth = length(vWorldPosition - cameraPosition);
+                            float fogFactor = smoothstep(fogNear, fogFar, fogDepth);
+                            finalColor = mix(finalColor, fogColor, fogFactor);
+
+                            gl_FragColor = vec4(finalColor, opacity * waterTex.a);
+                        }
+                    `,
+                    transparent: true,
+                    side: THREE.DoubleSide,
+                    depthWrite: false,
+                    depthTest: true,
+                    vertexColors: true,
+                    fog: false // We handle fog manually in shader
+                });
+                window.waterMaterialRefraction = waterMaterialRefraction; // Expose for render loop
+
                 // Select initial water material based on setting
-                waterMaterial = SETTINGS.waterFastMode ? waterMaterialFast : waterMaterialStandard;
+                waterMaterial = SETTINGS.waterFastMode ? waterMaterialFast : (SETTINGS.waterRefractionEnabled ? waterMaterialRefraction : waterMaterialStandard);
                 // Allow built-in fog to run with camera depth for all materials
                 chunkMaterial.fog = true;
                 waterMaterialStandard.fog = true;
@@ -11349,12 +11555,24 @@
 
                 // Function to switch water material mode and update all water meshes
                 function applyWaterFastMode() {
-                    const newMaterial = SETTINGS.waterFastMode ? waterMaterialFast : waterMaterialStandard;
+                    // Fast mode overrides refraction; otherwise use refraction if enabled
+                    let newMaterial;
+                    if (SETTINGS.waterFastMode) {
+                        newMaterial = waterMaterialFast;
+                    } else if (SETTINGS.waterRefractionEnabled) {
+                        newMaterial = waterMaterialRefraction;
+                    } else {
+                        newMaterial = waterMaterialStandard;
+                    }
                     if (waterMaterial === newMaterial) return;
                     waterMaterial = newMaterial;
-                    // Update opacity on both materials to stay in sync
+                    // Update opacity on all materials to stay in sync
                     waterMaterialStandard.opacity = SETTINGS.waterOpacity;
                     waterMaterialFast.opacity = SETTINGS.waterOpacity;
+                    if (waterMaterialRefraction.uniforms) {
+                        waterMaterialRefraction.uniforms.opacity.value = SETTINGS.waterOpacity;
+                        waterMaterialRefraction.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength;
+                    }
                     // Update all existing water meshes to use the new material
                     if (chunkMeshes) {
                         for (const [key, mesh] of chunkMeshes.entries()) {
@@ -11363,7 +11581,8 @@
                             }
                         }
                     }
-                    logDebug("[Water] Switched to " + (SETTINGS.waterFastMode ? "fast" : "standard") + " water mode");
+                    const mode = SETTINGS.waterFastMode ? "fast" : (SETTINGS.waterRefractionEnabled ? "refraction" : "standard");
+                    logDebug("[Water] Switched to " + mode + " water mode");
                 }
                 window.applyWaterFastMode = applyWaterFastMode;
 
@@ -14757,7 +14976,7 @@
             }
 
             // Add a water face with depth-based coloring (darker at depth)
-            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth) {
+            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist) {
                 // Get cached face vertices
                 const verts = getCachedFaceVertices(nx, ny, nz);
                 // Write vertex positions and normals
@@ -14771,6 +14990,14 @@
                 writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
+                // Write shore distance for all 6 vertices (normalized: 0 = at shore, 1 = far from shore)
+                const shoreNorm = Math.min(shoreDist / 4.0, 1.0); // Normalize to 0-1 range
+                shoreBuffer[shoreIdx] = shoreNorm;
+                shoreBuffer[shoreIdx + 1] = shoreNorm;
+                shoreBuffer[shoreIdx + 2] = shoreNorm;
+                shoreBuffer[shoreIdx + 3] = shoreNorm;
+                shoreBuffer[shoreIdx + 4] = shoreNorm;
+                shoreBuffer[shoreIdx + 5] = shoreNorm;
             }
 
             // OPTIMIZATION: Simplified face rendering for distant chunks
@@ -15035,8 +15262,9 @@
                     const waterNorm = normPool.acquire(maxFaces * 18);
                     const waterUvs = uvPool.acquire(maxFaces * 12);
                     const waterCols = colPool.acquire(maxFaces * 18);
+                    const waterShore = new Float32Array(maxFaces * 6); // Shore distance per vertex (1 float per vertex, 6 vertices per face)
                     let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
-                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wFaceCount = 0; // Water
+                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wFaceCount = 0; // Water (added wSIdx for shore)
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
@@ -15128,22 +15356,44 @@
                                             addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
                                         } else if (isWater) {
                                             // Calculate water depth (search DOWN to find bottom)
-                                            // Surface water has high depth (far from bottom) = more fog
-                                            // Bottom water has low depth (near bottom) = less fog
                                             let waterDepth = 0;
                                             for (let dy = y - 1; dy >= 0; dy--) {
                                                 const belowId = getLocal(x, dy, z);
                                                 if (belowId !== WATER) break;
                                                 waterDepth++;
                                             }
+                                            // Calculate shore distance - check horizontal neighbors for solid blocks
+                                            // Shore distance: 0 = at shore, 1 = 1 block away, etc.
+                                            // Check if this water has air above (surface water)
+                                            const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                            let shoreDist = 4; // Default: far from shore (max waves)
+                                            if (hasAirAbove) {
+                                                // Check in 4 horizontal directions for solid ground
+                                                const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                for (const [dx, dz] of directions) {
+                                                    for (let d = 1; d <= 4; d++) {
+                                                        const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                        // If solid block found, this is our shore distance in that direction
+                                                        if (checkId !== WATER && checkId !== AIR && checkId !== LEAVES) {
+                                                            shoreDist = Math.min(shoreDist, d);
+                                                            break;
+                                                        }
+                                                        // If air (edge of water), also counts as shore
+                                                        if (checkId === AIR) {
+                                                            shoreDist = Math.min(shoreDist, d);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                             // Use water-specific face rendering with depth-based coloring
-                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth);
+                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist);
                                         } else {
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
                                         }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wFaceCount++;
+                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
                                     }
                                 }
@@ -15188,11 +15438,14 @@
                         wUvArray.set(waterUvs.subarray(0, wUvIdx));
                         const wColArray = new Float32Array(wCIdx);
                         wColArray.set(waterCols.subarray(0, wCIdx));
+                        const wShoreArray = new Float32Array(wSIdx);
+                        wShoreArray.set(waterShore.subarray(0, wSIdx));
                         const waterGeo = new THREE.BufferGeometry();
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
+                        waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1)); // Shore distance per vertex
                         applyChunkBounds(waterGeo, startX, startZ);
                         optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
@@ -16446,6 +16699,44 @@
             function renderFrame() {
                 const renderStart = perfMonitor.start("rendering");
 
+                // Water refraction: render opaque scene to texture first (when not underwater)
+                const refractionEnabled = SETTINGS.waterRefractionEnabled && !SETTINGS.waterFastMode && !isUnderwater;
+                if (refractionEnabled && window.refractionRenderTarget && window.waterMaterialRefraction) {
+                    // Temporarily hide all water meshes
+                    const hiddenWaterMeshes = [];
+                    if (chunkMeshes) {
+                        for (const [key, mesh] of chunkMeshes.entries()) {
+                            if (key.endsWith("_WATER") && mesh && mesh.visible) {
+                                mesh.visible = false;
+                                hiddenWaterMeshes.push(mesh);
+                            }
+                        }
+                    }
+
+                    // Render opaque scene to refraction target
+                    renderer.setRenderTarget(window.refractionRenderTarget);
+                    renderer.clear();
+                    renderer.render(scene, camera);
+                    renderer.setRenderTarget(null);
+
+                    // Restore water mesh visibility
+                    for (const mesh of hiddenWaterMeshes) {
+                        mesh.visible = true;
+                    }
+
+                    // Update refraction shader uniforms
+                    const mat = window.waterMaterialRefraction;
+                    mat.uniforms.tRefraction.value = window.refractionRenderTarget.texture;
+                    mat.uniforms.time.value = performance.now();
+                    mat.uniforms.opacity.value = SETTINGS.waterOpacity;
+                    mat.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength;
+                    if (scene.fog) {
+                        mat.uniforms.fogColor.value.copy(scene.fog.color);
+                        mat.uniforms.fogNear.value = scene.fog.near;
+                        mat.uniforms.fogFar.value = scene.fog.far;
+                    }
+                }
+
                 // INSTRUMENTATION: Track volumetric lighting time
                 const volumetricStartMs = performance.now();
                 // OPTIMIZATION: Only update volumetric lighting when enabled
@@ -16472,7 +16763,7 @@
                 // If not, bypass EffectComposer entirely and render directly (composer adds overhead)
                 // Use settings/state directly rather than pass.enabled which may be out of sync
                 const volumetricActive = SETTINGS.volumetricLightingEnabled;
-                const underwaterActive = isUnderwater; // Global state set by updateUnderwaterFog
+                const underwaterActive = isUnderwater; // Global state set by updateUnderwaterState
                 const anyPostEffectsActive = volumetricActive || underwaterActive || zombieEffectsEnabled;
 
                 // NOTE: Keep ALL passes enabled when using the composer to maintain
@@ -16518,10 +16809,9 @@
                 }
                 perfMonitor.end("rendering", renderStart);
             }
-            // Update underwater fog based on player position
-            // OPTIMIZATION: Uses reusable color objects and caches depth calculation
-            function updateUnderwaterFog() {
-                if (!scene.fog || !controls) return;
+            // Update underwater state and shader uniforms
+            function updateUnderwaterState() {
+                if (!controls) return;
 
                 const camPos = controls.getObject().position;
                 const eyeY = camPos.y;
@@ -16536,7 +16826,6 @@
 
                 if (isUnderwater) {
                     // OPTIMIZATION: Only recalculate depth when Y position changes significantly
-                    // This avoids the loop running every frame when treading water
                     const yDelta = Math.abs(eyeY - _lastUnderwaterCheckY);
                     if (yDelta > 0.25 || !wasUnderwater) {
                         _lastUnderwaterCheckY = eyeY;
@@ -16552,56 +16841,26 @@
                         underwaterDepth = Math.max(0, surfaceY - eyeY);
                     }
 
-                    // Save normal fog state when entering water
-                    if (!wasUnderwater) {
-                        savedFogState = {
-                            near: scene.fog.near,
-                            far: scene.fog.far,
-                            color: scene.fog.color.clone()
-                        };
-                    }
-
-                    // Use texture-matched underwater fog color (0x2389DA matches water texture)
-                    // Don't use SETTINGS.waterColor here - that's for the surface material, not underwater fog
-
-                    // Darken based on depth - deeper = darker and shorter visibility
-                    const maxDepth = 35; // Maximum depth for full darkness
-                    const depthFactor = Math.min(underwaterDepth / maxDepth, 1.0);
-
-                    // Interpolate from water color to dark blue/black using reusable objects
-                    _underwaterResultColor.copy(_underwaterBaseColor).lerp(_underwaterDarkColor, depthFactor * 0.9);
-
-                    // Fog distance decreases with depth (murkier water deeper down)
-                    const baseFogFar = SETTINGS.underwaterFogFar;
-                    const baseFogNear = SETTINGS.underwaterFogNear;
-                    const fogFar = THREE.MathUtils.lerp(baseFogFar, 8, depthFactor);
-                    const fogNear = THREE.MathUtils.lerp(baseFogNear, 0.5, depthFactor);
-
-                    // Apply underwater fog
-                    scene.fog.color.copy(_underwaterResultColor);
-                    scene.fog.near = fogNear;
-                    scene.fog.far = fogFar;
-
-                    // Update underwater shader uniforms (pass enabled state is synced in renderFrame)
+                    // Update underwater shader uniforms
                     if (underwaterPass) {
                         underwaterPass.uniforms.isUnderwater.value = true;
                         underwaterPass.uniforms.underwaterDepth.value = underwaterDepth;
                         underwaterPass.uniforms.time.value = performance.now();
+                        // Sync Beer-Lambert absorption coefficients
+                        underwaterPass.uniforms.absorptionR.value = SETTINGS.waterAbsorptionR;
+                        underwaterPass.uniforms.absorptionG.value = SETTINGS.waterAbsorptionG;
+                        underwaterPass.uniforms.absorptionB.value = SETTINGS.waterAbsorptionB;
                     }
-                } else if (wasUnderwater && savedFogState) {
-                    // Restore normal fog when exiting water
-                    // Note: updateDayNight will override the color, so just restore distances
-                    scene.fog.near = savedFogState.near;
-                    scene.fog.far = savedFogState.far;
-                    savedFogState = null;
+                } else if (wasUnderwater) {
+                    // Reset state when exiting water
                     underwaterDepth = 0;
-                    _lastUnderwaterCheckY = -Infinity; // Reset cache when exiting water
+                    _lastUnderwaterCheckY = -Infinity;
 
-                    // Reset swimming state when exiting water
+                    // Reset swimming state
                     swimSpaceHoldTime = 0;
                     isTreadingWater = false;
 
-                    // Reset underwater shader uniforms (pass enabled state is synced in renderFrame)
+                    // Reset underwater shader uniforms
                     if (underwaterPass) {
                         underwaterPass.uniforms.isUnderwater.value = false;
                     }
@@ -16641,7 +16900,7 @@
                         updateDayNight(clampedDt);
                         // INSTRUMENTATION: Track underwater update time
                         const underwaterStartMs = performance.now();
-                        updateUnderwaterFog(); // Apply underwater fog after day/night (overrides when underwater)
+                        updateUnderwaterState(); // Update underwater state and shader uniforms
                         perfMetrics.underwaterTime = performance.now() - underwaterStartMs;
                         updateFPSTracking(time, rawDt, clampedDt);
                         // Track physics timing
@@ -16807,6 +17066,14 @@
                 // Update aspect ratio for circular point light glow
                 if (volumetricLightPass) {
                     volumetricLightPass.uniforms.aspectRatio.value = window.innerWidth / window.innerHeight;
+                }
+                // Update refraction render target size
+                if (window.refractionRenderTarget) {
+                    const pixelRatio = window.devicePixelRatio * SETTINGS.pixelRatio;
+                    window.refractionRenderTarget.setSize(
+                        window.innerWidth * pixelRatio,
+                        window.innerHeight * pixelRatio
+                    );
                 }
             }
         </script>
