@@ -7113,6 +7113,9 @@
                 // Then propagate light from neighboring chunks into this chunk's edges
                 propagateLightFromNeighbors(chunk, cx, cz, chunkSize, chunkHeight);
 
+                // Spread edge light into chunk interior via BFS
+                propagateLightFromEdgesInward(chunk, chunkSize, chunkHeight);
+
                 // Mark chunk as having completed edge lighting
                 if (!chunk.renderState) chunk.renderState = 0;
                 chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
@@ -7200,6 +7203,86 @@
                 }
             }
 
+            // BFS propagation from chunk edges inward
+            // Call this AFTER propagateLightFromNeighbors to spread edge light into interior
+            function propagateLightFromEdgesInward(chunk, chunkSize, chunkHeight) {
+                const skyLight = chunk.skyLight;
+                const blocks = chunk.blocks;
+                const cs = chunkSize;
+
+                // BFS queue: [lx, ly, lz, level]
+                const queue = [];
+
+                // Seed queue with all edge blocks that have light > 1
+                // West edge (lx = 0)
+                for (let lz = 0; lz < cs; lz++) {
+                    for (let ly = 0; ly < chunkHeight; ly++) {
+                        const idx = 0 + lz * cs + ly * cs * cs;
+                        if (skyLight[idx] > 1 && IS_TRANSPARENT[blocks[idx]]) {
+                            queue.push(0, ly, lz, skyLight[idx]);
+                        }
+                    }
+                }
+                // East edge (lx = 15)
+                for (let lz = 0; lz < cs; lz++) {
+                    for (let ly = 0; ly < chunkHeight; ly++) {
+                        const idx = 15 + lz * cs + ly * cs * cs;
+                        if (skyLight[idx] > 1 && IS_TRANSPARENT[blocks[idx]]) {
+                            queue.push(15, ly, lz, skyLight[idx]);
+                        }
+                    }
+                }
+                // North edge (lz = 0)
+                for (let lx = 1; lx < cs - 1; lx++) { // Skip corners (already added)
+                    for (let ly = 0; ly < chunkHeight; ly++) {
+                        const idx = lx + 0 * cs + ly * cs * cs;
+                        if (skyLight[idx] > 1 && IS_TRANSPARENT[blocks[idx]]) {
+                            queue.push(lx, ly, 0, skyLight[idx]);
+                        }
+                    }
+                }
+                // South edge (lz = 15)
+                for (let lx = 1; lx < cs - 1; lx++) { // Skip corners
+                    for (let ly = 0; ly < chunkHeight; ly++) {
+                        const idx = lx + 15 * cs + ly * cs * cs;
+                        if (skyLight[idx] > 1 && IS_TRANSPARENT[blocks[idx]]) {
+                            queue.push(lx, ly, 15, skyLight[idx]);
+                        }
+                    }
+                }
+
+                // BFS propagation into interior
+                let qIdx = 0;
+                while (qIdx < queue.length) {
+                    const lx = queue[qIdx++];
+                    const ly = queue[qIdx++];
+                    const lz = queue[qIdx++];
+                    const level = queue[qIdx++];
+
+                    const propagated = level - 1;
+                    if (propagated <= 1) continue;
+
+                    // Check 6 neighbors (but only within chunk)
+                    const neighbors = [
+                        [lx - 1, ly, lz], [lx + 1, ly, lz],
+                        [lx, ly - 1, lz], [lx, ly + 1, lz],
+                        [lx, ly, lz - 1], [lx, ly, lz + 1]
+                    ];
+
+                    for (const [nx, ny, nz] of neighbors) {
+                        if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue;
+
+                        const nIdx = nx + nz * cs + ny * cs * cs;
+                        if (!IS_TRANSPARENT[blocks[nIdx]]) continue;
+
+                        if (propagated > skyLight[nIdx]) {
+                            skyLight[nIdx] = propagated;
+                            queue.push(nx, ny, nz, propagated);
+                        }
+                    }
+                }
+            }
+
             // Queue chunks for lighting update when neighbors are built
             function queueChunkForLightingUpdate(cx, cz, key) {
                 const chunk = chunks.get(key);
@@ -7259,8 +7342,13 @@
                     // This ensures proper vertical propagation through water/transparent blocks
                     calculateChunkSunlight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
 
-                    // Propagate light from neighbors
+                    // Propagate light from neighbors (sets edge values)
                     propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+
+                    // CRITICAL: Spread edge light into chunk interior via BFS
+                    // Without this, edge values from neighbors don't propagate inward
+                    // This fixes dark water chunks that are next to lit land chunks
+                    propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
 
                     // Mark as having edge lighting
                     if (!chunk.renderState) chunk.renderState = 0;
@@ -15379,20 +15467,23 @@
             function updateLocalArea(x, y, z) {
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                // Always update the chunk the block is in
-                scheduleChunkUpdate(cx, cz, false, "edit-center");
+                // Always update the chunk the block is in - force=true and bypassLighting=true
+                // to ensure block edits are visible even if chunk has pending lighting issues
+                // This fixes dark chunks not responding to block changes
+                scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: true });
                 // Check boundaries and update neighbors if necessary
                 const lx = ((x % 16) + 16) % 16;
                 const lz = ((z % 16) + 16) % 16;
-                if (lx === 0) scheduleChunkUpdate(cx - 1, cz, false, "edit-west-edge");
-                if (lx === 15) scheduleChunkUpdate(cx + 1, cz, false, "edit-east-edge");
-                if (lz === 0) scheduleChunkUpdate(cx, cz - 1, false, "edit-north-edge");
-                if (lz === 15) scheduleChunkUpdate(cx, cz + 1, false, "edit-south-edge");
+                // Neighbors also use force=true to ensure proper seam updates
+                if (lx === 0) scheduleChunkUpdate(cx - 1, cz, true, "edit-west-edge", { bypassLighting: true });
+                if (lx === 15) scheduleChunkUpdate(cx + 1, cz, true, "edit-east-edge", { bypassLighting: true });
+                if (lz === 0) scheduleChunkUpdate(cx, cz - 1, true, "edit-north-edge", { bypassLighting: true });
+                if (lz === 15) scheduleChunkUpdate(cx, cz + 1, true, "edit-south-edge", { bypassLighting: true });
                 // ALSO update diagonal neighbors if on a corner
-                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1, false, "edit-nw-corner");
-                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1, false, "edit-sw-corner");
-                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, false, "edit-ne-corner");
-                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, false, "edit-se-corner");
+                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1, true, "edit-nw-corner", { bypassLighting: true });
+                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1, true, "edit-sw-corner", { bypassLighting: true });
+                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, true, "edit-ne-corner", { bypassLighting: true });
+                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, true, "edit-se-corner", { bypassLighting: true });
             }
             function pickVoxel(origin, dir, range) {
                 let x = Math.floor(origin.x), y = Math.floor(origin.y), z = Math.floor(origin.z);
