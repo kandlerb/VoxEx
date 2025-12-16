@@ -11817,15 +11817,18 @@
                     },
                     vertexShader: `
                         attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
+                        attribute float waterThickness; // Water depth in blocks (normalized: 0 = surface, 1 = 8+ blocks)
                         varying vec2 vUv;
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
                         varying float vShoreDist;
+                        varying float vWaterThickness;
                         void main() {
                             vUv = uv;
                             vColor = color;
                             vShoreDist = shoreDist;
+                            vWaterThickness = waterThickness;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -11854,6 +11857,7 @@
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
                         varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
+                        varying float vWaterThickness; // Actual water depth (0 = surface, 1 = 8+ blocks deep)
 
                         // Simple noise function for wave distortion
                         float hash(vec2 p) {
@@ -11891,14 +11895,11 @@
                             // Sample refracted scene
                             vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
 
-                            // Calculate approximate water depth based on view angle
-                            // Steeper angle = looking deeper into water
-                            vec3 viewDir = normalize(vWorldPosition - cameraPosition);
-                            float viewDepth = length(vWorldPosition - cameraPosition);
-                            // How much we're looking "down" into water (0 = horizontal, 1 = straight down)
-                            float downwardness = max(0.0, -viewDir.y);
-                            // Effective depth through water increases with distance and downward angle
-                            float effectiveDepth = viewDepth * waterDepthScale * (0.3 + downwardness * 0.7);
+                            // Use actual water thickness (from vertex attribute) for absorption
+                            // vWaterThickness is normalized 0-1 where 1 = 8+ blocks deep
+                            // Convert back to blocks and apply absorption scaling
+                            float thicknessBlocks = vWaterThickness * 8.0;
+                            float effectiveDepth = thicknessBlocks * waterDepthScale;
 
                             // Apply Beer-Lambert absorption (same as underwater shader)
                             vec3 absorption = vec3(absorptionR, absorptionG, absorptionB);
@@ -15462,7 +15463,7 @@
             }
 
             // Add a water face with depth-based coloring (darker at depth)
-            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist) {
+            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
                 // Get cached face vertices
                 const verts = getCachedFaceVertices(nx, ny, nz);
                 // Write vertex positions and normals
@@ -15484,6 +15485,15 @@
                 shoreBuffer[shoreIdx + 3] = shoreNorm;
                 shoreBuffer[shoreIdx + 4] = shoreNorm;
                 shoreBuffer[shoreIdx + 5] = shoreNorm;
+                // Write water thickness (depth in blocks) for Beer-Lambert absorption
+                // Normalize: 0 = surface, 1 = 8+ blocks deep (max absorption)
+                const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+                thicknessBuffer[thicknessIdx] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 4] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 5] = thicknessNorm;
             }
 
             // OPTIMIZATION: Simplified face rendering for distant chunks
@@ -15749,8 +15759,9 @@
                     const waterUvs = uvPool.acquire(maxFaces * 12);
                     const waterCols = colPool.acquire(maxFaces * 18);
                     const waterShore = new Float32Array(maxFaces * 6); // Shore distance per vertex (1 float per vertex, 6 vertices per face)
+                    const waterThickness = new Float32Array(maxFaces * 6); // Water thickness (depth) per vertex for Beer-Lambert absorption
                     let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
-                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wFaceCount = 0; // Water (added wSIdx for shore)
+                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water (wSIdx for shore, wTIdx for thickness)
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
@@ -15873,13 +15884,13 @@
                                                 }
                                             }
                                             // Use water-specific face rendering with depth-based coloring
-                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist);
+                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
                                         } else {
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
                                         }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wFaceCount++;
+                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wTIdx += 6; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
                                     }
                                 }
@@ -15926,12 +15937,15 @@
                         wColArray.set(waterCols.subarray(0, wCIdx));
                         const wShoreArray = new Float32Array(wSIdx);
                         wShoreArray.set(waterShore.subarray(0, wSIdx));
+                        const wThicknessArray = new Float32Array(wTIdx);
+                        wThicknessArray.set(waterThickness.subarray(0, wTIdx));
                         const waterGeo = new THREE.BufferGeometry();
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
                         waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1)); // Shore distance per vertex
+                        waterGeo.setAttribute("waterThickness", new THREE.Float32BufferAttribute(wThicknessArray, 1)); // Water thickness for absorption
                         applyChunkBounds(waterGeo, startX, startZ);
                         optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
