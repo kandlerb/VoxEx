@@ -5670,6 +5670,7 @@
             let isUnderwater = false; // Track if player's eyes are underwater
             let underwaterDepth = 0; // How deep underwater (for shader effects)
             let isUnderground = false; // Track if player is underground (low sky light)
+            let lastStableSkyLight = 15; // Skylight stabilizer to prevent flicker during pending lighting
             // Swimming/treading water state
             let swimSpaceHoldTime = 0; // How long space has been held while underwater
             let isTreadingWater = false; // Whether player is floating at surface
@@ -8038,7 +8039,8 @@
             // Scan a column in source chunk for tree trunk TOP and apply canopy-style overhang
             // Uses trunk CENTER (not anchor) for canopy placement to match tree generation
             // Uses global coordinates for robust target-chunk membership calculation
-            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, radius, chunkSize, chunkHeight, seed, srcCx, srcCz, tgtCx, tgtCz, processedTrunks) {
+            // Profile-driven: resolves biome at trunk center and uses biome's tree profile for canopy params
+            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, maxRadius, chunkSize, chunkHeight, seed, srcCx, srcCz, tgtCx, tgtCz, processedTrunks) {
                 // Find the TOPMOST log in this column (scan downward from top)
                 let topY = -1;
                 for (let y = chunkHeight - 1; y >= 0; y--) {
@@ -8064,37 +8066,67 @@
                 if (processedTrunks.has(trunkKey)) return;
                 processedTrunks.add(trunkKey);
 
-                // Detect canopy parameters from existing tree structure (using CENTER)
-                const { topExtension, overlapDown, leafChance, detectedLeafBlock, hasLeaves } = detectCanopyParams(
-                    sourceBlocks, centerX, centerZ, topY, chunkSize, chunkHeight
-                );
+                // Compute global trunk center coordinates
+                const gxCenter = srcCx * chunkSize + centerX;
+                const gzCenter = srcCz * chunkSize + centerZ;
 
+                // Resolve biome at trunk center and get tree profile
+                const biome = getBiomeParams(gxCenter, gzCenter);
+                const treeProfile = resolveTreeProfile(biome);
+
+                // Get actual log block type from the trunk top
+                const trunkLogIdx = centerX + centerZ * chunkSize + topY * chunkSize * chunkSize;
+                const actualLogBlock = sourceBlocks[trunkLogIdx];
+
+                // Validate trunk block matches the resolved profile's log type
+                // Skip if mismatch (player-placed log of wrong type, or anomaly)
+                if (actualLogBlock !== treeProfile.blocks.log) return;
+
+                // Check for leaves presence using a quick scan near trunk top
                 // Skip if no leaves detected (likely player-placed logs, not a tree)
+                let hasLeaves = false;
+                for (let dy = 1; dy <= 3 && !hasLeaves; dy++) {
+                    const checkY = topY + dy;
+                    if (checkY >= chunkHeight) break;
+                    for (let dx = -2; dx <= 2 && !hasLeaves; dx++) {
+                        for (let dz = -2; dz <= 2; dz++) {
+                            const cx = centerX + dx, cz = centerZ + dz;
+                            if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
+                            const idx = cx + cz * chunkSize + checkY * chunkSize * chunkSize;
+                            if (isLeafBlock(sourceBlocks[idx])) {
+                                hasLeaves = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (!hasLeaves) return;
+
+                // Use profile-driven canopy parameters
+                const canopyRadius = treeProfile.canopy.radius;
+                const topExtension = treeProfile.canopy.topExtension;
+                const overlapDown = treeProfile.canopy.overlapDown ?? 2;
+                const leafChance = treeProfile.canopy.leafChance ?? 1.0;
+                const leafBlock = treeProfile.blocks.leaves;
 
                 // Calculate canopy bounds (matching forestDecorateColumn)
                 const canopyBottom = topY - overlapDown;
                 const canopyTop = topY + topExtension;
 
-                // Global coordinates for seeded RNG (use CENTER for consistency with tree generation)
-                // This matches forestDecorateColumn which uses gx = cx*chunkSize + lx where lx is trunk center
-                const gx = srcCx * chunkSize + centerX;
-                const gz = srcCz * chunkSize + centerZ;
-
                 // Generate canopy-style overhang (same loop as forestDecorateColumn)
                 for (let y = canopyBottom; y <= canopyTop; y++) {
                     if (y < 0 || y >= chunkHeight) continue;
 
-                    for (let dx = -radius; dx <= radius; dx++) {
-                        for (let dz = -radius; dz <= radius; dz++) {
+                    for (let dx = -canopyRadius; dx <= canopyRadius; dx++) {
+                        for (let dz = -canopyRadius; dz <= canopyRadius; dz++) {
                             // Deterministic rounded corners (same as forestDecorateColumn)
-                            if (Math.abs(dx) === radius && Math.abs(dz) === radius) {
-                                if (seededRandom(seed, gx, gz, dx, y, dz) > 0.5) continue;
+                            if (Math.abs(dx) === canopyRadius && Math.abs(dz) === canopyRadius) {
+                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz) > 0.5) continue;
                             }
 
                             // Sparse leaves (same as forestDecorateColumn)
                             if (leafChance < 1.0) {
-                                if (seededRandom(seed, gx, gz, dx, y, dz + 9999) > leafChance) continue;
+                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999) > leafChance) continue;
                             }
 
                             // Skip trunk footprint (don't place leaves inside trunk)
@@ -8107,8 +8139,8 @@
                             }
 
                             // Calculate GLOBAL position of this leaf candidate (relative to center)
-                            const globalX = srcCx * chunkSize + centerX + dx;
-                            const globalZ = srcCz * chunkSize + centerZ + dz;
+                            const globalX = gxCenter + dx;
+                            const globalZ = gzCenter + dz;
 
                             // Convert to target chunk local coordinates
                             const tgtLx = globalX - tgtCx * chunkSize;
@@ -8120,7 +8152,7 @@
                             // Place leaf if target is air
                             const tgtIdx = tgtLx + tgtLz * chunkSize + y * chunkSize * chunkSize;
                             if (targetBlocks[tgtIdx] === AIR) {
-                                targetBlocks[tgtIdx] = detectedLeafBlock;
+                                targetBlocks[tgtIdx] = leafBlock;
                             }
                         }
                     }
@@ -17418,7 +17450,21 @@
                 const t = THREE.MathUtils.clamp((smoothH + 0.1) / 0.4, 0, 1);
                 if (colorsInitialized) {
                     // Check if player is underground (sky light at head position is low)
-                    const playerSkyLight = getSkyLight(Math.floor(camPos.x), Math.floor(camPos.y), Math.floor(camPos.z));
+                    const rawSkyLight = getSkyLight(Math.floor(camPos.x), Math.floor(camPos.y + 1.6), Math.floor(camPos.z));
+
+                    // Stabilize skylight during pending lighting updates to prevent flicker
+                    // Check if player's chunk or neighbors have pending lighting
+                    const playerCx = Math.floor(camPos.x / WORLD_DIMS.chunkSize);
+                    const playerCz = Math.floor(camPos.z / WORLD_DIMS.chunkSize);
+                    const lightingPending = chunkOrNeighborsPending(playerCx, playerCz);
+
+                    // Only update stable skylight when lighting is not pending
+                    if (!lightingPending) {
+                        lastStableSkyLight = rawSkyLight;
+                    }
+
+                    // Use stabilized skylight for underground detection
+                    const playerSkyLight = lastStableSkyLight;
                     isUnderground = playerSkyLight < 8; // Below 8 = likely in a cave/underground
                     // Calculate underground factor: 0 = full light, 1 = deep underground
                     // Smooth transition from light level 12 down to 4
