@@ -1439,8 +1439,8 @@
                     tags: ["forested"], // Can be used for biome-specific logic
                     decorateColumn: forestDecorateColumn, // Reuses forest decorator
                 },
-                // Redwoods biome - demonstrates data-driven trunk size and height
-                // Giant trees with 3×3 trunks, 14-24 height, larger canopy
+                // Redwoods biome - demonstrates data-driven trunk size, height, and custom block types
+                // Giant trees with 3×3 trunks, 14-24 height, larger canopy, custom log/leaves
                 redwoods: {
                     weight: 2,        // Rare biome
                     roughness: 0.008, // Smooth terrain for giant trees
@@ -1460,8 +1460,34 @@
                             radius: 4,    // Larger canopy for big trees
                             topExtension: 3,
                         },
+                        blocks: {
+                            log: REDWOOD_LOG,     // Custom redwood log block
+                            leaves: REDWOOD_LEAVES, // Custom redwood leaves block
+                        },
                     },
                     tags: ["forested", "giant_trees"],
+                    decorateColumn: forestDecorateColumn,
+                },
+                // Birch forest biome - demonstrates custom block types with standard tree size
+                birch_forest: {
+                    weight: 2,        // Rare biome
+                    roughness: 0.014, // Medium terrain
+                    amplitude: 18,    // Gentle hills
+                    baseHeight: 65,   // Slightly elevated
+                    heightFunc: defaultHeightFunc,
+                    trees: {
+                        density: 0.20,    // Moderate density
+                        spacing: 5,       // Standard spacing
+                        trunk: {
+                            minHeight: 6, // Slightly taller than default
+                            maxHeight: 12,
+                        },
+                        blocks: {
+                            log: BIRCH_LOG,       // Custom birch log block
+                            leaves: BIRCH_LEAVES, // Custom birch leaves block
+                        },
+                    },
+                    tags: ["forested"],
                     decorateColumn: forestDecorateColumn,
                 },
             };
@@ -1559,6 +1585,39 @@
                     },
                 };
             }
+
+            // Seeded deterministic hash RNG for tree generation
+            // Returns a value in [0, 1) that is stable for the same inputs
+            // Uses a simple but effective hash combining multiple coordinates
+            function seededRandom(seed, gx, gz, x, y, z) {
+                // Combine all inputs into a single hash
+                let h = seed;
+                h = ((h << 5) - h + gx) | 0;
+                h = ((h << 5) - h + gz) | 0;
+                h = ((h << 5) - h + x) | 0;
+                h = ((h << 5) - h + y) | 0;
+                h = ((h << 5) - h + z) | 0;
+                // Additional mixing for better distribution
+                h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+                h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+                h ^= h >>> 16;
+                // Convert to [0, 1) range
+                return (h >>> 0) / 4294967296;
+            }
+
+            // Check if position is within trunk footprint (for any w×d trunk centered at origin)
+            function isInTrunkFootprint(x, z, trunkW, trunkD) {
+                const halfW = Math.floor(trunkW / 2);
+                const halfD = Math.floor(trunkD / 2);
+                // For odd widths: -halfW to halfW inclusive
+                // For even widths: -halfW to halfW-1 inclusive (shifted slightly)
+                const minX = -halfW;
+                const maxX = trunkW - halfW - 1;
+                const minZ = -halfD;
+                const maxZ = trunkD - halfD - 1;
+                return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+            }
+
             const savedSettings = JSON.parse(localStorage.getItem("voxex_settings")) || {};
             const savedLighting = savedSettings.lighting || {};
             const SETTINGS = {
@@ -5311,8 +5370,15 @@
                 TORCH = 10,
                 SNOW = 11,
                 GRAVEL = 12,
+                // New tree block variants (use same textures as LOG/LEAVES for now)
+                REDWOOD_LOG = 13,
+                REDWOOD_LEAVES = 14,
+                BIRCH_LOG = 15,
+                BIRCH_LEAVES = 16,
                 UNLOADED_BLOCK = 255; // Sentinel used when neighbors aren't available yet
             const NUM_TILES = 14; // Shared texture atlas tile count (must match initTextures)
+            // Set of all log block IDs for nearby tree detection
+            const LOG_BLOCK_IDS = new Set([LOG, REDWOOD_LOG, BIRCH_LOG]);
             const blockIds = {
                 grass: GRASS,
                 dirt: DIRT,
@@ -5326,6 +5392,10 @@
                 torch: TORCH,
                 snow: SNOW,
                 gravel: GRAVEL,
+                redwood_log: REDWOOD_LOG,
+                redwood_leaves: REDWOOD_LEAVES,
+                birch_log: BIRCH_LOG,
+                birch_leaves: BIRCH_LEAVES,
             };
             const NEIGHBOR_OFFSETS = [ // --- OPTIMIZATION: Pre-computed neighbor offsets for light propagation --- Avoids array allocation inside tight loops
                 [1, 0, 0],
@@ -6135,6 +6205,8 @@
                 BLOCK_IS_OPAQUE[AIR] = 0;
                 BLOCK_IS_OPAQUE[WATER] = 0;
                 BLOCK_IS_OPAQUE[LEAVES] = 0;
+                BLOCK_IS_OPAQUE[REDWOOD_LEAVES] = 0;
+                BLOCK_IS_OPAQUE[BIRCH_LEAVES] = 0;
                 BLOCK_IS_OPAQUE[TORCH] = 0;
             }
 
@@ -11207,7 +11279,7 @@
 
                 // 1. Define Transparent Blocks
                 // UNLOADED_BLOCK must be transparent to prevent false AO at chunk borders
-                const transparentIds = [AIR, LEAVES, WATER, TORCH, UNLOADED_BLOCK];
+                const transparentIds = [AIR, LEAVES, REDWOOD_LEAVES, BIRCH_LEAVES, WATER, TORCH, UNLOADED_BLOCK];
                 for (const id of transparentIds) {
                     IS_TRANSPARENT[id] = 1;
                     BLOCKLIGHT_ATTENUATION[id] = 0;
@@ -11215,8 +11287,12 @@
                 // Sunlight attenuation values (0 = no loss, 1 = slight loss like leaves, 15 = opaque)
                 for (let i = 0; i < 256; i++) { if (IS_TRANSPARENT[i]) SUNLIGHT_ATTENUATION[i] = 0; }
                 SUNLIGHT_ATTENUATION[LEAVES] = 1; // Leaves soften light instead of fully blocking
+                SUNLIGHT_ATTENUATION[REDWOOD_LEAVES] = 1; // Same as regular leaves
+                SUNLIGHT_ATTENUATION[BIRCH_LEAVES] = 1; // Same as regular leaves
                 SUNLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Prevent chunk seams from acting opaque
                 BLOCKLIGHT_ATTENUATION[LEAVES] = 1; // Torches bleed softly through leaves
+                BLOCKLIGHT_ATTENUATION[REDWOOD_LEAVES] = 1; // Same as regular leaves
+                BLOCKLIGHT_ATTENUATION[BIRCH_LEAVES] = 1; // Same as regular leaves
                 BLOCKLIGHT_ATTENUATION[WATER] = 2; // Water dims torches slightly
                 BLOCKLIGHT_ATTENUATION[UNLOADED_BLOCK] = 0; // Avoid seams darkening when neighbors are pending
                 // Water does NOT attenuate sunlight - this must match calculateChunkSunlight behavior
@@ -11307,6 +11383,28 @@
                         top: [GRAVEL_ID * uvStep, 0],
                         side: [GRAVEL_ID * uvStep, 0],
                         bottom: [GRAVEL_ID * uvStep, 0],
+                    };
+                    // New tree block variants - use same textures as LOG/LEAVES for now
+                    // TODO: Add unique textures for these in future
+                    uvMap[REDWOOD_LOG] = {
+                        top: [LOG_TOP * uvStep, 0],
+                        side: [LOG_SIDE * uvStep, 0],
+                        bottom: [LOG_TOP * uvStep, 0],
+                    };
+                    uvMap[REDWOOD_LEAVES] = {
+                        top: [LEAF_ID * uvStep, 0],
+                        side: [LEAF_ID * uvStep, 0],
+                        bottom: [LEAF_ID * uvStep, 0],
+                    };
+                    uvMap[BIRCH_LOG] = {
+                        top: [LOG_TOP * uvStep, 0],
+                        side: [LOG_SIDE * uvStep, 0],
+                        bottom: [LOG_TOP * uvStep, 0],
+                    };
+                    uvMap[BIRCH_LEAVES] = {
+                        top: [LEAF_ID * uvStep, 0],
+                        side: [LEAF_ID * uvStep, 0],
+                        bottom: [LEAF_ID * uvStep, 0],
                     };
                 }
                 // Precompute a dense UV cache for fast lookup during meshing
@@ -14038,14 +14136,22 @@
                 }
                 return -1;
             }
-            function forestHasNearbyTree(lx, lz, spacing, get) {
+            // Check for nearby trees using biome-specific log block ID
+            // Optimized: only scans a small y-range near ground level (groundY ± 30)
+            function hasNearbyTree(lx, lz, spacing, groundY, logBlockId, get) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                // Scan a limited y-range near ground level (trees are ground-up structures)
+                const yMin = Math.max(0, groundY - 5);
+                const yMax = Math.min(chunkHeight - 1, groundY + 30);
                 for (let ox = -spacing; ox <= spacing; ox++) {
                     for (let oz = -spacing; oz <= spacing; oz++) {
-                        const nx = lx + ox,
-                            nz = lz + oz;
-                        if (nx < 0 || nx >= WORLD_DIMS.chunkSize || nz < 0 || nz >= WORLD_DIMS.chunkSize) continue;
-                        for (let y = 0; y < WORLD_DIMS.chunkHeight; y++) {
-                            if (get(nx, y, nz) === LOG) return true;
+                        const nx = lx + ox, nz = lz + oz;
+                        if (nx < 0 || nx >= chunkSize || nz < 0 || nz >= chunkSize) continue;
+                        for (let y = yMin; y <= yMax; y++) {
+                            const blockId = get(nx, y, nz);
+                            // Check for the specific biome's log block, or any log type
+                            if (blockId === logBlockId || LOG_BLOCK_IDS.has(blockId)) return true;
                         }
                     }
                 }
@@ -14054,29 +14160,29 @@
             // Generic forest decorator - fully data-driven from biome.trees config
             // Uses resolveTreeProfile() to merge biome overrides with TREE_CONFIG defaults
             // Supports w×d trunks, custom canopy radius, and per-biome block types
+            // DETERMINISTIC: Uses seededRandom instead of Math.random
             function forestDecorateColumn(cx, cz, gx, gz, lx, lz, topY, setAcrossChunks, get, seed, biome) {
                 if (topY <= 0) return;
                 const groundY = topY - WORLD_DIMS.yOffset;
                 if (!getTreeMaskValueGlobal(gx, gz, seed)) return;
 
                 // Resolve tree profile from biome config (merges with TREE_CONFIG defaults)
-                const profile = resolveTreeProfile(biome);
-                const { trunk, canopy, blocks, spacing } = profile;
-                const treeDensity = profile.density;
+                const tp = resolveTreeProfile(biome);
+                const { trunk, canopy, blocks, spacing } = tp;
+                const treeDensity = tp.density;
 
                 // Compute border required for trunk footprint and canopy
-                // Trunk occupies from lx to lx + trunk.w - 1, same for lz
                 const trunkHalfW = Math.floor(trunk.w / 2);
                 const trunkHalfD = Math.floor(trunk.d / 2);
                 const canopyRadius = canopy.radius;
-                const borderNeeded = Math.max(trunkHalfW, trunkHalfD, canopyRadius) + 1;
+                const borderNeeded = Math.max(trunkHalfW + trunk.w - trunkHalfW, trunkHalfD + trunk.d - trunkHalfD, canopyRadius) + 1;
                 const chunkSize = WORLD_DIMS.chunkSize;
 
                 // Border check: ensure trunk stays within chunk, canopy can extend via setAcrossChunks
                 if (lx < borderNeeded || lx >= chunkSize - borderNeeded ||
                     lz < borderNeeded || lz >= chunkSize - borderNeeded) return;
 
-                // Slope check
+                // Slope check - uses biome's leaves block for transparency check
                 const maxSlope = 2;
                 let tooSteep = false;
                 for (let ox = -1; ox <= 1 && !tooSteep; ox++) {
@@ -14088,7 +14194,8 @@
                         for (let y = groundY + 3; y >= groundY - 3; y--) {
                             if (y < 0 || y >= WORLD_DIMS.chunkHeight) continue;
                             const id = get(nx, y, nz);
-                            if (id !== AIR && id !== LEAVES) { neighborY = y; break; }
+                            // Skip air and any leaves-type blocks (biome-specific or standard)
+                            if (id !== AIR && id !== blocks.leaves && id !== LEAVES) { neighborY = y; break; }
                         }
                         if (neighborY === -1 || Math.abs(neighborY - groundY) > maxSlope) tooSteep = true;
                     }
@@ -14118,8 +14225,8 @@
                 }
                 if (tooClose) return;
 
-                // Nearby tree check
-                if (forestHasNearbyTree(lx, lz, spacing + 1, get)) return;
+                // Nearby tree check - uses biome's log block ID
+                if (hasNearbyTree(lx, lz, spacing + 1, groundY, blocks.log, get)) return;
 
                 // Calculate trunk height from profile
                 const n = noise2D(gx * 0.01 + seed, gz * 0.01 - seed);
@@ -14128,21 +14235,20 @@
                 const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
                 const trunkTopY = groundY + trunkHeight;
 
-                // Build w×d trunk (use set, not setAcrossChunks - trunk stays in chunk)
+                // Build w×d trunk using biome's log block
                 for (let y = groundY + 1; y <= trunkTopY; y++) {
                     for (let tx = -trunkHalfW; tx < trunk.w - trunkHalfW; tx++) {
                         for (let tz = -trunkHalfD; tz < trunk.d - trunkHalfD; tz++) {
                             const bx = lx + tx, bz = lz + tz;
                             // Trunk must stay within chunk bounds
                             if (bx >= 0 && bx < chunkSize && bz >= 0 && bz < chunkSize) {
-                                get(bx, y, bz); // Ensure block exists
-                                setAcrossChunks(bx, y, bz, blocks.log); // Use set for trunk within chunk
+                                setAcrossChunks(bx, y, bz, blocks.log);
                             }
                         }
                     }
                 }
 
-                // Build canopy using resolved config
+                // Build canopy using biome's leaves block
                 const overlapAmount = Math.min(3, Math.floor(trunkHeight / 3));
                 const canopyBottom = Math.max(groundY + 2, trunkTopY - overlapAmount);
                 const canopyTop = trunkTopY + canopy.topExtension;
@@ -14150,11 +14256,12 @@
                 for (let y = canopyBottom; y <= canopyTop; y++) {
                     for (let x = -canopyRadius; x <= canopyRadius; x++) {
                         for (let z = -canopyRadius; z <= canopyRadius; z++) {
-                            // Rounded corners
-                            if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius && Math.random() > 0.5) continue;
-                            // Don't overwrite trunk
-                            const inTrunk = Math.abs(x) < trunk.w && Math.abs(z) < trunk.d && y <= trunkTopY;
-                            if (inTrunk) continue;
+                            // Deterministic rounded corners using seededRandom
+                            if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius) {
+                                if (seededRandom(seed, gx, gz, x, y, z) > 0.5) continue;
+                            }
+                            // Don't overwrite trunk - use isInTrunkFootprint for any w×d trunk
+                            if (y <= trunkTopY && isInTrunkFootprint(x, z, trunk.w, trunk.d)) continue;
                             setAcrossChunks(lx + x, y, lz + z, blocks.leaves);
                         }
                     }
@@ -15144,7 +15251,7 @@
                         const trunkBaseY = worldY + 1;
                         if (trunkBaseY + trunkHeight + canopy.topExtension >= chunkHeight) continue;
 
-                        // Build w×d trunk (stays within chunk - use set, not setAcrossChunks)
+                        // Build w×d trunk using biome's log block (stays within chunk)
                         for (let i = 0; i < trunkHeight; i++) {
                             for (let tx = -trunkHalfW; tx < trunk.w - trunkHalfW; tx++) {
                                 for (let tz = -trunkHalfD; tz < trunk.d - trunkHalfD; tz++) {
@@ -15156,19 +15263,21 @@
                             }
                         }
 
-                        // Build canopy using resolved config
+                        // Build canopy using biome's leaves block
                         const canopyRadius = trunkHeight < 4 ? Math.max(1, canopy.radius - 1) : canopy.radius;
                         const leavesBottom = trunkBaseY + trunkHeight - Math.min(2, Math.floor(trunkHeight / 2));
                         const leavesTop = trunkBaseY + trunkHeight + canopy.topExtension;
+                        const trunkTopY = trunkBaseY + trunkHeight;
 
                         for (let y = leavesBottom; y <= leavesTop; y++) {
                             for (let x = -canopyRadius; x <= canopyRadius; x++) {
                                 for (let z = -canopyRadius; z <= canopyRadius; z++) {
-                                    // Rounded corners
-                                    if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius && Math.random() > 0.5) continue;
-                                    // Don't overwrite trunk
-                                    const inTrunk = Math.abs(x) < trunk.w && Math.abs(z) < trunk.d && y < trunkBaseY + trunkHeight;
-                                    if (inTrunk) continue;
+                                    // Deterministic rounded corners using seededRandom
+                                    if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius) {
+                                        if (seededRandom(seed, gx, gz, x, y, z) > 0.5) continue;
+                                    }
+                                    // Don't overwrite trunk - use isInTrunkFootprint for any w×d trunk
+                                    if (y < trunkTopY && isInTrunkFootprint(x, z, trunk.w, trunk.d)) continue;
                                     setAcrossChunks(lx + x, y, lz + z, blocks.leaves);
                                 }
                             }
