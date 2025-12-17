@@ -7473,11 +7473,19 @@
                 if (!waterMaterial) return;
                 let changed = false;
                 // Note: Water material color is kept white (0xffffff) to allow vertex colors
-                // to control depth-based tinting. SETTINGS.waterColor is no longer applied here.
+                // to control depth-based tinting. SETTINGS.waterColor is applied to shader uniforms instead.
                 if (Math.abs(waterMaterial.opacity - SETTINGS.waterOpacity) > 0.0001) {
                     waterMaterial.opacity = SETTINGS.waterOpacity;
                     materialUpdateState.waterOpacity = SETTINGS.waterOpacity;
                     changed = true;
+                }
+                // Sync waterColor to refraction shader uniform
+                if (window.waterMaterialRefraction && window.waterMaterialRefraction.uniforms.waterColor) {
+                    window.waterMaterialRefraction.uniforms.waterColor.value.setHex(SETTINGS.waterColor);
+                }
+                // Sync waterColor to underwater post-processing shader
+                if (typeof underwaterPass !== 'undefined' && underwaterPass && underwaterPass.uniforms.waterColor) {
+                    underwaterPass.uniforms.waterColor.value.setHex(SETTINGS.waterColor);
                 }
                 if (changed) queueMaterialUpdate("water");
             }
@@ -10368,12 +10376,25 @@
                 document.body.appendChild(renderer.domElement);
 
                 // Water refraction render target - stores opaque scene for water to sample
+                // OPTIMIZATION: Render at 1/2 resolution - blur is barely noticeable through water distortion
+                const REFRACTION_SCALE = 0.5; // 1/2 resolution (use 0.33 for 1/3)
+                const REFRACTION_UPDATE_FRAMES = 2; // Update every N frames (1 = every frame)
+                const REFRACTION_MOVE_THRESHOLD = 0.5; // Force update if camera moves this far
+                const REFRACTION_ROTATE_THRESHOLD = 0.1; // Force update if camera rotates this much (radians)
                 let refractionRenderTarget = new THREE.WebGLRenderTarget(
-                    window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio),
-                    window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio),
+                    Math.floor(window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
+                    Math.floor(window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
                     { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat }
                 );
                 window.refractionRenderTarget = refractionRenderTarget; // Expose for resize handling
+                window.REFRACTION_SCALE = REFRACTION_SCALE; // Expose for resize handling
+                // Refraction temporal caching state - exposed via window for renderFrame access
+                window.REFRACTION_UPDATE_FRAMES = REFRACTION_UPDATE_FRAMES;
+                window.REFRACTION_MOVE_THRESHOLD = REFRACTION_MOVE_THRESHOLD;
+                window.REFRACTION_ROTATE_THRESHOLD = REFRACTION_ROTATE_THRESHOLD;
+                window.refractionFrameCounter = 0;
+                window.lastRefractionCamPos = new THREE.Vector3();
+                window.lastRefractionCamQuat = new THREE.Quaternion();
                 // Fix z-index layering: canvas should be below all HUD elements
                 renderer.domElement.style.position = "fixed";
                 renderer.domElement.style.top = "0";
@@ -10450,8 +10471,8 @@
                         time: { value: 0.0 },
                         isUnderwater: { value: false },
                         underwaterDepth: { value: 0.0 },
-                        // Underwater tint color (matches water texture #2389DA)
-                        waterColor: { value: new THREE.Color(0x2389DA) },
+                        // Underwater tint color from settings
+                        waterColor: { value: new THREE.Color(SETTINGS.waterColor) },
                         // Beer-Lambert per-channel absorption coefficients
                         absorptionR: { value: SETTINGS.waterAbsorptionR },
                         absorptionG: { value: SETTINGS.waterAbsorptionG },
@@ -11246,7 +11267,7 @@
                 // Note: Fog colors are now tied to sky bottom colors (unified), no separate fog color listeners
                 // EVENT HANDLERS - Graphics > Water
                 waterFastToggle?.addEventListener("change", () => { SETTINGS.waterFastMode = waterFastToggle.checked; if (window.applyWaterFastMode) window.applyWaterFastMode(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
-                waterColorInput?.addEventListener("input", () => { SETTINGS.waterColor = parseInt(waterColorInput.value.substring(1), 16); applyWaterMaterialSettings(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                waterColorInput?.addEventListener("input", () => { SETTINGS.waterColor = parseInt(waterColorInput.value.substring(1), 16); applyWaterMaterialSettings(); rebuildAllVisibleChunks(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 waterOpacitySlider?.addEventListener("input", () => { SETTINGS.waterOpacity = parseFloat(waterOpacitySlider.value); waterOpacityVal.textContent = SETTINGS.waterOpacity; applyWaterMaterialSettings(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 waterFogSlider?.addEventListener("input", () => { SETTINGS.waterFogDensity = parseFloat(waterFogSlider.value); waterFogVal.textContent = SETTINGS.waterFogDensity; rebuildAllVisibleChunks(); localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 // Beer-Lambert absorption sliders - update shader uniforms in real-time (both underwater pass and water surface)
@@ -12289,7 +12310,7 @@
                         time: { value: 0.0 },
                         opacity: { value: SETTINGS.waterOpacity },
                         refractionStrength: { value: SETTINGS.waterRefractionStrength },
-                        waterColor: { value: new THREE.Color(0x2389DA) }, // Water tint
+                        waterColor: { value: new THREE.Color(SETTINGS.waterColor) }, // Water tint from settings
                         fogColor: { value: new THREE.Color(0xb3d9ff) },
                         fogNear: { value: 1.0 },
                         fogFar: { value: 400.0 },
@@ -12301,15 +12322,18 @@
                     },
                     vertexShader: `
                         attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
+                        attribute float waterThickness; // Water depth in blocks (normalized: 0 = surface, 1 = 8+ blocks)
                         varying vec2 vUv;
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
                         varying float vShoreDist;
+                        varying float vWaterThickness;
                         void main() {
                             vUv = uv;
                             vColor = color;
                             vShoreDist = shoreDist;
+                            vWaterThickness = waterThickness;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -12338,6 +12362,7 @@
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
                         varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
+                        varying float vWaterThickness; // Actual water depth (0 = surface, 1 = 8+ blocks deep)
 
                         // Simple noise function for wave distortion
                         float hash(vec2 p) {
@@ -12375,14 +12400,11 @@
                             // Sample refracted scene
                             vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
 
-                            // Calculate approximate water depth based on view angle
-                            // Steeper angle = looking deeper into water
-                            vec3 viewDir = normalize(vWorldPosition - cameraPosition);
-                            float viewDepth = length(vWorldPosition - cameraPosition);
-                            // How much we're looking "down" into water (0 = horizontal, 1 = straight down)
-                            float downwardness = max(0.0, -viewDir.y);
-                            // Effective depth through water increases with distance and downward angle
-                            float effectiveDepth = viewDepth * waterDepthScale * (0.3 + downwardness * 0.7);
+                            // Use actual water thickness (from vertex attribute) for absorption
+                            // vWaterThickness is normalized 0-1 where 1 = 8+ blocks deep
+                            // Convert back to blocks and apply absorption scaling
+                            float thicknessBlocks = vWaterThickness * 8.0;
+                            float effectiveDepth = thicknessBlocks * waterDepthScale;
 
                             // Apply Beer-Lambert absorption (same as underwater shader)
                             vec3 absorption = vec3(absorptionR, absorptionG, absorptionB);
@@ -15931,6 +15953,16 @@
                 gMult = Math.min(1.2, Math.max(0.0, gMult));
                 bMult = Math.min(1.2, Math.max(0.0, bMult));
 
+                // === APPLY BASE WATER COLOR FROM SETTINGS ===
+                // Extract RGB components from SETTINGS.waterColor (0-1 normalized)
+                const baseR = ((SETTINGS.waterColor >> 16) & 0xff) / 255;
+                const baseG = ((SETTINGS.waterColor >> 8) & 0xff) / 255;
+                const baseB = (SETTINGS.waterColor & 0xff) / 255;
+                // Multiply vertex tints by base water color
+                rMult *= baseR;
+                gMult *= baseG;
+                bMult *= baseB;
+
                 // === PER-VERTEX VARIATION ===
                 // Each vertex gets slight unique tint for organic look
                 const v1Var = 1.0 + (waterHash(wx, wy, wz) - 0.5) * 0.05;
@@ -15983,7 +16015,7 @@
             }
 
             // Add a water face with depth-based coloring (darker at depth)
-            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist) {
+            function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
                 // Get cached face vertices
                 const verts = getCachedFaceVertices(nx, ny, nz);
                 // Write vertex positions and normals
@@ -16005,6 +16037,15 @@
                 shoreBuffer[shoreIdx + 3] = shoreNorm;
                 shoreBuffer[shoreIdx + 4] = shoreNorm;
                 shoreBuffer[shoreIdx + 5] = shoreNorm;
+                // Write water thickness (depth in blocks) for Beer-Lambert absorption
+                // Normalize: 0 = surface, 1 = 8+ blocks deep (max absorption)
+                const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+                thicknessBuffer[thicknessIdx] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 4] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 5] = thicknessNorm;
             }
 
             // OPTIMIZATION: Simplified face rendering for distant chunks
@@ -16270,8 +16311,9 @@
                     const waterUvs = uvPool.acquire(maxFaces * 12);
                     const waterCols = colPool.acquire(maxFaces * 18);
                     const waterShore = new Float32Array(maxFaces * 6); // Shore distance per vertex (1 float per vertex, 6 vertices per face)
+                    const waterThickness = new Float32Array(maxFaces * 6); // Water thickness (depth) per vertex for Beer-Lambert absorption
                     let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
-                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wFaceCount = 0; // Water (added wSIdx for shore)
+                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water (wSIdx for shore, wTIdx for thickness)
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
@@ -16394,13 +16436,13 @@
                                                 }
                                             }
                                             // Use water-specific face rendering with depth-based coloring
-                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist);
+                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
                                         } else {
                                             // Pass faceIdx for AO caching
                                             addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
                                         }
                                         vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wFaceCount++;
+                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wTIdx += 6; wFaceCount++;
                                         } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
                                     }
                                 }
@@ -16447,12 +16489,15 @@
                         wColArray.set(waterCols.subarray(0, wCIdx));
                         const wShoreArray = new Float32Array(wSIdx);
                         wShoreArray.set(waterShore.subarray(0, wSIdx));
+                        const wThicknessArray = new Float32Array(wTIdx);
+                        wThicknessArray.set(waterThickness.subarray(0, wTIdx));
                         const waterGeo = new THREE.BufferGeometry();
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
                         waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1)); // Shore distance per vertex
+                        waterGeo.setAttribute("waterThickness", new THREE.Float32BufferAttribute(wThicknessArray, 1)); // Water thickness for absorption
                         applyChunkBounds(waterGeo, startX, startZ);
                         optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
                         const waterMesh = acquireChunkMesh("water");
@@ -17710,29 +17755,54 @@
                 // Keep updating even when underwater so water surface is visible from below
                 const refractionEnabled = SETTINGS.waterRefractionEnabled && !SETTINGS.waterFastMode;
                 if (refractionEnabled && window.refractionRenderTarget && window.waterMaterialRefraction) {
-                    // Temporarily hide all water meshes
-                    const hiddenWaterMeshes = [];
-                    if (chunkMeshes) {
-                        for (const [key, mesh] of chunkMeshes.entries()) {
-                            if (key.endsWith("_WATER") && mesh && mesh.visible) {
-                                mesh.visible = false;
-                                hiddenWaterMeshes.push(mesh);
+                    // OPTIMIZATION: Temporal caching - skip refraction update if camera hasn't moved much
+                    window.refractionFrameCounter++;
+                    const camPos = camera.position;
+                    const camQuat = camera.quaternion;
+                    const posDelta = window.lastRefractionCamPos.distanceTo(camPos);
+                    const quatDot = Math.abs(window.lastRefractionCamQuat.dot(camQuat));
+                    const rotDelta = quatDot < 1 ? Math.acos(Math.min(1, quatDot)) * 2 : 0;
+                    const needsUpdate = window.refractionFrameCounter >= window.REFRACTION_UPDATE_FRAMES ||
+                                        posDelta > window.REFRACTION_MOVE_THRESHOLD ||
+                                        rotDelta > window.REFRACTION_ROTATE_THRESHOLD;
+
+                    if (needsUpdate) {
+                        window.refractionFrameCounter = 0;
+                        window.lastRefractionCamPos.copy(camPos);
+                        window.lastRefractionCamQuat.copy(camQuat);
+
+                        // Temporarily hide all water meshes
+                        const hiddenWaterMeshes = [];
+                        if (chunkMeshes) {
+                            for (const [key, mesh] of chunkMeshes.entries()) {
+                                if (key.endsWith("_WATER") && mesh && mesh.visible) {
+                                    mesh.visible = false;
+                                    hiddenWaterMeshes.push(mesh);
+                                }
                             }
+                        }
+
+                        // OPTIMIZATION: Exclude viewmodel layer from refraction render
+                        // Prevents torch/hands from appearing weirdly in water refraction
+                        camera.layers.set(0); // Only render world layer
+
+                        // Render opaque scene to refraction target
+                        renderer.setRenderTarget(window.refractionRenderTarget);
+                        renderer.clear();
+                        renderer.render(scene, camera);
+                        renderer.setRenderTarget(null);
+
+                        // Restore camera layers
+                        camera.layers.enable(0);
+                        camera.layers.enable(1);
+
+                        // Restore water mesh visibility
+                        for (const mesh of hiddenWaterMeshes) {
+                            mesh.visible = true;
                         }
                     }
 
-                    // Render opaque scene to refraction target
-                    renderer.setRenderTarget(window.refractionRenderTarget);
-                    renderer.clear();
-                    renderer.render(scene, camera);
-                    renderer.setRenderTarget(null);
-
-                    // Restore water mesh visibility
-                    for (const mesh of hiddenWaterMeshes) {
-                        mesh.visible = true;
-                    }
-
-                    // Update refraction shader uniforms
+                    // Always update shader uniforms (cheap, keeps things in sync)
                     const mat = window.waterMaterialRefraction;
                     mat.uniforms.tRefraction.value = window.refractionRenderTarget.texture;
                     mat.uniforms.time.value = performance.now();
@@ -18091,12 +18161,13 @@
                 if (volumetricLightPass) {
                     volumetricLightPass.uniforms.aspectRatio.value = window.innerWidth / window.innerHeight;
                 }
-                // Update refraction render target size
+                // Update refraction render target size (at reduced resolution)
                 if (window.refractionRenderTarget) {
                     const pixelRatio = window.devicePixelRatio * SETTINGS.pixelRatio;
+                    const scale = window.REFRACTION_SCALE || 0.5;
                     window.refractionRenderTarget.setSize(
-                        window.innerWidth * pixelRatio,
-                        window.innerHeight * pixelRatio
+                        Math.floor(window.innerWidth * pixelRatio * scale),
+                        Math.floor(window.innerHeight * pixelRatio * scale)
                     );
                 }
             }
