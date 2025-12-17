@@ -4751,9 +4751,8 @@
 
                 setHotbarSlot(slot) {
                     this.hotbarSlot = slot;
-                    const slotToBlock = [BLOCKS.GRASS, BLOCKS.DIRT, BLOCKS.STONE, BLOCKS.WOOD,
-                                        BLOCKS.LOG, BLOCKS.LEAVES, BLOCKS.SAND, BLOCKS.WATER, BLOCKS.TORCH];
-                    this.selectedBlockId = slotToBlock[slot - 1] || BLOCKS.GRASS;
+                    // Use config-derived initialHotbarSlots for slot mapping
+                    this.selectedBlockId = initialHotbarSlots[slot - 1] || BLOCKS.GRASS;
                 }
 
                 toggleFly() {
@@ -5709,8 +5708,9 @@
             const _physRight = new THREE.Vector3();
             const _physUp = new THREE.Vector3(0, 1, 0);
             const _pickDirTmp = new THREE.Vector3(); // Reusable vector for pickVoxel direction (avoids per-frame allocation in updateHighlight)
-            // OPTIMIZATION: Hoisted constant array for hotbar slot mapping (avoids per-scroll allocation in onMouseWheel)
-            let HOTBAR_SLOT_TO_BLOCK = [GRASS, DIRT, STONE, WOOD, LOG, LEAVES, SAND, WATER, TORCH];
+            // OPTIMIZATION: Hoisted array for hotbar slot mapping (initialized from config-derived initialHotbarSlots)
+            // This is mutable and gets updated by inventory drag-drop
+            let HOTBAR_SLOT_TO_BLOCK = [...initialHotbarSlots];
             let nightSkyTop, daySkyTop, nightSkyBottom, daySkyBottom; // --- OPTIMIZATION: Cached Color objects for day/night cycle --- These are initialized later in init() after SETTINGS is available
             // Note: Fog colors are now tied to sky bottom colors (nightSkyBottom/daySkyBottom)
             let colorsInitialized = false;
@@ -7898,7 +7898,7 @@
             // OPTIMIZATION AUDIT: scanTreeColumnForOverhang
             //   - PER-CHUNK EDGE: Called 16x per edge (64x max per chunk)
             //   - O(chunkHeight × leafY range × radius) iterations
-            //   - Uses Math.random() which is fast
+            //   - Uses seeded RNG for deterministic placement
             //   - No-op: Necessary complexity for tree overhang
             function applyTreeOverhangFromNeighbor(targetChunk, sourceChunk, targetCx, targetCz, sourceCx, sourceCz, direction, seed) {
                 const chunkSize = WORLD_DIMS.chunkSize;
@@ -7915,36 +7915,58 @@
                     // West neighbor's east edge (lx = 15)
                     scanLx = chunkSize - 1;
                     for (let lz = 0; lz < chunkSize; lz++) {
-                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, 0, lz, treeRadius, chunkSize, chunkHeight, direction);
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, 0, lz, treeRadius, chunkSize, chunkHeight, direction, seed, sourceCx, sourceCz);
                     }
                 } else if (direction === 'east') {
                     // East neighbor's west edge (lx = 0)
                     scanLx = 0;
                     for (let lz = 0; lz < chunkSize; lz++) {
-                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, chunkSize - 1, lz, treeRadius, chunkSize, chunkHeight, direction);
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, scanLx, lz, chunkSize - 1, lz, treeRadius, chunkSize, chunkHeight, direction, seed, sourceCx, sourceCz);
                     }
                 } else if (direction === 'north') {
                     // North neighbor's south edge (lz = 15)
                     scanLz = chunkSize - 1;
                     for (let lx = 0; lx < chunkSize; lx++) {
-                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, 0, treeRadius, chunkSize, chunkHeight, direction);
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, 0, treeRadius, chunkSize, chunkHeight, direction, seed, sourceCx, sourceCz);
                     }
                 } else if (direction === 'south') {
                     // South neighbor's north edge (lz = 0)
                     scanLz = 0;
                     for (let lx = 0; lx < chunkSize; lx++) {
-                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, chunkSize - 1, treeRadius, chunkSize, chunkHeight, direction);
+                        scanTreeColumnForOverhang(sourceBlocks, targetBlocks, lx, scanLz, lx, chunkSize - 1, treeRadius, chunkSize, chunkHeight, direction, seed, sourceCx, sourceCz);
                     }
                 }
             }
 
             // Scan a column in source chunk and apply tree overhang to target chunk
-            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, tgtLx, tgtLz, radius, chunkSize, chunkHeight, direction) {
+            // Detects leaf block type from source chunk and uses seeded RNG for deterministic placement
+            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, tgtLx, tgtLz, radius, chunkSize, chunkHeight, direction, seed, srcCx, srcCz) {
                 // Find any LOG-type blocks in the source column (works for all tree variants)
                 for (let y = 0; y < chunkHeight; y++) {
                     const srcIdx = srcLx + srcLz * chunkSize + y * chunkSize * chunkSize;
                     if (isLogBlock(sourceBlocks[srcIdx])) {
-                        // Found a tree trunk - check for leaves above it that should extend into target
+                        // Found a tree trunk - detect the leaf type used by this tree
+                        // Scan nearby blocks in the source chunk to find what leaf type is used
+                        let detectedLeafBlock = LEAVES; // Default fallback
+                        for (let dy = 0; dy <= 6 && detectedLeafBlock === LEAVES; dy++) {
+                            const checkY = y + dy;
+                            if (checkY >= chunkHeight) break;
+                            for (let dx = -2; dx <= 2; dx++) {
+                                for (let dz = -2; dz <= 2; dz++) {
+                                    const cx = srcLx + dx, cz = srcLz + dz;
+                                    if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
+                                    const checkIdx = cx + cz * chunkSize + checkY * chunkSize * chunkSize;
+                                    const checkBlock = sourceBlocks[checkIdx];
+                                    if (isLeafBlock(checkBlock)) {
+                                        detectedLeafBlock = checkBlock;
+                                        break;
+                                    }
+                                }
+                                if (detectedLeafBlock !== LEAVES) break;
+                            }
+                        }
+
+                        // Check for leaves above trunk that should extend into target
                         for (let dy = -2; dy <= 4; dy++) {
                             const leafY = y + dy;
                             if (leafY < 0 || leafY >= chunkHeight) continue;
@@ -7975,10 +7997,12 @@
                                         const tgtIdx = targetCheckLx + targetCheckLz * chunkSize + leafY * chunkSize * chunkSize;
                                         // Only place leaves in air
                                         if (targetBlocks[tgtIdx] === AIR) {
-                                            // Check if there should be leaves here based on tree shape
+                                            // Use seeded RNG for deterministic placement
+                                            const gx = srcCx * chunkSize + srcLx;
+                                            const gz = srcCz * chunkSize + srcLz;
                                             const distFromTrunk = dr;
-                                            if (distFromTrunk <= 2 && Math.random() > 0.3) {
-                                                targetBlocks[tgtIdx] = LEAVES;
+                                            if (distFromTrunk <= 2 && seededRandom(seed, gx, gz, targetCheckLx, leafY, targetCheckLz) > 0.3) {
+                                                targetBlocks[tgtIdx] = detectedLeafBlock;
                                             }
                                         }
                                     }
