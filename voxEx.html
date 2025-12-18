@@ -2036,6 +2036,26 @@
             // within its own bounds. This eliminates race conditions and
             // ensures complete canopies regardless of chunk generation order.
 
+            // Helper to check if a position would have a valid tree (for spacing competition)
+            function wouldHaveValidTree(gx, gz, worldSeed) {
+                // Check biome supports trees
+                const biome = getBiomeParams(gx, gz);
+                if (!biome || !biome.trees || biome.trees.density <= 0) return false;
+                
+                // Check tree mask
+                if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) return false;
+                
+                // Check terrain height (not underwater)
+                const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+                if (groundY < WORLD_DIMS.seaLevel) return false;
+                
+                // Check river factor
+                const riverFactor = getRiverFactor(gx, gz, worldSeed);
+                if (riverFactor < 0.8) return false;
+                
+                return true;
+            }
+
             // Calculate tree positions for a chunk deterministically (without needing chunk data)
             // Returns array of tree objects with position and profile info
             function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
@@ -2065,6 +2085,36 @@
                         const p = treePlacementValue(gx, gz, worldSeed);
                         if (p > density) continue;
 
+                        // TERRAIN VALIDATION (deterministic)
+                        // Check terrain height - skip if underwater
+                        const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+                        if (groundY < WORLD_DIMS.seaLevel) continue;
+
+                        // Check river factor - skip trees in rivers
+                        const riverFactor = getRiverFactor(gx, gz, worldSeed);
+                        if (riverFactor < 0.8) continue;
+
+                        // SPACING CHECK (deterministic) - ensure no closer tree with lower placement value
+                        // This must be done here so it applies to all trees consistently
+                        let tooClose = false;
+                        for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
+                            for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
+                                if (ddx === 0 && ddz === 0) continue;
+                                const dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                                if (dist >= spacing) continue;
+                                
+                                const neighborGx = gx + ddx;
+                                const neighborGz = gz + ddz;
+                                const np = treePlacementValue(neighborGx, neighborGz, worldSeed);
+                                
+                                // Neighbor wins if it has lower placement value AND would be a valid tree
+                                if (np <= density && np < p && wouldHaveValidTree(neighborGx, neighborGz, worldSeed)) {
+                                    tooClose = true;
+                                }
+                            }
+                        }
+                        if (tooClose) continue;
+
                         // Pick trunk size (deterministic)
                         const { w: trunkW, d: trunkD, maxW, maxD } = pickTrunkSize(profile, worldSeed, gx, gz);
 
@@ -2087,6 +2137,7 @@
 
                         trees.push({
                             gx, gz, lx, lz,
+                            groundY,  // Include computed ground height
                             trunkHeight,
                             trunkW, trunkD,
                             halfW, halfD,
@@ -2097,6 +2148,7 @@
                             density,
                             placementValue: p,
                             spacing,
+                            riverFactor,  // Include for debugging
                         });
                     }
                 }
@@ -2150,48 +2202,30 @@
                 // Process each tree
                 for (const tree of allTrees) {
                     const { gx, gz, lx, lz, trunkHeight, trunkW, trunkD, profile, isOwnChunk,
-                            halfW, halfD, minTx, maxTx, minTz, maxTz, spacing, density, placementValue } = tree;
+                            halfW, halfD, minTx, maxTx, minTz, maxTz, groundY } = tree;
                     const { canopy, blocks, allowedGroundBlocks } = profile;
 
                     // Calculate local coordinates in THIS chunk for the tree center
                     const localX = gx - startX;
                     const localZ = gz - startZ;
 
-                    // Get ground height
-                    let groundY;
+                    // Use the pre-computed groundY from getChunkTreePositions
+                    // For own chunk trees, prefer the cached height which matches actual terrain
+                    let finalGroundY = groundY;
                     if (isOwnChunk) {
-                        // Use cached height for trees in this chunk
-                        groundY = heightCache[lx + lz * chunkSize];
-                    } else {
-                        // Calculate height for neighbor chunk trees (deterministic)
-                        groundY = Math.floor(blendedHeight(gx, gz, seed));
+                        // Use cached height for trees in this chunk (more accurate)
+                        finalGroundY = heightCache[lx + lz * chunkSize];
                     }
 
-                    const trunkBaseY = groundY + 1;
+                    const trunkBaseY = finalGroundY + 1;
                     const trunkTopY = trunkBaseY + trunkHeight;
 
                     // Validate and place trunk only for trees in THIS chunk
+                    // Note: River check and spacing check are now done in getChunkTreePositions
                     if (isOwnChunk) {
-                        // River check
-                        const riverFactor = riverCache[lx + lz * chunkSize];
-                        if (riverFactor < 0.8) continue;
-
-                        // Ground block check
-                        const groundId = get(lx, groundY, lz);
+                        // Ground block check - only this requires actual chunk data
+                        const groundId = get(lx, finalGroundY, lz);
                         if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
-
-                        // Spacing check - ensure no closer tree with lower placement value
-                        let tooClose = false;
-                        for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
-                            for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
-                                if (ddx === 0 && ddz === 0) continue;
-                                const dist = Math.sqrt(ddx * ddx + ddz * ddz);
-                                if (dist >= spacing) continue;
-                                const np = treePlacementValue(gx + ddx, gz + ddz, seed);
-                                if (np <= density && np < placementValue) tooClose = true;
-                            }
-                        }
-                        if (tooClose) continue;
 
                         // Check space for trunk
                         let hasSpace = true;
@@ -2220,7 +2254,9 @@
 
                     // Place canopy leaves that fall within THIS chunk
                     // This runs for ALL trees (own and neighbor) whose canopy overlaps
-                    const minCanopyY = groundY + 2;
+                    // Use finalGroundY for own chunk trees, groundY (from tree object) for neighbor trees
+                    const actualGroundY = isOwnChunk ? finalGroundY : groundY;
+                    const minCanopyY = actualGroundY + 2;
                     forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
                         if (y < minCanopyY) return; // Skip leaves that would be too low
 
