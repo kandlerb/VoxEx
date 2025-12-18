@@ -7453,6 +7453,10 @@
             };
             const activeChunks = new Set();
             const globalPendingMods = new Map();
+            // Registry for pending tree canopy data that extends into not-yet-generated chunks
+            // Key: chunkKey of the TARGET chunk that needs canopy, Value: array of tree data
+            // Tree data: { gx, gz, trunkTopY, trunkW, trunkD, profile, sourceChunkKey }
+            const pendingCanopyOverhang = new Map();
             const chunkBuildQueue = [];
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
@@ -7945,11 +7949,17 @@
                 const startX = cx * chunkSize;
                 const startZ = cz * chunkSize;
 
-                // Get neighbor chunks for cross-boundary operations
+                // Get neighbor chunks for cross-boundary operations (cardinal directions)
                 const westChunk = chunks.get(getChunkKey(cx - 1, cz));
                 const eastChunk = chunks.get(getChunkKey(cx + 1, cz));
                 const northChunk = chunks.get(getChunkKey(cx, cz - 1));
                 const southChunk = chunks.get(getChunkKey(cx, cz + 1));
+
+                // Get diagonal neighbor chunks (for trees at chunk corners)
+                const nwChunk = chunks.get(getChunkKey(cx - 1, cz - 1));
+                const neChunk = chunks.get(getChunkKey(cx + 1, cz - 1));
+                const swChunk = chunks.get(getChunkKey(cx - 1, cz + 1));
+                const seChunk = chunks.get(getChunkKey(cx + 1, cz + 1));
 
                 // Check edge columns for trees from neighbors that might extend into this chunk
                 // West edge (lx = 0) - check if trees from west neighbor extend here
@@ -7969,13 +7979,119 @@
                     applyTreeOverhangFromNeighbor(chunk, southChunk, cx, cz, cx, cz + 1, 'south', seed);
                 }
 
+                // Diagonal neighbors - trees at chunk corners can extend into 4 chunks
+                if (nwChunk && nwChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, nwChunk, cx, cz, cx - 1, cz - 1, 'northwest', seed);
+                }
+                if (neChunk && neChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, neChunk, cx, cz, cx + 1, cz - 1, 'northeast', seed);
+                }
+                if (swChunk && swChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, swChunk, cx, cz, cx - 1, cz + 1, 'southwest', seed);
+                }
+                if (seChunk && seChunk.blocks) {
+                    applyTreeOverhangFromNeighbor(chunk, seChunk, cx, cz, cx + 1, cz + 1, 'southeast', seed);
+                }
+
                 // Recalculate edge lighting to account for neighboring chunks
                 recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
             }
 
+            // Store pending canopy data for trees near chunk edges
+            // Called during tree generation when canopy may extend into not-yet-generated neighbors
+            // treeData: { gx, gz, trunkTopY, trunkW, trunkD, profile }
+            // canopyRadius: the radius of the canopy that may extend across borders
+            function storePendingCanopy(sourceCx, sourceCz, treeData, canopyRadius, chunkSize) {
+                const { gx, gz } = treeData;
+                const sourceKey = getChunkKey(sourceCx, sourceCz);
+
+                // Check all 8 neighbors (including diagonals) that canopy might extend into
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (dx === 0 && dz === 0) continue;
+
+                        const neighborCx = sourceCx + dx;
+                        const neighborCz = sourceCz + dz;
+                        const neighborKey = getChunkKey(neighborCx, neighborCz);
+
+                        // Skip if neighbor chunk already exists (canopy was written via setAcrossChunks)
+                        if (chunks.has(neighborKey)) continue;
+
+                        // Check if canopy could actually extend into this neighbor
+                        const neighborStartX = neighborCx * chunkSize;
+                        const neighborEndX = neighborStartX + chunkSize;
+                        const neighborStartZ = neighborCz * chunkSize;
+                        const neighborEndZ = neighborStartZ + chunkSize;
+
+                        // Canopy extends from gx-canopyRadius to gx+canopyRadius
+                        const canopyMinX = gx - canopyRadius;
+                        const canopyMaxX = gx + canopyRadius;
+                        const canopyMinZ = gz - canopyRadius;
+                        const canopyMaxZ = gz + canopyRadius;
+
+                        // Check if canopy box overlaps neighbor chunk
+                        if (canopyMaxX < neighborStartX || canopyMinX >= neighborEndX ||
+                            canopyMaxZ < neighborStartZ || canopyMinZ >= neighborEndZ) {
+                            continue; // No overlap
+                        }
+
+                        // Store pending canopy for this neighbor
+                        if (!pendingCanopyOverhang.has(neighborKey)) {
+                            pendingCanopyOverhang.set(neighborKey, []);
+                        }
+                        pendingCanopyOverhang.get(neighborKey).push({
+                            ...treeData,
+                            sourceChunkKey: sourceKey
+                        });
+                    }
+                }
+            }
+
+            // Apply pending canopy data from neighboring chunks when this chunk generates
+            // Called during chunk generation before lighting calculation
+            function applyPendingCanopiesFromNeighbors(cx, cz, data, chunkSize, chunkHeight, seed) {
+                const chunkKey = getChunkKey(cx, cz);
+                const pending = pendingCanopyOverhang.get(chunkKey);
+                if (!pending || pending.length === 0) return;
+
+                const chunkStartX = cx * chunkSize;
+                const chunkStartZ = cz * chunkSize;
+
+                for (const tree of pending) {
+                    const { gx, gz, trunkTopY, trunkW, trunkD, profile } = tree;
+
+                    // Use forEachCanopyVoxel for identical shape as original tree
+                    forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (dx, dz, y) => {
+                        // Skip if outside chunk height bounds
+                        if (y < 0 || y >= chunkHeight) return;
+
+                        // Calculate global position of this canopy voxel
+                        const globalX = gx + dx;
+                        const globalZ = gz + dz;
+
+                        // Convert to local coordinates in this chunk
+                        const localX = globalX - chunkStartX;
+                        const localZ = globalZ - chunkStartZ;
+
+                        // Only place if within this chunk's bounds
+                        if (localX < 0 || localX >= chunkSize || localZ < 0 || localZ >= chunkSize) return;
+
+                        const idx = localX + localZ * chunkSize + y * chunkSize * chunkSize;
+
+                        // Only place leaves in air (don't overwrite terrain or other blocks)
+                        if (data[idx] === AIR) {
+                            data[idx] = profile.blocks.leaves;
+                        }
+                    });
+                }
+
+                // Clean up processed pending data
+                pendingCanopyOverhang.delete(chunkKey);
+            }
+
             // OPTIMIZATION AUDIT: applyTreeOverhangFromNeighbor
-            //   - PER-CHUNK: Called up to 4x per chunk when neighbors exist
-            //   - Scans a BAND near each edge (radius+3 columns) for tree trunk tops
+            //   - PER-CHUNK: Called up to 8x per chunk (4 cardinal + 4 diagonal neighbors)
+            //   - Scans a BAND near each edge/corner (radius+3 columns) for tree trunk tops
             //   - Uses processedTrunks Set to deduplicate multi-column trunks
             //   - Generates canopy-style leaves matching forestDecorateColumn rules
             //   - Uses global coordinates for robust target-chunk membership
@@ -8024,6 +8140,42 @@
                     // Source is south neighbor - scan its NORTH edge band (low Z values)
                     const maxScanZ = Math.min(chunkSize, bandWidth);
                     for (let srcLx = 0; srcLx < chunkSize; srcLx++) {
+                        for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
+                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
+                        }
+                    }
+                } else if (direction === 'northwest') {
+                    // Source is northwest neighbor - scan its SOUTHEAST corner
+                    const minScanX = Math.max(0, chunkSize - bandWidth);
+                    const minScanZ = Math.max(0, chunkSize - bandWidth);
+                    for (let srcLx = minScanX; srcLx < chunkSize; srcLx++) {
+                        for (let srcLz = minScanZ; srcLz < chunkSize; srcLz++) {
+                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
+                        }
+                    }
+                } else if (direction === 'northeast') {
+                    // Source is northeast neighbor - scan its SOUTHWEST corner
+                    const maxScanX = Math.min(chunkSize, bandWidth);
+                    const minScanZ = Math.max(0, chunkSize - bandWidth);
+                    for (let srcLx = 0; srcLx < maxScanX; srcLx++) {
+                        for (let srcLz = minScanZ; srcLz < chunkSize; srcLz++) {
+                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
+                        }
+                    }
+                } else if (direction === 'southwest') {
+                    // Source is southwest neighbor - scan its NORTHEAST corner
+                    const minScanX = Math.max(0, chunkSize - bandWidth);
+                    const maxScanZ = Math.min(chunkSize, bandWidth);
+                    for (let srcLx = minScanX; srcLx < chunkSize; srcLx++) {
+                        for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
+                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
+                        }
+                    }
+                } else if (direction === 'southeast') {
+                    // Source is southeast neighbor - scan its NORTHWEST corner
+                    const maxScanX = Math.min(chunkSize, bandWidth);
+                    const maxScanZ = Math.min(chunkSize, bandWidth);
+                    for (let srcLx = 0; srcLx < maxScanX; srcLx++) {
                         for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
                             scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
                         }
@@ -14906,6 +15058,16 @@
                     if (y < minCanopyY) return; // Skip leaves that would be too low
                     setAcrossChunks(lx + dx, y, lz + dz, blocks.leaves);
                 });
+
+                // Store pending canopy data for neighbor chunks that don't exist yet
+                // This ensures canopy is completed when those chunks generate
+                const canopyRadius = canopy.radius;
+                storePendingCanopy(cx, cz, {
+                    gx, gz, trunkTopY,
+                    trunkW: actualTrunkW,
+                    trunkD: actualTrunkD,
+                    profile: tp
+                }, canopyRadius, chunkSize);
             }
             function continentalHeight(gx, gz, seed) {
                 const base = fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
@@ -15924,6 +16086,15 @@
                                 }
                             }
                         }
+
+                        // Store pending canopy data for neighbor chunks that don't exist yet
+                        storePendingCanopy(cx, cz, {
+                            gx, gz,
+                            trunkTopY,
+                            trunkW: trunk.w,
+                            trunkD: trunk.d,
+                            profile
+                        }, canopyRadius, chunkSize);
                     }
                 }
             }
@@ -16037,6 +16208,10 @@
                     // --- PASS 3: Generate decorations (trees, etc.) ---
                     generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks);
                     genState |= GEN_PASS.DECORATIONS;
+
+                    // --- PASS 3.5: Apply pending canopies from neighboring chunks ---
+                    // Trees in neighbors may have registered canopy data that extends into this chunk
+                    applyPendingCanopiesFromNeighbors(cx, cz, data, chunkSize, chunkHeight, seed);
 
                     // Create chunk with light data and generation state
                     const size = chunkSize * chunkSize * chunkHeight;
