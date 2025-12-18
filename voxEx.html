@@ -1726,7 +1726,6 @@
                         },
                     },
                     tags: [],
-                    decorateColumn: forestDecorateColumn, // Custom dense forest decorator
                 },
                 mountains: {
                     weight: 4,        // Balanced - creates dramatic features without dominating
@@ -1809,7 +1808,6 @@
                         },
                     },
                     tags: ["forested", "giant_trees"],
-                    decorateColumn: forestDecorateColumn,
                 },
             };
             // Default values for biome configuration fields
@@ -2028,6 +2026,221 @@
                 }
 
                 return { w, d, maxW, maxD };
+            }
+
+            // ============================================================
+            // DETERMINISTIC CROSS-CHUNK TREE GENERATION
+            // ============================================================
+            // Each chunk independently calculates tree positions for itself
+            // AND all 8 neighbors, then places only the parts that fall
+            // within its own bounds. This eliminates race conditions and
+            // ensures complete canopies regardless of chunk generation order.
+
+            // Calculate tree positions for a chunk deterministically (without needing chunk data)
+            // Returns array of tree objects with position and profile info
+            function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+                const trees = [];
+
+                // Sample positions across the chunk to find potential trees
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
+
+                        // Get biome at this position (deterministic)
+                        const biome = getBiomeParams(gx, gz);
+                        if (!biome || !biome.trees || biome.trees.density <= 0) continue;
+
+                        // Check tree mask (deterministic)
+                        if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) continue;
+
+                        // Resolve tree profile
+                        const profile = resolveTreeProfile(biome);
+                        const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = profile;
+                        const density = profile.density;
+
+                        // Density check (deterministic)
+                        const p = treePlacementValue(gx, gz, worldSeed);
+                        if (p > density) continue;
+
+                        // Pick trunk size (deterministic)
+                        const { w: trunkW, d: trunkD, maxW, maxD } = pickTrunkSize(profile, worldSeed, gx, gz);
+
+                        // Border check - trunk must stay within chunk
+                        const halfW = Math.floor(trunkW / 2);
+                        const halfD = Math.floor(trunkD / 2);
+                        const minTx = -halfW;
+                        const maxTx = trunkW - halfW - 1;
+                        const minTz = -halfD;
+                        const maxTz = trunkD - halfD - 1;
+
+                        if (lx + minTx < 0 || lx + maxTx >= chunkSize ||
+                            lz + minTz < 0 || lz + maxTz >= chunkSize) continue;
+
+                        // Calculate trunk height (deterministic)
+                        const n = noise2D(gx * 0.01 + worldSeed, gz * 0.01 - worldSeed);
+                        const val01 = (n + 1) * 0.5;
+                        const heightRange = trunk.maxHeight - trunk.minHeight;
+                        const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
+
+                        trees.push({
+                            gx, gz, lx, lz,
+                            trunkHeight,
+                            trunkW, trunkD,
+                            halfW, halfD,
+                            minTx, maxTx, minTz, maxTz,
+                            profile,
+                            biome,
+                            canopyRadius: canopy.radius,
+                            density,
+                            placementValue: p,
+                            spacing,
+                        });
+                    }
+                }
+
+                return trees;
+            }
+
+            // Generate trees using deterministic cross-chunk approach
+            // Collects trees from all 9 chunks that could affect this chunk
+            function generateTreesForChunk(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, get, set, caches) {
+                const { heightCache, riverCache } = caches;
+
+                // Collect trees from all 9 chunks that could affect this chunk
+                const allTrees = [];
+                const MAX_CANOPY_RADIUS = 8; // Maximum possible canopy radius
+
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        const ncx = cx + dx;
+                        const ncz = cz + dz;
+                        const chunkTrees = getChunkTreePositions(ncx, ncz, seed, chunkSize);
+
+                        for (const tree of chunkTrees) {
+                            // Check if this tree's canopy could reach our chunk
+                            const canopyMinX = tree.gx - tree.canopyRadius;
+                            const canopyMaxX = tree.gx + tree.canopyRadius;
+                            const canopyMinZ = tree.gz - tree.canopyRadius;
+                            const canopyMaxZ = tree.gz + tree.canopyRadius;
+
+                            const chunkMinX = startX;
+                            const chunkMaxX = startX + chunkSize;
+                            const chunkMinZ = startZ;
+                            const chunkMaxZ = startZ + chunkSize;
+
+                            // Skip if no overlap with canopy bounds
+                            if (canopyMaxX < chunkMinX || canopyMinX >= chunkMaxX ||
+                                canopyMaxZ < chunkMinZ || canopyMinZ >= chunkMaxZ) {
+                                continue;
+                            }
+
+                            allTrees.push({
+                                ...tree,
+                                isOwnChunk: (dx === 0 && dz === 0),
+                                sourceCx: ncx,
+                                sourceCz: ncz,
+                            });
+                        }
+                    }
+                }
+
+                // Process each tree
+                for (const tree of allTrees) {
+                    const { gx, gz, lx, lz, trunkHeight, trunkW, trunkD, profile, isOwnChunk,
+                            halfW, halfD, minTx, maxTx, minTz, maxTz, spacing, density, placementValue } = tree;
+                    const { canopy, blocks, allowedGroundBlocks } = profile;
+
+                    // Calculate local coordinates in THIS chunk for the tree center
+                    const localX = gx - startX;
+                    const localZ = gz - startZ;
+
+                    // Get ground height
+                    let groundY;
+                    if (isOwnChunk) {
+                        // Use cached height for trees in this chunk
+                        groundY = heightCache[lx + lz * chunkSize];
+                    } else {
+                        // Calculate height for neighbor chunk trees (deterministic)
+                        groundY = Math.floor(blendedHeight(gx, gz, seed));
+                    }
+
+                    const trunkBaseY = groundY + 1;
+                    const trunkTopY = trunkBaseY + trunkHeight;
+
+                    // Validate and place trunk only for trees in THIS chunk
+                    if (isOwnChunk) {
+                        // River check
+                        const riverFactor = riverCache[lx + lz * chunkSize];
+                        if (riverFactor < 0.8) continue;
+
+                        // Ground block check
+                        const groundId = get(lx, groundY, lz);
+                        if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
+
+                        // Spacing check - ensure no closer tree with lower placement value
+                        let tooClose = false;
+                        for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
+                            for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
+                                if (ddx === 0 && ddz === 0) continue;
+                                const dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                                if (dist >= spacing) continue;
+                                const np = treePlacementValue(gx + ddx, gz + ddz, seed);
+                                if (np <= density && np < placementValue) tooClose = true;
+                            }
+                        }
+                        if (tooClose) continue;
+
+                        // Check space for trunk
+                        let hasSpace = true;
+                        for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
+                            const block = get(lx, y, lz);
+                            if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                        }
+                        if (!hasSpace) continue;
+
+                        // Height limit check
+                        if (trunkTopY + canopy.topExtension >= chunkHeight) continue;
+
+                        // Place trunk
+                        for (let y = trunkBaseY; y <= trunkTopY; y++) {
+                            for (let tx = minTx; tx <= maxTx; tx++) {
+                                for (let tz = minTz; tz <= maxTz; tz++) {
+                                    const bx = lx + tx;
+                                    const bz = lz + tz;
+                                    if (bx >= 0 && bx < chunkSize && bz >= 0 && bz < chunkSize) {
+                                        set(bx, y, bz, blocks.log);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Place canopy leaves that fall within THIS chunk
+                    // This runs for ALL trees (own and neighbor) whose canopy overlaps
+                    const minCanopyY = groundY + 2;
+                    forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
+                        if (y < minCanopyY) return; // Skip leaves that would be too low
+
+                        const globalX = gx + cdx;
+                        const globalZ = gz + cdz;
+                        const leafLocalX = globalX - startX;
+                        const leafLocalZ = globalZ - startZ;
+
+                        // Only place if within this chunk's bounds
+                        if (leafLocalX < 0 || leafLocalX >= chunkSize ||
+                            leafLocalZ < 0 || leafLocalZ >= chunkSize) return;
+                        if (y < 0 || y >= chunkHeight) return;
+
+                        // Only place in air (don't overwrite trunk or terrain)
+                        const existing = get(leafLocalX, y, leafLocalZ);
+                        if (existing === AIR) {
+                            set(leafLocalX, y, leafLocalZ, blocks.leaves);
+                        }
+                    });
+                }
             }
 
             // Calculate effective radius for a canopy layer based on shape and position
@@ -7808,10 +8021,6 @@
             };
             const activeChunks = new Set();
             const globalPendingMods = new Map();
-            // Registry for pending tree canopy data that extends into not-yet-generated chunks
-            // Key: chunkKey of the TARGET chunk that needs canopy, Value: array of tree data
-            // Tree data: { gx, gz, trunkTopY, trunkW, trunkD, profile, sourceChunkKey }
-            const pendingCanopyOverhang = new Map();
             const chunkBuildQueue = [];
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
@@ -8295,549 +8504,13 @@
             }
 
             // Run neighbor update pass on a chunk
-            // This handles cross-chunk tree foliage, lighting propagation, etc.
+            // Handles edge lighting propagation for smooth chunk boundaries
             function runNeighborUpdatePass(chunk, cx, cz) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
-                const blocks = chunk.blocks;
-                const seed = worldConfig.seed;
-                const startX = cx * chunkSize;
-                const startZ = cz * chunkSize;
-
-                // Get neighbor chunks for cross-boundary operations (cardinal directions)
-                const westChunk = chunks.get(getChunkKey(cx - 1, cz));
-                const eastChunk = chunks.get(getChunkKey(cx + 1, cz));
-                const northChunk = chunks.get(getChunkKey(cx, cz - 1));
-                const southChunk = chunks.get(getChunkKey(cx, cz + 1));
-
-                // Get diagonal neighbor chunks (for trees at chunk corners)
-                const nwChunk = chunks.get(getChunkKey(cx - 1, cz - 1));
-                const neChunk = chunks.get(getChunkKey(cx + 1, cz - 1));
-                const swChunk = chunks.get(getChunkKey(cx - 1, cz + 1));
-                const seChunk = chunks.get(getChunkKey(cx + 1, cz + 1));
-
-                // Check edge columns for trees from neighbors that might extend into this chunk
-                // West edge (lx = 0) - check if trees from west neighbor extend here
-                if (westChunk && westChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, westChunk, cx, cz, cx - 1, cz, 'west', seed);
-                }
-                // East edge (lx = 15) - check if trees from east neighbor extend here
-                if (eastChunk && eastChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, eastChunk, cx, cz, cx + 1, cz, 'east', seed);
-                }
-                // North edge (lz = 0) - check if trees from north neighbor extend here
-                if (northChunk && northChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, northChunk, cx, cz, cx, cz - 1, 'north', seed);
-                }
-                // South edge (lz = 15) - check if trees from south neighbor extend here
-                if (southChunk && southChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, southChunk, cx, cz, cx, cz + 1, 'south', seed);
-                }
-
-                // Diagonal neighbors - trees at chunk corners can extend into 4 chunks
-                if (nwChunk && nwChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, nwChunk, cx, cz, cx - 1, cz - 1, 'northwest', seed);
-                }
-                if (neChunk && neChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, neChunk, cx, cz, cx + 1, cz - 1, 'northeast', seed);
-                }
-                if (swChunk && swChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, swChunk, cx, cz, cx - 1, cz + 1, 'southwest', seed);
-                }
-                if (seChunk && seChunk.blocks) {
-                    applyTreeOverhangFromNeighbor(chunk, seChunk, cx, cz, cx + 1, cz + 1, 'southeast', seed);
-                }
 
                 // Recalculate edge lighting to account for neighboring chunks
                 recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
-            }
-
-            // Store pending canopy data for trees near chunk edges
-            // Called during tree generation when canopy may extend into not-yet-generated neighbors
-            // treeData: { gx, gz, trunkTopY, trunkW, trunkD, profile }
-            // canopyRadius: the radius of the canopy that may extend across borders
-            function storePendingCanopy(sourceCx, sourceCz, treeData, canopyRadius, chunkSize) {
-                const { gx, gz } = treeData;
-                const sourceKey = getChunkKey(sourceCx, sourceCz);
-
-                // DIAGNOSTIC: Log tree data being processed
-                if (isDebug) {
-                    console.log(`[storePendingCanopy] Tree at global(${gx},${gz}) in chunk(${sourceCx},${sourceCz}), radius=${canopyRadius}`);
-                }
-
-                // Check all 8 neighbors (including diagonals) that canopy might extend into
-                for (let dx = -1; dx <= 1; dx++) {
-                    for (let dz = -1; dz <= 1; dz++) {
-                        if (dx === 0 && dz === 0) continue;
-
-                        const neighborCx = sourceCx + dx;
-                        const neighborCz = sourceCz + dz;
-                        const neighborKey = getChunkKey(neighborCx, neighborCz);
-
-                        // Skip if neighbor chunk already exists (canopy was written via setAcrossChunks)
-                        if (chunks.has(neighborKey)) {
-                            if (isDebug) {
-                                console.log(`[storePendingCanopy] SKIP: Neighbor ${neighborKey} exists (should have been handled by setAcrossChunks)`);
-                            }
-                            continue;
-                        }
-
-                        // Check if canopy could actually extend into this neighbor
-                        const neighborStartX = neighborCx * chunkSize;
-                        const neighborEndX = neighborStartX + chunkSize;
-                        const neighborStartZ = neighborCz * chunkSize;
-                        const neighborEndZ = neighborStartZ + chunkSize;
-
-                        // Canopy extends from gx-canopyRadius to gx+canopyRadius
-                        const canopyMinX = gx - canopyRadius;
-                        const canopyMaxX = gx + canopyRadius;
-                        const canopyMinZ = gz - canopyRadius;
-                        const canopyMaxZ = gz + canopyRadius;
-
-                        // Check if canopy box overlaps neighbor chunk
-                        if (canopyMaxX < neighborStartX || canopyMinX >= neighborEndX ||
-                            canopyMaxZ < neighborStartZ || canopyMinZ >= neighborEndZ) {
-                            continue; // No overlap
-                        }
-
-                        // Store pending canopy for this neighbor
-                        if (!pendingCanopyOverhang.has(neighborKey)) {
-                            pendingCanopyOverhang.set(neighborKey, []);
-                        }
-                        pendingCanopyOverhang.get(neighborKey).push({
-                            ...treeData,
-                            sourceChunkKey: sourceKey
-                        });
-
-                        if (isDebug) {
-                            console.log(`[storePendingCanopy] STORING: Pending canopy for neighbor ${neighborKey}`);
-                        }
-                    }
-                }
-            }
-
-            // Apply pending canopy data from neighboring chunks when this chunk generates
-            // Called during chunk generation before lighting calculation
-            function applyPendingCanopiesFromNeighbors(cx, cz, data, chunkSize, chunkHeight, seed) {
-                const chunkKey = getChunkKey(cx, cz);
-                const pending = pendingCanopyOverhang.get(chunkKey);
-                if (!pending || pending.length === 0) return;
-
-                const chunkStartX = cx * chunkSize;
-                const chunkStartZ = cz * chunkSize;
-
-                for (const tree of pending) {
-                    const { gx, gz, trunkTopY, trunkW, trunkD, profile } = tree;
-
-                    // Use forEachCanopyVoxel for identical shape as original tree
-                    forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (dx, dz, y) => {
-                        // Skip if outside chunk height bounds
-                        if (y < 0 || y >= chunkHeight) return;
-
-                        // Calculate global position of this canopy voxel
-                        const globalX = gx + dx;
-                        const globalZ = gz + dz;
-
-                        // Convert to local coordinates in this chunk
-                        const localX = globalX - chunkStartX;
-                        const localZ = globalZ - chunkStartZ;
-
-                        // Only place if within this chunk's bounds
-                        if (localX < 0 || localX >= chunkSize || localZ < 0 || localZ >= chunkSize) return;
-
-                        const idx = localX + localZ * chunkSize + y * chunkSize * chunkSize;
-
-                        // Only place leaves in air (don't overwrite terrain or other blocks)
-                        if (data[idx] === AIR) {
-                            data[idx] = profile.blocks.leaves;
-                        }
-                    });
-                }
-
-                // Clean up processed pending data
-                pendingCanopyOverhang.delete(chunkKey);
-            }
-
-            // Apply canopy from THIS chunk's trees to existing neighbor chunks
-            // Called after decoration pass to ensure leaves appear in pre-generated neighbors
-            // Handles the case where chunk A (no trees) generated first, then chunk B (with trees) generates
-            // and its canopy should extend into chunk A - but A was already generated and rendered
-            function applyCanopyToExistingNeighbors(cx, cz, data, chunkSize, chunkHeight, seed) {
-                const chunkStartX = cx * chunkSize;
-                const chunkStartZ = cz * chunkSize;
-
-                // Track which neighbor chunks were modified so we can queue them for rebuild
-                const modifiedNeighbors = new Set();
-
-                // Scan for tree trunks in this chunk
-                // For each trunk found near an edge, apply canopy to existing neighbors
-                for (let lx = 0; lx < chunkSize; lx++) {
-                    for (let lz = 0; lz < chunkSize; lz++) {
-                        // Only check columns near chunk edges (within canopy radius of edge)
-                        const nearEdge = lx < 8 || lx >= chunkSize - 8 || lz < 8 || lz >= chunkSize - 8;
-                        if (!nearEdge) continue;
-
-                        // Find trunk top in this column
-                        let trunkTopY = -1;
-                        for (let y = chunkHeight - 1; y >= 0; y--) {
-                            const idx = lx + lz * chunkSize + y * chunkSize * chunkSize;
-                            if (isLogBlock(data[idx])) {
-                                // Check if this is trunk top (block above is not log)
-                                if (y + 1 >= chunkHeight) {
-                                    trunkTopY = y;
-                                    break;
-                                }
-                                const aboveIdx = lx + lz * chunkSize + (y + 1) * chunkSize * chunkSize;
-                                if (!isLogBlock(data[aboveIdx])) {
-                                    trunkTopY = y;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (trunkTopY < 0) continue;
-
-                        // DIAGNOSTIC: Log found trunk
-                        if (isDebug) {
-                            console.log(`[applyCanopyToExisting] Found trunk at local(${lx},${trunkTopY},${lz}) in chunk(${cx},${cz})`);
-                        }
-
-                        // Detect actual trunk dimensions by scanning neighbors at trunk top
-                        // This handles 2x2 and 3x3 trunks in Longwoods biome
-                        let trunkW = 1, trunkD = 1;
-                        // Scan for trunk extent in X direction
-                        for (let scanX = lx - 2; scanX <= lx + 2; scanX++) {
-                            if (scanX < 0 || scanX >= chunkSize) continue;
-                            const scanIdx = scanX + lz * chunkSize + trunkTopY * chunkSize * chunkSize;
-                            if (isLogBlock(data[scanIdx])) {
-                                trunkW = Math.max(trunkW, Math.abs(scanX - lx) + 1);
-                            }
-                        }
-                        // Scan for trunk extent in Z direction
-                        for (let scanZ = lz - 2; scanZ <= lz + 2; scanZ++) {
-                            if (scanZ < 0 || scanZ >= chunkSize) continue;
-                            const scanIdx = lx + scanZ * chunkSize + trunkTopY * chunkSize * chunkSize;
-                            if (isLogBlock(data[scanIdx])) {
-                                trunkD = Math.max(trunkD, Math.abs(scanZ - lz) + 1);
-                            }
-                        }
-
-                        // Get tree profile from biome at this location
-                        const gx = chunkStartX + lx;
-                        const gz = chunkStartZ + lz;
-                        const biome = getBiomeParams(gx, gz);
-                        const profile = resolveTreeProfile(biome);
-                        const canopyRadius = profile.canopy.radius;
-
-                        if (isDebug) {
-                            console.log(`[applyCanopyToExisting] Tree global(${gx},${gz}) trunkW=${trunkW} trunkD=${trunkD} radius=${canopyRadius}`);
-                        }
-
-                        // Check which neighbor chunks this tree's canopy might extend into
-                        for (let dx = -1; dx <= 1; dx++) {
-                            for (let dz = -1; dz <= 1; dz++) {
-                                if (dx === 0 && dz === 0) continue;
-
-                                const neighborCx = cx + dx;
-                                const neighborCz = cz + dz;
-                                const neighborKey = getChunkKey(neighborCx, neighborCz);
-
-                                // Only process if neighbor exists
-                                if (!chunks.has(neighborKey)) continue;
-
-                                const neighborChunk = chunks.get(neighborKey);
-                                // Handle both old format (Uint8Array) and new format (object with .blocks)
-                                const neighborBlocks = neighborChunk.blocks || neighborChunk;
-                                const neighborStartX = neighborCx * chunkSize;
-                                const neighborStartZ = neighborCz * chunkSize;
-
-                                // Check if canopy could reach this neighbor
-                                // For cardinal neighbors: canopy must extend past chunk edge in that direction
-                                // For diagonal neighbors: canopy must extend past chunk edge in BOTH directions
-                                const canopyOverlapX = dx > 0 ? (lx + canopyRadius) - (chunkSize - 1) :
-                                                       dx < 0 ? canopyRadius - lx : canopyRadius;
-                                const canopyOverlapZ = dz > 0 ? (lz + canopyRadius) - (chunkSize - 1) :
-                                                       dz < 0 ? canopyRadius - lz : canopyRadius;
-
-                                // Skip if canopy doesn't extend into this neighbor
-                                if (dx !== 0 && dz === 0 && canopyOverlapX <= 0) continue; // Cardinal X
-                                if (dx === 0 && dz !== 0 && canopyOverlapZ <= 0) continue; // Cardinal Z
-                                if (dx !== 0 && dz !== 0 && (canopyOverlapX <= 0 || canopyOverlapZ <= 0)) continue; // Diagonal
-
-                                let modified = false;
-                                let placedCount = 0;
-                                let skippedCount = 0;
-
-                                // Apply canopy voxels that fall within neighbor chunk
-                                forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
-                                    if (y < 0 || y >= chunkHeight) return;
-
-                                    const globalX = gx + cdx;
-                                    const globalZ = gz + cdz;
-                                    const nlx = globalX - neighborStartX;
-                                    const nlz = globalZ - neighborStartZ;
-
-                                    if (nlx < 0 || nlx >= chunkSize || nlz < 0 || nlz >= chunkSize) return;
-
-                                    const nIdx = nlx + nlz * chunkSize + y * chunkSize * chunkSize;
-                                    if (neighborBlocks[nIdx] === AIR) {
-                                        neighborBlocks[nIdx] = profile.blocks.leaves;
-                                        modified = true;
-                                        placedCount++;
-                                    } else {
-                                        skippedCount++;
-                                    }
-                                });
-
-                                if (isDebug && (placedCount > 0 || skippedCount > 0)) {
-                                    console.log(`[applyCanopyToExisting] Neighbor ${neighborKey}: placed=${placedCount}, skipped=${skippedCount}`);
-                                }
-
-                                if (modified) {
-                                    modifiedNeighbors.add(neighborKey);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Queue all modified neighbors for mesh rebuild
-                for (const neighborKey of modifiedNeighbors) {
-                    // Release existing mesh if present
-                    if (chunkMeshes.has(neighborKey)) {
-                        releaseMeshForKey(neighborKey);
-                        releaseMeshForKey(neighborKey + "_WATER");
-                        // Mesh was released, remove from queuedChunkKeys to ensure re-queueing
-                        // (key might still be there from initial chunk generation)
-                        queuedChunkKeys.delete(neighborKey);
-                    }
-                    // Queue for rebuild
-                    if (typeof chunkBuildQueue !== "undefined" && !queuedChunkKeys.has(neighborKey)) {
-                        const [ncx, ncz] = neighborKey.split(',').map(Number);
-                        chunkBuildQueue.push({ key: neighborKey, cx: ncx, cz: ncz, dist: 0 });
-                        queuedChunkKeys.add(neighborKey);
-                    }
-                }
-            }
-
-            // OPTIMIZATION AUDIT: applyTreeOverhangFromNeighbor
-            //   - PER-CHUNK: Called up to 8x per chunk (4 cardinal + 4 diagonal neighbors)
-            //   - Scans a BAND near each edge/corner (radius+3 columns) for tree trunk tops
-            //   - Uses processedTrunks Set to deduplicate multi-column trunks
-            //   - Generates canopy-style leaves matching forestDecorateColumn rules
-            //   - Uses global coordinates for robust target-chunk membership
-            function applyTreeOverhangFromNeighbor(targetChunk, sourceChunk, targetCx, targetCz, sourceCx, sourceCz, direction, seed) {
-                const chunkSize = WORLD_DIMS.chunkSize;
-                const chunkHeight = WORLD_DIMS.chunkHeight;
-                const sourceBlocks = sourceChunk.blocks;
-                const targetBlocks = targetChunk.blocks;
-
-                // Scan a band near the edge of the source chunk for trees
-                // Band width = radius + 3 to catch trees whose center is away from edge but canopy extends across
-                const treeRadius = MAX_TREE_CANOPY_RADIUS;
-                const bandWidth = treeRadius + 3;
-
-                // Set to deduplicate multi-column trunks (2×2, 3×3)
-                // Key format: "minX,minZ,topY" - each tree generates overhang once
-                const processedTrunks = new Set();
-
-                // Scan a band near the relevant edge based on direction
-                if (direction === 'west') {
-                    // Source is west neighbor - scan its EAST edge band (high X values)
-                    // Trees here might have canopies extending into target (which is east of source)
-                    const minScanX = Math.max(0, chunkSize - bandWidth);
-                    for (let srcLx = minScanX; srcLx < chunkSize; srcLx++) {
-                        for (let srcLz = 0; srcLz < chunkSize; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'east') {
-                    // Source is east neighbor - scan its WEST edge band (low X values)
-                    const maxScanX = Math.min(chunkSize, bandWidth);
-                    for (let srcLx = 0; srcLx < maxScanX; srcLx++) {
-                        for (let srcLz = 0; srcLz < chunkSize; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'north') {
-                    // Source is north neighbor - scan its SOUTH edge band (high Z values)
-                    const minScanZ = Math.max(0, chunkSize - bandWidth);
-                    for (let srcLx = 0; srcLx < chunkSize; srcLx++) {
-                        for (let srcLz = minScanZ; srcLz < chunkSize; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'south') {
-                    // Source is south neighbor - scan its NORTH edge band (low Z values)
-                    const maxScanZ = Math.min(chunkSize, bandWidth);
-                    for (let srcLx = 0; srcLx < chunkSize; srcLx++) {
-                        for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'northwest') {
-                    // Source is northwest neighbor - scan its SOUTHEAST corner
-                    const minScanX = Math.max(0, chunkSize - bandWidth);
-                    const minScanZ = Math.max(0, chunkSize - bandWidth);
-                    for (let srcLx = minScanX; srcLx < chunkSize; srcLx++) {
-                        for (let srcLz = minScanZ; srcLz < chunkSize; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'northeast') {
-                    // Source is northeast neighbor - scan its SOUTHWEST corner
-                    const maxScanX = Math.min(chunkSize, bandWidth);
-                    const minScanZ = Math.max(0, chunkSize - bandWidth);
-                    for (let srcLx = 0; srcLx < maxScanX; srcLx++) {
-                        for (let srcLz = minScanZ; srcLz < chunkSize; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'southwest') {
-                    // Source is southwest neighbor - scan its NORTHEAST corner
-                    const minScanX = Math.max(0, chunkSize - bandWidth);
-                    const maxScanZ = Math.min(chunkSize, bandWidth);
-                    for (let srcLx = minScanX; srcLx < chunkSize; srcLx++) {
-                        for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                } else if (direction === 'southeast') {
-                    // Source is southeast neighbor - scan its NORTHWEST corner
-                    const maxScanX = Math.min(chunkSize, bandWidth);
-                    const maxScanZ = Math.min(chunkSize, bandWidth);
-                    for (let srcLx = 0; srcLx < maxScanX; srcLx++) {
-                        for (let srcLz = 0; srcLz < maxScanZ; srcLz++) {
-                            scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, treeRadius, chunkSize, chunkHeight, seed, sourceCx, sourceCz, targetCx, targetCz, processedTrunks);
-                        }
-                    }
-                }
-            }
-
-            // Find trunk bounds at given Y level (min/max X/Z of contiguous log blocks)
-            // Returns { minX, maxX, minZ, maxZ, centerX, centerZ } for the trunk footprint
-            // Used for deduplication (anchor = min corner) and canopy placement (center)
-            function findTrunkBounds(sourceBlocks, srcLx, srcLz, topY, chunkSize) {
-                let minX = srcLx, maxX = srcLx, minZ = srcLz, maxZ = srcLz;
-
-                // Scan a 5×5 neighborhood to find all contiguous trunk logs at this Y
-                // (Max trunk size is 3×3, so 5×5 is sufficient with margin)
-                for (let dx = -2; dx <= 2; dx++) {
-                    for (let dz = -2; dz <= 2; dz++) {
-                        const cx = srcLx + dx, cz = srcLz + dz;
-                        if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
-                        const idx = cx + cz * chunkSize + topY * chunkSize * chunkSize;
-                        if (isLogBlock(sourceBlocks[idx])) {
-                            if (cx < minX) minX = cx;
-                            if (cx > maxX) maxX = cx;
-                            if (cz < minZ) minZ = cz;
-                            if (cz > maxZ) maxZ = cz;
-                        }
-                    }
-                }
-
-                // Compute center matching tree generation's placement convention
-                // (forestDecorateColumn places trunk centered at lx,lz)
-                const width = maxX - minX + 1;
-                const depth = maxZ - minZ + 1;
-                const centerX = minX + Math.floor(width / 2);
-                const centerZ = minZ + Math.floor(depth / 2);
-
-                return { minX, maxX, minZ, maxZ, centerX, centerZ, width, depth };
-            }
-
-            // Scan a column in source chunk for tree trunk TOP and apply canopy-style overhang
-            // Uses trunk CENTER (not anchor) for canopy placement to match tree generation
-            // Uses global coordinates for robust target-chunk membership calculation
-            // Profile-driven: resolves biome at trunk center and uses biome's tree profile for canopy params
-            // Uses unified forEachCanopyVoxel helper for identical shape logic as in-chunk generation
-            function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, maxRadius, chunkSize, chunkHeight, seed, srcCx, srcCz, tgtCx, tgtCz, processedTrunks) {
-                // Find the TOPMOST log in this column (scan downward from top)
-                let topY = -1;
-                for (let y = chunkHeight - 1; y >= 0; y--) {
-                    const idx = srcLx + srcLz * chunkSize + y * chunkSize * chunkSize;
-                    if (isLogBlock(sourceBlocks[idx])) {
-                        // Check if this is the TOP of the trunk (block above is not log)
-                        if (y + 1 >= chunkHeight || !isLogBlock(sourceBlocks[srcLx + srcLz * chunkSize + (y + 1) * chunkSize * chunkSize])) {
-                            topY = y;
-                            break;
-                        }
-                    }
-                }
-
-                if (topY < 0) return; // No trunk top found in this column
-
-                // Find trunk bounds and center
-                const { minX, minZ, centerX, centerZ, width, depth } = findTrunkBounds(sourceBlocks, srcLx, srcLz, topY, chunkSize);
-
-                // Use min corner (anchor) for deduplication key
-                const trunkKey = `${minX},${minZ},${topY}`;
-
-                // Skip if this trunk was already processed
-                if (processedTrunks.has(trunkKey)) return;
-                processedTrunks.add(trunkKey);
-
-                // Compute global trunk center coordinates
-                const gxCenter = srcCx * chunkSize + centerX;
-                const gzCenter = srcCz * chunkSize + centerZ;
-
-                // Resolve biome at trunk center and get tree profile
-                const biome = getBiomeParams(gxCenter, gzCenter);
-                const treeProfile = resolveTreeProfile(biome);
-
-                // Get actual log block type from the trunk top
-                const trunkLogIdx = centerX + centerZ * chunkSize + topY * chunkSize * chunkSize;
-                const actualLogBlock = sourceBlocks[trunkLogIdx];
-
-                // Validate trunk block matches the resolved profile's log type
-                // Skip if mismatch (player-placed log of wrong type, or anomaly)
-                if (actualLogBlock !== treeProfile.blocks.log) return;
-
-                // Check for leaves presence using a quick scan near trunk top
-                // Skip if no leaves detected (likely player-placed logs, not a tree)
-                let hasLeaves = false;
-                for (let dy = 1; dy <= 3 && !hasLeaves; dy++) {
-                    const checkY = topY + dy;
-                    if (checkY >= chunkHeight) break;
-                    for (let dx = -2; dx <= 2 && !hasLeaves; dx++) {
-                        for (let dz = -2; dz <= 2; dz++) {
-                            const cx = centerX + dx, cz = centerZ + dz;
-                            if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
-                            const idx = cx + cz * chunkSize + checkY * chunkSize * chunkSize;
-                            if (isLeafBlock(sourceBlocks[idx])) {
-                                hasLeaves = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (!hasLeaves) return;
-
-                // Get leaf block from profile
-                const leafBlock = treeProfile.blocks.leaves;
-
-                // Generate canopy using unified helper - identical logic to forestDecorateColumn
-                forEachCanopyVoxel(treeProfile, seed, gxCenter, gzCenter, topY, width, depth, (dx, dz, y) => {
-                    // Skip voxels outside chunk height bounds
-                    if (y < 0 || y >= chunkHeight) return;
-
-                    // Calculate GLOBAL position of this leaf candidate (relative to center)
-                    const globalX = gxCenter + dx;
-                    const globalZ = gzCenter + dz;
-
-                    // Convert to target chunk local coordinates
-                    const tgtLx = globalX - tgtCx * chunkSize;
-                    const tgtLz = globalZ - tgtCz * chunkSize;
-
-                    // Only place if within target chunk bounds
-                    if (tgtLx < 0 || tgtLx >= chunkSize || tgtLz < 0 || tgtLz >= chunkSize) return;
-
-                    // Place leaf if target is air
-                    const tgtIdx = tgtLx + tgtLz * chunkSize + y * chunkSize * chunkSize;
-                    if (targetBlocks[tgtIdx] === AIR) {
-                        targetBlocks[tgtIdx] = leafBlock;
-                    }
-                });
             }
 
             // Recalculate lighting at chunk edges to account for neighboring chunks
@@ -15487,119 +15160,6 @@
                 }
                 return false;
             }
-            // Generic forest decorator - fully data-driven from biome.trees config
-            // Uses resolveTreeProfile() to merge biome overrides with TREE_CONFIG defaults
-            // Supports w×d trunks (including trunk.sizes variance), custom canopy radius, and per-biome block types
-            // DETERMINISTIC: Uses seededRandom instead of Math.random
-            // ALL behavior is config-driven - no special-casing by block type
-            function forestDecorateColumn(cx, cz, gx, gz, lx, lz, topY, setAcrossChunks, get, seed, biome) {
-                if (topY <= 0) return;
-                const groundY = topY - WORLD_DIMS.yOffset;
-                if (!getTreeMaskValueGlobal(gx, gz, seed)) return;
-
-                // Resolve tree profile from biome config (merges with TREE_CONFIG defaults)
-                const tp = resolveTreeProfile(biome);
-                const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = tp;
-                const treeDensity = tp.density;
-
-                // Pick trunk dimensions using helper (handles trunk.sizes weighted selection)
-                const { w: actualTrunkW, d: actualTrunkD } = pickTrunkSize(tp, seed, gx, gz);
-
-                // Exact trunk footprint bounds check (matches trunk placement loop)
-                const halfW = Math.floor(actualTrunkW / 2);
-                const halfD = Math.floor(actualTrunkD / 2);
-                const minTx = -halfW;
-                const maxTx = actualTrunkW - halfW - 1;
-                const minTz = -halfD;
-                const maxTz = actualTrunkD - halfD - 1;
-                const chunkSize = WORLD_DIMS.chunkSize;
-
-                // Border check: ensure trunk footprint stays within chunk
-                // Canopy can safely extend across chunk boundaries via setAcrossChunks
-                if (lx + minTx < 0 || lx + maxTx >= chunkSize ||
-                    lz + minTz < 0 || lz + maxTz >= chunkSize) return;
-
-                // Slope check - uses biome's leaves block for transparency check
-                const maxSlope = 2;
-                let tooSteep = false;
-                for (let ox = -1; ox <= 1 && !tooSteep; ox++) {
-                    for (let oz = -1; oz <= 1 && !tooSteep; oz++) {
-                        if (!ox && !oz) continue;
-                        const nx = lx + ox, nz = lz + oz;
-                        if (nx < 0 || nx >= chunkSize || nz < 0 || nz >= chunkSize) continue;
-                        let neighborY = -1;
-                        for (let y = groundY + 3; y >= groundY - 3; y--) {
-                            if (y < 0 || y >= WORLD_DIMS.chunkHeight) continue;
-                            const id = get(nx, y, nz);
-                            // Skip air and any leaves-type blocks (biome-specific or standard)
-                            if (id !== AIR && !isLeafBlock(id)) { neighborY = y; break; }
-                        }
-                        if (neighborY === -1 || Math.abs(neighborY - groundY) > maxSlope) tooSteep = true;
-                    }
-                }
-                if (tooSteep) return;
-
-                // Ground block check - uses config-driven allowed blocks
-                const groundId = get(lx, groundY, lz);
-                if (!isValidTreeGround(groundId, allowedGroundBlocks)) return;
-
-                // Density check
-                const p = treePlacementValue(gx, gz, seed);
-                if (p > treeDensity) return;
-
-                // River check
-                if (getRiverFactor(gx, gz, seed) < 0.8) return;
-
-                // Spacing check using profile spacing
-                let tooClose = false;
-                for (let dx = -spacing; dx <= spacing && !tooClose; dx++) {
-                    for (let dz = -spacing; dz <= spacing && !tooClose; dz++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const dist = Math.sqrt(dx * dx + dz * dz);
-                        if (dist >= spacing) continue;
-                        const np = treePlacementValue(gx + dx, gz + dz, seed);
-                        if (np <= treeDensity && np < p) tooClose = true;
-                    }
-                }
-                if (tooClose) return;
-
-                // Nearby tree check - uses biome's log block ID
-                if (hasNearbyTree(lx, lz, spacing + 1, groundY, blocks.log, get)) return;
-
-                // Calculate trunk height from profile
-                const n = noise2D(gx * 0.01 + seed, gz * 0.01 - seed);
-                const val01 = (n + 1) * 0.5;
-                const heightRange = trunk.maxHeight - trunk.minHeight;
-                const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
-                const trunkTopY = groundY + trunkHeight;
-
-                // Build trunk using actual dimensions (may vary per-tree if trunk.sizes used)
-                for (let y = groundY + 1; y <= trunkTopY; y++) {
-                    for (let tx = minTx; tx <= maxTx; tx++) {
-                        for (let tz = minTz; tz <= maxTz; tz++) {
-                            setAcrossChunks(lx + tx, y, lz + tz, blocks.log);
-                        }
-                    }
-                }
-
-                // Build canopy using unified helper - config-driven, no special-casing
-                // Clamp canopy bottom to avoid leaves going below groundY+2
-                const minCanopyY = groundY + 2;
-                forEachCanopyVoxel(tp, seed, gx, gz, trunkTopY, actualTrunkW, actualTrunkD, (dx, dz, y) => {
-                    if (y < minCanopyY) return; // Skip leaves that would be too low
-                    setAcrossChunks(lx + dx, y, lz + dz, blocks.leaves);
-                });
-
-                // Store pending canopy data for neighbor chunks that don't exist yet
-                // This ensures canopy is completed when those chunks generate
-                const canopyRadius = canopy.radius;
-                storePendingCanopy(cx, cz, {
-                    gx, gz, trunkTopY,
-                    trunkW: actualTrunkW,
-                    trunkD: actualTrunkD,
-                    profile: tp
-                }, canopyRadius, chunkSize);
-            }
             function continentalHeight(gx, gz, seed) {
                 const base = fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
                 const erosion = fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8);
@@ -16463,171 +16023,13 @@
                 }
             }
             // Generate trees and decorations
-            function generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks) {
-                const { heightCache, riverCache, biomeCache } = caches;
-
-                // ============================================================
-                // TREE LINE CONFIGURATION (considerations 23-28)
-                // ============================================================
-                const TREE_LINE_BASE = 80;        // Base treeline elevation
-                const TREE_LINE_SOUTH_BONUS = 12; // South-facing slopes: higher treeline
-                const TREE_LINE_NORTH_PENALTY = 8; // North-facing slopes: lower treeline
-                const KRUMMHOLZ_ZONE = 10;        // Zone above treeline with stunted trees
-                const SPARSE_ZONE = 15;           // Zone below treeline with thinning trees
-
-                // Note: biome.decorateColumn is now set directly in BIOME_CONFIG
-                // No runtime decorator injection needed - fully data-driven
-
-                for (let lx = 0; lx < chunkSize; lx++) {
-                    for (let lz = 0; lz < chunkSize; lz++) {
-                        const idx = lx + lz * chunkSize;
-                        const gx = startX + lx;
-                        const gz = startZ + lz;
-                        const biome = biomeCache[idx];
-                        const riverFactor = riverCache[idx];
-                        const worldTopY = heightCache[idx];
-
-                        // Skip default tree logic if special decorator used
-                        // Pass biome object so decorator can read biome.trees.density (fully data-driven)
-                        if (biome.decorateColumn) {
-                            const localTopY = findSurfaceY(data, lx, lz);
-                            biome.decorateColumn(cx, cz, gx, gz, lx, lz, localTopY, setAcrossChunks, get, seed, biome);
-                            continue;
-                        }
-
-                        // Default tree logic - fully data-driven from biome.trees config
-                        // Resolve tree profile (merges biome overrides with TREE_CONFIG defaults)
-                        const profile = resolveTreeProfile(biome);
-                        const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = profile;
-                        let density = profile.density;
-                        if (density <= 0) continue;
-                        if (!getTreeMaskValueGlobal(gx, gz, seed)) continue;
-
-                        const centerY = findSurfaceY(data, lx, lz);
-                        if (centerY <= 0) continue;
-                        const worldY = centerY - WORLD_DIMS.yOffset;
-
-                        // ============================================================
-                        // ASPECT-BASED TREELINE (consideration 24)
-                        // ============================================================
-                        let effectiveTreeLine = TREE_LINE_BASE;
-                        // Use tag-based check for mountain-specific treeline logic
-                        const hasMountainTag = biome.tags?.includes("mountain");
-                        if (hasMountainTag) {
-                            // Calculate slope aspect from neighbors
-                            let slopeNorth = 0, slopeSouth = 0;
-                            const neighbors = [[0, -1], [0, 1]];
-                            for (const [dx, dz] of neighbors) {
-                                const nx = lx + dx;
-                                const nz = lz + dz;
-                                if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
-                                    const nIdx = nx + nz * chunkSize;
-                                    const neighborY = heightCache[nIdx];
-                                    const slope = worldTopY - neighborY;
-                                    if (dz < 0) slopeNorth = slope;
-                                    if (dz > 0) slopeSouth = slope;
-                                }
-                            }
-
-                            // Adjust treeline based on aspect
-                            if (slopeSouth > slopeNorth + 2) {
-                                effectiveTreeLine += TREE_LINE_SOUTH_BONUS;
-                            } else if (slopeNorth > slopeSouth + 2) {
-                                effectiveTreeLine -= TREE_LINE_NORTH_PENALTY;
-                            }
-
-                            // Add noise variation to treeline
-                            const treelineNoise = noise2D(gx * 0.02 + seed * 50, gz * 0.02 - seed * 50);
-                            effectiveTreeLine += treelineNoise * 5;
-
-                            // Hard cutoff above treeline + krummholz zone
-                            if (worldY >= effectiveTreeLine + KRUMMHOLZ_ZONE) continue;
-
-                            // Sparse transition zone
-                            if (worldY >= effectiveTreeLine - SPARSE_ZONE) {
-                                const distToTreeline = effectiveTreeLine - worldY;
-                                const sparseMultiplier = Math.max(0.1, distToTreeline / SPARSE_ZONE);
-                                density *= sparseMultiplier;
-                            }
-                        }
-
-                        const p = treePlacementValue(gx, gz, seed);
-                        if (p > density) continue;
-                        if (riverFactor < 0.8) continue;
-
-                        // Ground block check - uses config-driven allowed blocks
-                        const groundId = get(lx, worldY, lz);
-                        if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
-
-                        // Only constrain by trunk footprint, not canopy (canopy uses setAcrossChunks)
-                        const trunkHalfW = Math.floor(trunk.w / 2);
-                        const trunkHalfD = Math.floor(trunk.d / 2);
-                        const trunkBorderMin = Math.max(trunkHalfW, trunkHalfD);
-                        const trunkBorderMax = Math.max(trunk.w - trunkHalfW, trunk.d - trunkHalfD);
-                        if (lx < trunkBorderMin || lx >= chunkSize - trunkBorderMax + 1 ||
-                            lz < trunkBorderMin || lz >= chunkSize - trunkBorderMax + 1) continue;
-
-                        // ============================================================
-                        // TREE SIZE BASED ON ELEVATION (consideration 28 - Krummholz)
-                        // ============================================================
-                        const n = noise2D(gx * 0.01 + seed, gz * 0.01 - seed);
-                        const val01 = (n + 1) * 0.5;
-                        let heightRange = trunk.maxHeight - trunk.minHeight;
-                        let baseHeight = trunk.minHeight;
-
-                        // Stunted trees near treeline (krummholz zone)
-                        if (hasMountainTag && worldY >= effectiveTreeLine - 5) {
-                            const stuntFactor = Math.max(0.3, (effectiveTreeLine + KRUMMHOLZ_ZONE - worldY) / (KRUMMHOLZ_ZONE + 5));
-                            heightRange = Math.floor(heightRange * stuntFactor);
-                            baseHeight = Math.max(2, Math.floor(baseHeight * stuntFactor));
-                        }
-
-                        const trunkHeight = baseHeight + Math.floor(val01 * heightRange);
-                        const trunkBaseY = worldY + 1;
-                        if (trunkBaseY + trunkHeight + canopy.topExtension >= chunkHeight) continue;
-
-                        // Build w×d trunk using biome's log block (stays within chunk)
-                        for (let i = 0; i < trunkHeight; i++) {
-                            for (let tx = -trunkHalfW; tx < trunk.w - trunkHalfW; tx++) {
-                                for (let tz = -trunkHalfD; tz < trunk.d - trunkHalfD; tz++) {
-                                    const bx = lx + tx, bz = lz + tz;
-                                    if (bx >= 0 && bx < chunkSize && bz >= 0 && bz < chunkSize) {
-                                        set(bx, trunkBaseY + i, bz, blocks.log);
-                                    }
-                                }
-                            }
-                        }
-
-                        // Build canopy using biome's leaves block
-                        const canopyRadius = trunkHeight < 4 ? Math.max(1, canopy.radius - 1) : canopy.radius;
-                        const leavesBottom = trunkBaseY + trunkHeight - Math.min(2, Math.floor(trunkHeight / 2));
-                        const leavesTop = trunkBaseY + trunkHeight + canopy.topExtension;
-                        const trunkTopY = trunkBaseY + trunkHeight;
-
-                        for (let y = leavesBottom; y <= leavesTop; y++) {
-                            for (let x = -canopyRadius; x <= canopyRadius; x++) {
-                                for (let z = -canopyRadius; z <= canopyRadius; z++) {
-                                    // Deterministic rounded corners using seededRandom
-                                    if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius) {
-                                        if (seededRandom(seed, gx, gz, x, y, z) > 0.5) continue;
-                                    }
-                                    // Don't overwrite trunk - use isInTrunkFootprint for any w×d trunk
-                                    if (y < trunkTopY && isInTrunkFootprint(x, z, trunk.w, trunk.d)) continue;
-                                    setAcrossChunks(lx + x, y, lz + z, blocks.leaves);
-                                }
-                            }
-                        }
-
-                        // Store pending canopy data for neighbor chunks that don't exist yet
-                        storePendingCanopy(cx, cz, {
-                            gx, gz,
-                            trunkTopY,
-                            trunkW: trunk.w,
-                            trunkD: trunk.d,
-                            profile
-                        }, canopyRadius, chunkSize);
-                    }
-                }
+            // Uses deterministic cross-chunk tree generation - each chunk calculates
+            // tree positions for itself AND all 8 neighbors, placing only parts that
+            // fall within its bounds. This eliminates race conditions.
+            function generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get) {
+                // Use new deterministic tree generation
+                // Trees from this chunk AND neighbor chunks that overlap are all placed
+                generateTreesForChunk(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, get, set, caches);
             }
             // OPTIMIZATION AUDIT: generateChunkData
             //   - HOT PATH: Called once per chunk (16×16×128 = 32,768 blocks)
@@ -16635,7 +16037,7 @@
             //   - Allocations per new chunk:
             //     * 1× Uint8Array(32768) for blocks
             //     * 2× Uint8Array(32768) for skyLight/blockLight
-            //     * Helper closures (set, get, setAcrossChunks) - acceptable
+            //     * Helper closures (set, get) - acceptable
             //   - Multi-pass generation: terrain → water → decorations → lighting
             //   - Uses precalculateTerrainCaches() to batch noise calculations
             //   - Uses precalculateCaveNoise() to batch cave noise
@@ -16691,60 +16093,6 @@
                         if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
                         return data[x + z * chunkSize + y * chunkSize * chunkSize];
                     };
-                    // Helper: Set block across chunk boundaries (for tree decorations)
-                    const setAcrossChunks = (lx, ly, lz, id) => {
-                        if (lx >= 0 && lx < WORLD_DIMS.chunkSize && lz >= 0 && lz < WORLD_DIMS.chunkSize) {
-                            set(lx, ly, lz, id);
-                            return;
-                        }
-                        const neighborCx = cx + Math.floor(lx / WORLD_DIMS.chunkSize);
-                        const neighborCz = cz + Math.floor(lz / WORLD_DIMS.chunkSize);
-                        const nKey = getChunkKey(neighborCx, neighborCz);
-
-                        // DIAGNOSTIC: Log cross-chunk placement attempts
-                        const isLeaf = isLeafBlock(id);
-                        if (isLeaf && isDebug) {
-                            console.log(`[setAcrossChunks] Attempting leaf at local(${lx},${ly},${lz}) -> chunk ${nKey}`);
-                        }
-
-                        if (chunks.has(nKey)) {
-                            const nChunk = chunks.get(nKey);
-                            const nData = nChunk.blocks || nChunk; // Handle object format
-                            const nLx = ((lx % WORLD_DIMS.chunkSize) + WORLD_DIMS.chunkSize) % WORLD_DIMS.chunkSize;
-                            const nLz = ((lz % WORLD_DIMS.chunkSize) + WORLD_DIMS.chunkSize) % WORLD_DIMS.chunkSize;
-                            const idx = nLx + nLz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
-
-                            // DIAGNOSTIC: Log what's at target position
-                            if (isLeaf && isDebug) {
-                                const existingBlock = nData[idx];
-                                console.log(`[setAcrossChunks] Target nLocal(${nLx},${ly},${nLz}) idx=${idx}, existing=${existingBlock}, isAir=${existingBlock === AIR}`);
-                            }
-
-                            if (idx >= 0 && idx < nData.length && (nData[idx] === AIR || isLeafBlock(nData[idx]))) {
-                                nData[idx] = id;
-                                if (isLeaf && isDebug) {
-                                    console.log(`[setAcrossChunks] SUCCESS: Placed leaf at chunk ${nKey} local(${nLx},${ly},${nLz})`);
-                                }
-                                // Release existing mesh if present (it will be rebuilt)
-                                if (chunkMeshes.has(nKey)) {
-                                    releaseMeshForKey(nKey);
-                                    releaseMeshForKey(nKey + "_WATER");
-                                    // Mesh was released, remove from queuedChunkKeys to ensure re-queueing
-                                    // (key might still be there from initial chunk generation)
-                                    queuedChunkKeys.delete(nKey);
-                                }
-                                // Queue chunk for mesh rebuild
-                                if (typeof chunkBuildQueue !== "undefined" && !queuedChunkKeys.has(nKey)) {
-                                    chunkBuildQueue.push({ key: nKey, cx: neighborCx, cz: neighborCz, dist: 0 });
-                                    queuedChunkKeys.add(nKey);
-                                }
-                            } else if (isLeaf && isDebug) {
-                                console.log(`[setAcrossChunks] FAILED: Could not place leaf - idx=${idx}, length=${nData.length}, existing=${nData[idx]}`);
-                            }
-                        } else if (isLeaf && isDebug) {
-                            console.log(`[setAcrossChunks] SKIPPED: Neighbor chunk ${nKey} doesn't exist`);
-                        }
-                    };
                     // Pre-calculate all caches
                     const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seed);
                     const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
@@ -16761,18 +16109,11 @@
                     genState |= GEN_PASS.WATER;
 
                     // --- PASS 3: Generate decorations (trees, etc.) ---
-                    generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get, setAcrossChunks);
+                    // Uses deterministic cross-chunk tree generation - each chunk independently
+                    // calculates tree positions for itself and neighbors, placing canopy leaves
+                    // that fall within its own bounds
+                    generateDecorationsPass(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get);
                     genState |= GEN_PASS.DECORATIONS;
-
-                    // --- PASS 3.5: Apply pending canopies from neighboring chunks ---
-                    // Trees in neighbors may have registered canopy data that extends into this chunk
-                    applyPendingCanopiesFromNeighbors(cx, cz, data, chunkSize, chunkHeight, seed);
-
-                    // --- PASS 3.6: Push canopy to existing neighbor chunks ---
-                    // When THIS chunk generates trees near borders, existing neighbors need the canopy
-                    // This handles the case where chunk A (no trees) generated first, then this chunk
-                    // generates with trees whose canopy extends into A
-                    applyCanopyToExistingNeighbors(cx, cz, data, chunkSize, chunkHeight, seed);
 
                     // Create chunk with light data and generation state
                     const size = chunkSize * chunkSize * chunkHeight;
