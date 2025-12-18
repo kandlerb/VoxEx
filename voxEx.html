@@ -2254,6 +2254,9 @@
                 let iterations = 0;
                 const maxIterations = 10; // Prevent infinite loops
 
+                // DIAGNOSTIC: Track candidate count before filtering
+                const beforeCount = candidates.size;
+
                 while (changed && iterations < maxIterations) {
                     changed = false;
                     iterations++;
@@ -2265,6 +2268,12 @@
                             changed = true;
                         }
                     }
+                }
+
+                // DIAGNOSTIC: Log filter results
+                const afterCount = candidates.size;
+                if (isDebug && beforeCount !== afterCount) {
+                    console.log(`[forEachCanopyVoxel] Connectivity filter at (${gxCenter},${gzCenter}): ${beforeCount} -> ${afterCount} candidates (removed ${beforeCount - afterCount})`);
                 }
 
                 // PASS 3: Output surviving candidates
@@ -8332,6 +8341,11 @@
                 const { gx, gz } = treeData;
                 const sourceKey = getChunkKey(sourceCx, sourceCz);
 
+                // DIAGNOSTIC: Log tree data being processed
+                if (isDebug) {
+                    console.log(`[storePendingCanopy] Tree at global(${gx},${gz}) in chunk(${sourceCx},${sourceCz}), radius=${canopyRadius}`);
+                }
+
                 // Check all 8 neighbors (including diagonals) that canopy might extend into
                 for (let dx = -1; dx <= 1; dx++) {
                     for (let dz = -1; dz <= 1; dz++) {
@@ -8342,7 +8356,12 @@
                         const neighborKey = getChunkKey(neighborCx, neighborCz);
 
                         // Skip if neighbor chunk already exists (canopy was written via setAcrossChunks)
-                        if (chunks.has(neighborKey)) continue;
+                        if (chunks.has(neighborKey)) {
+                            if (isDebug) {
+                                console.log(`[storePendingCanopy] SKIP: Neighbor ${neighborKey} exists (should have been handled by setAcrossChunks)`);
+                            }
+                            continue;
+                        }
 
                         // Check if canopy could actually extend into this neighbor
                         const neighborStartX = neighborCx * chunkSize;
@@ -8370,6 +8389,10 @@
                             ...treeData,
                             sourceChunkKey: sourceKey
                         });
+
+                        if (isDebug) {
+                            console.log(`[storePendingCanopy] STORING: Pending canopy for neighbor ${neighborKey}`);
+                        }
                     }
                 }
             }
@@ -8455,6 +8478,11 @@
 
                         if (trunkTopY < 0) continue;
 
+                        // DIAGNOSTIC: Log found trunk
+                        if (isDebug) {
+                            console.log(`[applyCanopyToExisting] Found trunk at local(${lx},${trunkTopY},${lz}) in chunk(${cx},${cz})`);
+                        }
+
                         // Detect actual trunk dimensions by scanning neighbors at trunk top
                         // This handles 2x2 and 3x3 trunks in Longwoods biome
                         let trunkW = 1, trunkD = 1;
@@ -8481,6 +8509,10 @@
                         const biome = getBiomeParams(gx, gz);
                         const profile = resolveTreeProfile(biome);
                         const canopyRadius = profile.canopy.radius;
+
+                        if (isDebug) {
+                            console.log(`[applyCanopyToExisting] Tree global(${gx},${gz}) trunkW=${trunkW} trunkD=${trunkD} radius=${canopyRadius}`);
+                        }
 
                         // Check which neighbor chunks this tree's canopy might extend into
                         for (let dx = -1; dx <= 1; dx++) {
@@ -8514,6 +8546,8 @@
                                 if (dx !== 0 && dz !== 0 && (canopyOverlapX <= 0 || canopyOverlapZ <= 0)) continue; // Diagonal
 
                                 let modified = false;
+                                let placedCount = 0;
+                                let skippedCount = 0;
 
                                 // Apply canopy voxels that fall within neighbor chunk
                                 forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
@@ -8530,8 +8564,15 @@
                                     if (neighborBlocks[nIdx] === AIR) {
                                         neighborBlocks[nIdx] = profile.blocks.leaves;
                                         modified = true;
+                                        placedCount++;
+                                    } else {
+                                        skippedCount++;
                                     }
                                 });
+
+                                if (isDebug && (placedCount > 0 || skippedCount > 0)) {
+                                    console.log(`[applyCanopyToExisting] Neighbor ${neighborKey}: placed=${placedCount}, skipped=${skippedCount}`);
+                                }
 
                                 if (modified) {
                                     modifiedNeighbors.add(neighborKey);
@@ -16637,14 +16678,31 @@
                         const neighborCx = cx + Math.floor(lx / WORLD_DIMS.chunkSize);
                         const neighborCz = cz + Math.floor(lz / WORLD_DIMS.chunkSize);
                         const nKey = getChunkKey(neighborCx, neighborCz);
+
+                        // DIAGNOSTIC: Log cross-chunk placement attempts
+                        const isLeaf = isLeafBlock(id);
+                        if (isLeaf && isDebug) {
+                            console.log(`[setAcrossChunks] Attempting leaf at local(${lx},${ly},${lz}) -> chunk ${nKey}`);
+                        }
+
                         if (chunks.has(nKey)) {
                             const nChunk = chunks.get(nKey);
                             const nData = nChunk.blocks || nChunk; // Handle object format
                             const nLx = ((lx % WORLD_DIMS.chunkSize) + WORLD_DIMS.chunkSize) % WORLD_DIMS.chunkSize;
                             const nLz = ((lz % WORLD_DIMS.chunkSize) + WORLD_DIMS.chunkSize) % WORLD_DIMS.chunkSize;
                             const idx = nLx + nLz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
+
+                            // DIAGNOSTIC: Log what's at target position
+                            if (isLeaf && isDebug) {
+                                const existingBlock = nData[idx];
+                                console.log(`[setAcrossChunks] Target nLocal(${nLx},${ly},${nLz}) idx=${idx}, existing=${existingBlock}, isAir=${existingBlock === AIR}`);
+                            }
+
                             if (idx >= 0 && idx < nData.length && (nData[idx] === AIR || isLeafBlock(nData[idx]))) {
                                 nData[idx] = id;
+                                if (isLeaf && isDebug) {
+                                    console.log(`[setAcrossChunks] SUCCESS: Placed leaf at chunk ${nKey} local(${nLx},${ly},${nLz})`);
+                                }
                                 // Release existing mesh if present (it will be rebuilt)
                                 if (chunkMeshes.has(nKey)) {
                                     releaseMeshForKey(nKey);
@@ -16656,7 +16714,11 @@
                                     chunkBuildQueue.push({ key: nKey, cx: neighborCx, cz: neighborCz, dist: 0 });
                                     queuedChunkKeys.add(nKey);
                                 }
+                            } else if (isLeaf && isDebug) {
+                                console.log(`[setAcrossChunks] FAILED: Could not place leaf - idx=${idx}, length=${nData.length}, existing=${nData[idx]}`);
                             }
+                        } else if (isLeaf && isDebug) {
+                            console.log(`[setAcrossChunks] SKIPPED: Neighbor chunk ${nKey} doesn't exist`);
                         }
                     };
                     // Pre-calculate all caches
