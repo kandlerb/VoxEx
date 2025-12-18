@@ -2087,6 +2087,7 @@
             // Supports multiple shapes: round, conical, spherical, layered, umbrella
             // Supports explicit layer definitions via layers array
             // Adds organic variation via noise for natural-looking canopies
+            // Uses two-pass system: collect candidates, then filter to ensure face-adjacency
             function forEachCanopyVoxel(profile, seed, gxCenter, gzCenter, trunkTopY, trunkW, trunkD, fn) {
                 const {
                     radius: baseRadius,
@@ -2114,33 +2115,17 @@
                 const trunkMinZ = -halfD;
                 const trunkMaxZ = trunkD - halfD - 1;
 
-                // Track which positions we've placed for branch extension check
-                const placedPositions = new Set();
+                // PASS 1: Collect all candidate positions
+                // Store as Map with key "dx,y,dz" -> true
+                const candidates = new Map();
 
-                // If explicit layers are defined, use them instead of shape calculation
-                if (layers && layers.length > 0) {
-                    for (const layer of layers) {
-                        const y = trunkTopY + (layer.yOffset || 0);
-                        const layerRadius = layer.radius || baseRadius;
-                        const layerLeafChance = layer.leafChance ?? defaultLeafChance;
-                        processCanopyLayer(y, layerRadius, layerLeafChance);
-                    }
-                    return;
+                // Helper to check if position is inside trunk column
+                function isInTrunk(dx, dz) {
+                    return dx >= trunkMinX && dx <= trunkMaxX && dz >= trunkMinZ && dz <= trunkMaxZ;
                 }
 
-                // Standard shape-based iteration
-                for (let y = canopyBottom; y <= canopyTop; y++) {
-                    // Get shape-dependent radius for this layer
-                    const layerRadius = getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap);
-
-                    // Skip if radius is 0 (used by layered shape with gaps)
-                    if (layerRadius <= 0) continue;
-
-                    processCanopyLayer(y, layerRadius, defaultLeafChance);
-                }
-
-                // Inner function to process a single canopy layer
-                function processCanopyLayer(y, layerRadius, leafChance) {
+                // Inner function to collect candidates for a single canopy layer
+                function collectCandidatesForLayer(y, layerRadius, leafChance) {
                     // Apply noise variation to radius (±1 block based on noiseStrength)
                     const noiseValue = seededRandom(seed, gxCenter, gzCenter, 0, y, 7777);
                     const radiusNoise = Math.round((noiseValue - 0.5) * 2 * noiseStrength);
@@ -2157,11 +2142,7 @@
                             if (dist > effectiveRadius + 2) continue;
 
                             // Don't place leaves inside trunk footprint (below trunk top)
-                            if (y <= trunkTopY) {
-                                if (dx >= trunkMinX && dx <= trunkMaxX && dz >= trunkMinZ && dz <= trunkMaxZ) {
-                                    continue;
-                                }
-                            }
+                            if (y <= trunkTopY && isInTrunk(dx, dz)) continue;
 
                             // Determine if this position should have a leaf
                             let shouldPlace = false;
@@ -2211,12 +2192,86 @@
                                 if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999) > leafChance) continue;
                             }
 
-                            // Call the provided function with relative position
-                            fn(dx, dz, y);
-                            placedPositions.add(`${dx},${y},${dz}`);
+                            // Add to candidate set
+                            candidates.set(`${dx},${y},${dz}`, true);
                         }
                     }
-                } // end processCanopyLayer
+                }
+
+                // Process layers (either explicit or shape-based)
+                if (layers && layers.length > 0) {
+                    for (const layer of layers) {
+                        const y = trunkTopY + (layer.yOffset || 0);
+                        const layerRadius = layer.radius || baseRadius;
+                        const layerLeafChance = layer.leafChance ?? defaultLeafChance;
+                        collectCandidatesForLayer(y, layerRadius, layerLeafChance);
+                    }
+                } else {
+                    // Standard shape-based iteration
+                    for (let y = canopyBottom; y <= canopyTop; y++) {
+                        // Get shape-dependent radius for this layer
+                        const layerRadius = getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap);
+
+                        // Skip if radius is 0 (used by layered shape with gaps)
+                        if (layerRadius <= 0) continue;
+
+                        collectCandidatesForLayer(y, layerRadius, defaultLeafChance);
+                    }
+                }
+
+                // PASS 2: Filter candidates - only keep those with face-adjacent support
+                // A leaf is supported if it has a face-adjacent (not diagonal) neighbor that is:
+                // - Another candidate leaf
+                // - Inside the trunk column (any Y level at or below trunk top)
+                const faceOffsets = [
+                    [1, 0, 0], [-1, 0, 0],  // +X, -X
+                    [0, 1, 0], [0, -1, 0],  // +Y, -Y
+                    [0, 0, 1], [0, 0, -1]   // +Z, -Z
+                ];
+
+                function hasSupport(dx, y, dz) {
+                    for (const [ox, oy, oz] of faceOffsets) {
+                        const nx = dx + ox;
+                        const ny = y + oy;
+                        const nz = dz + oz;
+
+                        // Check if neighbor is inside trunk column (at trunk level or below)
+                        if (isInTrunk(nx, nz) && ny <= trunkTopY) {
+                            return true;
+                        }
+
+                        // Check if neighbor is another candidate leaf
+                        if (candidates.has(`${nx},${ny},${nz}`)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+
+                // Iteratively remove unsupported leaves until stable
+                // This handles chains of leaves where removing one makes others unsupported
+                let changed = true;
+                let iterations = 0;
+                const maxIterations = 10; // Prevent infinite loops
+
+                while (changed && iterations < maxIterations) {
+                    changed = false;
+                    iterations++;
+
+                    for (const key of Array.from(candidates.keys())) {
+                        const [dx, y, dz] = key.split(',').map(Number);
+                        if (!hasSupport(dx, y, dz)) {
+                            candidates.delete(key);
+                            changed = true;
+                        }
+                    }
+                }
+
+                // PASS 3: Output surviving candidates
+                for (const key of candidates.keys()) {
+                    const [dx, y, dz] = key.split(',').map(Number);
+                    fn(dx, dz, y);
+                }
             }
 
             // Check if position is within trunk footprint (for any w×d trunk centered at origin)
