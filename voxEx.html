@@ -8361,6 +8361,119 @@
                 pendingCanopyOverhang.delete(chunkKey);
             }
 
+            // Apply canopy from THIS chunk's trees to existing neighbor chunks
+            // Called after decoration pass to ensure leaves appear in pre-generated neighbors
+            // Handles the case where chunk A (no trees) generated first, then chunk B (with trees) generates
+            // and its canopy should extend into chunk A - but A was already generated and rendered
+            function applyCanopyToExistingNeighbors(cx, cz, data, chunkSize, chunkHeight, seed) {
+                const chunkStartX = cx * chunkSize;
+                const chunkStartZ = cz * chunkSize;
+
+                // Track which neighbor chunks were modified so we can queue them for rebuild
+                const modifiedNeighbors = new Set();
+
+                // Scan for tree trunks in this chunk
+                // For each trunk found near an edge, apply canopy to existing neighbors
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        // Only check columns near chunk edges (within canopy radius of edge)
+                        const nearEdge = lx < 8 || lx >= chunkSize - 8 || lz < 8 || lz >= chunkSize - 8;
+                        if (!nearEdge) continue;
+
+                        // Find trunk top in this column
+                        let trunkTopY = -1;
+                        for (let y = chunkHeight - 1; y >= 0; y--) {
+                            const idx = lx + lz * chunkSize + y * chunkSize * chunkSize;
+                            if (isLogBlock(data[idx])) {
+                                // Check if this is trunk top (block above is not log)
+                                if (y + 1 >= chunkHeight) {
+                                    trunkTopY = y;
+                                    break;
+                                }
+                                const aboveIdx = lx + lz * chunkSize + (y + 1) * chunkSize * chunkSize;
+                                if (!isLogBlock(data[aboveIdx])) {
+                                    trunkTopY = y;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (trunkTopY < 0) continue;
+
+                        // Get tree profile from biome at this location
+                        const gx = chunkStartX + lx;
+                        const gz = chunkStartZ + lz;
+                        const biome = getBiomeParams(gx, gz);
+                        const profile = resolveTreeProfile(biome);
+                        const canopyRadius = profile.canopy.radius;
+
+                        // Check which neighbor chunks this tree's canopy might extend into
+                        for (let dx = -1; dx <= 1; dx++) {
+                            for (let dz = -1; dz <= 1; dz++) {
+                                if (dx === 0 && dz === 0) continue;
+
+                                const neighborCx = cx + dx;
+                                const neighborCz = cz + dz;
+                                const neighborKey = getChunkKey(neighborCx, neighborCz);
+
+                                // Only process if neighbor exists and is a chunk object (not just Uint8Array)
+                                if (!chunks.has(neighborKey)) continue;
+
+                                const neighborChunk = chunks.get(neighborKey);
+                                // Handle both old format (Uint8Array) and new format (object with .blocks)
+                                const neighborBlocks = neighborChunk.blocks || neighborChunk;
+                                const neighborStartX = neighborCx * chunkSize;
+                                const neighborStartZ = neighborCz * chunkSize;
+
+                                // Check if canopy could even reach this neighbor
+                                const distToNeighborX = dx > 0 ? (chunkSize - lx - 1) : (dx < 0 ? lx : 0);
+                                const distToNeighborZ = dz > 0 ? (chunkSize - lz - 1) : (dz < 0 ? lz : 0);
+                                if (distToNeighborX > canopyRadius && distToNeighborZ > canopyRadius) continue;
+
+                                let modified = false;
+
+                                // Apply canopy voxels that fall within neighbor chunk
+                                forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, 1, 1, (cdx, cdz, y) => {
+                                    if (y < 0 || y >= chunkHeight) return;
+
+                                    const globalX = gx + cdx;
+                                    const globalZ = gz + cdz;
+                                    const nlx = globalX - neighborStartX;
+                                    const nlz = globalZ - neighborStartZ;
+
+                                    if (nlx < 0 || nlx >= chunkSize || nlz < 0 || nlz >= chunkSize) return;
+
+                                    const nIdx = nlx + nlz * chunkSize + y * chunkSize * chunkSize;
+                                    if (neighborBlocks[nIdx] === AIR) {
+                                        neighborBlocks[nIdx] = profile.blocks.leaves;
+                                        modified = true;
+                                    }
+                                });
+
+                                if (modified) {
+                                    modifiedNeighbors.add(neighborKey);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Queue all modified neighbors for mesh rebuild
+                for (const neighborKey of modifiedNeighbors) {
+                    // Release existing mesh if present
+                    if (chunkMeshes.has(neighborKey)) {
+                        releaseMeshForKey(neighborKey);
+                        releaseMeshForKey(neighborKey + "_WATER");
+                    }
+                    // Queue for rebuild
+                    if (typeof chunkBuildQueue !== "undefined" && !queuedChunkKeys.has(neighborKey)) {
+                        const [ncx, ncz] = neighborKey.split(',').map(Number);
+                        chunkBuildQueue.push({ key: neighborKey, cx: ncx, cz: ncz, dist: 0 });
+                        queuedChunkKeys.add(neighborKey);
+                    }
+                }
+            }
+
             // OPTIMIZATION AUDIT: applyTreeOverhangFromNeighbor
             //   - PER-CHUNK: Called up to 8x per chunk (4 cardinal + 4 diagonal neighbors)
             //   - Scans a BAND near each edge/corner (radius+3 columns) for tree trunk tops
@@ -16448,16 +16561,16 @@
                             const idx = nLx + nLz * WORLD_DIMS.chunkSize + ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize;
                             if (idx >= 0 && idx < nData.length && (nData[idx] === AIR || isLeafBlock(nData[idx]))) {
                                 nData[idx] = id;
+                                // Release existing mesh if present (it will be rebuilt)
                                 if (chunkMeshes.has(nKey)) {
                                     releaseMeshForKey(nKey);
                                     releaseMeshForKey(nKey + "_WATER");
                                 }
-                                if (typeof chunkBuildQueue !== "undefined" && chunkMeshes.has(nKey)) {
-                                    const alreadyQueued = queuedChunkKeys.has(nKey);
-                                    if (!alreadyQueued) {
-                                        chunkBuildQueue.push({ key: nKey, cx: neighborCx, cz: neighborCz, dist: 0 });
-                                        queuedChunkKeys.add(nKey);
-                                    }
+                                // Queue chunk for mesh rebuild (even if mesh doesn't exist yet)
+                                // Note: Check queue existence but NOT mesh existence - mesh was just released above
+                                if (typeof chunkBuildQueue !== "undefined" && !queuedChunkKeys.has(nKey)) {
+                                    chunkBuildQueue.push({ key: nKey, cx: neighborCx, cz: neighborCz, dist: 0 });
+                                    queuedChunkKeys.add(nKey);
                                 }
                             }
                         }
@@ -16484,6 +16597,12 @@
                     // --- PASS 3.5: Apply pending canopies from neighboring chunks ---
                     // Trees in neighbors may have registered canopy data that extends into this chunk
                     applyPendingCanopiesFromNeighbors(cx, cz, data, chunkSize, chunkHeight, seed);
+
+                    // --- PASS 3.6: Push canopy to existing neighbor chunks ---
+                    // When THIS chunk generates trees near borders, existing neighbors need the canopy
+                    // This handles the case where chunk A (no trees) generated first, then this chunk
+                    // generates with trees whose canopy extends into A
+                    applyCanopyToExistingNeighbors(cx, cz, data, chunkSize, chunkHeight, seed);
 
                     // Create chunk with light data and generation state
                     const size = chunkSize * chunkSize * chunkHeight;
