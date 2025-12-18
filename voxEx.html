@@ -1825,6 +1825,7 @@
             }
             // Default tree configuration - merged with biome.trees overrides via resolveTreeProfile()
             // Biomes can override any of these values in their trees: { ... } config
+            // ALL tree behavior is config-driven - no special-casing by block type
             const TREE_CONFIG = {
                 // Trunk configuration
                 trunk: {
@@ -1835,13 +1836,14 @@
                     // sizes: optional array of {w, d, weight} for weighted trunk size selection
                     // If present, w/d are ignored and size is chosen per-tree via seededRandom
                 },
-                // Canopy configuration
+                // Canopy configuration - fully config-driven, no inference from block types
                 canopy: {
-                    radius: 2,        // Canopy radius
-                    topExtension: 2,  // How far canopy extends above trunk top
-                    shape: "round",   // "round" or "cone" (future)
-                    overlapDown: null,// If set, overrides default overlapAmount (null = use trunkHeight/3)
-                    leafChance: 1.0,  // Probability to place leaf at candidate position (1.0 = full, <1 = sparse)
+                    radius: 2,           // Canopy radius
+                    topExtension: 2,     // How far canopy extends above trunk top
+                    overlapDown: 2,      // How far canopy extends below trunk top (explicit default)
+                    leafChance: 1.0,     // Probability to place leaf at candidate position (1.0 = full, <1 = sparse)
+                    cornerCutChance: 0.5,// Probability to cut corners (0 = always cut, 1 = never cut)
+                    shape: "round",      // "round" or "cone" (future)
                 },
                 // Block types (can be overridden per-biome)
                 blocks: {
@@ -1859,7 +1861,8 @@
             const DEFAULT_TREE_GROUND_BLOCKS = new Set([GRASS, DIRT]);
 
             // Resolve tree profile by merging biome overrides with TREE_CONFIG defaults
-            // Returns a complete tree profile with all properties defined
+            // Returns a complete tree profile with ALL properties explicitly defined
+            // This is the single source of truth for tree configuration - no special-casing elsewhere
             function resolveTreeProfile(biome) {
                 const trees = biome.trees || {};
                 const trunk = { ...TREE_CONFIG.trunk, ...trees.trunk };
@@ -1867,7 +1870,16 @@
                 if (trees.trunk?.sizes) {
                     trunk.sizes = trees.trunk.sizes;
                 }
-                const canopy = { ...TREE_CONFIG.canopy, ...trees.canopy };
+                // Merge canopy with explicit defaults for all properties
+                const canopy = {
+                    radius: TREE_CONFIG.canopy.radius,
+                    topExtension: TREE_CONFIG.canopy.topExtension,
+                    overlapDown: TREE_CONFIG.canopy.overlapDown,
+                    leafChance: TREE_CONFIG.canopy.leafChance,
+                    cornerCutChance: TREE_CONFIG.canopy.cornerCutChance,
+                    shape: TREE_CONFIG.canopy.shape,
+                    ...trees.canopy,
+                };
                 const blocks = { ...TREE_CONFIG.blocks, ...trees.blocks };
                 // Resolve allowed ground blocks - use biome override, or default
                 let allowedGround = trees.allowedGroundBlocks ?? TREE_CONFIG.allowedGroundBlocks;
@@ -1911,6 +1923,85 @@
                 h ^= h >>> 16;
                 // Convert to [0, 1) range
                 return (h >>> 0) / 4294967296;
+            }
+
+            // Pick trunk size from profile using weighted random selection
+            // If trunk.sizes exists, selects from weighted options; otherwise uses trunk.w/d
+            // Returns { w, d, maxW, maxD } where maxW/maxD are the largest possible sizes (for border checks)
+            function pickTrunkSize(profile, seed, gx, gz) {
+                const trunk = profile.trunk;
+                let w = trunk.w;
+                let d = trunk.d;
+                let maxW = trunk.w;
+                let maxD = trunk.d;
+
+                if (trunk.sizes && trunk.sizes.length > 0) {
+                    // Calculate max possible size for border check (use worst case)
+                    for (const s of trunk.sizes) {
+                        if (s.w > maxW) maxW = s.w;
+                        if (s.d > maxD) maxD = s.d;
+                    }
+                    // Weighted selection using seededRandom
+                    const totalWeight = trunk.sizes.reduce((sum, s) => sum + (s.weight || 1), 0);
+                    const r = seededRandom(seed, gx, gz, 0, 0, 12345) * totalWeight;
+                    let cumulative = 0;
+                    for (const s of trunk.sizes) {
+                        cumulative += (s.weight || 1);
+                        if (r < cumulative) {
+                            w = s.w;
+                            d = s.d;
+                            break;
+                        }
+                    }
+                }
+
+                return { w, d, maxW, maxD };
+            }
+
+            // Unified canopy voxel iteration - used by both in-chunk generation and cross-chunk overhang
+            // Calls fn(dx, dz, y) for each canopy voxel position (relative to trunk center)
+            // All randomization is config-driven via profile - no block-type special-casing
+            function forEachCanopyVoxel(profile, seed, gxCenter, gzCenter, trunkTopY, trunkW, trunkD, fn) {
+                const { radius, topExtension, overlapDown, leafChance, cornerCutChance } = profile.canopy;
+
+                // Calculate canopy bounds (relative to trunk top)
+                const canopyBottom = trunkTopY - overlapDown;
+                const canopyTop = trunkTopY + topExtension;
+
+                // Pre-compute trunk footprint bounds for collision check
+                const halfW = Math.floor(trunkW / 2);
+                const halfD = Math.floor(trunkD / 2);
+                const trunkMinX = -halfW;
+                const trunkMaxX = trunkW - halfW - 1;
+                const trunkMinZ = -halfD;
+                const trunkMaxZ = trunkD - halfD - 1;
+
+                for (let y = canopyBottom; y <= canopyTop; y++) {
+                    for (let dx = -radius; dx <= radius; dx++) {
+                        for (let dz = -radius; dz <= radius; dz++) {
+                            // Deterministic rounded corners using seededRandom
+                            // cornerCutChance: 0.5 means 50% chance to keep corner voxels
+                            if (Math.abs(dx) === radius && Math.abs(dz) === radius) {
+                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz) > cornerCutChance) continue;
+                            }
+
+                            // Sparse leaves: skip placement based on leafChance
+                            if (leafChance < 1.0) {
+                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999) > leafChance) continue;
+                            }
+
+                            // Don't place leaves inside trunk footprint (below trunk top)
+                            if (y <= trunkTopY) {
+                                if (dx >= trunkMinX && dx <= trunkMaxX && dz >= trunkMinZ && dz <= trunkMaxZ) {
+                                    continue;
+                                }
+                            }
+
+                            // Call the provided function with relative position
+                            fn(dx, dz, y);
+                        }
+                    }
+                }
             }
 
             // Check if position is within trunk footprint (for any w×d trunk centered at origin)
@@ -7975,71 +8066,11 @@
                 return { minX, maxX, minZ, maxZ, centerX, centerZ, width, depth };
             }
 
-            // Detect canopy parameters from existing tree structure
-            // Returns { topExtension, overlapDown, leafChance, detectedLeafBlock, hasLeaves }
-            // hasLeaves indicates if real leaves were found (to avoid player-placed logs)
-            function detectCanopyParams(sourceBlocks, centerX, centerZ, topY, chunkSize, chunkHeight) {
-                let detectedLeafBlock = LEAVES;
-                let topExtension = 2;  // Default
-                let overlapDown = 2;   // Default
-                let leafChance = 1.0;  // Default
-                let hasLeaves = false; // Track if we found any leaves
-
-                // Find highest leaf above trunk top (scan from center)
-                for (let dy = 1; dy <= 6; dy++) {
-                    const checkY = topY + dy;
-                    if (checkY >= chunkHeight) break;
-                    let foundLeafAtLevel = false;
-                    for (let dx = -4; dx <= 4 && !foundLeafAtLevel; dx++) {
-                        for (let dz = -4; dz <= 4; dz++) {
-                            const cx = centerX + dx, cz = centerZ + dz;
-                            if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
-                            const idx = cx + cz * chunkSize + checkY * chunkSize * chunkSize;
-                            if (isLeafBlock(sourceBlocks[idx])) {
-                                detectedLeafBlock = sourceBlocks[idx];
-                                topExtension = dy;
-                                foundLeafAtLevel = true;
-                                hasLeaves = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!foundLeafAtLevel) break;
-                }
-
-                // Find lowest leaf below trunk top (scan from center)
-                for (let dy = 1; dy <= 4; dy++) {
-                    const checkY = topY - dy;
-                    if (checkY < 0) break;
-                    let foundLeafAtLevel = false;
-                    for (let dx = -4; dx <= 4 && !foundLeafAtLevel; dx++) {
-                        for (let dz = -4; dz <= 4; dz++) {
-                            const cx = centerX + dx, cz = centerZ + dz;
-                            if (cx < 0 || cx >= chunkSize || cz < 0 || cz >= chunkSize) continue;
-                            const idx = cx + cz * chunkSize + checkY * chunkSize * chunkSize;
-                            if (isLeafBlock(sourceBlocks[idx])) {
-                                overlapDown = dy;
-                                foundLeafAtLevel = true;
-                                hasLeaves = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!foundLeafAtLevel) break;
-                }
-
-                // Detect leaf type for sparse leaves (longwood = 0.65)
-                if (detectedLeafBlock === LONGWOOD_LEAVES) {
-                    leafChance = 0.65;
-                }
-
-                return { topExtension, overlapDown, leafChance, detectedLeafBlock, hasLeaves };
-            }
-
             // Scan a column in source chunk for tree trunk TOP and apply canopy-style overhang
             // Uses trunk CENTER (not anchor) for canopy placement to match tree generation
             // Uses global coordinates for robust target-chunk membership calculation
             // Profile-driven: resolves biome at trunk center and uses biome's tree profile for canopy params
+            // Uses unified forEachCanopyVoxel helper for identical shape logic as in-chunk generation
             function scanTreeColumnForOverhang(sourceBlocks, targetBlocks, srcLx, srcLz, maxRadius, chunkSize, chunkHeight, seed, srcCx, srcCz, tgtCx, tgtCz, processedTrunks) {
                 // Find the TOPMOST log in this column (scan downward from top)
                 let topY = -1;
@@ -8102,61 +8133,31 @@
                 }
                 if (!hasLeaves) return;
 
-                // Use profile-driven canopy parameters
-                const canopyRadius = treeProfile.canopy.radius;
-                const topExtension = treeProfile.canopy.topExtension;
-                const overlapDown = treeProfile.canopy.overlapDown ?? 2;
-                const leafChance = treeProfile.canopy.leafChance ?? 1.0;
+                // Get leaf block from profile
                 const leafBlock = treeProfile.blocks.leaves;
 
-                // Calculate canopy bounds (matching forestDecorateColumn)
-                const canopyBottom = topY - overlapDown;
-                const canopyTop = topY + topExtension;
+                // Generate canopy using unified helper - identical logic to forestDecorateColumn
+                forEachCanopyVoxel(treeProfile, seed, gxCenter, gzCenter, topY, width, depth, (dx, dz, y) => {
+                    // Skip voxels outside chunk height bounds
+                    if (y < 0 || y >= chunkHeight) return;
 
-                // Generate canopy-style overhang (same loop as forestDecorateColumn)
-                for (let y = canopyBottom; y <= canopyTop; y++) {
-                    if (y < 0 || y >= chunkHeight) continue;
+                    // Calculate GLOBAL position of this leaf candidate (relative to center)
+                    const globalX = gxCenter + dx;
+                    const globalZ = gzCenter + dz;
 
-                    for (let dx = -canopyRadius; dx <= canopyRadius; dx++) {
-                        for (let dz = -canopyRadius; dz <= canopyRadius; dz++) {
-                            // Deterministic rounded corners (same as forestDecorateColumn)
-                            if (Math.abs(dx) === canopyRadius && Math.abs(dz) === canopyRadius) {
-                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz) > 0.5) continue;
-                            }
+                    // Convert to target chunk local coordinates
+                    const tgtLx = globalX - tgtCx * chunkSize;
+                    const tgtLz = globalZ - tgtCz * chunkSize;
 
-                            // Sparse leaves (same as forestDecorateColumn)
-                            if (leafChance < 1.0) {
-                                if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999) > leafChance) continue;
-                            }
+                    // Only place if within target chunk bounds
+                    if (tgtLx < 0 || tgtLx >= chunkSize || tgtLz < 0 || tgtLz >= chunkSize) return;
 
-                            // Skip trunk footprint (don't place leaves inside trunk)
-                            if (y <= topY) {
-                                const halfW = Math.floor(width / 2);
-                                const halfD = Math.floor(depth / 2);
-                                if (dx >= -halfW && dx < width - halfW && dz >= -halfD && dz < depth - halfD) {
-                                    continue;
-                                }
-                            }
-
-                            // Calculate GLOBAL position of this leaf candidate (relative to center)
-                            const globalX = gxCenter + dx;
-                            const globalZ = gzCenter + dz;
-
-                            // Convert to target chunk local coordinates
-                            const tgtLx = globalX - tgtCx * chunkSize;
-                            const tgtLz = globalZ - tgtCz * chunkSize;
-
-                            // Only place if within target chunk bounds
-                            if (tgtLx < 0 || tgtLx >= chunkSize || tgtLz < 0 || tgtLz >= chunkSize) continue;
-
-                            // Place leaf if target is air
-                            const tgtIdx = tgtLx + tgtLz * chunkSize + y * chunkSize * chunkSize;
-                            if (targetBlocks[tgtIdx] === AIR) {
-                                targetBlocks[tgtIdx] = leafBlock;
-                            }
-                        }
+                    // Place leaf if target is air
+                    const tgtIdx = tgtLx + tgtLz * chunkSize + y * chunkSize * chunkSize;
+                    if (targetBlocks[tgtIdx] === AIR) {
+                        targetBlocks[tgtIdx] = leafBlock;
                     }
-                }
+                });
             }
 
             // Recalculate lighting at chunk edges to account for neighboring chunks
@@ -14810,6 +14811,7 @@
             // Uses resolveTreeProfile() to merge biome overrides with TREE_CONFIG defaults
             // Supports w×d trunks (including trunk.sizes variance), custom canopy radius, and per-biome block types
             // DETERMINISTIC: Uses seededRandom instead of Math.random
+            // ALL behavior is config-driven - no special-casing by block type
             function forestDecorateColumn(cx, cz, gx, gz, lx, lz, topY, setAcrossChunks, get, seed, biome) {
                 if (topY <= 0) return;
                 const groundY = topY - WORLD_DIMS.yOffset;
@@ -14820,41 +14822,16 @@
                 const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = tp;
                 const treeDensity = tp.density;
 
-                // Determine actual trunk dimensions for this tree
-                // If trunk.sizes exists, do weighted random selection; otherwise use trunk.w/d
-                let actualTrunkW = trunk.w;
-                let actualTrunkD = trunk.d;
-                let maxTrunkW = trunk.w;
-                let maxTrunkD = trunk.d;
-                if (trunk.sizes && trunk.sizes.length > 0) {
-                    // Calculate max possible size for border check (use worst case)
-                    for (const s of trunk.sizes) {
-                        if (s.w > maxTrunkW) maxTrunkW = s.w;
-                        if (s.d > maxTrunkD) maxTrunkD = s.d;
-                    }
-                    // Weighted selection using seededRandom
-                    const totalWeight = trunk.sizes.reduce((sum, s) => sum + (s.weight || 1), 0);
-                    const r = seededRandom(seed, gx, gz, 0, 0, 12345) * totalWeight;
-                    let cumulative = 0;
-                    for (const s of trunk.sizes) {
-                        cumulative += (s.weight || 1);
-                        if (r < cumulative) {
-                            actualTrunkW = s.w;
-                            actualTrunkD = s.d;
-                            break;
-                        }
-                    }
-                }
+                // Pick trunk dimensions using helper (handles trunk.sizes weighted selection)
+                const { w: actualTrunkW, d: actualTrunkD } = pickTrunkSize(tp, seed, gx, gz);
 
                 // Exact trunk footprint bounds check (matches trunk placement loop)
-                // Uses actual selected trunk size, not max - allows tighter placement
                 const halfW = Math.floor(actualTrunkW / 2);
                 const halfD = Math.floor(actualTrunkD / 2);
                 const minTx = -halfW;
                 const maxTx = actualTrunkW - halfW - 1;
                 const minTz = -halfD;
                 const maxTz = actualTrunkD - halfD - 1;
-                const canopyRadius = canopy.radius;
                 const chunkSize = WORLD_DIMS.chunkSize;
 
                 // Border check: ensure trunk footprint stays within chunk
@@ -14917,7 +14894,6 @@
                 const trunkTopY = groundY + trunkHeight;
 
                 // Build trunk using actual dimensions (may vary per-tree if trunk.sizes used)
-                // Reuses halfW/halfD and minTx/maxTx/minTz/maxTz from bounds check above
                 for (let y = groundY + 1; y <= trunkTopY; y++) {
                     for (let tx = minTx; tx <= maxTx; tx++) {
                         for (let tz = minTz; tz <= maxTz; tz++) {
@@ -14926,32 +14902,13 @@
                     }
                 }
 
-                // Build canopy using biome's leaves block
-                // Use canopy.overlapDown if specified, otherwise calculate from trunk height
-                const overlapAmount = (canopy.overlapDown !== null && canopy.overlapDown !== undefined)
-                    ? canopy.overlapDown
-                    : Math.min(3, Math.floor(trunkHeight / 3));
-                const canopyBottom = Math.max(groundY + 2, trunkTopY - overlapAmount);
-                const canopyTop = trunkTopY + canopy.topExtension;
-                const leafChance = canopy.leafChance ?? 1.0;
-
-                for (let y = canopyBottom; y <= canopyTop; y++) {
-                    for (let x = -canopyRadius; x <= canopyRadius; x++) {
-                        for (let z = -canopyRadius; z <= canopyRadius; z++) {
-                            // Deterministic rounded corners using seededRandom
-                            if (Math.abs(x) === canopyRadius && Math.abs(z) === canopyRadius) {
-                                if (seededRandom(seed, gx, gz, x, y, z) > 0.5) continue;
-                            }
-                            // Sparse leaves: skip placement based on leafChance
-                            if (leafChance < 1.0) {
-                                if (seededRandom(seed, gx, gz, x, y, z + 9999) > leafChance) continue;
-                            }
-                            // Don't overwrite trunk - use isInTrunkFootprint for actual trunk size
-                            if (y <= trunkTopY && isInTrunkFootprint(x, z, actualTrunkW, actualTrunkD)) continue;
-                            setAcrossChunks(lx + x, y, lz + z, blocks.leaves);
-                        }
-                    }
-                }
+                // Build canopy using unified helper - config-driven, no special-casing
+                // Clamp canopy bottom to avoid leaves going below groundY+2
+                const minCanopyY = groundY + 2;
+                forEachCanopyVoxel(tp, seed, gx, gz, trunkTopY, actualTrunkW, actualTrunkD, (dx, dz, y) => {
+                    if (y < minCanopyY) return; // Skip leaves that would be too low
+                    setAcrossChunks(lx + dx, y, lz + dz, blocks.leaves);
+                });
             }
             function continentalHeight(gx, gz, seed) {
                 const base = fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
