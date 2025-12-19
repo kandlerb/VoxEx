@@ -11378,7 +11378,7 @@
                 showToast('Preparing export...', 'info');
 
                 // Collect all chunks for this world's seed
-                const chunks = [];
+                const exportChunks = [];
                 const seed = metadata.seed;
 
                 if (db && seed) {
@@ -11390,8 +11390,8 @@
                         request.onsuccess = (e) => {
                             const cursor = e.target.result;
                             if (cursor) {
-                                if (cursor.value.seed === seed || cursor.value.seed === seed.toString()) {
-                                    chunks.push({
+                                if (seedsMatch(cursor.value.seed, seed)) {
+                                    exportChunks.push({
                                         key: cursor.value.key,
                                         data: cursor.value.data,
                                         timestamp: cursor.value.timestamp
@@ -11412,7 +11412,7 @@
                     exportDate: Date.now(),
                     worldName: worldName,
                     metadata: metadata,
-                    chunks: chunks
+                    chunks: exportChunks
                 };
 
                 // Create and download file
@@ -11426,7 +11426,7 @@
                 document.body.removeChild(a);
                 URL.revokeObjectURL(url);
 
-                showToast(`Exported "${worldName}" (${chunks.length} chunks)`, 'success');
+                showToast(`Exported "${worldName}" (${exportChunks.length} chunks)`, 'success');
             }
 
             document.getElementById('btn-export-world')?.addEventListener('click', () => {
@@ -11474,7 +11474,7 @@
                                 key: chunk.key,
                                 data: chunk.data,
                                 timestamp: chunk.timestamp || Date.now(),
-                                seed: importData.metadata.seed
+                                seed: importData.metadata.seed.toString()  // Ensure string format
                             };
                             store.put(record);
                         }
@@ -11926,7 +11926,12 @@
                 blocker.addEventListener("click", startGame);
                 document.getElementById("clear-cache-btn")?.addEventListener("click", async () => { if (confirm("Clear all cached world data? This will regenerate chunks on next load.")) { await clearChunkCache(); alert("Cache cleared!"); }});
                 // If we loaded a save, apply player position now that controls exist
-                if (loadedPlayerState) { controls.getObject().position.copy(loadedPlayerState.pos); controls.getObject().rotation.copy(loadedPlayerState.rot); lastChunkX = -Infinity; }
+                if (loadedPlayerState) {
+                    controls.getObject().position.copy(loadedPlayerState.pos);
+                    controls.getObject().rotation.copy(loadedPlayerState.rot);
+                    lastChunkX = -Infinity;
+                    lastChunkUpdate = -Infinity;  // Force immediate chunk update
+                }
                 animate();
             }
             /**
@@ -13055,16 +13060,26 @@
                     request.onerror = () => reject(request.error);
                 });
             }
+            // ===========================================
+            // SEED COMPARISON HELPER
+            // ===========================================
+            // Compares seeds handling both string and numeric formats for backward compatibility
+            function seedsMatch(recordSeed, currentSeed) {
+                if (!recordSeed || !currentSeed) return false;
+                return recordSeed === currentSeed ||
+                       recordSeed.toString() === currentSeed.toString();
+            }
+
             async function loadChunkFromCache(chunkKey) {
                 if (!db) return null;
-                return new Promise((resolve, reject) => { const transaction = db.transaction([STORE_NAME], "readonly");
+                return new Promise((resolve, reject) => {
+                    const transaction = db.transaction([STORE_NAME], "readonly");
                     const store = transaction.objectStore(STORE_NAME);
                     const request = store.get(chunkKey);
-                    request.onsuccess = () => {     const record = request.result;
-                        if (record && record.seed === finalSeedDisplay) {
+                    request.onsuccess = () => {
+                        const record = request.result;
+                        if (record && seedsMatch(record.seed, finalSeedDisplay)) {
                             logDebug(`Cache HIT for ${chunkKey}`);
-                            // OLD: resolve(new Uint8Array(record.data));
-                            // NEW: Decompress RLE data back to chunk object (or normalize if old format)
                             let decompressed = ChunkCompressor.decompress(record.data);
                             // Normalize old format (Uint8Array) to new format (object)
                             if (!decompressed.blocks) {
@@ -13075,7 +13090,10 @@
                                 };
                             }
                             resolve(decompressed);
-                        } else { logDebug(`Cache MISS for ${chunkKey}`); resolve(null); }
+                        } else {
+                            logDebug(`Cache MISS for ${chunkKey}`);
+                            resolve(null);
+                        }
                     };
                     request.onerror = () => resolve(null);
                 });
@@ -13093,16 +13111,24 @@
             // Batch read multiple chunks in a single transaction (~200% faster)
             async function batchLoadChunksFromCache(chunkKeys) {
                 if (!db || !chunkKeys || chunkKeys.length === 0) return new Map();
-                return new Promise((resolve, reject) => { const transaction = db.transaction([STORE_NAME], "readonly");
+                return new Promise((resolve, reject) => {
+                    const transaction = db.transaction([STORE_NAME], "readonly");
                     const store = transaction.objectStore(STORE_NAME);
                     const results = new Map();
                     let pending = chunkKeys.length;
                     let hasError = false;
                     if (pending === 0) { resolve(results); return; }
-                    chunkKeys.forEach((key) => {     const request = store.get(key);
-                        request.onsuccess = () => {         const record = request.result;
-                            if (record && record.seed === finalSeedDisplay) { const decompressed = ChunkCompressor.decompress(record.data); results.set(key, decompressed); logDebug(`Batch Cache HIT for ${key}`);
-                            } else { logDebug(`Batch Cache MISS for ${key}`); }
+                    chunkKeys.forEach((key) => {
+                        const request = store.get(key);
+                        request.onsuccess = () => {
+                            const record = request.result;
+                            if (record && seedsMatch(record.seed, finalSeedDisplay)) {
+                                const decompressed = ChunkCompressor.decompress(record.data);
+                                results.set(key, decompressed);
+                                logDebug(`Batch Cache HIT for ${key}`);
+                            } else {
+                                logDebug(`Batch Cache MISS for ${key}`);
+                            }
                             pending--;
                             if (pending === 0 && !hasError) { resolve(results); }
                         };
