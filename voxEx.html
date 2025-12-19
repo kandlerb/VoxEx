@@ -8445,7 +8445,8 @@
                 SUNLIGHT: 8,      // Sunlight calculated
                 BLOCKLIGHT: 16,   // Block light calculated
                 NEIGHBOR_UPDATE: 32, // Adjacent chunk update pass completed
-                ALL: 63           // All passes complete (sum of above)
+                TREE_NEIGHBOR_UPDATE: 64, // Cross-chunk tree leaves placed
+                ALL: 127          // All passes complete (sum of above)
             };
 
             // --- RENDER PASS STATE TRACKING ---
@@ -8493,7 +8494,10 @@
                     if (chunks.has(nKey)) {
                         const neighborChunk = chunks.get(nKey);
                         // Check if the neighbor hasn't had the neighbor update pass yet
-                        if (neighborChunk && !(neighborChunk.genState & GEN_PASS.NEIGHBOR_UPDATE)) {
+                        // Or if it's missing tree neighbor update (needed for cross-chunk canopies)
+                        const needsNeighborUpdate = !(neighborChunk.genState & GEN_PASS.NEIGHBOR_UPDATE);
+                        const needsTreeUpdate = !(neighborChunk.genState & GEN_PASS.TREE_NEIGHBOR_UPDATE);
+                        if (neighborChunk && (needsNeighborUpdate || needsTreeUpdate)) {
                             adjacentChunkUpdateQueue.add(nKey);
                         }
                         // ALWAYS re-queue neighbors for edge lighting when a new chunk appears
@@ -8548,9 +8552,9 @@
                         continue;
                     }
 
-                    // Run the neighbor update pass
+                    // Run the neighbor update pass (includes tree leaves + lighting)
                     runNeighborUpdatePass(chunk, cx, cz);
-                    chunk.genState |= GEN_PASS.NEIGHBOR_UPDATE;
+                    chunk.genState |= GEN_PASS.NEIGHBOR_UPDATE | GEN_PASS.TREE_NEIGHBOR_UPDATE;
 
                     // Schedule mesh rebuild for updated chunk
                     // Check for both terrain and water meshes (water-only chunks have no terrain mesh)
@@ -8564,11 +8568,118 @@
                 return processed;
             }
 
+            // Place leaves from neighbor chunk trees that overlap into this chunk
+            // Called during neighbor update pass to fix cross-chunk tree canopies
+            function placeNeighborTreeLeaves(chunk, cx, cz) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+                const blocks = chunk.blocks;
+                const seed = WORLD_CONFIG.seed;
+
+                // Helper to get block at local coordinates
+                const get = (lx, ly, lz) => {
+                    if (lx < 0 || lx >= chunkSize || lz < 0 || lz >= chunkSize || ly < 0 || ly >= chunkHeight) return AIR;
+                    return blocks[lx + lz * chunkSize + ly * chunkSize * chunkSize];
+                };
+
+                // Helper to set block at local coordinates
+                const set = (lx, ly, lz, blockId) => {
+                    if (lx < 0 || lx >= chunkSize || lz < 0 || lz >= chunkSize || ly < 0 || ly >= chunkHeight) return;
+                    blocks[lx + lz * chunkSize + ly * chunkSize * chunkSize] = blockId;
+                };
+
+                // Check all 8 neighbor chunks (not this chunk - own trees already handled)
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (dx === 0 && dz === 0) continue; // Skip own chunk
+
+                        const ncx = cx + dx;
+                        const ncz = cz + dz;
+                        const neighborKey = getChunkKey(ncx, ncz);
+                        const neighborChunk = chunks.get(neighborKey);
+
+                        // Neighbor must exist for us to place its tree leaves
+                        if (!neighborChunk) continue;
+
+                        // Get trees from this neighbor chunk
+                        const neighborTrees = getChunkTreePositions(ncx, ncz, seed, chunkSize);
+
+                        for (const tree of neighborTrees) {
+                            const { gx, gz, groundY, trunkHeight, trunkW, trunkD, profile, canopyRadius } = tree;
+                            const { canopy, blocks: treeBlocks } = profile;
+
+                            // Check if this tree's canopy could reach our chunk
+                            const canopyMinX = gx - canopyRadius;
+                            const canopyMaxX = gx + canopyRadius;
+                            const canopyMinZ = gz - canopyRadius;
+                            const canopyMaxZ = gz + canopyRadius;
+
+                            const chunkMinX = startX;
+                            const chunkMaxX = startX + chunkSize;
+                            const chunkMinZ = startZ;
+                            const chunkMaxZ = startZ + chunkSize;
+
+                            // Skip if no overlap with canopy bounds
+                            if (canopyMaxX < chunkMinX || canopyMinX >= chunkMaxX ||
+                                canopyMaxZ < chunkMinZ || canopyMinZ >= chunkMaxZ) {
+                                continue;
+                            }
+
+                            // NEIGHBOR TREE VALIDATION
+                            // Verify the trunk was actually placed by checking if source chunk contains trunk blocks
+                            const neighborBlocks = neighborChunk.blocks || neighborChunk;
+                            const neighborStartX = ncx * chunkSize;
+                            const neighborStartZ = ncz * chunkSize;
+
+                            const trunkBaseY = groundY + 1;
+                            const trunkTopY = trunkBaseY + trunkHeight;
+
+                            // Check if trunk exists at expected position in neighbor chunk
+                            const trunkLocalX = gx - neighborStartX;
+                            const trunkLocalZ = gz - neighborStartZ;
+                            const checkY = Math.min(trunkTopY, chunkHeight - 1);
+                            const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
+
+                            // Verify trunk block exists - if not, the tree failed validation
+                            if (!isLogBlock(neighborBlocks[trunkIdx])) continue;
+
+                            // Place canopy leaves that fall within THIS chunk
+                            const minCanopyY = groundY + 2;
+                            forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
+                                if (y < minCanopyY) return; // Skip leaves that would be too low
+
+                                const globalX = gx + cdx;
+                                const globalZ = gz + cdz;
+                                const leafLocalX = globalX - startX;
+                                const leafLocalZ = globalZ - startZ;
+
+                                // Only place if within this chunk's bounds
+                                if (leafLocalX < 0 || leafLocalX >= chunkSize ||
+                                    leafLocalZ < 0 || leafLocalZ >= chunkSize) return;
+                                if (y < 0 || y >= chunkHeight) return;
+
+                                // Only place in air (don't overwrite trunk or terrain)
+                                const existing = get(leafLocalX, y, leafLocalZ);
+                                if (existing === AIR) {
+                                    set(leafLocalX, y, leafLocalZ, treeBlocks.leaves);
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+
             // Run neighbor update pass on a chunk
-            // Handles edge lighting propagation for smooth chunk boundaries
+            // Handles cross-chunk tree leaves and edge lighting propagation
             function runNeighborUpdatePass(chunk, cx, cz) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
+
+                // First, place leaves from neighbor chunk trees that overlap into this chunk
+                // This must happen BEFORE lighting recalculation
+                placeNeighborTreeLeaves(chunk, cx, cz);
 
                 // Recalculate edge lighting to account for neighboring chunks
                 recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
