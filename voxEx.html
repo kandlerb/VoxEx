@@ -3805,6 +3805,13 @@
                 specularShininess: savedSettings.specularShininess !== undefined ? savedSettings.specularShininess : 32,
                 specularFresnel: savedSettings.specularFresnel !== undefined ? savedSettings.specularFresnel : 0.5,
                 specularRoughness: savedSettings.specularRoughness !== undefined ? savedSettings.specularRoughness : 0.5,
+                // Atmospheric Effects
+                particlesEnabled: savedSettings.particlesEnabled !== undefined ? savedSettings.particlesEnabled : true,
+                starsEnabled: savedSettings.starsEnabled !== undefined ? savedSettings.starsEnabled : true,
+                cloudsEnabled: savedSettings.cloudsEnabled !== undefined ? savedSettings.cloudsEnabled : true,
+                waterRipplesEnabled: savedSettings.waterRipplesEnabled !== undefined ? savedSettings.waterRipplesEnabled : true,
+                colorGradingEnabled: savedSettings.colorGradingEnabled !== undefined ? savedSettings.colorGradingEnabled : true,
+                torchSmokeEnabled: savedSettings.torchSmokeEnabled !== undefined ? savedSettings.torchSmokeEnabled : true,
             };
             const DEFAULTS = {
                 // Performance
@@ -3901,6 +3908,13 @@
                 specularShininess: 32,
                 specularFresnel: 0.5,
                 specularRoughness: 0.5,
+                // Atmospheric Effects
+                particlesEnabled: true,
+                starsEnabled: true,
+                cloudsEnabled: true,
+                waterRipplesEnabled: true,
+                colorGradingEnabled: true,
+                torchSmokeEnabled: true,
             };
             // Settings Profiles - predefined configurations
             const SETTINGS_PROFILES = {
@@ -9265,6 +9279,674 @@
             const mobTmpB = new THREE.Vector3();
             const mobTmpC = new THREE.Vector3();
             const mobTmpD = new THREE.Vector3();
+
+            // ============================================
+            // PARTICLE SYSTEM FOUNDATION
+            // ============================================
+            const PARTICLE_CONFIG = {
+                maxParticles: 500,
+                poolSize: 200,
+                updateDistance: 64, // Only update particles within this range
+            };
+
+            class ParticleSystem {
+                constructor(scene) {
+                    this.scene = scene;
+                    this.particles = [];
+                    this.pool = [];
+                    this.geometry = null;
+                    this.material = null;
+                    this.mesh = null;
+                    this.positions = null;
+                    this.colors = null;
+                    this.sizes = null;
+                    this.maxCount = PARTICLE_CONFIG.maxParticles;
+                    this.activeCount = 0;
+                }
+
+                init() {
+                    // Create instanced buffer geometry for particles
+                    this.geometry = new THREE.BufferGeometry();
+                    this.positions = new Float32Array(this.maxCount * 3);
+                    this.colors = new Float32Array(this.maxCount * 4);
+                    this.sizes = new Float32Array(this.maxCount);
+
+                    // Initialize with zeros
+                    for (let i = 0; i < this.maxCount; i++) {
+                        this.positions[i * 3] = 0;
+                        this.positions[i * 3 + 1] = -1000; // Off-screen
+                        this.positions[i * 3 + 2] = 0;
+                        this.colors[i * 4] = 1;
+                        this.colors[i * 4 + 1] = 1;
+                        this.colors[i * 4 + 2] = 1;
+                        this.colors[i * 4 + 3] = 0; // Transparent
+                        this.sizes[i] = 0.1;
+                    }
+
+                    this.geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
+                    this.geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 4));
+                    this.geometry.setAttribute('size', new THREE.BufferAttribute(this.sizes, 1));
+
+                    // Custom shader material for particles
+                    this.material = new THREE.ShaderMaterial({
+                        uniforms: {
+                            time: { value: 0 }
+                        },
+                        vertexShader: `
+                            attribute float size;
+                            attribute vec4 color;
+                            varying vec4 vColor;
+                            void main() {
+                                vColor = color;
+                                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                                gl_PointSize = size * (300.0 / -mvPosition.z);
+                                gl_Position = projectionMatrix * mvPosition;
+                            }
+                        `,
+                        fragmentShader: `
+                            varying vec4 vColor;
+                            void main() {
+                                vec2 center = gl_PointCoord - vec2(0.5);
+                                float dist = length(center);
+                                if (dist > 0.5) discard;
+                                // Square-ish voxel particles
+                                float alpha = vColor.a * (1.0 - smoothstep(0.3, 0.5, dist));
+                                gl_FragColor = vec4(vColor.rgb, alpha);
+                            }
+                        `,
+                        transparent: true,
+                        depthWrite: false,
+                        blending: THREE.NormalBlending
+                    });
+
+                    this.mesh = new THREE.Points(this.geometry, this.material);
+                    this.mesh.frustumCulled = false;
+                    this.scene.add(this.mesh);
+
+                    // Pre-populate pool
+                    for (let i = 0; i < PARTICLE_CONFIG.poolSize; i++) {
+                        this.pool.push(this.createParticle());
+                    }
+                }
+
+                createParticle() {
+                    return {
+                        active: false,
+                        index: -1,
+                        x: 0, y: 0, z: 0,
+                        vx: 0, vy: 0, vz: 0,
+                        r: 1, g: 1, b: 1, a: 1,
+                        size: 0.1,
+                        life: 0,
+                        maxLife: 1,
+                        gravity: 0,
+                        fadeOut: true,
+                        type: 'generic'
+                    };
+                }
+
+                spawn(x, y, z, options = {}) {
+                    if (this.activeCount >= this.maxCount) return null;
+
+                    let particle = this.pool.pop();
+                    if (!particle) {
+                        particle = this.createParticle();
+                    }
+
+                    particle.active = true;
+                    particle.index = this.activeCount;
+                    particle.x = x;
+                    particle.y = y;
+                    particle.z = z;
+                    particle.vx = options.vx || (Math.random() - 0.5) * 2;
+                    particle.vy = options.vy || Math.random() * 2;
+                    particle.vz = options.vz || (Math.random() - 0.5) * 2;
+                    particle.r = options.r || 1;
+                    particle.g = options.g || 1;
+                    particle.b = options.b || 1;
+                    particle.a = options.a || 1;
+                    particle.size = options.size || 0.15;
+                    particle.life = options.life || 1;
+                    particle.maxLife = particle.life;
+                    particle.gravity = options.gravity !== undefined ? options.gravity : 5;
+                    particle.fadeOut = options.fadeOut !== undefined ? options.fadeOut : true;
+                    particle.type = options.type || 'generic';
+
+                    this.particles.push(particle);
+                    this.activeCount++;
+
+                    return particle;
+                }
+
+                update(dt, playerPos) {
+                    if (!this.mesh || !playerPos) return;
+
+                    const distSq = PARTICLE_CONFIG.updateDistance * PARTICLE_CONFIG.updateDistance;
+
+                    for (let i = this.particles.length - 1; i >= 0; i--) {
+                        const p = this.particles[i];
+                        if (!p.active) continue;
+
+                        // Update life
+                        p.life -= dt;
+                        if (p.life <= 0) {
+                            this.despawn(i);
+                            continue;
+                        }
+
+                        // Distance check for performance
+                        const dx = p.x - playerPos.x;
+                        const dy = p.y - playerPos.y;
+                        const dz = p.z - playerPos.z;
+                        if (dx * dx + dy * dy + dz * dz > distSq) {
+                            this.despawn(i);
+                            continue;
+                        }
+
+                        // Physics
+                        p.vy -= p.gravity * dt;
+                        p.x += p.vx * dt;
+                        p.y += p.vy * dt;
+                        p.z += p.vz * dt;
+
+                        // Update buffer data
+                        const idx = p.index;
+                        this.positions[idx * 3] = p.x;
+                        this.positions[idx * 3 + 1] = p.y;
+                        this.positions[idx * 3 + 2] = p.z;
+
+                        const alpha = p.fadeOut ? p.a * (p.life / p.maxLife) : p.a;
+                        this.colors[idx * 4] = p.r;
+                        this.colors[idx * 4 + 1] = p.g;
+                        this.colors[idx * 4 + 2] = p.b;
+                        this.colors[idx * 4 + 3] = alpha;
+
+                        this.sizes[idx] = p.size;
+                    }
+
+                    // Mark buffers for update
+                    if (this.activeCount > 0) {
+                        this.geometry.attributes.position.needsUpdate = true;
+                        this.geometry.attributes.color.needsUpdate = true;
+                        this.geometry.attributes.size.needsUpdate = true;
+                    }
+                }
+
+                despawn(index) {
+                    const p = this.particles[index];
+                    if (!p) return;
+
+                    // Move last particle to fill gap
+                    const lastIdx = this.particles.length - 1;
+                    if (index !== lastIdx) {
+                        const lastP = this.particles[lastIdx];
+                        lastP.index = p.index;
+                        this.particles[index] = lastP;
+
+                        // Update buffer position
+                        const idx = lastP.index;
+                        this.positions[idx * 3] = lastP.x;
+                        this.positions[idx * 3 + 1] = lastP.y;
+                        this.positions[idx * 3 + 2] = lastP.z;
+                        this.colors[idx * 4] = lastP.r;
+                        this.colors[idx * 4 + 1] = lastP.g;
+                        this.colors[idx * 4 + 2] = lastP.b;
+                        this.colors[idx * 4 + 3] = lastP.fadeOut ? lastP.a * (lastP.life / lastP.maxLife) : lastP.a;
+                        this.sizes[idx] = lastP.size;
+                    }
+
+                    // Hide removed particle
+                    const oldIdx = p.index;
+                    this.positions[oldIdx * 3 + 1] = -1000;
+                    this.colors[oldIdx * 4 + 3] = 0;
+
+                    // Return to pool
+                    p.active = false;
+                    p.index = -1;
+                    this.pool.push(p);
+
+                    this.particles.pop();
+                    this.activeCount--;
+                }
+
+                // Spawn block break particles
+                spawnBlockBreak(x, y, z, blockType) {
+                    if (!SETTINGS.particlesEnabled) return;
+
+                    const color = getBlockParticleColor(blockType);
+                    const count = 8 + Math.floor(Math.random() * 4);
+
+                    for (let i = 0; i < count; i++) {
+                        const offsetX = (Math.random() - 0.5) * 0.8;
+                        const offsetY = (Math.random() - 0.5) * 0.8;
+                        const offsetZ = (Math.random() - 0.5) * 0.8;
+
+                        this.spawn(x + 0.5 + offsetX, y + 0.5 + offsetY, z + 0.5 + offsetZ, {
+                            vx: (Math.random() - 0.5) * 4,
+                            vy: Math.random() * 3 + 1,
+                            vz: (Math.random() - 0.5) * 4,
+                            r: color.r,
+                            g: color.g,
+                            b: color.b,
+                            size: 0.08 + Math.random() * 0.08,
+                            life: 0.5 + Math.random() * 0.5,
+                            gravity: 12,
+                            type: 'block_break'
+                        });
+                    }
+                }
+
+                // Spawn torch smoke
+                spawnTorchSmoke(x, y, z) {
+                    if (!SETTINGS.particlesEnabled || !SETTINGS.torchSmokeEnabled) return;
+
+                    this.spawn(x, y + 0.1, z, {
+                        vx: (Math.random() - 0.5) * 0.3,
+                        vy: 0.5 + Math.random() * 0.5,
+                        vz: (Math.random() - 0.5) * 0.3,
+                        r: 0.3,
+                        g: 0.3,
+                        b: 0.35,
+                        a: 0.4,
+                        size: 0.1 + Math.random() * 0.1,
+                        life: 1.5 + Math.random() * 1,
+                        gravity: -0.3, // Float upward
+                        type: 'smoke'
+                    });
+                }
+
+                dispose() {
+                    if (this.mesh) {
+                        this.scene.remove(this.mesh);
+                        this.geometry.dispose();
+                        this.material.dispose();
+                    }
+                    this.particles = [];
+                    this.pool = [];
+                    this.activeCount = 0;
+                }
+            }
+
+            // Get block particle color based on type
+            function getBlockParticleColor(blockType) {
+                const colors = {
+                    [GRASS]: { r: 0.3, g: 0.6, b: 0.2 },
+                    [DIRT]: { r: 0.55, g: 0.35, b: 0.2 },
+                    [STONE]: { r: 0.5, g: 0.5, b: 0.5 },
+                    [SAND]: { r: 0.9, g: 0.85, b: 0.6 },
+                    [WOOD]: { r: 0.6, g: 0.4, b: 0.2 },
+                    [LEAVES]: { r: 0.2, g: 0.5, b: 0.15 },
+                    [WATER]: { r: 0.3, g: 0.5, b: 0.8 },
+                    [GRAVEL]: { r: 0.45, g: 0.42, b: 0.4 },
+                    [CLAY]: { r: 0.6, g: 0.55, b: 0.5 },
+                    [SNOW]: { r: 0.95, g: 0.95, b: 0.98 },
+                    [ICE]: { r: 0.7, g: 0.85, b: 0.95 },
+                };
+                return colors[blockType] || { r: 0.5, g: 0.5, b: 0.5 };
+            }
+
+            // Global particle system instance
+            let particleSystem = null;
+
+            // ============================================
+            // ATMOSPHERIC EFFECTS: STARS
+            // ============================================
+            let starField = null;
+            const STAR_CONFIG = {
+                count: 800,
+                radius: 450,
+                minSize: 0.5,
+                maxSize: 2.0,
+                twinkleSpeed: 2.0
+            };
+
+            function createStarField(theScene) {
+                if (!SETTINGS.starsEnabled) return null;
+
+                const geometry = new THREE.BufferGeometry();
+                const positions = new Float32Array(STAR_CONFIG.count * 3);
+                const colors = new Float32Array(STAR_CONFIG.count * 3);
+                const sizes = new Float32Array(STAR_CONFIG.count);
+                const twinklePhases = new Float32Array(STAR_CONFIG.count);
+
+                for (let i = 0; i < STAR_CONFIG.count; i++) {
+                    // Distribute on hemisphere (only above horizon)
+                    const theta = Math.random() * Math.PI * 2;
+                    const phi = Math.acos(Math.random() * 0.8 + 0.2); // More stars near zenith
+
+                    const x = STAR_CONFIG.radius * Math.sin(phi) * Math.cos(theta);
+                    const y = STAR_CONFIG.radius * Math.cos(phi); // Y is up
+                    const z = STAR_CONFIG.radius * Math.sin(phi) * Math.sin(theta);
+
+                    positions[i * 3] = x;
+                    positions[i * 3 + 1] = y;
+                    positions[i * 3 + 2] = z;
+
+                    // Slight color variation (white to blue-white)
+                    const colorVar = 0.9 + Math.random() * 0.1;
+                    colors[i * 3] = colorVar;
+                    colors[i * 3 + 1] = colorVar;
+                    colors[i * 3 + 2] = 1.0;
+
+                    sizes[i] = STAR_CONFIG.minSize + Math.random() * (STAR_CONFIG.maxSize - STAR_CONFIG.minSize);
+                    twinklePhases[i] = Math.random() * Math.PI * 2;
+                }
+
+                geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+                geometry.setAttribute('twinklePhase', new THREE.BufferAttribute(twinklePhases, 1));
+
+                const material = new THREE.ShaderMaterial({
+                    uniforms: {
+                        time: { value: 0 },
+                        visibility: { value: 0 },
+                        twinkleSpeed: { value: STAR_CONFIG.twinkleSpeed }
+                    },
+                    vertexShader: `
+                        attribute float size;
+                        attribute vec3 color;
+                        attribute float twinklePhase;
+                        uniform float time;
+                        uniform float visibility;
+                        uniform float twinkleSpeed;
+                        varying vec3 vColor;
+                        varying float vAlpha;
+                        void main() {
+                            vColor = color;
+                            // Twinkle effect
+                            float twinkle = 0.7 + 0.3 * sin(time * twinkleSpeed + twinklePhase);
+                            vAlpha = visibility * twinkle;
+                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            gl_PointSize = size * (400.0 / -mvPosition.z);
+                            gl_Position = projectionMatrix * mvPosition;
+                        }
+                    `,
+                    fragmentShader: `
+                        varying vec3 vColor;
+                        varying float vAlpha;
+                        void main() {
+                            vec2 center = gl_PointCoord - vec2(0.5);
+                            float dist = length(center);
+                            if (dist > 0.5) discard;
+                            float glow = 1.0 - smoothstep(0.0, 0.5, dist);
+                            gl_FragColor = vec4(vColor, vAlpha * glow);
+                        }
+                    `,
+                    transparent: true,
+                    depthWrite: false,
+                    blending: THREE.AdditiveBlending
+                });
+
+                const stars = new THREE.Points(geometry, material);
+                stars.renderOrder = -100; // Render behind everything
+                theScene.add(stars);
+
+                return { mesh: stars, material, geometry };
+            }
+
+            function updateStars(time, dayNightTime) {
+                if (!starField || !starField.material) return;
+
+                // Stars visible only at night (dayNightTime 0.5-1.0 or 0-0.1)
+                // Using smooth transition
+                let visibility = 0;
+                if (dayNightTime > 0.7 || dayNightTime < 0.2) {
+                    if (dayNightTime > 0.7) {
+                        visibility = (dayNightTime - 0.7) / 0.15; // Fade in
+                    } else if (dayNightTime < 0.2) {
+                        visibility = 1.0 - (dayNightTime / 0.2); // Fade out
+                    }
+                    visibility = Math.min(1, Math.max(0, visibility));
+                }
+
+                starField.material.uniforms.time.value = time * 0.001;
+                starField.material.uniforms.visibility.value = visibility;
+            }
+
+            // ============================================
+            // ATMOSPHERIC EFFECTS: CLOUDS
+            // ============================================
+            let cloudPlane = null;
+            const CLOUD_CONFIG = {
+                height: 180,
+                size: 1000,
+                speed: 0.5,
+                opacity: 0.4,
+                scale: 0.002
+            };
+
+            function createCloudPlane(theScene) {
+                if (!SETTINGS.cloudsEnabled) return null;
+
+                const geometry = new THREE.PlaneGeometry(CLOUD_CONFIG.size, CLOUD_CONFIG.size, 1, 1);
+
+                const material = new THREE.ShaderMaterial({
+                    uniforms: {
+                        time: { value: 0 },
+                        cloudScale: { value: CLOUD_CONFIG.scale },
+                        cloudOpacity: { value: CLOUD_CONFIG.opacity },
+                        cloudSpeed: { value: CLOUD_CONFIG.speed },
+                        sunPosition: { value: new THREE.Vector3(0, 1, 0) }
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform float time;
+                        uniform float cloudScale;
+                        uniform float cloudOpacity;
+                        uniform float cloudSpeed;
+                        uniform vec3 sunPosition;
+                        varying vec2 vUv;
+
+                        // Simple noise for clouds
+                        float hash(vec2 p) {
+                            return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+                        }
+
+                        float noise(vec2 p) {
+                            vec2 i = floor(p);
+                            vec2 f = fract(p);
+                            f = f * f * (3.0 - 2.0 * f);
+                            return mix(
+                                mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x),
+                                mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x),
+                                f.y
+                            );
+                        }
+
+                        float fbm(vec2 p) {
+                            float value = 0.0;
+                            float amplitude = 0.5;
+                            for (int i = 0; i < 4; i++) {
+                                value += amplitude * noise(p);
+                                p *= 2.0;
+                                amplitude *= 0.5;
+                            }
+                            return value;
+                        }
+
+                        void main() {
+                            vec2 uv = vUv * 10.0;
+                            vec2 movement = vec2(time * cloudSpeed, time * cloudSpeed * 0.3);
+                            float cloudNoise = fbm(uv / cloudScale + movement);
+
+                            // Create cloud shapes
+                            float clouds = smoothstep(0.4, 0.8, cloudNoise);
+
+                            // Sun-side lighting
+                            float sunFactor = max(0.0, sunPosition.y);
+                            vec3 cloudColor = mix(vec3(0.6, 0.65, 0.7), vec3(1.0, 1.0, 1.0), sunFactor);
+
+                            // Fade at edges
+                            float edgeFade = 1.0 - smoothstep(0.3, 0.5, length(vUv - 0.5));
+
+                            float alpha = clouds * cloudOpacity * edgeFade;
+                            gl_FragColor = vec4(cloudColor, alpha);
+                        }
+                    `,
+                    transparent: true,
+                    depthWrite: false,
+                    side: THREE.DoubleSide
+                });
+
+                const clouds = new THREE.Mesh(geometry, material);
+                clouds.rotation.x = -Math.PI / 2;
+                clouds.position.y = CLOUD_CONFIG.height;
+                clouds.renderOrder = -50;
+                theScene.add(clouds);
+
+                return { mesh: clouds, material };
+            }
+
+            function updateClouds(time, sunY, playerPos) {
+                if (!cloudPlane || !cloudPlane.material) return;
+
+                cloudPlane.material.uniforms.time.value = time * 0.001;
+                cloudPlane.material.uniforms.sunPosition.value.y = sunY;
+
+                // Keep clouds centered on player
+                if (playerPos) {
+                    cloudPlane.mesh.position.x = playerPos.x;
+                    cloudPlane.mesh.position.z = playerPos.z;
+                }
+            }
+
+            // ============================================
+            // ATMOSPHERIC EFFECTS: WATER RIPPLES
+            // ============================================
+            const waterRipples = [];
+            const MAX_WATER_RIPPLES = 10;
+
+            function spawnWaterRipple(x, y, z) {
+                if (!SETTINGS.waterRipplesEnabled) return;
+                if (waterRipples.length >= MAX_WATER_RIPPLES) {
+                    // Remove oldest ripple
+                    const oldest = waterRipples.shift();
+                    if (oldest && oldest.mesh) {
+                        scene.remove(oldest.mesh);
+                        oldest.geometry.dispose();
+                        oldest.material.dispose();
+                    }
+                }
+
+                const geometry = new THREE.RingGeometry(0.05, 0.1, 16);
+                const material = new THREE.MeshBasicMaterial({
+                    color: 0xffffff,
+                    transparent: true,
+                    opacity: 0.5,
+                    side: THREE.DoubleSide
+                });
+
+                const ripple = new THREE.Mesh(geometry, material);
+                ripple.rotation.x = -Math.PI / 2;
+                ripple.position.set(x, y + 0.01, z);
+
+                scene.add(ripple);
+
+                waterRipples.push({
+                    mesh: ripple,
+                    geometry,
+                    material,
+                    life: 1.5,
+                    maxLife: 1.5,
+                    scale: 0.1
+                });
+            }
+
+            function updateWaterRipples(dt) {
+                for (let i = waterRipples.length - 1; i >= 0; i--) {
+                    const ripple = waterRipples[i];
+                    ripple.life -= dt;
+
+                    if (ripple.life <= 0) {
+                        scene.remove(ripple.mesh);
+                        ripple.geometry.dispose();
+                        ripple.material.dispose();
+                        waterRipples.splice(i, 1);
+                        continue;
+                    }
+
+                    // Expand and fade
+                    ripple.scale += dt * 2;
+                    ripple.mesh.scale.set(ripple.scale, ripple.scale, 1);
+                    ripple.material.opacity = 0.5 * (ripple.life / ripple.maxLife);
+                }
+            }
+
+            // ============================================
+            // ATMOSPHERIC EFFECTS: SUNRISE/SUNSET COLOR GRADING
+            // ============================================
+            let colorGradingPass = null;
+
+            function createColorGradingPass() {
+                if (!SETTINGS.colorGradingEnabled) return null;
+
+                const shader = {
+                    uniforms: {
+                        tDiffuse: { value: null },
+                        sunriseInfluence: { value: 0 },
+                        sunsetInfluence: { value: 0 }
+                    },
+                    vertexShader: `
+                        varying vec2 vUv;
+                        void main() {
+                            vUv = uv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                        }
+                    `,
+                    fragmentShader: `
+                        uniform sampler2D tDiffuse;
+                        uniform float sunriseInfluence;
+                        uniform float sunsetInfluence;
+                        varying vec2 vUv;
+
+                        void main() {
+                            vec4 color = texture2D(tDiffuse, vUv);
+
+                            // Sunrise: warm orange/pink tint
+                            vec3 sunriseTint = vec3(1.1, 0.9, 0.7);
+                            color.rgb = mix(color.rgb, color.rgb * sunriseTint, sunriseInfluence * 0.3);
+
+                            // Sunset: deep orange/red tint
+                            vec3 sunsetTint = vec3(1.2, 0.8, 0.6);
+                            color.rgb = mix(color.rgb, color.rgb * sunsetTint, sunsetInfluence * 0.4);
+
+                            gl_FragColor = color;
+                        }
+                    `
+                };
+
+                const pass = new ShaderPass(shader);
+                return pass;
+            }
+
+            function updateColorGrading(dayNightTime) {
+                if (!colorGradingPass) return;
+
+                // Sunrise around 0.2-0.3, sunset around 0.7-0.8
+                let sunriseInfluence = 0;
+                let sunsetInfluence = 0;
+
+                if (dayNightTime > 0.15 && dayNightTime < 0.35) {
+                    sunriseInfluence = 1.0 - Math.abs(dayNightTime - 0.25) / 0.1;
+                    sunriseInfluence = Math.max(0, Math.min(1, sunriseInfluence));
+                }
+
+                if (dayNightTime > 0.65 && dayNightTime < 0.85) {
+                    sunsetInfluence = 1.0 - Math.abs(dayNightTime - 0.75) / 0.1;
+                    sunsetInfluence = Math.max(0, Math.min(1, sunsetInfluence));
+                }
+
+                colorGradingPass.uniforms.sunriseInfluence.value = sunriseInfluence;
+                colorGradingPass.uniforms.sunsetInfluence.value = sunsetInfluence;
+            }
+
             // Track material changes so we only set needsUpdate when values actually change
             const materialUpdateState = {
                 waterColor: SETTINGS.waterColor,
@@ -13401,6 +14083,14 @@
                 moonSprite.castShadow = false;
                 moonSprite.receiveShadow = false;
                 scene.add(moonSprite);
+
+                // 3.5. Atmospheric Effects - Stars and Clouds
+                starField = createStarField(scene);
+                cloudPlane = createCloudPlane(scene);
+
+                // 3.6. Particle System
+                particleSystem = new ParticleSystem(scene);
+                particleSystem.init();
 
                 // 4. Camera & Lighting
                 camera = new THREE.PerspectiveCamera(SETTINGS.normalFOV, window.innerWidth / window.innerHeight, 0.01, 800); // Fix: Small near plane to render blocks close to camera and prevent clipping
@@ -20525,6 +21215,10 @@
                 updateHighlight();
                 perfMonitor.end("physics", physicsStart);
             }
+            // Torch smoke timer for periodic particle spawning
+            let lastTorchSmokeTime = 0;
+            const TORCH_SMOKE_INTERVAL = 150; // Spawn smoke every 150ms
+
             // Update visual effects (torch, FOV, camera)
             function updateVisualEffects(time) {
                 // FOV changes for sprint
@@ -20546,8 +21240,39 @@
                             const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
                             glow.scale.set(glowScale, glowScale, glowScale);
                         }
+
+                        // Spawn torch smoke particles periodically
+                        if (particleSystem && time - lastTorchSmokeTime > TORCH_SMOKE_INTERVAL) {
+                            lastTorchSmokeTime = time;
+                            // Get world position of torch flame
+                            const flameWorldPos = new THREE.Vector3();
+                            flame.getWorldPosition(flameWorldPos);
+                            particleSystem.spawnTorchSmoke(flameWorldPos.x, flameWorldPos.y, flameWorldPos.z);
+                        }
                     }
                 }
+
+                // Calculate dt for atmospheric updates
+                const dt = 1 / 60; // Approximate frame time
+
+                // Update particle system
+                if (particleSystem && controls) {
+                    particleSystem.update(dt, controls.getObject().position);
+                }
+
+                // Update atmospheric effects
+                updateStars(time, dayNightTime);
+
+                // Calculate sun Y position for cloud lighting
+                const sunAngle = dayNightTime * Math.PI * 2;
+                const sunY = Math.sin(sunAngle);
+                updateClouds(time, sunY, controls ? controls.getObject().position : null);
+
+                // Update water ripples
+                updateWaterRipples(dt);
+
+                // Update color grading
+                updateColorGrading(dayNightTime);
             }
             // Update volumetric lighting shader uniforms with light positions
             const volumetricTempVec3 = new THREE.Vector3();
@@ -21150,6 +21875,11 @@
                     if (breakingBlock && controls.isLocked) {
                         breakProgress += clampedDt / BREAK_TIME;
                         if (breakProgress >= 1.0) {
+                            // Spawn block break particles before destroying
+                            const brokenBlockType = getBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z);
+                            if (particleSystem && brokenBlockType !== AIR) {
+                                particleSystem.spawnBlockBreak(breakingBlock.x, breakingBlock.y, breakingBlock.z, brokenBlockType);
+                            }
                             setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR);
                             updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z);
                             breakingBlock = null;
