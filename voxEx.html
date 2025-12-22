@@ -9308,6 +9308,29 @@
                 }
             }
 
+            /**
+             * Optimize chunk geometry for GPU with DynamicDrawUsage hint.
+             * Chunks may be rebuilt when blocks change, so we hint to the GPU
+             * that these buffers will be updated (though not every frame).
+             * @param {THREE.BufferGeometry} geometry - Geometry to optimize
+             */
+            function optimizeChunkGeometryForGPU(geometry) {
+                if (!geometry || !geometry.attributes) return;
+                // Use DynamicDrawUsage for chunk geometry that may be rebuilt
+                // This tells the GPU driver to optimize for occasional updates
+                for (const key in geometry.attributes) {
+                    const attr = geometry.attributes[key];
+                    if (attr) {
+                        attr.setUsage(THREE.DynamicDrawUsage);
+                    }
+                }
+                // Also set usage on index buffer if present
+                if (geometry.index) {
+                    geometry.index.setUsage(THREE.DynamicDrawUsage);
+                }
+                // Bounding sphere/box are set by applyChunkBounds
+            }
+
             // --- OPTIMIZATION 21: Frustum Plane Caching ---
             // Cache frustum planes to avoid recalculation every frame
             const frustumPlanes = [];
@@ -10128,6 +10151,23 @@
                 html += `Faces: ${(totalFaces/1000).toFixed(1)}K\n`;
                 html += `Culled: ${culled} chunks\n`;
                 html += `Memory: ~${memMB}MB\n`;
+
+                // GPU memory monitoring (detects geometry leaks)
+                if (typeof renderer !== 'undefined' && renderer && renderer.info) {
+                    const geoCount = renderer.info.memory.geometries;
+                    const texCount = renderer.info.memory.textures;
+                    // Expected geometry count: (renderDistance * 2 + 1)² chunks * 2 (terrain + water)
+                    // Plus some overhead for UI, torch models, skybox, etc.
+                    const rd = typeof currentRenderRadius !== 'undefined' ? currentRenderRadius : SETTINGS.renderDistance;
+                    const expectedMax = Math.pow(rd * 2 + 1, 2) * 2 + 50;
+                    const geoColor = geoCount > expectedMax ? 'perf-bad' : geoCount > expectedMax * 0.8 ? 'perf-warn' : '';
+                    html += `<span class="perf-section">── GPU Memory ──</span>\n`;
+                    html += `<span class="${geoColor}">Geometries: ${geoCount}</span> (max ~${expectedMax})\n`;
+                    html += `Textures: ${texCount}\n`;
+                    if (geoCount > expectedMax) {
+                        html += `<span class="perf-bad">⚠ Geometry leak detected!</span>\n`;
+                    }
+                }
 
                 overlay.innerHTML = html;
             }
@@ -12147,6 +12187,35 @@
                 faceVertexCache.set(key, verts);
                 return verts;
             }
+            // --- INDEXED GEOMETRY: 4-vertex cache (33% less data than 6-vertex) ---
+            const faceVertexCacheIndexed = new Map();
+            /**
+             * Get cached face vertices for indexed geometry (4 unique vertices per face).
+             * @param {number} nx - Normal X component
+             * @param {number} ny - Normal Y component
+             * @param {number} nz - Normal Z component
+             * @returns {Float32Array} Array of 12 floats (4 vertices × 3 coords)
+             */
+            function getCachedFaceVerticesIndexed(nx, ny, nz) {
+                const key = `${nx},${ny},${nz}`;
+                if (faceVertexCacheIndexed.has(key)) return faceVertexCacheIndexed.get(key);
+                // 4 unique vertices for indexed rendering (v1, v2, v3, v4)
+                const verts = new Float32Array(12);
+                let x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4;
+                if (ny > 0) { x1 = 0; y1 = 1; z1 = 1; x2 = 1; y2 = 1; z2 = 1; x3 = 1; y3 = 1; z3 = 0; x4 = 0; y4 = 1; z4 = 0; // Top
+                } else if (ny < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 0; z3 = 1; x4 = 0; y4 = 0; z4 = 1; // Bottom
+                } else if (nx > 0) { x1 = 1; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 1; // Right
+                } else if (nx < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 1; x3 = 0; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 0; // Left
+                } else if (nz > 0) { x1 = 0; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 1; x3 = 1; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 1; // Back
+                } else { x1 = 1; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 0; x3 = 0; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 0; } // Front
+                // Store in order: v1, v2, v3, v4 (4 unique corners)
+                verts[0] = x1; verts[1] = y1; verts[2] = z1;  // V1
+                verts[3] = x2; verts[4] = y2; verts[5] = z2;  // V2
+                verts[6] = x3; verts[7] = y3; verts[8] = z3;  // V3
+                verts[9] = x4; verts[10] = y4; verts[11] = z4; // V4
+                faceVertexCacheIndexed.set(key, verts);
+                return verts;
+            }
             // OPTIMIZATION AUDIT: scheduleChunkUpdate
             //   - EVENT-DRIVEN: Called on block changes, not per-frame
             //   - Uses debounce (50ms timeout) to batch rapid updates
@@ -12311,6 +12380,50 @@
             const normPool = new Float32ArrayPool();
             const uvPool = new Float32ArrayPool();
             const colPool = new Float32ArrayPool();
+
+            // --- INDEXED GEOMETRY SUPPORT ---
+            // Pool for index buffers (Uint32 to support large vertex counts)
+            class Uint32ArrayPool {
+                constructor(initialSize = 10000) {
+                    this.pool = [];
+                    this.initialSize = initialSize;
+                    this.maxPoolSize = 64;
+                    this._callCounts = { acquire: 0, acquireHit: 0, acquireMiss: 0, release: 0, releaseAccepted: 0, releaseRejected: 0 };
+                }
+                acquire(minLength) {
+                    this._callCounts.acquire++;
+                    for (let i = 0; i < this.pool.length; i++) {
+                        if (this.pool[i].length >= minLength) {
+                            this._callCounts.acquireHit++;
+                            const arr = this.pool[i];
+                            this.pool[i] = this.pool[this.pool.length - 1];
+                            this.pool.pop();
+                            return arr;
+                        }
+                    }
+                    this._callCounts.acquireMiss++;
+                    return new Uint32Array(Math.max(this.initialSize, minLength));
+                }
+                release(arr) {
+                    this._callCounts.release++;
+                    if (arr.length > 1000000 || this.pool.length >= this.maxPoolSize) {
+                        this._callCounts.releaseRejected++;
+                        return;
+                    }
+                    this._callCounts.releaseAccepted++;
+                    this.pool.push(arr);
+                }
+                stats() {
+                    const hitRate = this._callCounts.acquire > 0 ? (this._callCounts.acquireHit / this._callCounts.acquire * 100).toFixed(1) : 0;
+                    let totalBytes = 0;
+                    for (let i = 0; i < this.pool.length; i++) { totalBytes += this.pool[i].byteLength; }
+                    return { poolSize: this.pool.length, maxPoolSize: this.maxPoolSize, totalBytesMB: (totalBytes / (1024 * 1024)).toFixed(2), hitRate: `${hitRate}%`, calls: { ...this._callCounts } };
+                }
+            }
+            const indexPool = new Uint32ArrayPool();
+            const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
+            const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
+
             const perm = new Uint8Array(512);
             const p = new Uint8Array(256).map((_, i) => i);
             const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
@@ -21361,6 +21474,166 @@
                 uvs[uvIdx + 8] = u1;  uvs[uvIdx + 9] = v1c;
                 uvs[uvIdx + 10] = u0; uvs[uvIdx + 11] = v1c;
             }
+
+            // --- INDEXED GEOMETRY FACE FUNCTIONS ---
+            // These functions write 4 vertices per face instead of 6, reducing buffer size by 33%
+            // Used with index buffers for efficient GPU rendering
+
+            /**
+             * Write 4 vertices for indexed geometry (12 position floats, 12 normal floats).
+             * @param {Float32Array} pos - Position buffer
+             * @param {Float32Array} norm - Normal buffer
+             * @param {number} vIdx - Starting vertex index (position/normal offset)
+             * @param {Float32Array} verts - Cached 4-vertex array (12 floats)
+             * @param {GlobalCoord} wx - World X offset
+             * @param {GlobalCoord} wy - World Y offset
+             * @param {GlobalCoord} wz - World Z offset
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             */
+            function writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz) {
+                // 4 vertices × 3 components = 12 writes (33% fewer than non-indexed)
+                pos[vIdx + 0] = verts[0] + wx;  pos[vIdx + 1] = verts[1] + wy;  pos[vIdx + 2] = verts[2] + wz;
+                norm[vIdx + 0] = nx;            norm[vIdx + 1] = ny;            norm[vIdx + 2] = nz;
+                pos[vIdx + 3] = verts[3] + wx;  pos[vIdx + 4] = verts[4] + wy;  pos[vIdx + 5] = verts[5] + wz;
+                norm[vIdx + 3] = nx;            norm[vIdx + 4] = ny;            norm[vIdx + 5] = nz;
+                pos[vIdx + 6] = verts[6] + wx;  pos[vIdx + 7] = verts[7] + wy;  pos[vIdx + 8] = verts[8] + wz;
+                norm[vIdx + 6] = nx;            norm[vIdx + 7] = ny;            norm[vIdx + 8] = nz;
+                pos[vIdx + 9] = verts[9] + wx;  pos[vIdx + 10] = verts[10] + wy; pos[vIdx + 11] = verts[11] + wz;
+                norm[vIdx + 9] = nx;            norm[vIdx + 10] = ny;           norm[vIdx + 11] = nz;
+            }
+
+            /**
+             * Write 4 vertex colors for indexed geometry (12 color floats).
+             * @param {Float32Array} col - Color buffer
+             * @param {number} cIdx - Starting color index
+             * @param {AOValue[]} ao - Array of 4 AO values [v1, v2, v3, v4]
+             * @param {number} lightLevel - Light level (normalized 0-1)
+             */
+            function writeFaceColorsIndexed(col, cIdx, ao, lightLevel) {
+                const c1 = ao[0] * lightLevel;
+                const c2 = ao[1] * lightLevel;
+                const c3 = ao[2] * lightLevel;
+                const c4 = ao[3] * lightLevel;
+                // 4 vertices × RGB = 12 components (vertex order: v1, v2, v3, v4)
+                col[cIdx + 0] = c1; col[cIdx + 1] = c1; col[cIdx + 2] = c1;   // V1
+                col[cIdx + 3] = c2; col[cIdx + 4] = c2; col[cIdx + 5] = c2;   // V2
+                col[cIdx + 6] = c3; col[cIdx + 7] = c3; col[cIdx + 8] = c3;   // V3
+                col[cIdx + 9] = c4; col[cIdx + 10] = c4; col[cIdx + 11] = c4; // V4
+            }
+
+            /**
+             * Write 4 UV coordinates for indexed geometry (8 UV floats).
+             * @param {Float32Array} uvs - UV buffer
+             * @param {number} uvIdx - Starting UV index
+             * @param {number[]} uv - UV tile offset [u, v]
+             */
+            function writeFaceUVsIndexed(uvs, uvIdx, uv) {
+                const tileW = 1 / NUM_TILES;
+                const u0 = uv[0];
+                const u1 = uv[0] + tileW;
+                const v0 = uv[1];
+                const v1 = uv[1] + 1.0;
+                // 4 vertices × 2 components = 8 writes (vertex order: v1, v2, v3, v4)
+                uvs[uvIdx + 0] = u0; uvs[uvIdx + 1] = v0;  // V1 bottom-left
+                uvs[uvIdx + 2] = u1; uvs[uvIdx + 3] = v0;  // V2 bottom-right
+                uvs[uvIdx + 4] = u1; uvs[uvIdx + 5] = v1;  // V3 top-right
+                uvs[uvIdx + 6] = u0; uvs[uvIdx + 7] = v1;  // V4 top-left
+            }
+
+            /**
+             * Write 6 indices for one face (two triangles).
+             * @param {Uint32Array} indices - Index buffer
+             * @param {number} iIdx - Starting index offset
+             * @param {number} baseVertex - Base vertex index for this face
+             */
+            function writeFaceIndices(indices, iIdx, baseVertex) {
+                // Two triangles: [v1,v2,v4] and [v2,v3,v4] (0-indexed from baseVertex)
+                indices[iIdx + 0] = baseVertex + 0; // V1
+                indices[iIdx + 1] = baseVertex + 1; // V2
+                indices[iIdx + 2] = baseVertex + 3; // V4
+                indices[iIdx + 3] = baseVertex + 1; // V2
+                indices[iIdx + 4] = baseVertex + 2; // V3
+                indices[iIdx + 5] = baseVertex + 3; // V4
+            }
+
+            /**
+             * Write 4 water vertex colors for indexed geometry with depth effects.
+             * @param {Float32Array} col - Color buffer
+             * @param {number} cIdx - Starting color index
+             * @param {AOValue[]} ao - Array of 4 AO values
+             * @param {number} lightLevel - Light level (normalized 0-1)
+             * @param {number} waterDepth - Water depth in blocks
+             * @param {GlobalCoord} wx - World X
+             * @param {GlobalCoord} wy - World Y
+             * @param {GlobalCoord} wz - World Z
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             */
+            function writeFaceColorsWaterIndexed(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
+                // Same water coloring logic as non-indexed version, but for 4 vertices
+                const fogDensity = SETTINGS.waterFogDensity;
+                const maxVisualDepth = 6 + (1 - fogDensity) * 10;
+                const depthFactor = Math.min(waterDepth / maxVisualDepth, 1.0);
+                const fogEffect = depthFactor * (0.5 + fogDensity * 0.5);
+                const fogR = 0.1 + (1 - fogDensity) * 0.15;
+                const fogG = 0.25 + (1 - fogDensity) * 0.15;
+                const fogB = 0.4 + (1 - fogDensity) * 0.1;
+                let rMult = 1.0 - fogEffect * (1.0 - fogR);
+                let gMult = 1.0 - fogEffect * (1.0 - fogG);
+                let bMult = 1.0 - fogEffect * (1.0 - fogB);
+                // Caustics
+                const shallowFactor = 1.0 - depthFactor;
+                const causticStrength = shallowFactor * 0.15;
+                const caustic1 = waterHash(wx * 2, wy * 3, wz * 2);
+                const caustic2 = waterHash(wx * 5 + 17, wy * 7 + 31, wz * 5 + 23);
+                const causticPattern = caustic1 * 0.6 + caustic2 * 0.4;
+                const causticBoost = 1.0 + (causticPattern - 0.5) * 2 * causticStrength;
+                // Foam
+                const isTopFace = ny > 0.5;
+                let foamBoost = 1.0;
+                if (isTopFace && waterDepth <= 2) {
+                    const foamNoise = waterHash(wx * 3 + 7, wy, wz * 3 + 11);
+                    if (foamNoise > 0.6) {
+                        foamBoost = 1.0 + (foamNoise - 0.6) * 0.5;
+                        rMult = Math.min(1.0, rMult * 1.1);
+                        gMult = Math.min(1.0, gMult * 1.05);
+                    }
+                }
+                // Depth variation
+                const depthVariation = waterHash(wx + 101, wy * 2 + 53, wz + 79);
+                const depthMod = 1.0 + (depthVariation - 0.5) * 0.1 * depthFactor;
+                rMult *= causticBoost * foamBoost * depthMod;
+                gMult *= causticBoost * foamBoost * depthMod;
+                bMult *= causticBoost * foamBoost;
+                rMult = Math.min(1.2, Math.max(0.0, rMult));
+                gMult = Math.min(1.2, Math.max(0.0, gMult));
+                bMult = Math.min(1.2, Math.max(0.0, bMult));
+                // Base water color from settings
+                const baseR = ((SETTINGS.waterColor >> 16) & 0xff) / 255;
+                const baseG = ((SETTINGS.waterColor >> 8) & 0xff) / 255;
+                const baseB = (SETTINGS.waterColor & 0xff) / 255;
+                rMult *= baseR;
+                gMult *= baseG;
+                bMult *= baseB;
+                // Per-vertex variation
+                const v1Var = 1.0 + (waterHash(wx, wy, wz) - 0.5) * 0.05;
+                const v2Var = 1.0 + (waterHash(wx + 1, wy, wz) - 0.5) * 0.05;
+                const v3Var = 1.0 + (waterHash(wx + 1, wy, wz + 1) - 0.5) * 0.05;
+                const v4Var = 1.0 + (waterHash(wx, wy, wz + 1) - 0.5) * 0.05;
+                const c1 = ao[0] * lightLevel * v1Var;
+                const c2 = ao[1] * lightLevel * v2Var;
+                const c3 = ao[2] * lightLevel * v3Var;
+                const c4 = ao[3] * lightLevel * v4Var;
+                // Write 4 vertices (indexed order: v1, v2, v3, v4)
+                col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
+                col[cIdx + 3] = c2 * rMult; col[cIdx + 4] = c2 * gMult; col[cIdx + 5] = c2 * bMult;
+                col[cIdx + 6] = c3 * rMult; col[cIdx + 7] = c3 * gMult; col[cIdx + 8] = c3 * bMult;
+                col[cIdx + 9] = c4 * rMult; col[cIdx + 10] = c4 * gMult; col[cIdx + 11] = c4 * bMult;
+            }
+
             // Add a face to the chunk mesh (simplified orchestrator)
             function addFace(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx) {
                 // Get cached face vertices
@@ -21431,6 +21704,90 @@
                 // Write UV coordinates
                 writeFaceUVs(uvs, uvIdx, uv);
             }
+
+            // --- INDEXED GEOMETRY addFace FUNCTIONS ---
+            // These functions use 4 vertices + 6 indices per face instead of 6 vertices
+
+            /**
+             * Add a face using indexed geometry (4 vertices + 6 indices).
+             * @param {GlobalCoord} wx - World X position
+             * @param {GlobalCoord} wy - World Y position
+             * @param {GlobalCoord} wz - World Z position
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             * @param {number[]} uv - UV tile offset
+             * @param {Float32Array} pos - Position buffer
+             * @param {Float32Array} norm - Normal buffer
+             * @param {Float32Array} uvs - UV buffer
+             * @param {Float32Array} col - Color buffer
+             * @param {Uint32Array} indices - Index buffer
+             * @param {Function} getter - Block getter function
+             * @param {LocalCoord} solidX - Solid block X
+             * @param {LocalCoord} solidY - Solid block Y
+             * @param {LocalCoord} solidZ - Solid block Z
+             * @param {BlockId} blockId - Block type ID
+             * @param {number} vIdx - Vertex buffer index
+             * @param {number} uvIdx - UV buffer index
+             * @param {number} cIdx - Color buffer index
+             * @param {number} iIdx - Index buffer index
+             * @param {number} vertexCount - Current vertex count (for index offset)
+             * @param {Function} lightGetter - Light getter function
+             * @param {LocalCoord} lightX - Light sample X
+             * @param {LocalCoord} lightY - Light sample Y
+             * @param {LocalCoord} lightZ - Light sample Z
+             * @param {number} faceIdx - Face index for AO caching
+             */
+            function addFaceIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx) {
+                const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+                writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
+                const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+                writeFaceColorsIndexed(col, cIdx, ao, lightLevel);
+                writeFaceUVsIndexed(uvs, uvIdx, uv);
+                writeFaceIndices(indices, iIdx, vertexCount);
+            }
+
+            /**
+             * Add a water face using indexed geometry.
+             */
+            function addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
+                const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+                writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
+                const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+                writeFaceColorsWaterIndexed(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
+                writeFaceUVsIndexed(uvs, uvIdx, uv);
+                writeFaceIndices(indices, iIdx, vertexCount);
+                // Shore and thickness attributes (4 vertices instead of 6)
+                const shoreNorm = Math.min(shoreDist / 4.0, 1.0);
+                shoreBuffer[shoreIdx] = shoreNorm;
+                shoreBuffer[shoreIdx + 1] = shoreNorm;
+                shoreBuffer[shoreIdx + 2] = shoreNorm;
+                shoreBuffer[shoreIdx + 3] = shoreNorm;
+                const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+                thicknessBuffer[thicknessIdx] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
+                thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+            }
+
+            /**
+             * Add a simplified face using indexed geometry (for distant LOD chunks).
+             */
+            function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly) {
+                const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+                writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+                const simplifiedLight = getSimplifiedLight(ly, WORLD_DIMS.chunkHeight) / 15.0;
+                // Write flat colors for 4 vertices
+                col[cIdx] = simplifiedLight; col[cIdx+1] = simplifiedLight; col[cIdx+2] = simplifiedLight;
+                col[cIdx+3] = simplifiedLight; col[cIdx+4] = simplifiedLight; col[cIdx+5] = simplifiedLight;
+                col[cIdx+6] = simplifiedLight; col[cIdx+7] = simplifiedLight; col[cIdx+8] = simplifiedLight;
+                col[cIdx+9] = simplifiedLight; col[cIdx+10] = simplifiedLight; col[cIdx+11] = simplifiedLight;
+                writeFaceUVsIndexed(uvs, uvIdx, uv);
+                writeFaceIndices(indices, iIdx, vertexCount);
+            }
+
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
             function createWorldTorch(x, y, z) {
                 const torchGroup = new THREE.Group();
@@ -21667,19 +22024,27 @@
                         return 15;
                     };
                     const maxFaces = 30000;
-                    // --- SEPARATE POOLS FOR TERRAIN AND WATER ---
-                    const terrainPos = posPool.acquire(maxFaces * 18);
-                    const terrainNorm = normPool.acquire(maxFaces * 18);
-                    const terrainUvs = uvPool.acquire(maxFaces * 12);
-                    const terrainCols = colPool.acquire(maxFaces * 18);
-                    const waterPos = posPool.acquire(maxFaces * 18);
-                    const waterNorm = normPool.acquire(maxFaces * 18);
-                    const waterUvs = uvPool.acquire(maxFaces * 12);
-                    const waterCols = colPool.acquire(maxFaces * 18);
-                    const waterShore = new Float32Array(maxFaces * 6); // Shore distance per vertex (1 float per vertex, 6 vertices per face)
-                    const waterThickness = new Float32Array(maxFaces * 6); // Water thickness (depth) per vertex for Beer-Lambert absorption
-                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tFaceCount = 0; // Terrain
-                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water (wSIdx for shore, wTIdx for thickness)
+                    // --- INDEXED GEOMETRY POOLS (4 vertices + 6 indices per face) ---
+                    // Position/Normal: 12 floats per face (4 verts × 3 coords) - 33% smaller than non-indexed
+                    // Color: 12 floats per face (4 verts × 3 RGB)
+                    // UV: 8 floats per face (4 verts × 2 coords)
+                    // Indices: 6 per face (2 triangles)
+                    const terrainPos = posPool.acquire(maxFaces * 12);
+                    const terrainNorm = normPool.acquire(maxFaces * 12);
+                    const terrainUvs = uvPool.acquire(maxFaces * 8);
+                    const terrainCols = colPool.acquire(maxFaces * 12);
+                    const terrainIndices = indexPool.acquire(maxFaces * 6);
+                    const waterPos = posPool.acquire(maxFaces * 12);
+                    const waterNorm = normPool.acquire(maxFaces * 12);
+                    const waterUvs = uvPool.acquire(maxFaces * 8);
+                    const waterCols = colPool.acquire(maxFaces * 12);
+                    const waterIndices = indexPool.acquire(maxFaces * 6);
+                    const waterShore = shorePool.acquire(maxFaces * 4); // Shore distance per vertex (1 float × 4 verts per face)
+                    const waterThickness = thicknessPool.acquire(maxFaces * 4); // Water thickness per vertex
+                    // Indexed geometry counters: vIdx = position/normal offset, cIdx = color offset, uvIdx = UV offset, iIdx = index offset
+                    // tVertCount/wVertCount = vertex count for index base calculations
+                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0; // Terrain
+                    let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wIIdx = 0, wVertCount = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
                     const height = WORLD_DIMS.chunkHeight;
@@ -21766,9 +22131,15 @@
                                     if (draw) {
                                         // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
                                         // But calculate AO from the solid block position (x,y,z), not the neighbor
+                                        // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
+                                        // Get vertex count for index offset calculation
+                                        const vertCount = isWater ? wVertCount : tVertCount;
+                                        const iIdx = isWater ? wIIdx : tIIdx;
+                                        const indices = isWater ? waterIndices : terrainIndices;
+
                                         // OPTIMIZATION: Use simplified lighting for distant chunks
                                         if (useDeferredLight) {
-                                            addFaceSimplified(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, ly);
+                                            addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
                                         } else if (isWater) {
                                             // Calculate water depth (search DOWN to find bottom)
                                             let waterDepth = 0;
@@ -21778,22 +22149,17 @@
                                                 waterDepth++;
                                             }
                                             // Calculate shore distance - check horizontal neighbors for solid blocks
-                                            // Shore distance: 0 = at shore, 1 = 1 block away, etc.
-                                            // Check if this water has air above (surface water)
                                             const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                            let shoreDist = 4; // Default: far from shore (max waves)
+                                            let shoreDist = 4;
                                             if (hasAirAbove) {
-                                                // Check in 4 horizontal directions for solid ground
                                                 const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
                                                 for (const [dx, dz] of directions) {
                                                     for (let d = 1; d <= 4; d++) {
                                                         const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                        // If solid block found, this is our shore distance in that direction
                                                         if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
                                                             shoreDist = Math.min(shoreDist, d);
                                                             break;
                                                         }
-                                                        // If air (edge of water), also counts as shore
                                                         if (checkId === AIR) {
                                                             shoreDist = Math.min(shoreDist, d);
                                                             break;
@@ -21801,23 +22167,30 @@
                                                     }
                                                 }
                                             }
-                                            // Use water-specific face rendering with depth-based coloring
-                                            addFaceWater(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                            // Indexed water face rendering
+                                            addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
                                         } else {
-                                            // Pass faceIdx for AO caching
-                                            addFace(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, getLocalLight, lx, ly, lz, faceIdx);
+                                            // Indexed terrain face rendering
+                                            addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
                                         }
-                                        vIdx += 18; uvIdx += 12; cIdx += 18;
-                                        if (isWater) {  wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx; wSIdx += 6; wTIdx += 6; wFaceCount++;
-                                        } else {        tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx; tFaceCount++; }
+                                        // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
+                                        vIdx += 12; uvIdx += 8; cIdx += 12;
+                                        if (isWater) {
+                                            wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
+                                            wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
+                                        } else {
+                                            tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
+                                            tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
 
-                    // --- CREATE TERRAIN MESH ---
+                    // --- CREATE TERRAIN MESH (INDEXED GEOMETRY) ---
                     if (tFaceCount > 0) {
+                        // Copy vertex data to correctly-sized arrays
                         const tPosArray = new Float32Array(tVIdx);
                         tPosArray.set(terrainPos.subarray(0, tVIdx));
                         const tNormArray = new Float32Array(tVIdx);
@@ -21826,13 +22199,19 @@
                         tUvArray.set(terrainUvs.subarray(0, tUvIdx));
                         const tColArray = new Float32Array(tCIdx);
                         tColArray.set(terrainCols.subarray(0, tCIdx));
+                        const tIdxArray = new Uint32Array(tIIdx);
+                        tIdxArray.set(terrainIndices.subarray(0, tIIdx));
+
                         const terrainGeo = new THREE.BufferGeometry();
+                        // Set indexed geometry - uses 33% less vertex data
+                        terrainGeo.setIndex(new THREE.Uint32BufferAttribute(tIdxArray, 1));
                         terrainGeo.setAttribute("position", new THREE.Float32BufferAttribute(tPosArray, 3));
                         terrainGeo.setAttribute("normal", new THREE.Float32BufferAttribute(tNormArray, 3));
                         terrainGeo.setAttribute("uv", new THREE.Float32BufferAttribute(tUvArray, 2));
                         terrainGeo.setAttribute("color", new THREE.Float32BufferAttribute(tColArray, 3));
                         applyChunkBounds(terrainGeo, startX, startZ);
-                        optimizeGeometryForGPU(terrainGeo); // OPTIMIZATION: Mark as static for GPU
+                        // Mark as DynamicDrawUsage since chunk geometry updates when blocks change
+                        optimizeChunkGeometryForGPU(terrainGeo);
                         const terrainMesh = acquireChunkMesh("terrain");
                         terrainMesh.name = "CHUNK_TERRAIN_" + cKey;
                         terrainMesh.geometry = terrainGeo;
@@ -21843,7 +22222,7 @@
                         scene.add(terrainMesh);
                         chunkMeshes.set(cKey, terrainMesh);
                     }
-                    // --- CREATE WATER MESH ---
+                    // --- CREATE WATER MESH (INDEXED GEOMETRY) ---
                     if (wFaceCount > 0) {
                         const wPosArray = new Float32Array(wVIdx);
                         wPosArray.set(waterPos.subarray(0, wVIdx));
@@ -21853,24 +22232,29 @@
                         wUvArray.set(waterUvs.subarray(0, wUvIdx));
                         const wColArray = new Float32Array(wCIdx);
                         wColArray.set(waterCols.subarray(0, wCIdx));
+                        const wIdxArray = new Uint32Array(wIIdx);
+                        wIdxArray.set(waterIndices.subarray(0, wIIdx));
                         const wShoreArray = new Float32Array(wSIdx);
                         wShoreArray.set(waterShore.subarray(0, wSIdx));
                         const wThicknessArray = new Float32Array(wTIdx);
                         wThicknessArray.set(waterThickness.subarray(0, wTIdx));
+
                         const waterGeo = new THREE.BufferGeometry();
+                        // Set indexed geometry
+                        waterGeo.setIndex(new THREE.Uint32BufferAttribute(wIdxArray, 1));
                         waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
                         waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
                         waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
                         waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
-                        waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1)); // Shore distance per vertex
-                        waterGeo.setAttribute("waterThickness", new THREE.Float32BufferAttribute(wThicknessArray, 1)); // Water thickness for absorption
+                        waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1));
+                        waterGeo.setAttribute("waterThickness", new THREE.Float32BufferAttribute(wThicknessArray, 1));
                         applyChunkBounds(waterGeo, startX, startZ);
-                        optimizeGeometryForGPU(waterGeo); // OPTIMIZATION: Mark as static for GPU
+                        optimizeChunkGeometryForGPU(waterGeo);
                         const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
                         waterMesh.geometry = waterGeo;
-                        waterMesh.frustumCulled = SETTINGS.enableFrustumCulling; // OPTIMIZATION: Use frustum culling for water too
-                        waterMesh.castShadow = false; // Water doesn't cast shadows
+                        waterMesh.frustumCulled = SETTINGS.enableFrustumCulling;
+                        waterMesh.castShadow = false;
                         waterMesh.receiveShadow = false;
                         waterMesh.updateMatrix();
                         scene.add(waterMesh);
@@ -21900,15 +22284,19 @@
                         }
                     }
                     if (torchArray.length > 0) { chunkTorches.set(cKey, torchArray); }
-                    // Release pools
+                    // Release all pools (including indexed geometry pools)
                     posPool.release(terrainPos);
                     normPool.release(terrainNorm);
                     uvPool.release(terrainUvs);
                     colPool.release(terrainCols);
+                    indexPool.release(terrainIndices);
                     posPool.release(waterPos);
                     normPool.release(waterNorm);
                     uvPool.release(waterUvs);
                     colPool.release(waterCols);
+                    indexPool.release(waterIndices);
+                    shorePool.release(waterShore);
+                    thicknessPool.release(waterThickness);
                     // OPTIMIZATION: Clear AO cache after chunk is done
                     clearAOCache();
                     meshedChunkKeys.add(cKey);
