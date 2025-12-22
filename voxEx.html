@@ -4479,6 +4479,7 @@
                 dayLength: 360,
                 // Shader
                 shadowQuality: 2048,
+                shadowMapType: 'medium', // 'low' = BasicShadowMap, 'medium' = PCFShadowMap, 'high' = PCFSoftShadowMap
                 shadowBias: 0.0001,
                 shadowRadius: 0,
                 antialiasing: true,
@@ -10002,6 +10003,9 @@
                 lightingTime: 0,
                 // Effect timing (for verifying disabled settings skip work)
                 shadowUpdateTime: 0,
+                shadowUpdatesThisSecond: 0,
+                shadowUpdateCount: 0, // Total count for current second
+                lastShadowSecond: 0, // Timestamp of last second boundary
                 volumetricTime: 0,
                 zombiePassTime: 0,
                 underwaterTime: 0,
@@ -10071,6 +10075,8 @@
                     this.lightingTime = 0;
                     // Reset effect timing
                     this.shadowUpdateTime = 0;
+                    // Note: shadowUpdatesThisSecond, shadowUpdateCount, lastShadowSecond are NOT reset per frame
+                    // They track updates over 1-second windows for display purposes
                     this.volumetricTime = 0;
                     this.zombiePassTime = 0;
                     this.underwaterTime = 0;
@@ -10130,7 +10136,10 @@
                 html += `<span class="${timeColor(perfMetrics.lightingTime)}">Lighting:${perfMetrics.lightingTime.toFixed(2)}ms</span>\n`;
                 html += `<span class="${gpuColor}">GPU(est):${estimatedGpuTime.toFixed(2)}ms</span>\n`;
                 html += `<span class="perf-section">── Effects ──</span>\n`;
-                html += `Shadow:  ${perfMetrics.shadowUpdateTime.toFixed(3)}ms ${SETTINGS.shadows ? '' : '(off)'}\n`;
+                const shadowInfo = SETTINGS.shadows
+                    ? `${perfMetrics.shadowUpdatesThisSecond}/sec (${perfMetrics.shadowUpdateTime.toFixed(2)}ms)`
+                    : '(off)';
+                html += `Shadow:  ${shadowInfo}\n`;
                 html += `Volum:   ${perfMetrics.volumetricTime.toFixed(3)}ms ${SETTINGS.volumetricLightingEnabled ? '' : '(off)'}\n`;
                 html += `Zombie:  ${perfMetrics.zombiePassTime.toFixed(3)}ms ${(SETTINGS.zombieVignetteEnabled || SETTINGS.zombieDesaturationEnabled) ? '' : '(off)'}\n`;
                 html += `Water:   ${perfMetrics.underwaterTime.toFixed(3)}ms ${isUnderwater ? '(underwater)' : ''}\n`;
@@ -10176,6 +10185,52 @@
             let composer, renderPass, zombieScarePass, underwaterPass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
+            // Shadow optimization: manual update control
+            let shadowMapDirty = true; // Start dirty for initial render
+            let lastShadowAngle = 0; // Track sun angle for throttled updates
+            let lastShadowRenderRadius = 0; // Track render radius for frustum resizing
+            /**
+             * Marks the shadow map as needing an update on the next frame.
+             * Call this when chunks change, blocks are modified, or sun angle changes significantly.
+             */
+            function markShadowsDirty() {
+                shadowMapDirty = true;
+            }
+            /**
+             * Updates shadow camera frustum to match the current render distance.
+             * Called when render distance changes to keep shadows properly sized.
+             * @param {number} renderRadius - Current render radius in chunks.
+             */
+            function updateShadowFrustumSize(renderRadius) {
+                if (!sun || !moon) return;
+                // Calculate shadow coverage to match render distance
+                // Add 1 chunk padding to avoid shadow pop-in at edges
+                const shadowRadius = (renderRadius + 1) * 16; // WORLD_DIMS.chunkSize = 16
+                const shadowDiameter = shadowRadius * 2;
+                // Update sun shadow camera
+                if (sun.shadow && sun.shadow.camera) {
+                    sun.shadow.camera.left = -shadowRadius;
+                    sun.shadow.camera.right = shadowRadius;
+                    sun.shadow.camera.top = shadowRadius;
+                    sun.shadow.camera.bottom = -shadowRadius;
+                    sun.shadow.camera.near = 0.5;
+                    sun.shadow.camera.far = shadowRadius * 3;
+                    sun.shadow.camera.updateProjectionMatrix();
+                }
+                // Update moon shadow camera
+                if (moon.shadow && moon.shadow.camera) {
+                    moon.shadow.camera.left = -shadowRadius;
+                    moon.shadow.camera.right = shadowRadius;
+                    moon.shadow.camera.top = shadowRadius;
+                    moon.shadow.camera.bottom = -shadowRadius;
+                    moon.shadow.camera.near = 0.5;
+                    moon.shadow.camera.far = shadowRadius * 3;
+                    moon.shadow.camera.updateProjectionMatrix();
+                }
+                lastShadowRenderRadius = renderRadius;
+                markShadowsDirty();
+                logDebug(`[Shadows] Frustum resized for render distance ${renderRadius} (${shadowDiameter} units)`);
+            }
             let moveForward = false;
             let moveBackward = false;
             let moveLeft = false;
@@ -14597,6 +14652,9 @@
                 const changed = voxelWorld.setBlock(x, y, z, id);
                 if (!changed) return;
 
+                // OPTIMIZATION: Mark shadows dirty for update (block changed = shadow geometry changed)
+                markShadowsDirty();
+
                 // Schedule localized relight so sunlight/torches react to edits
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
@@ -14626,7 +14684,7 @@
              * applyShadowSettings - Dynamically toggle GPU shadow rendering
              * ============================================================
              * NOT HOT: Called only when shadow setting changes (user-triggered)
-             * Toggles renderer.shadowMap.enabled and autoUpdate to skip GPU shadow map rendering
+             * Toggles renderer.shadowMap.enabled. autoUpdate stays false for manual control.
              * Also updates castShadow on all relevant lights
              */
             function applyShadowSettings() {
@@ -14635,33 +14693,25 @@
                 // Toggle renderer shadow map
                 if (renderer) {
                     renderer.shadowMap.enabled = shadowsEnabled;
-                    renderer.shadowMap.autoUpdate = shadowsEnabled; // Stop GPU shadow updates when disabled
+                    // Keep autoUpdate = false - we control shadow updates manually via shadowMapDirty
+                    renderer.shadowMap.autoUpdate = false;
                     if (shadowsEnabled) {
-                        // Force shadow map update on next frame when re-enabling
-                        renderer.shadowMap.needsUpdate = true;
+                        // Mark shadows dirty for update on next frame when re-enabling
+                        markShadowsDirty();
                     }
                 }
 
                 // Update main directional lights
                 if (sun) {
                     sun.castShadow = shadowsEnabled;
-                    if (shadowsEnabled && sun.shadow) {
-                        sun.shadow.needsUpdate = true;
-                    }
                 }
                 if (moon) {
                     moon.castShadow = shadowsEnabled;
-                    if (shadowsEnabled && moon.shadow) {
-                        moon.shadow.needsUpdate = true;
-                    }
                 }
 
                 // Update handheld torch light
                 if (torchLight) {
                     torchLight.castShadow = shadowsEnabled;
-                    if (shadowsEnabled && torchLight.shadow) {
-                        torchLight.shadow.needsUpdate = true;
-                    }
                 }
 
                 // Update all placed torch lights
@@ -14670,9 +14720,7 @@
                         torch.traverse((node) => {
                             if (!node.isPointLight) return;
                             node.castShadow = shadowsEnabled;
-                            if (shadowsEnabled && node.shadow) {
-                                node.shadow.needsUpdate = true;
-                            }
+                            // Shadow update handled centrally via markShadowsDirty()
                         });
                     }
                 });
@@ -15470,8 +15518,17 @@
                 renderer.setSize(window.innerWidth, window.innerHeight);
                 renderer.info.autoReset = false;
                 renderer.shadowMap.enabled = SETTINGS.shadows;
-                if (SETTINGS.shadows) { renderer.shadowMap.type = THREE.PCFShadowMap; }
-                logDebug('[Renderer] Initialized with high-performance mode');
+                // OPTIMIZATION: Disable automatic shadow map updates - we control when shadows render
+                renderer.shadowMap.autoUpdate = false;
+                renderer.shadowMap.needsUpdate = true; // Initial render
+                // Shadow map type based on quality setting
+                const shadowMapTypes = {
+                    low: THREE.BasicShadowMap,
+                    medium: THREE.PCFShadowMap,
+                    high: THREE.PCFSoftShadowMap
+                };
+                renderer.shadowMap.type = shadowMapTypes[SETTINGS.shadowMapType] ?? THREE.PCFShadowMap;
+                logDebug(`[Renderer] Initialized with high-performance mode, shadowMapType: ${SETTINGS.shadowMapType}`);
                 refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
 
@@ -22301,6 +22358,8 @@
                     clearAOCache();
                     meshedChunkKeys.add(cKey);
                     chunkRenderedFaces.set(cKey, tFaceCount + wFaceCount);
+                    // OPTIMIZATION: Mark shadows dirty when new mesh is created
+                    markShadowsDirty();
                     const renderTimestamp = performance.now();
                     const prevDiag = chunkRenderDiagnostics.get(cKey);
                     chunkRenderDiagnostics.set(cKey, {
@@ -22344,6 +22403,10 @@
                     }
                     // Force static setting if dynamic is off
                 } else { if (currentRenderRadius !== SETTINGS.renderDistance) { currentRenderRadius = SETTINGS.renderDistance; renderDistanceChanged = true; }}
+                // --- 1b. Update shadow frustum when render distance changes ---
+                if (renderDistanceChanged || currentRenderRadius !== lastShadowRenderRadius) {
+                    updateShadowFrustumSize(currentRenderRadius);
+                }
                 // --- 2. Calculate Player Position ---
                 const pPos = controls.getObject().position;
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
@@ -22848,7 +22911,9 @@
                         Math.abs(snapTargetX - lastShadowState.targetX) > posThreshold ||
                         Math.abs(snapTargetY - lastShadowState.targetY) > posThreshold ||
                         Math.abs(snapTargetZ - lastShadowState.targetZ) > posThreshold;
-                    const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.02; // Slightly larger threshold
+                    // OPTIMIZATION: ~5 degrees (0.087 radians) threshold for sun angle changes
+                    // Reduces shadow updates during slow day/night transitions
+                    const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.087;
                     if (posChanged || angleChanged) {
                         // 3. Sun direction from angle
                         const diskH = Math.sin(sunAngle);
@@ -22882,6 +22947,8 @@
                         lastShadowState.targetY = snapTargetY;
                         lastShadowState.targetZ = snapTargetZ;
                         lastShadowState.sunAngle = sunAngle;
+                        // Mark shadows dirty for next render frame
+                        markShadowsDirty();
                     }
                 }
                 perfMetrics.shadowUpdateTime = performance.now() - shadowStartMs;
@@ -23736,6 +23803,24 @@
                         mat.uniforms.fogNear.value = scene.fog.near;
                         mat.uniforms.fogFar.value = scene.fog.far;
                     }
+                }
+
+                // OPTIMIZATION: Manual shadow map update control
+                // Only update shadow maps when geometry has changed (shadowMapDirty flag)
+                if (shadowMapDirty && SETTINGS.shadows && renderer) {
+                    const shadowUpdateStart = performance.now();
+                    renderer.shadowMap.needsUpdate = true;
+                    shadowMapDirty = false;
+
+                    // Track shadow update metrics
+                    const now = Math.floor(performance.now() / 1000);
+                    if (now !== perfMetrics.lastShadowSecond) {
+                        perfMetrics.shadowUpdatesThisSecond = perfMetrics.shadowUpdateCount;
+                        perfMetrics.shadowUpdateCount = 0;
+                        perfMetrics.lastShadowSecond = now;
+                    }
+                    perfMetrics.shadowUpdateCount++;
+                    perfMetrics.shadowUpdateTime = performance.now() - shadowUpdateStart;
                 }
 
                 // INSTRUMENTATION: Track volumetric lighting time
