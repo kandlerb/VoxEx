@@ -1444,8 +1444,10 @@
         <script type="importmap">
             {
                 "imports": {
-                    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
-                    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+                    "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+                    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
+                    "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.webgpu.js",
+                    "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.tsl.js"
                 }
             }
         </script>
@@ -4793,11 +4795,37 @@
                 targetZ: -1,
                 sunAngle: -1,
             };
-            import * as THREE from "three";
+            // --- THREE.JS WEBGPU/TSL IMPORTS ---
+            // Use three/webgpu for WebGPU renderer with WebGL fallback.
+            // TSL (Three.js Shading Language) compiles to GLSL (WebGL) or WGSL (WebGPU) automatically.
+            import * as THREE from "three/webgpu";
             import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
             import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
             import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
             import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+
+            // --- TSL (Three.js Shading Language) Functions ---
+            // Used for node-based materials with cylindrical fog and shared shader logic.
+            import {
+                MeshStandardNodeMaterial,
+                MeshLambertNodeMaterial,
+                MeshBasicNodeMaterial,
+                positionWorld,
+                cameraPosition,
+                uniform,
+                float,
+                vec2,
+                vec3,
+                vec4,
+                sub,
+                length as tslLength,
+                smoothstep,
+                mix,
+                Fn,
+                texture as tslTexture,
+                fog,
+                color as tslColor
+            } from 'three/tsl';
 
             // =====================================================
             // VOXEX CLASS-BASED ARCHITECTURE
@@ -6309,7 +6337,8 @@
                 }
 
                 // OPTIMIZATION: init - no-op (called once at startup)
-                init() {
+                // Note: This method is async because WebGPURenderer requires async initialization
+                async init() {
                     // Scene
                     this.scene = new THREE.Scene();
                     this.scene.matrixAutoUpdate = false;
@@ -6320,17 +6349,21 @@
                     this.camera.layers.enable(0);
                     this.camera.layers.enable(1);
 
-                    // Renderer
+                    // Renderer - WebGPURenderer with WebGL fallback
                     // Note: logarithmicDepthBuffer removed - incompatible with custom particle shaders
-                    this.renderer = new THREE.WebGLRenderer({
+                    // forceWebGL: true ensures WebGL backend for compatibility
+                    this.renderer = new THREE.WebGPURenderer({
                         antialias: this.settings.get('antialiasing'),
                         powerPreference: 'high-performance',
-                        stencil: false
+                        forceWebGL: true // Use WebGL backend for stability
                     });
+                    // WebGPURenderer requires async initialization
+                    await this.renderer.init();
                     this.renderer.setPixelRatio(window.devicePixelRatio * (this.settings.get('pixelRatio') || 1.0));
                     this.renderer.setSize(window.innerWidth, window.innerHeight);
-                    this.renderer.shadowMap.enabled = this.settings.get('shadows');
+                    // Configure shadow mapping after init
                     if (this.settings.get('shadows')) {
+                        this.renderer.shadowMap.enabled = true;
                         this.renderer.shadowMap.type = THREE.PCFShadowMap;
                     }
 
@@ -10233,6 +10266,68 @@
             let outlineMesh;
             let chunkMaterial;
             let waterMaterial;
+
+            // =====================================================
+            // CYLINDRICAL FOG NODE (TSL)
+            // =====================================================
+            // Computes fog based on horizontal (XZ) distance only, ignoring Y.
+            // This prevents fog from changing when looking up/down.
+            // TSL compiles to GLSL (WebGL) or WGSL (WebGPU) automatically.
+            //
+            // Usage: Set scene.fogNode = cylindricalFogNode in init()
+            // The fog is automatically applied to all materials that support fog.
+
+            /** @type {UniformNode<number>} Fog start distance */
+            const fogNearUniform = uniform(1.0);
+            /** @type {UniformNode<number>} Fog end distance */
+            const fogFarUniform = uniform(400.0);
+            /** @type {THREE.Color} Fog color for uniform (mutable) */
+            const fogColorValue = new THREE.Color(0xb3d9ff);
+            /** @type {UniformNode<THREE.Color>} Fog color uniform node */
+            const fogColorUniform = uniform(fogColorValue);
+
+            /**
+             * Cylindrical fog factor node - computes fog based on XZ distance from camera.
+             * @returns {Node} Fog factor (0 = no fog, 1 = full fog)
+             */
+            const cylindricalFogFactor = Fn(() => {
+                // Get world position XZ and camera position XZ
+                const worldXZ = vec2(positionWorld.x, positionWorld.z);
+                const cameraXZ = vec2(cameraPosition.x, cameraPosition.z);
+
+                // Compute horizontal distance
+                const horizontalDist = tslLength(sub(worldXZ, cameraXZ));
+
+                // Smoothstep fog falloff
+                return smoothstep(fogNearUniform, fogFarUniform, horizontalDist);
+            });
+
+            /**
+             * Cylindrical fog node for use with scene.fogNode.
+             * Uses the fog() TSL function with our custom cylindrical factor.
+             */
+            const cylindricalFogNode = fog(fogColorUniform, cylindricalFogFactor());
+
+            /**
+             * Update fog uniforms based on current render distance.
+             * Call this when render distance changes.
+             */
+            function updateFogUniforms() {
+                const rd = SETTINGS.renderDistance * WORLD_DIMS.chunkSize;
+                fogNearUniform.value = rd * 0.3;
+                fogFarUniform.value = rd * 0.95;
+                // fogColorValue is updated by day/night cycle via updateFogColor()
+            }
+
+            /**
+             * Update fog color for day/night cycle.
+             * @param {THREE.Color} newColor - The new fog color
+             */
+            function updateFogColor(newColor) {
+                fogColorValue.copy(newColor);
+                fogColorUniform.value = fogColorValue;
+            }
+
             const mobs = [];
             const mobPool = [];
             let zombieSpawnTimer = 0;
@@ -11232,6 +11327,8 @@
                 // Store the current fog color, apply tint
                 _baseFogColor.copy(scene.fog.color);
                 scene.fog.color.multiply(currentBiomeTint);
+                // Also update TSL fog color for node materials
+                updateFogColor(scene.fog.color);
             }
 
             // Track material changes so we only set needsUpdate when values actually change
@@ -15118,11 +15215,17 @@
                         skyMaterial.uniforms.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
                         // Fog copies sky bottom for seamless horizon blend
                         if (scene?.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                        // Also update TSL fog color for node materials
+                        updateFogColor(skyMaterial.uniforms.bottomColor.value);
                     }
                 };
                 // 1. Setup Scene + Sky
                 scene = new THREE.Scene();
                 scene.matrixAutoUpdate = false; // GLOBAL OPTIMIZATION
+                // Apply cylindrical fog via TSL node (uses horizontal XZ distance only)
+                scene.fogNode = cylindricalFogNode;
+                // Initialize fog uniforms based on render distance
+                updateFogUniforms();
                 const skyGeo = new THREE.SphereGeometry(500, 32, 15);
                 skyMaterial = new THREE.ShaderMaterial({
                     uniforms: {
@@ -15346,19 +15449,25 @@
                 outlineMesh = new THREE.LineSegments(new THREE.EdgesGeometry(og), om);
                 outlineMesh.visible = false;
                 scene.add(outlineMesh);
-                // 8. Renderer
+                // 8. Renderer - WebGPURenderer with WebGL fallback
                 // Note: logarithmicDepthBuffer removed - causes particle rendering issues with custom shaders
-                renderer = new THREE.WebGLRenderer({
+                // forceWebGL: true ensures WebGL backend for stability during TSL migration
+                renderer = new THREE.WebGPURenderer({
                     antialias: SETTINGS.antialiasing,
                     powerPreference: 'high-performance',
-                    stencil: false
+                    forceWebGL: true // Use WebGL backend for stability
                 });
+                // WebGPURenderer requires async initialization
+                await renderer.init();
                 renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio);
                 renderer.setSize(window.innerWidth, window.innerHeight);
                 renderer.info.autoReset = false;
-                renderer.shadowMap.enabled = SETTINGS.shadows;
-                if (SETTINGS.shadows) { renderer.shadowMap.type = THREE.PCFShadowMap; }
-                logDebug('[Renderer] Initialized with high-performance mode');
+                // Configure shadow mapping after init
+                if (SETTINGS.shadows) {
+                    renderer.shadowMap.enabled = true;
+                    renderer.shadowMap.type = THREE.PCFShadowMap;
+                }
+                logDebug(`[Renderer] Initialized with WebGPU renderer (backend: ${renderer.backend?.constructor?.name || 'WebGL'})`);
                 refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
 
@@ -17824,7 +17933,10 @@
                 registerPixelTexture(roughnessMap);
                 console.log(`[Textures] Created per-texture roughness map: ${roughnessCanvas.width}x${roughnessCanvas.height}`);
 
-                chunkMaterial = new THREE.MeshStandardMaterial({
+                // --- TERRAIN MATERIAL (Node-based with cylindrical fog) ---
+                // MeshStandardNodeMaterial supports TSL nodes for custom shading.
+                // Cylindrical fog is applied via scene.fogNode (set in init).
+                chunkMaterial = new MeshStandardNodeMaterial({
                     map: tex,
                     roughnessMap: roughnessMap,
                     vertexColors: true,
@@ -17832,9 +17944,12 @@
                     alphaTest: 0.1,
                     roughness: 1.0, // Base roughness multiplied by roughnessMap
                     metalness: 0.0,
+                    fog: true, // Enable fog (uses scene.fogNode for cylindrical fog)
                 });
-                // Create two water materials - Standard (quality) and Lambert (fast)
-                const waterMaterialStandard = new THREE.MeshStandardMaterial({
+                // --- WATER MATERIALS (Node-based with cylindrical fog) ---
+                // Two water materials: Standard (quality) and Lambert (fast)
+                // Both use scene.fogNode for cylindrical fog.
+                const waterMaterialStandard = new MeshStandardNodeMaterial({
                     map: tex,
                     vertexColors: true,
                     side: THREE.DoubleSide, // Render both sides so water surface is visible from below
@@ -17846,10 +17961,11 @@
                     depthTest: true,
                     roughness: 0.3, // Water has shine - only material with specular
                     metalness: 0.1, // Slight metalness for reflectivity
+                    fog: true, // Enable fog (uses scene.fogNode for cylindrical fog)
                 });
-                // Fast water material - MeshLambertMaterial is MUCH cheaper than MeshStandardMaterial
+                // Fast water material - MeshLambertNodeMaterial is MUCH cheaper than MeshStandardNodeMaterial
                 // Uses simple Lambertian shading instead of PBR, significantly reducing GPU load
-                const waterMaterialFast = new THREE.MeshLambertMaterial({
+                const waterMaterialFast = new MeshLambertNodeMaterial({
                     map: tex,
                     vertexColors: true,
                     side: THREE.FrontSide, // Single-sided for performance (no underside rendering)
@@ -17859,6 +17975,7 @@
                     alphaTest: 0.1,
                     depthWrite: false,
                     depthTest: true,
+                    fog: true, // Enable fog (uses scene.fogNode for cylindrical fog)
                 });
                 // Refraction water material - ShaderMaterial that samples opaque scene with UV distortion
                 const waterMaterialRefraction = new THREE.ShaderMaterial({
@@ -18003,58 +18120,10 @@
 
                 // Select initial water material based on setting
                 waterMaterial = SETTINGS.waterFastMode ? waterMaterialFast : (SETTINGS.waterRefractionEnabled ? waterMaterialRefraction : waterMaterialStandard);
-                // Allow built-in fog to run with camera depth for all materials
-                chunkMaterial.fog = true;
-                waterMaterialStandard.fog = true;
-                waterMaterialFast.fog = true;
 
-                // --- CYLINDRICAL FOG ---
-                // Override fog calculation to use only horizontal (XZ) distance from player.
-                // This prevents fog from changing when looking up/down and keeps ground visible when flying.
-                function applyCylindricalFog(material) {
-                    material.onBeforeCompile = (shader) => {
-                        // Add world position varying to vertex shader
-                        shader.vertexShader = shader.vertexShader.replace(
-                            '#include <fog_vertex>',
-                            `#include <fog_vertex>
-                            vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;`
-                        );
-                        shader.vertexShader = shader.vertexShader.replace(
-                            'void main() {',
-                            `varying vec3 vWorldPositionCyl;
-                            void main() {`
-                        );
-
-                        // Override fog calculation in fragment shader to use cylindrical distance
-                        shader.fragmentShader = shader.fragmentShader.replace(
-                            'void main() {',
-                            `varying vec3 vWorldPositionCyl;
-                            void main() {`
-                        );
-                        // Replace the fog_fragment include with cylindrical fog calculation
-                        shader.fragmentShader = shader.fragmentShader.replace(
-                            '#include <fog_fragment>',
-                            `#ifdef USE_FOG
-                                // Cylindrical fog: only use horizontal (XZ) distance
-                                vec2 horizontalDiff = vWorldPositionCyl.xz - cameraPosition.xz;
-                                float fogDepthCyl = length(horizontalDiff);
-                                #ifdef FOG_EXP2
-                                    float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
-                                #else
-                                    float fogFactor = smoothstep(fogNear, fogFar, fogDepthCyl);
-                                #endif
-                                gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
-                            #endif`
-                        );
-                    };
-                    // Force shader recompilation
-                    material.needsUpdate = true;
-                }
-
-                // Apply cylindrical fog to all terrain and water materials
-                applyCylindricalFog(chunkMaterial);
-                applyCylindricalFog(waterMaterialStandard);
-                applyCylindricalFog(waterMaterialFast);
+                // Note: Cylindrical fog is now applied via scene.fogNode (TSL)
+                // The old onBeforeCompile approach has been replaced with cleaner TSL nodes.
+                // Materials with fog: true will automatically use scene.fogNode.
 
                 // Function to switch water material mode and update all water meshes
                 function applyWaterFastMode() {
@@ -21978,6 +22047,9 @@
                     const fogNear = fogFarActual * 0.5; // Start fade at 50% for smooth gradient
                     if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogNear;
                     } else { scene.fog = new THREE.Fog(SETTINGS.daySkyBottom, fogNear, fogFarActual); }
+                    // Update TSL fog uniforms for node materials
+                    fogNearUniform.value = fogNear;
+                    fogFarUniform.value = fogFarActual;
                 }
                 // --- FRUSTUM CULLING HELPER ---
                 function isChunkInFrustum(chunkX, chunkZ, playerPos, normCamX, normCamZ, chunkDistSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir) {
@@ -22427,11 +22499,13 @@
                     }
 
                     // Fog color: black when underground, sky color otherwise (but not when underwater)
-                    if (scene.fog && !isUnderwater) {
+                    if (!isUnderwater) {
                         if (isUnderground) {
-                            scene.fog.color.copy(_undergroundFogColor);
+                            if (scene.fog) scene.fog.color.copy(_undergroundFogColor);
+                            updateFogColor(_undergroundFogColor); // TSL fog color
                         } else {
-                            scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                            if (scene.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                            updateFogColor(skyMaterial.uniforms.bottomColor.value); // TSL fog color
                         }
                     }
                 }
