@@ -2293,6 +2293,22 @@
                         <label for="water-ripples-toggle">Water Ripples</label>
                         <input type="checkbox" id="water-ripples-toggle" checked />
                     </div>
+                    <div class="setting-item">
+                        <label for="water-splash-toggle">Splash Particles</label>
+                        <input type="checkbox" id="water-splash-toggle" checked />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-wading-toggle">Wading Ripples</label>
+                        <input type="checkbox" id="water-wading-toggle" checked />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-wake-toggle">Swim Wake</label>
+                        <input type="checkbox" id="water-wake-toggle" checked />
+                    </div>
+                    <div class="setting-item">
+                        <label for="water-bubbles-toggle">Underwater Bubbles</label>
+                        <input type="checkbox" id="water-bubbles-toggle" checked />
+                    </div>
 
                     <div style="font-weight: 600; margin: 16px 0 6px 0">Atmospheric Effects</div>
 
@@ -4498,6 +4514,11 @@
                 starsEnabled: savedSettings.starsEnabled !== undefined ? savedSettings.starsEnabled : true,
                 cloudsEnabled: savedSettings.cloudsEnabled !== undefined ? savedSettings.cloudsEnabled : true,
                 waterRipplesEnabled: savedSettings.waterRipplesEnabled !== undefined ? savedSettings.waterRipplesEnabled : true,
+                // Water velocity effects
+                waterSplashParticlesEnabled: savedSettings.waterSplashParticlesEnabled !== undefined ? savedSettings.waterSplashParticlesEnabled : true,
+                waterWadingRipplesEnabled: savedSettings.waterWadingRipplesEnabled !== undefined ? savedSettings.waterWadingRipplesEnabled : true,
+                waterWakeEnabled: savedSettings.waterWakeEnabled !== undefined ? savedSettings.waterWakeEnabled : true,
+                waterBubblesEnabled: savedSettings.waterBubblesEnabled !== undefined ? savedSettings.waterBubblesEnabled : true,
                 colorGradingEnabled: savedSettings.colorGradingEnabled !== undefined ? savedSettings.colorGradingEnabled : true,
                 biomeFogEnabled: savedSettings.biomeFogEnabled !== undefined ? savedSettings.biomeFogEnabled : true,
                 // Star Settings (per-layer)
@@ -4653,6 +4674,11 @@
                 starsEnabled: true,
                 cloudsEnabled: true,
                 waterRipplesEnabled: true,
+                // Water velocity effect defaults
+                waterSplashParticlesEnabled: true,
+                waterWadingRipplesEnabled: true,
+                waterWakeEnabled: true,
+                waterBubblesEnabled: true,
                 colorGradingEnabled: true,
                 biomeFogEnabled: true,
                 // Star Defaults
@@ -8787,6 +8813,12 @@
             let swimSpaceHoldTime = 0; // How long space has been held while underwater
             let isTreadingWater = false; // Whether player is floating at surface
             let waterSurfaceY = 0; // Y position of water surface for treading
+            // Water velocity effects state
+            let waterEntryVelocityY = 0; // Capture vertical velocity at moment of water entry
+            let lastWadeRippleTime = 0; // Cooldown tracking for wading ripples
+            let lastWakeParticleTime = 0; // Cooldown tracking for swim wake
+            let lastBubbleTime = 0; // Cooldown tracking for underwater bubbles
+            let breathBubbleTimer = 0; // Timer for periodic breath bubbles
             const _undergroundFogColor = new THREE.Color(0x000000); // Black fog for underground/caves
             let _lastUnderwaterCheckY = -Infinity; // Cache last Y position for depth calculation
             const NEIGHBOR_OFFSETS = [ // --- OPTIMIZATION: Pre-computed neighbor offsets for light propagation --- Avoids array allocation inside tight loops
@@ -11330,15 +11362,150 @@
             }
 
             // ============================================
-            // ATMOSPHERIC EFFECTS: WATER RIPPLES
+            // ATMOSPHERIC EFFECTS: WATER RIPPLES & VELOCITY EFFECTS
             // ============================================
             const waterRipples = [];
-            const MAX_WATER_RIPPLES = 10;
+            const MAX_WATER_RIPPLES = 20; // Increased for multiple concurrent ripples
 
-            function spawnWaterRipple(x, y, z) {
+            /**
+             * Creates a voxel-style diamond/octagonal ring geometry for water ripples.
+             * Uses BufferGeometry with 4 or 8 vertices per ring for blocky aesthetic.
+             * @param {number} innerRadius - Inner radius of the ring.
+             * @param {number} outerRadius - Outer radius of the ring.
+             * @param {number} segments - Number of segments (4 for diamond, 8 for octagon).
+             * @returns {THREE.BufferGeometry} The voxel-style ring geometry.
+             */
+            function createSquareRippleGeometry(innerRadius, outerRadius, segments = 4) {
+                const geometry = new THREE.BufferGeometry();
+                const vertices = [];
+                const indices = [];
+                const uvs = [];
+
+                // Rotate by 45 degrees for diamond orientation when segments=4
+                const angleOffset = segments === 4 ? Math.PI / 4 : 0;
+
+                for (let i = 0; i < segments; i++) {
+                    const angle = (i / segments) * Math.PI * 2 + angleOffset;
+                    const nextAngle = ((i + 1) / segments) * Math.PI * 2 + angleOffset;
+
+                    // Inner vertices
+                    const ix1 = Math.cos(angle) * innerRadius;
+                    const iz1 = Math.sin(angle) * innerRadius;
+                    const ix2 = Math.cos(nextAngle) * innerRadius;
+                    const iz2 = Math.sin(nextAngle) * innerRadius;
+
+                    // Outer vertices
+                    const ox1 = Math.cos(angle) * outerRadius;
+                    const oz1 = Math.sin(angle) * outerRadius;
+                    const ox2 = Math.cos(nextAngle) * outerRadius;
+                    const oz2 = Math.sin(nextAngle) * outerRadius;
+
+                    const baseIdx = i * 4;
+
+                    // Add vertices (inner1, inner2, outer1, outer2)
+                    vertices.push(ix1, 0, iz1);
+                    vertices.push(ix2, 0, iz2);
+                    vertices.push(ox1, 0, oz1);
+                    vertices.push(ox2, 0, oz2);
+
+                    // UVs for potential texture support
+                    uvs.push(0, 0, 1, 0, 0, 1, 1, 1);
+
+                    // Two triangles per segment
+                    indices.push(baseIdx, baseIdx + 2, baseIdx + 1);
+                    indices.push(baseIdx + 1, baseIdx + 2, baseIdx + 3);
+                }
+
+                geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+                geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+                geometry.setIndex(indices);
+                geometry.computeVertexNormals();
+
+                return geometry;
+            }
+
+            /**
+             * Spawns a velocity-scaled water ripple at the given position.
+             * Uses diamond geometry for voxel aesthetic, scales based on impact velocity.
+             * @param {number} x - X position.
+             * @param {number} y - Y position (water surface).
+             * @param {number} z - Z position.
+             * @param {number} [impactVelocity=2] - Vertical velocity at impact (negative = falling).
+             */
+            function spawnWaterRipple(x, y, z, impactVelocity = 2) {
                 if (!SETTINGS.waterRipplesEnabled) return;
+
+                const absVelocity = Math.abs(impactVelocity);
+                const clampedVelocity = Math.min(absVelocity, 15);
+
+                // Calculate velocity-based parameters
+                const initialScale = 0.1 + clampedVelocity * 0.08;
+                const expansionRate = 2 + clampedVelocity * 0.25;
+                const initialOpacity = Math.min(0.6, 0.3 + clampedVelocity * 0.02);
+                const lifespan = 1.2 + clampedVelocity * 0.08;
+
+                // For high-velocity impacts, spawn multiple concentric ripples
+                const rippleCount = absVelocity > 8 ? Math.min(3, Math.ceil(absVelocity / 6)) : 1;
+
+                for (let r = 0; r < rippleCount; r++) {
+                    // Stagger spawns with small delay effect via scale offset
+                    const delay = r * 0.15;
+
+                    setTimeout(() => {
+                        if (waterRipples.length >= MAX_WATER_RIPPLES) {
+                            const oldest = waterRipples.shift();
+                            if (oldest && oldest.mesh) {
+                                scene.remove(oldest.mesh);
+                                oldest.geometry.dispose();
+                                oldest.material.dispose();
+                            }
+                        }
+
+                        // Use diamond geometry (4 segments) for voxel aesthetic
+                        const geometry = createSquareRippleGeometry(0.05, 0.12, 4);
+                        const material = new THREE.MeshBasicMaterial({
+                            color: 0xaaddff,
+                            transparent: true,
+                            opacity: initialOpacity * (1 - r * 0.2),
+                            side: THREE.DoubleSide,
+                            depthWrite: false
+                        });
+
+                        const ripple = new THREE.Mesh(geometry, material);
+                        ripple.rotation.x = -Math.PI / 2;
+                        ripple.position.set(x, y + 0.02, z);
+
+                        // Apply initial scale based on velocity and ring index
+                        const ringScale = initialScale * (1 + r * 0.3);
+                        ripple.scale.set(ringScale, ringScale, 1);
+
+                        scene.add(ripple);
+
+                        waterRipples.push({
+                            mesh: ripple,
+                            geometry,
+                            material,
+                            life: lifespan,
+                            maxLife: lifespan,
+                            scale: ringScale,
+                            expansionRate: expansionRate * (1 - r * 0.15),
+                            initialOpacity: initialOpacity * (1 - r * 0.2)
+                        });
+                    }, delay * 1000);
+                }
+            }
+
+            /**
+             * Spawns a small wading ripple when walking through shallow water.
+             * @param {number} x - X position.
+             * @param {number} y - Y position (water surface).
+             * @param {number} z - Z position.
+             * @param {number} hSpeed - Horizontal movement speed.
+             */
+            function spawnWadingRipple(x, y, z, hSpeed) {
+                if (!SETTINGS.waterRipplesEnabled || !SETTINGS.waterWadingRipplesEnabled) return;
+
                 if (waterRipples.length >= MAX_WATER_RIPPLES) {
-                    // Remove oldest ripple
                     const oldest = waterRipples.shift();
                     if (oldest && oldest.mesh) {
                         scene.remove(oldest.mesh);
@@ -11347,17 +11514,21 @@
                     }
                 }
 
-                const geometry = new THREE.RingGeometry(0.05, 0.1, 16);
+                const geometry = createSquareRippleGeometry(0.03, 0.07, 4);
                 const material = new THREE.MeshBasicMaterial({
-                    color: 0xffffff,
+                    color: 0xaaddff,
                     transparent: true,
-                    opacity: 0.5,
-                    side: THREE.DoubleSide
+                    opacity: 0.25 + Math.min(hSpeed * 0.05, 0.2),
+                    side: THREE.DoubleSide,
+                    depthWrite: false
                 });
 
                 const ripple = new THREE.Mesh(geometry, material);
                 ripple.rotation.x = -Math.PI / 2;
-                ripple.position.set(x, y + 0.01, z);
+                ripple.position.set(x, y + 0.02, z);
+
+                const wadeScale = 0.4 + Math.min(hSpeed * 0.1, 0.4);
+                ripple.scale.set(wadeScale, wadeScale, 1);
 
                 scene.add(ripple);
 
@@ -11365,12 +11536,52 @@
                     mesh: ripple,
                     geometry,
                     material,
-                    life: 1.5,
-                    maxLife: 1.5,
-                    scale: 0.1
+                    life: 0.8,
+                    maxLife: 0.8,
+                    scale: wadeScale,
+                    expansionRate: 1.5 + hSpeed * 0.3,
+                    initialOpacity: 0.25 + Math.min(hSpeed * 0.05, 0.2)
                 });
             }
 
+            /**
+             * Updates wading ripples when player walks through shallow water.
+             * @param {number} dt - Delta time.
+             * @param {THREE.Vector3} playerPos - Player position.
+             * @param {THREE.Vector3} playerVelocity - Player velocity.
+             */
+            function updateWadingRipples(dt, playerPos, playerVelocity) {
+                if (!SETTINGS.waterWadingRipplesEnabled) return;
+                if (!playerPos || !playerVelocity) return;
+
+                const feetY = Math.floor(playerPos.y - 1.7);
+                const feetInWater = getBlock(Math.floor(playerPos.x), feetY, Math.floor(playerPos.z)) === WATER;
+                const headInWater = isUnderwater;
+
+                // Wading: feet in water but head above water
+                if (!feetInWater || headInWater) return;
+
+                const hSpeed = Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z);
+                if (hSpeed < 1.5) return; // Not moving fast enough
+
+                const now = performance.now();
+                // Scale cooldown by speed: faster = more frequent ripples
+                const cooldown = Math.max(150, 500 - hSpeed * 50);
+
+                if (now - lastWadeRippleTime < cooldown) return;
+                lastWadeRippleTime = now;
+
+                // Spawn ripple slightly behind player (opposite movement direction)
+                const behindX = playerPos.x - (playerVelocity.x / hSpeed) * 0.3;
+                const behindZ = playerPos.z - (playerVelocity.z / hSpeed) * 0.3;
+
+                spawnWadingRipple(behindX, feetY + 0.5, behindZ, hSpeed);
+            }
+
+            /**
+             * Updates all water ripples: expansion, fading, and cleanup.
+             * @param {number} dt - Delta time.
+             */
             function updateWaterRipples(dt) {
                 for (let i = waterRipples.length - 1; i >= 0; i--) {
                     const ripple = waterRipples[i];
@@ -11384,11 +11595,301 @@
                         continue;
                     }
 
-                    // Expand and fade
-                    ripple.scale += dt * 2;
+                    // Expand using velocity-based expansion rate
+                    const expRate = ripple.expansionRate ?? 2;
+                    ripple.scale += dt * expRate;
                     ripple.mesh.scale.set(ripple.scale, ripple.scale, 1);
-                    ripple.material.opacity = 0.5 * (ripple.life / ripple.maxLife);
+
+                    // Fade based on initial opacity
+                    const baseOpacity = ripple.initialOpacity ?? 0.5;
+                    ripple.material.opacity = baseOpacity * (ripple.life / ripple.maxLife);
                 }
+            }
+
+            // ============================================
+            // WATER VELOCITY EFFECTS: SPLASH PARTICLES
+            // ============================================
+
+            /**
+             * Spawns velocity-scaled splash particles when entering water.
+             * Particle count and spread scale with impact velocity.
+             * @param {number} x - X position.
+             * @param {number} y - Y position (water surface).
+             * @param {number} z - Z position.
+             * @param {number} impactVelocity - Vertical velocity at impact.
+             */
+            function spawnWaterEntrySplash(x, y, z, impactVelocity) {
+                if (!particleSystem || !SETTINGS.waterSplashParticlesEnabled) return;
+
+                const impactSpeed = Math.abs(impactVelocity);
+                // Dynamic particle count: 1-8 based on impact speed
+                const particleCount = Math.ceil(Math.min(impactSpeed, 20) / 2.5);
+                const sizeBase = SETTINGS.footstepSize ?? 0.15;
+
+                for (let i = 0; i < particleCount; i++) {
+                    // Scale velocities by impact speed
+                    const spreadAngle = Math.random() * Math.PI * 2;
+                    const spreadRadius = 0.3 + impactSpeed * 0.05;
+                    const upVelocity = (1 + impactSpeed * 0.3) * (0.5 + Math.random());
+                    const outVelocity = (0.5 + impactSpeed * 0.15) * (0.3 + Math.random() * 0.7);
+
+                    particleSystem.spawn(
+                        x + (Math.random() - 0.5) * spreadRadius,
+                        y + 0.1,
+                        z + (Math.random() - 0.5) * spreadRadius,
+                        {
+                            vx: Math.cos(spreadAngle) * outVelocity,
+                            vy: upVelocity,
+                            vz: Math.sin(spreadAngle) * outVelocity,
+                            r: 0.7, g: 0.88, b: 1.0, a: 0.7,
+                            size: sizeBase * (0.5 + impactSpeed * 0.05 + Math.random() * 0.3),
+                            life: 0.6 + impactSpeed * 0.03,
+                            gravity: 10,
+                            type: 'splash'
+                        }
+                    );
+                }
+
+                // Secondary droplets after short delay for larger impacts
+                if (impactSpeed > 5) {
+                    setTimeout(() => {
+                        const dropletCount = Math.ceil(impactSpeed / 5);
+                        for (let i = 0; i < dropletCount; i++) {
+                            const angle = Math.random() * Math.PI * 2;
+                            particleSystem.spawn(
+                                x + (Math.random() - 0.5) * 0.5,
+                                y + 0.3 + Math.random() * 0.3,
+                                z + (Math.random() - 0.5) * 0.5,
+                                {
+                                    vx: Math.cos(angle) * (0.3 + Math.random() * 0.5),
+                                    vy: 0.5 + Math.random() * 1.5,
+                                    vz: Math.sin(angle) * (0.3 + Math.random() * 0.5),
+                                    r: 0.75, g: 0.9, b: 1.0, a: 0.5,
+                                    size: sizeBase * 0.4,
+                                    life: 0.4,
+                                    gravity: 12,
+                                    type: 'droplet'
+                                }
+                            );
+                        }
+                    }, 120);
+                }
+            }
+
+            /**
+             * Spawns a dramatic splash column for high-velocity water impacts.
+             * Creates vertical spray, crown ring, and mist effects.
+             * @param {number} x - X position.
+             * @param {number} y - Y position (water surface).
+             * @param {number} z - Z position.
+             * @param {number} impactVelocity - Vertical velocity at impact.
+             */
+            function spawnSplashColumn(x, y, z, impactVelocity) {
+                if (!particleSystem || !SETTINGS.waterSplashParticlesEnabled) return;
+
+                const impactSpeed = Math.abs(impactVelocity);
+                const sizeBase = SETTINGS.footstepSize ?? 0.15;
+
+                // Vertical column particles (8-15)
+                const columnCount = Math.min(15, 8 + Math.floor(impactSpeed / 3));
+                const columnHeight = 1 + impactSpeed * 0.15;
+
+                for (let i = 0; i < columnCount; i++) {
+                    const delay = i * 25; // Staggered spawns for rising effect
+                    setTimeout(() => {
+                        particleSystem.spawn(
+                            x + (Math.random() - 0.5) * 0.3,
+                            y + 0.1 + (i / columnCount) * 0.5,
+                            z + (Math.random() - 0.5) * 0.3,
+                            {
+                                vx: (Math.random() - 0.5) * 0.8,
+                                vy: columnHeight * (1 - i / columnCount * 0.3) + Math.random() * 2,
+                                vz: (Math.random() - 0.5) * 0.8,
+                                r: 0.8, g: 0.92, b: 1.0, a: 0.8,
+                                size: sizeBase * (0.8 + Math.random() * 0.4),
+                                life: 0.8 + Math.random() * 0.4,
+                                gravity: 12,
+                                type: 'column'
+                            }
+                        );
+                    }, delay);
+                }
+
+                // Crown ring particles (6-8 outward)
+                const crownCount = 6 + Math.floor(impactSpeed / 8);
+                for (let i = 0; i < crownCount; i++) {
+                    const angle = (i / crownCount) * Math.PI * 2;
+                    const outSpeed = 1.5 + impactSpeed * 0.1;
+
+                    setTimeout(() => {
+                        particleSystem.spawn(
+                            x + Math.cos(angle) * 0.2,
+                            y + 0.15,
+                            z + Math.sin(angle) * 0.2,
+                            {
+                                vx: Math.cos(angle) * outSpeed,
+                                vy: 1 + Math.random() * 0.5,
+                                vz: Math.sin(angle) * outSpeed,
+                                r: 0.75, g: 0.9, b: 1.0, a: 0.6,
+                                size: sizeBase * 0.6,
+                                life: 0.5,
+                                gravity: 8,
+                                type: 'crown'
+                            }
+                        );
+                    }, 50);
+                }
+
+                // Mist particles (low opacity, minimal gravity)
+                for (let i = 0; i < 5; i++) {
+                    particleSystem.spawn(
+                        x + (Math.random() - 0.5) * 0.6,
+                        y + 0.2 + Math.random() * 0.3,
+                        z + (Math.random() - 0.5) * 0.6,
+                        {
+                            vx: (Math.random() - 0.5) * 0.5,
+                            vy: 0.3 + Math.random() * 0.5,
+                            vz: (Math.random() - 0.5) * 0.5,
+                            r: 0.9, g: 0.95, b: 1.0, a: 0.25,
+                            size: sizeBase * 1.2,
+                            life: 0.6,
+                            gravity: 0.5,
+                            type: 'mist'
+                        }
+                    );
+                }
+            }
+
+            // ============================================
+            // WATER VELOCITY EFFECTS: SWIMMING WAKE & BUBBLES
+            // ============================================
+
+            /**
+             * Updates swimming wake effect (foam trail behind player).
+             * @param {number} dt - Delta time.
+             * @param {THREE.Vector3} playerPos - Player position.
+             * @param {THREE.Vector3} playerVelocity - Player velocity.
+             */
+            function updateSwimWake(dt, playerPos, playerVelocity) {
+                if (!SETTINGS.waterWakeEnabled || !particleSystem) return;
+                if (!playerPos || !playerVelocity || !isUnderwater) return;
+
+                const hSpeed = Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z);
+                if (hSpeed < 0.5) return;
+
+                const now = performance.now();
+                const cooldown = Math.max(50, 200 - hSpeed * 30);
+
+                if (now - lastWakeParticleTime < cooldown) return;
+                lastWakeParticleTime = now;
+
+                const sizeBase = SETTINGS.footstepSize ?? 0.15;
+
+                // Spawn foam/bubbles behind player
+                const behindX = playerPos.x - (playerVelocity.x / hSpeed) * 0.5;
+                const behindZ = playerPos.z - (playerVelocity.z / hSpeed) * 0.5;
+
+                // V-wake pattern: 2 particles offset perpendicular to movement
+                const perpX = -playerVelocity.z / hSpeed;
+                const perpZ = playerVelocity.x / hSpeed;
+
+                for (let side = -1; side <= 1; side += 2) {
+                    particleSystem.spawn(
+                        behindX + perpX * side * 0.25,
+                        playerPos.y - 0.3 + Math.random() * 0.2,
+                        behindZ + perpZ * side * 0.25,
+                        {
+                            vx: (Math.random() - 0.5) * 0.3,
+                            vy: -0.5 + Math.random() * 0.3, // Slight downward then float up
+                            vz: (Math.random() - 0.5) * 0.3,
+                            r: 0.85, g: 0.95, b: 1.0, a: 0.4,
+                            size: sizeBase * (0.4 + Math.random() * 0.3),
+                            life: 0.5 + Math.random() * 0.3,
+                            gravity: -0.5, // Float upward slightly
+                            type: 'wake'
+                        }
+                    );
+                }
+            }
+
+            /**
+             * Updates underwater bubble stream from player.
+             * @param {number} dt - Delta time.
+             * @param {THREE.Vector3} playerPos - Player position.
+             * @param {THREE.Vector3} playerVelocity - Player velocity.
+             */
+            function updateUnderwaterBubbles(dt, playerPos, playerVelocity) {
+                if (!SETTINGS.waterBubblesEnabled || !particleSystem) return;
+                if (!playerPos || !isUnderwater) return;
+
+                const now = performance.now();
+                const hSpeed = playerVelocity ? Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z) : 0;
+
+                // Base bubble rate: faster when moving
+                const bubbleCooldown = hSpeed > 1 ? 100 : 300;
+
+                if (now - lastBubbleTime >= bubbleCooldown) {
+                    lastBubbleTime = now;
+
+                    const sizeBase = SETTINGS.footstepSize ?? 0.15;
+
+                    // Spawn bubble slightly behind/below player
+                    particleSystem.spawn(
+                        playerPos.x + (Math.random() - 0.5) * 0.3,
+                        playerPos.y - 0.5 + (Math.random() - 0.5) * 0.3,
+                        playerPos.z + (Math.random() - 0.5) * 0.3,
+                        {
+                            vx: (Math.random() - 0.5) * 0.3,
+                            vy: 0, // Gravity handles upward float
+                            vz: (Math.random() - 0.5) * 0.3,
+                            r: 0.8, g: 0.92, b: 1.0, a: 0.5,
+                            size: sizeBase * (0.3 + Math.random() * 0.3),
+                            life: 1.5 + Math.random() * 1.0,
+                            gravity: -3 - Math.random() * 2, // Float upward
+                            type: 'bubble'
+                        }
+                    );
+                }
+
+                // Breath bubbles: periodic burst every 3-5 seconds
+                breathBubbleTimer += dt;
+                if (breathBubbleTimer >= 3 + Math.random() * 2) {
+                    breathBubbleTimer = 0;
+
+                    const sizeBase = SETTINGS.footstepSize ?? 0.15;
+                    const burstCount = 3 + Math.floor(Math.random() * 3);
+
+                    for (let i = 0; i < burstCount; i++) {
+                        particleSystem.spawn(
+                            playerPos.x + (Math.random() - 0.5) * 0.15,
+                            playerPos.y - 0.2,
+                            playerPos.z + (Math.random() - 0.5) * 0.15,
+                            {
+                                vx: (Math.random() - 0.5) * 0.2,
+                                vy: 0.5 + Math.random() * 0.5,
+                                vz: (Math.random() - 0.5) * 0.2,
+                                r: 0.85, g: 0.95, b: 1.0, a: 0.6,
+                                size: sizeBase * (0.5 + Math.random() * 0.3),
+                                life: 2.0,
+                                gravity: -4,
+                                type: 'breath_bubble'
+                            }
+                        );
+                    }
+                }
+            }
+
+            /**
+             * Main update function for all water velocity effects.
+             * Called from the main update loop.
+             * @param {number} dt - Delta time.
+             * @param {THREE.Vector3} playerPos - Player position.
+             * @param {THREE.Vector3} playerVelocity - Player velocity.
+             */
+            function updateWaterVelocityEffects(dt, playerPos, playerVelocity) {
+                updateWadingRipples(dt, playerPos, playerVelocity);
+                updateSwimWake(dt, playerPos, playerVelocity);
+                updateUnderwaterBubbles(dt, playerPos, playerVelocity);
             }
 
             // ============================================
@@ -16420,6 +16921,15 @@
                 if (particlesToggle) particlesToggle.checked = SETTINGS.particlesEnabled;
                 const waterRipplesToggle = document.getElementById("water-ripples-toggle");
                 if (waterRipplesToggle) waterRipplesToggle.checked = SETTINGS.waterRipplesEnabled;
+                // Water velocity effect toggles
+                const waterSplashToggle = document.getElementById("water-splash-toggle");
+                if (waterSplashToggle) waterSplashToggle.checked = SETTINGS.waterSplashParticlesEnabled;
+                const waterWadingToggle = document.getElementById("water-wading-toggle");
+                if (waterWadingToggle) waterWadingToggle.checked = SETTINGS.waterWadingRipplesEnabled;
+                const waterWakeToggle = document.getElementById("water-wake-toggle");
+                if (waterWakeToggle) waterWakeToggle.checked = SETTINGS.waterWakeEnabled;
+                const waterBubblesToggle = document.getElementById("water-bubbles-toggle");
+                if (waterBubblesToggle) waterBubblesToggle.checked = SETTINGS.waterBubblesEnabled;
                 const starsToggle = document.getElementById("stars-toggle");
                 if (starsToggle) starsToggle.checked = SETTINGS.starsEnabled;
                 const cloudsToggle = document.getElementById("clouds-toggle");
@@ -16638,6 +17148,11 @@
                 // Particle Effects toggles
                 particlesToggle?.addEventListener("change", () => { SETTINGS.particlesEnabled = particlesToggle.checked; saveSettings(); });
                 waterRipplesToggle?.addEventListener("change", () => { SETTINGS.waterRipplesEnabled = waterRipplesToggle.checked; saveSettings(); });
+                // Water velocity effect toggle listeners
+                waterSplashToggle?.addEventListener("change", () => { SETTINGS.waterSplashParticlesEnabled = waterSplashToggle.checked; saveSettings(); });
+                waterWadingToggle?.addEventListener("change", () => { SETTINGS.waterWadingRipplesEnabled = waterWadingToggle.checked; saveSettings(); });
+                waterWakeToggle?.addEventListener("change", () => { SETTINGS.waterWakeEnabled = waterWakeToggle.checked; saveSettings(); });
+                waterBubblesToggle?.addEventListener("change", () => { SETTINGS.waterBubblesEnabled = waterBubblesToggle.checked; saveSettings(); });
 
                 // Star layer visibility based on layer count setting
                 function updateStarLayerVisibility() {
@@ -17010,6 +17525,10 @@
                     if (zombieDesaturationToggle) zombieDesaturationToggle.checked = SETTINGS.zombieDesaturationEnabled;
                     if (particlesToggle) particlesToggle.checked = SETTINGS.particlesEnabled;
                     if (waterRipplesToggle) waterRipplesToggle.checked = SETTINGS.waterRipplesEnabled;
+                    if (waterSplashToggle) waterSplashToggle.checked = SETTINGS.waterSplashParticlesEnabled;
+                    if (waterWadingToggle) waterWadingToggle.checked = SETTINGS.waterWadingRipplesEnabled;
+                    if (waterWakeToggle) waterWakeToggle.checked = SETTINGS.waterWakeEnabled;
+                    if (waterBubblesToggle) waterBubblesToggle.checked = SETTINGS.waterBubblesEnabled;
                     if (starsToggle) starsToggle.checked = SETTINGS.starsEnabled;
                     if (cloudsToggle) cloudsToggle.checked = SETTINGS.cloudsEnabled;
                     if (colorGradingToggle) colorGradingToggle.checked = SETTINGS.colorGradingEnabled;
@@ -17203,6 +17722,11 @@
                     // Reset particle effects
                     SETTINGS.particlesEnabled = DEFAULTS.particlesEnabled;
                     SETTINGS.waterRipplesEnabled = DEFAULTS.waterRipplesEnabled;
+                    // Reset water velocity effects
+                    SETTINGS.waterSplashParticlesEnabled = DEFAULTS.waterSplashParticlesEnabled;
+                    SETTINGS.waterWadingRipplesEnabled = DEFAULTS.waterWadingRipplesEnabled;
+                    SETTINGS.waterWakeEnabled = DEFAULTS.waterWakeEnabled;
+                    SETTINGS.waterBubblesEnabled = DEFAULTS.waterBubblesEnabled;
                     // Reset atmospheric effects
                     SETTINGS.starsEnabled = DEFAULTS.starsEnabled;
                     SETTINGS.cloudsEnabled = DEFAULTS.cloudsEnabled;
@@ -23640,6 +24164,11 @@
                 // Update water ripples
                 updateWaterRipples(dt);
 
+                // Update water velocity effects (wading, wake, bubbles)
+                if (controls) {
+                    updateWaterVelocityEffects(dt, controls.getObject().position, velocity);
+                }
+
                 // Update color grading
                 updateColorGrading(dayNightTime);
 
@@ -24203,14 +24732,32 @@
                 const wasUnderwater = isUnderwater;
                 isUnderwater = (blockAtEye === WATER);
 
-                // Spawn water ripple when entering water
+                // Spawn water effects when entering water
                 if (isUnderwater && !wasUnderwater) {
-                    // Find water surface and spawn ripple
+                    // Capture entry velocity BEFORE water physics modifies it
+                    waterEntryVelocityY = velocity.y;
+                    const impactSpeed = Math.abs(waterEntryVelocityY);
+
+                    // Find water surface for effects
+                    let surfaceYForRipple = eyeBlockY;
                     for (let y = eyeBlockY; y < eyeBlockY + 10; y++) {
                         if (getBlock(eyeX, y, eyeZ) !== WATER) {
-                            spawnWaterRipple(camPos.x, y, camPos.z);
+                            surfaceYForRipple = y;
                             break;
                         }
+                    }
+
+                    // Spawn velocity-scaled ripple
+                    spawnWaterRipple(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
+
+                    // High-velocity impacts spawn splash column
+                    if (impactSpeed > 12 && SETTINGS.waterSplashParticlesEnabled) {
+                        spawnSplashColumn(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
+                    }
+
+                    // Spawn velocity-scaled splash particles
+                    if (SETTINGS.waterSplashParticlesEnabled) {
+                        spawnWaterEntrySplash(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
                     }
                 }
 
@@ -24249,6 +24796,9 @@
                     // Reset swimming state
                     swimSpaceHoldTime = 0;
                     isTreadingWater = false;
+
+                    // Reset bubble timer for next water entry
+                    breathBubbleTimer = 0;
 
                     // Reset underwater shader uniforms
                     if (underwaterPass) {
