@@ -1761,6 +1761,7 @@
                     <div class="control-row"><span>Select Block</span> <span class="key-badge">1-9</span></div>
                     <div class="control-row"><span>Toggle Debug</span> <span class="key-badge">~</span></div>
                     <div class="control-row"><span>Toggle Torch</span> <span class="key-badge">F</span></div>
+                    <div class="control-row"><span>Toggle View</span> <span class="key-badge">V</span></div>
                     <div class="control-row"><span>Open Inventory</span> <span class="key-badge">E</span></div>
                     <div class="control-row"><span>Quick Save</span> <span class="key-badge">F5</span></div>
                     <div class="control-row"><span>Quick Load</span> <span class="key-badge">F9</span></div>
@@ -10791,6 +10792,26 @@
                 arm: { height: 0.75, thickness: 0.25 },
                 head: { size: 0.5, height: 0.5, centerY: ZOMBIE_EYE_HEIGHT },
             };
+            /**
+             * Player body proportions scaled to PLAYER_EYE_HEIGHT_STAND (1.8).
+             * Slightly taller than zombies for visual distinction.
+             * @type {{hipY: number, leg: {height: number, thickness: number}, body: {height: number, width: number, depth: number}, shoulderY: number, arm: {height: number, thickness: number}, head: {size: number, height: number, centerY: number}}}
+             */
+            const PLAYER_PROPORTIONS = {
+                hipY: 0.85,
+                leg: { height: 0.85, thickness: 0.28 },
+                body: { height: 0.80, width: 0.55, depth: 0.28 },
+                shoulderY: 1.65,
+                arm: { height: 0.80, thickness: 0.25 },
+                head: { size: 0.45, height: 0.45, centerY: PLAYER_EYE_HEIGHT_STAND },
+            };
+            // Player body state
+            let playerBodyMesh = null;
+            let playerArmsModel = null;
+            let isThirdPerson = false;
+            let playerWalkPhase = 0;
+            let playerIdleTimer = 0;
+            let playerPose = null;
             const mobTmpA = new THREE.Vector3();
             const mobTmpB = new THREE.Vector3();
             const mobTmpC = new THREE.Vector3();
@@ -16520,6 +16541,7 @@
                 // Note: initUVLookupTable() is now called inside initBlockOptimization() after uvMap is populated
                 initZombies();
                 initDebugGrid();
+                initPlayerBody();
                 // 6. Find Spawn (keep this unchanged)
                 let maxSpawnY = -1;
                 const candidates = [ { x: 0, z: 0 }, { x: -1, z: 0 }, { x: 0, z: -1 }, { x: -1, z: -1 }, ];
@@ -21433,6 +21455,509 @@
                 // No pre-generated materials needed - each zombie is unique!
             }
             // =====================================================
+            // PLAYER BODY SYSTEM
+            // =====================================================
+            // Player body uses the same voxel construction pattern as zombies
+            // with pivot groups for limb rotation and lerped animations.
+            // Layer 2 is used for the body (separate from world Layer 0 and viewmodel Layer 1).
+            // =====================================================
+
+            /**
+             * Generate player skin texture canvas for body parts.
+             * Uses a simple human skin tone with basic clothing.
+             * @param {string} partType - 'head', 'body', 'arm', or 'leg'
+             * @returns {THREE.CanvasTexture} Generated texture
+             */
+            function generatePlayerSkinTexture(partType) {
+                const PIXELS_PER_TILE = Math.max(1, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+
+                // Color palettes
+                const skinTones = ["#e8beac", "#d9a693", "#c99a78"];
+                const shirtColors = ["#3a6ea5", "#2d5a8a", "#1e4670"]; // Blue shirt
+                const pantsColors = ["#4a4a4a", "#3d3d3d", "#2f2f2f"]; // Dark gray pants
+                const hairColors = ["#3d2314", "#2a1a0f", "#1f1409"]; // Dark brown hair
+
+                const fillPixel = (x, y, color) => {
+                    ctx.fillStyle = color;
+                    ctx.fillRect(x * STEP, y * STEP, STEP, STEP);
+                };
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        let color;
+                        const v = y / PIXELS_PER_TILE;
+
+                        if (partType === "head") {
+                            // Top part is hair, rest is skin with simple face
+                            if (v < 0.25) {
+                                color = hairColors[Math.floor(Math.random() * hairColors.length)];
+                            } else {
+                                color = skinTones[Math.floor(Math.random() * skinTones.length)];
+                            }
+                        } else if (partType === "body") {
+                            // Upper body is shirt
+                            color = shirtColors[Math.floor(Math.random() * shirtColors.length)];
+                        } else if (partType === "arm") {
+                            // Upper arm is shirt sleeve, lower is skin
+                            if (v < 0.5) {
+                                color = shirtColors[Math.floor(Math.random() * shirtColors.length)];
+                            } else {
+                                color = skinTones[Math.floor(Math.random() * skinTones.length)];
+                            }
+                        } else if (partType === "leg") {
+                            // Legs are pants
+                            color = pantsColors[Math.floor(Math.random() * pantsColors.length)];
+                        } else {
+                            color = skinTones[0];
+                        }
+                        fillPixel(x, y, color);
+                    }
+                }
+
+                const tex = new THREE.CanvasTexture(cvs);
+                tex.magFilter = THREE.NearestFilter;
+                tex.minFilter = THREE.NearestFilter;
+                registerPixelTexture(tex);
+                return tex;
+            }
+
+            /**
+             * Generate materials for player body parts.
+             * @returns {{head: THREE.MeshLambertMaterial, body: THREE.MeshLambertMaterial, arm: THREE.MeshLambertMaterial, leg: THREE.MeshLambertMaterial}}
+             */
+            function generatePlayerMaterials() {
+                return {
+                    head: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("head") }),
+                    body: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("body") }),
+                    arm: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("arm") }),
+                    leg: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("leg") }),
+                };
+            }
+
+            /**
+             * Build the player body mesh with pivot groups for animation.
+             * Follows the same pattern as buildZombieMesh().
+             * @returns {THREE.Group} Player body mesh group
+             */
+            function buildPlayerMesh() {
+                const group = new THREE.Group();
+                const { head, body, leg, shoulderY, hipY, arm } = PLAYER_PROPORTIONS;
+                const materials = generatePlayerMaterials();
+
+                // Create geometries
+                const headGeometry = new THREE.BoxGeometry(head.size, head.height, head.size);
+                const bodyGeometry = new THREE.BoxGeometry(body.width, body.height, body.depth);
+                const armGeometry = new THREE.BoxGeometry(arm.thickness, arm.height, arm.thickness);
+                const legGeometry = new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness);
+
+                // Create meshes
+                const headMesh = new THREE.Mesh(headGeometry, materials.head);
+                const bodyMesh = new THREE.Mesh(bodyGeometry, materials.body);
+
+                // Calculate offsets - legs under torso, arms at sides
+                const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
+                const armOffsetX = body.width * 0.5 + arm.thickness * 0.5;
+
+                // Left Arm - pivot at shoulder
+                const leftArmPivot = new THREE.Group();
+                const leftArmMesh = new THREE.Mesh(armGeometry, materials.arm);
+                leftArmMesh.castShadow = true;
+                leftArmMesh.receiveShadow = true;
+                leftArmMesh.position.y = -arm.height * 0.5;
+                leftArmPivot.add(leftArmMesh);
+                leftArmPivot.position.set(-armOffsetX, shoulderY, 0);
+
+                // Right Arm - pivot at shoulder
+                const rightArmPivot = new THREE.Group();
+                const rightArmMesh = new THREE.Mesh(armGeometry, materials.arm);
+                rightArmMesh.castShadow = true;
+                rightArmMesh.receiveShadow = true;
+                rightArmMesh.position.y = -arm.height * 0.5;
+                rightArmPivot.add(rightArmMesh);
+                rightArmPivot.position.set(armOffsetX, shoulderY, 0);
+
+                // Left Leg - pivot at hip
+                const leftLegPivot = new THREE.Group();
+                const leftLegMesh = new THREE.Mesh(legGeometry, materials.leg);
+                leftLegMesh.castShadow = true;
+                leftLegMesh.receiveShadow = true;
+                leftLegMesh.position.y = -leg.height * 0.5;
+                leftLegPivot.add(leftLegMesh);
+                leftLegPivot.position.set(-legOffsetX, hipY, 0);
+
+                // Right Leg - pivot at hip
+                const rightLegPivot = new THREE.Group();
+                const rightLegMesh = new THREE.Mesh(legGeometry, materials.leg);
+                rightLegMesh.castShadow = true;
+                rightLegMesh.receiveShadow = true;
+                rightLegMesh.position.y = -leg.height * 0.5;
+                rightLegPivot.add(rightLegMesh);
+                rightLegPivot.position.set(legOffsetX, hipY, 0);
+
+                // Position head and body
+                headMesh.position.set(0, head.centerY, 0);
+                bodyMesh.position.set(0, hipY + body.height * 0.5, 0);
+
+                // Enable shadows
+                headMesh.castShadow = true;
+                headMesh.receiveShadow = true;
+                bodyMesh.castShadow = true;
+                bodyMesh.receiveShadow = true;
+
+                // Store references for animation
+                const parts = {
+                    head: headMesh,
+                    body: bodyMesh,
+                    leftArm: leftArmPivot,
+                    rightArm: rightArmPivot,
+                    leftLeg: leftLegPivot,
+                    rightLeg: rightLegPivot,
+                    leftArmMesh,
+                    rightArmMesh,
+                    leftLegMesh,
+                    rightLegMesh,
+                };
+
+                // Add all parts to group
+                group.add(headMesh);
+                group.add(bodyMesh);
+                group.add(leftArmPivot);
+                group.add(rightArmPivot);
+                group.add(leftLegPivot);
+                group.add(rightLegPivot);
+
+                group.userData.parts = parts;
+                group.castShadow = true;
+                group.receiveShadow = true;
+
+                // Set to Layer 2 (player body layer)
+                group.traverse((child) => {
+                    if (child.isMesh) {
+                        child.layers.set(2);
+                    }
+                });
+
+                logDebug("[PlayerBody] Built player mesh with proportions:", PLAYER_PROPORTIONS);
+                return group;
+            }
+
+            /**
+             * Build viewmodel arms for first-person view.
+             * Similar to torch viewmodel: Layer 1, no depth test.
+             * @returns {THREE.Group} Viewmodel arms group
+             */
+            function buildPlayerViewmodelArms() {
+                const group = new THREE.Group();
+                const { arm } = PLAYER_PROPORTIONS;
+
+                // Create arm material with skin tone
+                const skinTones = ["#e8beac", "#d9a693"];
+                const PIXELS_PER_TILE = Math.max(1, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+                const shirtColors = ["#3a6ea5", "#2d5a8a"];
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        const v = y / PIXELS_PER_TILE;
+                        let color;
+                        if (v < 0.4) {
+                            color = shirtColors[Math.floor(Math.random() * shirtColors.length)];
+                        } else {
+                            color = skinTones[Math.floor(Math.random() * skinTones.length)];
+                        }
+                        ctx.fillStyle = color;
+                        ctx.fillRect(x * STEP, y * STEP, STEP, STEP);
+                    }
+                }
+
+                const tex = new THREE.CanvasTexture(cvs);
+                tex.magFilter = THREE.NearestFilter;
+                tex.minFilter = THREE.NearestFilter;
+                registerPixelTexture(tex);
+
+                const armMaterial = new THREE.MeshLambertMaterial({
+                    map: tex,
+                    depthTest: false,
+                    depthWrite: false,
+                });
+
+                // Arm geometry (smaller for viewmodel perspective)
+                const armGeo = new THREE.BoxGeometry(0.08, 0.35, 0.08);
+
+                // Left arm (visible in lower left of viewport)
+                const leftArmPivot = new THREE.Group();
+                const leftArm = new THREE.Mesh(armGeo, armMaterial);
+                leftArm.position.y = -0.175;
+                leftArm.renderOrder = 9998;
+                leftArm.layers.set(1);
+                leftArmPivot.add(leftArm);
+                leftArmPivot.position.set(-0.25, -0.30, -0.45);
+                leftArmPivot.rotation.set(0.3, 0.15, 0);
+
+                // Right arm (visible in lower right of viewport)
+                const rightArmPivot = new THREE.Group();
+                const rightArm = new THREE.Mesh(armGeo, armMaterial.clone());
+                rightArm.position.y = -0.175;
+                rightArm.renderOrder = 9998;
+                rightArm.layers.set(1);
+                rightArmPivot.add(rightArm);
+                rightArmPivot.position.set(0.25, -0.30, -0.45);
+                rightArmPivot.rotation.set(0.3, -0.15, 0);
+
+                group.add(leftArmPivot);
+                group.add(rightArmPivot);
+
+                group.userData.parts = {
+                    leftArm: leftArmPivot,
+                    rightArm: rightArmPivot,
+                    leftArmMesh: leftArm,
+                    rightArmMesh: rightArm,
+                };
+
+                group.layers.set(1);
+                group.renderOrder = 9998;
+                group.visible = true;
+
+                logDebug("[PlayerBody] Built viewmodel arms");
+                return group;
+            }
+
+            /**
+             * Animate player limbs based on movement state.
+             * Uses lerped smooth transitions like zombie animation.
+             * @param {number} dt - Delta time in seconds
+             * @param {{isMoving: boolean, isSprinting: boolean, isCrouching: boolean, isJumping: boolean, isFlying: boolean}} state - Movement state
+             * @param {number} moveSpeed - Current horizontal movement speed
+             */
+            function animatePlayerLimbs(dt, state, moveSpeed) {
+                if (!playerBodyMesh) return;
+                const parts = playerBodyMesh.userData.parts;
+                if (!parts) return;
+
+                // Initialize pose cache
+                if (!playerPose) {
+                    playerPose = {
+                        leftArm: 0,
+                        rightArm: 0,
+                        leftLeg: 0,
+                        rightLeg: 0,
+                        headX: 0,
+                        headY: PLAYER_PROPORTIONS.head.centerY,
+                        bodyY: PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5,
+                    };
+                }
+
+                // Smoothing function
+                const smooth = (key, target, factor = 0.18) => {
+                    playerPose[key] = THREE.MathUtils.lerp(playerPose[key], target, 1 - Math.pow(1 - factor, dt * 60));
+                    return playerPose[key];
+                };
+
+                // Calculate animation targets
+                let targetArmL = 0, targetArmR = 0, targetLegL = 0, targetLegR = 0;
+                let targetHeadY = PLAYER_PROPORTIONS.head.centerY;
+                let targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5;
+
+                // Stride rate based on movement type
+                let strideRate = 3.5;
+                let amplitude = 0.5;
+
+                if (state.isFlying) {
+                    // Flying: arms slightly back, legs trailing
+                    playerIdleTimer += dt;
+                    const flyBob = Math.sin(playerIdleTimer * 2) * 0.05;
+                    targetArmL = -0.4 + flyBob;
+                    targetArmR = -0.4 - flyBob;
+                    targetLegL = 0.2;
+                    targetLegR = 0.2;
+                } else if (state.isMoving) {
+                    // Walking or running animation
+                    if (state.isSprinting) {
+                        strideRate = 6.0;
+                        amplitude = 0.7;
+                    } else if (state.isCrouching) {
+                        strideRate = 2.0;
+                        amplitude = 0.3;
+                        // Lower body when crouching
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                    }
+
+                    playerWalkPhase += dt * strideRate;
+                    const swing = Math.sin(playerWalkPhase) * amplitude;
+                    const counter = Math.cos(playerWalkPhase) * amplitude;
+
+                    // Arms and legs swing in opposition
+                    targetArmL = swing;
+                    targetArmR = -swing;
+                    targetLegL = -counter;
+                    targetLegR = counter;
+                } else {
+                    // Idle animation - subtle breathing
+                    playerIdleTimer += dt;
+                    const breathe = Math.sin(playerIdleTimer * 1.2) * 0.04;
+                    targetHeadY = PLAYER_PROPORTIONS.head.centerY + breathe * 0.5;
+                    targetArmL = Math.sin(playerIdleTimer * 0.8) * 0.06;
+                    targetArmR = Math.sin(playerIdleTimer * 0.8 + 0.5) * 0.06;
+
+                    if (state.isCrouching) {
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                    }
+                }
+
+                // Apply smoothed rotations
+                parts.leftArm.rotation.x = smooth("leftArm", targetArmL);
+                parts.rightArm.rotation.x = smooth("rightArm", targetArmR);
+                parts.leftLeg.rotation.x = smooth("leftLeg", targetLegL, 0.12);
+                parts.rightLeg.rotation.x = smooth("rightLeg", targetLegR, 0.12);
+                parts.head.position.y = smooth("headY", targetHeadY, 0.15);
+                parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
+            }
+
+            /**
+             * Animate viewmodel arms based on movement.
+             * @param {number} dt - Delta time
+             * @param {{isMoving: boolean, isSprinting: boolean}} state - Movement state
+             */
+            function animateViewmodelArms(dt, state) {
+                if (!playerArmsModel) return;
+                const parts = playerArmsModel.userData.parts;
+                if (!parts) return;
+
+                // Bob animation when moving
+                let bobAmplitude = 0;
+                let bobSpeed = 0;
+
+                if (state.isMoving) {
+                    bobAmplitude = state.isSprinting ? 0.08 : 0.04;
+                    bobSpeed = state.isSprinting ? 8 : 5;
+                }
+
+                playerWalkPhase += dt * bobSpeed;
+                const bob = Math.sin(playerWalkPhase) * bobAmplitude;
+                const sway = Math.cos(playerWalkPhase * 0.5) * bobAmplitude * 0.5;
+
+                // Apply subtle movement to viewmodel arms
+                parts.leftArm.position.y = -0.30 + bob;
+                parts.rightArm.position.y = -0.30 - bob;
+                parts.leftArm.position.x = -0.25 + sway;
+                parts.rightArm.position.x = 0.25 - sway;
+            }
+
+            /**
+             * Update player body position and animation each frame.
+             * @param {number} dt - Delta time in seconds
+             */
+            function updatePlayerBody(dt) {
+                if (!controls) return;
+
+                const camPos = controls.getObject().position;
+
+                // Get movement state
+                const velX = velocity.x;
+                const velZ = velocity.z;
+                const horizontalSpeedSq = velX * velX + velZ * velZ;
+                const isMoving = horizontalSpeedSq > 0.01;
+                const moveSpeed = Math.sqrt(horizontalSpeedSq);
+
+                const state = {
+                    isMoving,
+                    isSprinting: isSprinting && isMoving,
+                    isCrouching,
+                    isJumping: !canJump && velocity.y > 0,
+                    isFlying,
+                };
+
+                // Update body mesh position and rotation
+                if (playerBodyMesh) {
+                    // Position body so feet are on ground (offset by eye height)
+                    playerBodyMesh.position.set(
+                        camPos.x,
+                        camPos.y - PLAYER_EYE_HEIGHT_STAND,
+                        camPos.z
+                    );
+
+                    // Rotate body to match camera yaw
+                    const camDir = camera.getWorldDirection(mobTmpA);
+                    playerBodyMesh.rotation.y = Math.atan2(camDir.x, camDir.z);
+
+                    // Animate limbs
+                    animatePlayerLimbs(dt, state, moveSpeed);
+
+                    // Toggle head visibility based on view mode
+                    const parts = playerBodyMesh.userData.parts;
+                    if (parts && parts.head) {
+                        parts.head.visible = isThirdPerson;
+                    }
+                }
+
+                // Update viewmodel arms
+                if (playerArmsModel && !isThirdPerson) {
+                    animateViewmodelArms(dt, state);
+                    playerArmsModel.visible = !isThirdPerson;
+                }
+            }
+
+            /**
+             * Toggle between first-person and third-person view.
+             */
+            function toggleThirdPerson() {
+                isThirdPerson = !isThirdPerson;
+
+                if (playerBodyMesh) {
+                    const parts = playerBodyMesh.userData.parts;
+                    if (parts && parts.head) {
+                        parts.head.visible = isThirdPerson;
+                    }
+                }
+
+                if (playerArmsModel) {
+                    playerArmsModel.visible = !isThirdPerson;
+                }
+
+                logDebug(`[PlayerBody] Third-person mode: ${isThirdPerson}`);
+            }
+
+            /**
+             * Initialize the player body system.
+             * Called from initGame() after scene setup.
+             */
+            function initPlayerBody() {
+                logDebug("[PlayerBody] Initializing player body system...");
+
+                // Build the body mesh
+                playerBodyMesh = buildPlayerMesh();
+                scene.add(playerBodyMesh);
+
+                // Build viewmodel arms and attach to camera
+                playerArmsModel = buildPlayerViewmodelArms();
+                camera.add(playerArmsModel);
+
+                // Hide head in first-person mode
+                const parts = playerBodyMesh.userData.parts;
+                if (parts && parts.head) {
+                    parts.head.visible = false;
+                }
+
+                // Enable camera layer 2 for player body
+                camera.layers.enable(2);
+
+                logDebug("[PlayerBody] Player body system initialized");
+            }
+
+            // =====================================================
             // TERRAIN GENERATION GLOBAL FUNCTIONS
             // =====================================================
             // NOTE: These functions DUPLICATE methods in the TerrainGenerator class
@@ -25406,10 +25931,11 @@
                 // Always use composer - bypassing causes color/lighting changes
                 const useComposer = true;
 
-                // Two-pass rendering for torch viewmodel
-                if (torchActive && window.torchModel) {
-                    // Pass 1: Render world (Layer 0)
+                // Two-pass rendering for torch/arms viewmodel
+                if ((torchActive && window.torchModel) || playerArmsModel) {
+                    // Pass 1: Render world (Layer 0) and player body (Layer 2)
                     camera.layers.set(0);
+                    camera.layers.enable(2); // Include player body
                     if (useComposer) {
                         composer.render();
                     } else {
@@ -25422,9 +25948,10 @@
                     renderer.clearDepth();
                     renderer.render(scene, camera);
                     renderer.autoClear = true;
-                    // Re-enable both layers
+                    // Re-enable all layers
                     camera.layers.enable(0);
                     camera.layers.enable(1);
+                    camera.layers.enable(2);
                 } else {
                     // Single-pass rendering
                     camera.layers.enableAll();
@@ -25593,6 +26120,7 @@
                     updateVisualEffects(time);
                     // Entity and material updates
                     updateZombies(clampedDt);
+                    updatePlayerBody(clampedDt);
                     flushMaterialUpdates();
                     // OPTIMIZATION: Process scheduled and incremental updates
                     scheduledUpdates.process();
@@ -25706,6 +26234,7 @@
                     case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); break;
                     case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); break;
                     case "KeyF": torchActive = !torchActive; if (window.torchModel) { window.torchModel.visible = torchActive; } if (torchLight) { torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0; } break;
+                    case "KeyV": toggleThirdPerson(); break;
                 }
             };
             function onKeyUp(e) {
