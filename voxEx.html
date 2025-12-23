@@ -8815,6 +8815,7 @@
             let waterSurfaceY = 0; // Y position of water surface for treading
             // Water velocity effects state
             let waterEntryVelocityY = 0; // Capture vertical velocity at moment of water entry
+            let wasFeetInWater = false; // Track feet water state for splash timing
             let lastWadeRippleTime = 0; // Cooldown tracking for wading ripples
             let lastWakeParticleTime = 0; // Cooldown tracking for swim wake
             let lastBubbleTime = 0; // Cooldown tracking for underwater bubbles
@@ -11369,7 +11370,7 @@
 
             /**
              * Creates a voxel-style diamond/octagonal ring geometry for water ripples.
-             * Uses BufferGeometry with 4 or 8 vertices per ring for blocky aesthetic.
+             * Uses shared vertices for a continuous ring with no seams.
              * @param {number} innerRadius - Inner radius of the ring.
              * @param {number} outerRadius - Outer radius of the ring.
              * @param {number} segments - Number of segments (4 for diamond, 8 for octagon).
@@ -11381,39 +11382,45 @@
                 const indices = [];
                 const uvs = [];
 
-                // Rotate by 45 degrees for diamond orientation when segments=4
+                // Rotate 45° for diamond orientation when segments=4
                 const angleOffset = segments === 4 ? Math.PI / 4 : 0;
+
+                // Create vertices: inner ring first, then outer ring (shared corners)
+                for (let i = 0; i < segments; i++) {
+                    const angle = (i / segments) * Math.PI * 2 + angleOffset;
+
+                    // Inner vertex
+                    vertices.push(
+                        Math.cos(angle) * innerRadius,
+                        0,
+                        Math.sin(angle) * innerRadius
+                    );
+                    uvs.push(0.5 + Math.cos(angle) * 0.25, 0.5 + Math.sin(angle) * 0.25);
+                }
 
                 for (let i = 0; i < segments; i++) {
                     const angle = (i / segments) * Math.PI * 2 + angleOffset;
-                    const nextAngle = ((i + 1) / segments) * Math.PI * 2 + angleOffset;
 
-                    // Inner vertices
-                    const ix1 = Math.cos(angle) * innerRadius;
-                    const iz1 = Math.sin(angle) * innerRadius;
-                    const ix2 = Math.cos(nextAngle) * innerRadius;
-                    const iz2 = Math.sin(nextAngle) * innerRadius;
+                    // Outer vertex
+                    vertices.push(
+                        Math.cos(angle) * outerRadius,
+                        0,
+                        Math.sin(angle) * outerRadius
+                    );
+                    uvs.push(0.5 + Math.cos(angle) * 0.5, 0.5 + Math.sin(angle) * 0.5);
+                }
 
-                    // Outer vertices
-                    const ox1 = Math.cos(angle) * outerRadius;
-                    const oz1 = Math.sin(angle) * outerRadius;
-                    const ox2 = Math.cos(nextAngle) * outerRadius;
-                    const oz2 = Math.sin(nextAngle) * outerRadius;
-
-                    const baseIdx = i * 4;
-
-                    // Add vertices (inner1, inner2, outer1, outer2)
-                    vertices.push(ix1, 0, iz1);
-                    vertices.push(ix2, 0, iz2);
-                    vertices.push(ox1, 0, oz1);
-                    vertices.push(ox2, 0, oz2);
-
-                    // UVs for potential texture support
-                    uvs.push(0, 0, 1, 0, 0, 1, 1, 1);
+                // Create triangles connecting inner and outer rings
+                for (let i = 0; i < segments; i++) {
+                    const nextI = (i + 1) % segments;
+                    const inner1 = i;
+                    const inner2 = nextI;
+                    const outer1 = i + segments;
+                    const outer2 = nextI + segments;
 
                     // Two triangles per segment
-                    indices.push(baseIdx, baseIdx + 2, baseIdx + 1);
-                    indices.push(baseIdx + 1, baseIdx + 2, baseIdx + 3);
+                    indices.push(inner1, outer1, inner2);
+                    indices.push(inner2, outer1, outer2);
                 }
 
                 geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
@@ -11441,7 +11448,7 @@
                 // Calculate velocity-based parameters
                 const initialScale = 0.1 + clampedVelocity * 0.08;
                 const expansionRate = 2 + clampedVelocity * 0.25;
-                const initialOpacity = Math.min(0.6, 0.3 + clampedVelocity * 0.02);
+                const initialOpacity = Math.min(0.5, 0.2 + clampedVelocity * 0.02);
                 const lifespan = 1.2 + clampedVelocity * 0.08;
 
                 // For high-velocity impacts, spawn multiple concentric ripples
@@ -11462,7 +11469,7 @@
                         }
 
                         // Use diamond geometry (4 segments) for voxel aesthetic
-                        const geometry = createSquareRippleGeometry(0.05, 0.12, 4);
+                        const geometry = createSquareRippleGeometry(0.08, 0.15, 4);
                         const material = new THREE.MeshBasicMaterial({
                             color: 0xaaddff,
                             transparent: true,
@@ -11514,7 +11521,7 @@
                     }
                 }
 
-                const geometry = createSquareRippleGeometry(0.03, 0.07, 4);
+                const geometry = createSquareRippleGeometry(0.05, 0.09, 4);
                 const material = new THREE.MeshBasicMaterial({
                     color: 0xaaddff,
                     transparent: true,
@@ -24727,39 +24734,46 @@
                 const eyeZ = Math.floor(camPos.z);
                 const eyeBlockY = Math.floor(eyeY);
 
-                // Check if player's eyes are in water
-                const blockAtEye = getBlock(eyeX, eyeBlockY, eyeZ);
-                const wasUnderwater = isUnderwater;
-                isUnderwater = (blockAtEye === WATER);
+                // Check feet position first (for splash/ripple timing)
+                const feetY = Math.floor(camPos.y - 1.7);
+                const feetX = Math.floor(camPos.x);
+                const feetZ = Math.floor(camPos.z);
+                const feetInWater = getBlock(feetX, feetY, feetZ) === WATER;
 
-                // Spawn water effects when entering water
-                if (isUnderwater && !wasUnderwater) {
-                    // Capture entry velocity BEFORE water physics modifies it
+                // Trigger effects when FEET enter water (realistic splash timing)
+                if (feetInWater && !wasFeetInWater) {
+                    // Capture velocity at moment feet touch water
                     waterEntryVelocityY = velocity.y;
                     const impactSpeed = Math.abs(waterEntryVelocityY);
 
-                    // Find water surface for effects
-                    let surfaceYForRipple = eyeBlockY;
-                    for (let y = eyeBlockY; y < eyeBlockY + 10; y++) {
-                        if (getBlock(eyeX, y, eyeZ) !== WATER) {
-                            surfaceYForRipple = y;
+                    // Find water surface (first air block above feet)
+                    let surfaceY = feetY + 1;
+                    for (let y = feetY; y < feetY + 10; y++) {
+                        if (getBlock(feetX, y, feetZ) !== WATER) {
+                            surfaceY = y;
                             break;
                         }
                     }
 
-                    // Spawn velocity-scaled ripple
-                    spawnWaterRipple(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
+                    // Spawn velocity-scaled ripple at water surface
+                    spawnWaterRipple(camPos.x, surfaceY, camPos.z, waterEntryVelocityY);
 
                     // High-velocity impacts spawn splash column
                     if (impactSpeed > 12 && SETTINGS.waterSplashParticlesEnabled) {
-                        spawnSplashColumn(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
+                        spawnSplashColumn(camPos.x, surfaceY, camPos.z, waterEntryVelocityY);
                     }
 
                     // Spawn velocity-scaled splash particles
                     if (SETTINGS.waterSplashParticlesEnabled) {
-                        spawnWaterEntrySplash(camPos.x, surfaceYForRipple, camPos.z, waterEntryVelocityY);
+                        spawnWaterEntrySplash(camPos.x, surfaceY, camPos.z, waterEntryVelocityY);
                     }
                 }
+                wasFeetInWater = feetInWater;
+
+                // Check if player's eyes are in water (for underwater effects)
+                const blockAtEye = getBlock(eyeX, eyeBlockY, eyeZ);
+                const wasUnderwater = isUnderwater;
+                isUnderwater = (blockAtEye === WATER);
 
                 if (isUnderwater) {
                     // OPTIMIZATION: Only recalculate depth when Y position changes significantly
@@ -24797,7 +24811,8 @@
                     swimSpaceHoldTime = 0;
                     isTreadingWater = false;
 
-                    // Reset bubble timer for next water entry
+                    // Reset water entry tracking for next water entry
+                    wasFeetInWater = false;
                     breathBubbleTimer = 0;
 
                     // Reset underwater shader uniforms
