@@ -10813,11 +10813,10 @@
             let playerIdleTimer = 0;
             let playerPose = null;
             let viewmodelWalkPhase = 0; // Separate phase for viewmodel arms
-            // Third-person camera settings
-            const THIRD_PERSON_DISTANCE = 4.5;  // Distance behind player
-            const THIRD_PERSON_HEIGHT = 2.0;    // Height above player feet
-            const THIRD_PERSON_LOOK_HEIGHT = 1.0; // Look at player chest
-            let savedFirstPersonPos = null; // Store camera position when entering third-person
+            // Third-person camera settings (LOCAL offsets from controls object)
+            const THIRD_PERSON_DISTANCE = 4.0;  // Distance behind player (Z offset)
+            const THIRD_PERSON_HEIGHT = 2.5;    // Height above player feet
+            const THIRD_PERSON_LOOK_HEIGHT = 1.2; // Look at chest level
             const mobTmpA = new THREE.Vector3();
             const mobTmpB = new THREE.Vector3();
             const mobTmpC = new THREE.Vector3();
@@ -21892,10 +21891,17 @@
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
                     if (isThirdPerson) {
-                        // In third-person: body stays at player position, camera orbits
-                        // Get camera direction for body rotation
-                        const camDir = camera.getWorldDirection(mobTmpA);
-                        const bodyYaw = Math.atan2(camDir.x, camDir.z);
+                        // In third-person: body stays at player position, camera orbits behind
+                        // Body rotation based on controls yaw (not camera, since camera looks backward)
+                        const controlsYaw = controlsObj.rotation.y;
+
+                        // If moving, face movement direction; otherwise face controls direction
+                        let bodyYaw = controlsYaw;
+                        if (isMoving && (Math.abs(velX) > 0.01 || Math.abs(velZ) > 0.01)) {
+                            // Calculate movement angle relative to controls
+                            const moveAngle = Math.atan2(velX, -velZ);
+                            bodyYaw = controlsYaw + moveAngle;
+                        }
 
                         // Position body at player location (feet on ground)
                         playerBodyMesh.position.set(
@@ -21903,25 +21909,35 @@
                             camPos.y - PLAYER_EYE_HEIGHT_STAND,
                             camPos.z
                         );
-                        playerBodyMesh.rotation.y = bodyYaw;
+                        // Smooth body rotation
+                        playerBodyMesh.rotation.y = THREE.MathUtils.lerp(
+                            playerBodyMesh.rotation.y,
+                            bodyYaw,
+                            0.15
+                        );
 
-                        // Calculate camera offset behind player
-                        const offsetX = Math.sin(bodyYaw) * THIRD_PERSON_DISTANCE;
-                        const offsetZ = Math.cos(bodyYaw) * THIRD_PERSON_DISTANCE;
+                        // Calculate LOCAL camera offset behind player (camera is child of controls)
+                        // Offset is relative to controls object, which faces -Z by default
+                        // So offsetZ positive = behind player, offsetY positive = above eye level
+                        const localOffsetY = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+                        const localOffsetZ = THIRD_PERSON_DISTANCE;
 
-                        // Target camera position (behind and above player)
-                        const targetCamX = camPos.x + offsetX;
-                        const targetCamY = camPos.y - PLAYER_EYE_HEIGHT_STAND + THIRD_PERSON_HEIGHT;
-                        const targetCamZ = camPos.z + offsetZ;
+                        // Smooth camera LOCAL position
+                        camera.position.x = THREE.MathUtils.lerp(camera.position.x, 0, 0.15);
+                        camera.position.y = THREE.MathUtils.lerp(camera.position.y, localOffsetY, 0.15);
+                        camera.position.z = THREE.MathUtils.lerp(camera.position.z, localOffsetZ, 0.15);
 
-                        // Smooth camera movement
-                        camera.position.x = THREE.MathUtils.lerp(camera.position.x, targetCamX, 0.15);
-                        camera.position.y = THREE.MathUtils.lerp(camera.position.y, targetCamY, 0.15);
-                        camera.position.z = THREE.MathUtils.lerp(camera.position.z, targetCamZ, 0.15);
+                        // Calculate pitch to look down at player body
+                        // Camera looks toward origin of parent (player position)
+                        const distToPlayer = localOffsetZ;
+                        const heightDiff = localOffsetY - THIRD_PERSON_LOOK_HEIGHT + PLAYER_EYE_HEIGHT_STAND;
+                        const pitchAngle = Math.atan2(heightDiff, distToPlayer);
 
-                        // Look at player chest level
-                        const lookAtY = camPos.y - PLAYER_EYE_HEIGHT_STAND + THIRD_PERSON_LOOK_HEIGHT;
-                        camera.lookAt(camPos.x, lookAtY, camPos.z);
+                        // Smooth camera LOCAL rotation
+                        // Yaw = PI to look backward (toward player), pitch to look down
+                        camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, pitchAngle, 0.15);
+                        camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, Math.PI, 0.15);
+                        camera.rotation.z = 0;
                     } else {
                         // In first-person: body follows camera, offset slightly forward for shadows
                         const camDir = camera.getWorldDirection(mobTmpA);
@@ -21965,17 +21981,13 @@
                 isThirdPerson = !isThirdPerson;
 
                 if (isThirdPerson) {
-                    // Entering third-person: save camera state for restoration
-                    savedFirstPersonPos = camera.position.clone();
+                    // Entering third-person: camera will be positioned by updatePlayerBody
                     logDebug("[PlayerBody] Entering third-person mode");
                 } else {
-                    // Exiting third-person: restore camera to controls position
-                    if (savedFirstPersonPos) {
-                        // Reset camera to follow controls object
-                        const controlsPos = controls.getObject().position;
-                        camera.position.copy(controlsPos);
-                        savedFirstPersonPos = null;
-                    }
+                    // Exiting third-person: reset camera to LOCAL origin (first-person position)
+                    // Camera is child of controls, so (0,0,0) = eye position
+                    camera.position.set(0, 0, 0);
+                    camera.rotation.set(0, 0, 0);
                     logDebug("[PlayerBody] Returning to first-person mode");
                 }
 
@@ -25250,10 +25262,18 @@
             // Apply a single collision step (axis-sweep collision resolution)
             function applyCollisionStep(obj, stepDt) {
                 // Get movement directions
-                controls.getDirection(_physFwd);
-                _physFwd.y = 0;
-                _physFwd.normalize();
-                _physRight.crossVectors(_physFwd, _physUp);
+                // In third-person, camera looks backward so controls.getDirection() is wrong
+                // Use controls object yaw instead for consistent movement direction
+                if (isThirdPerson) {
+                    const yaw = controls.getObject().rotation.y;
+                    _physFwd.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+                    _physRight.set(Math.cos(yaw), 0, -Math.sin(yaw));
+                } else {
+                    controls.getDirection(_physFwd);
+                    _physFwd.y = 0;
+                    _physFwd.normalize();
+                    _physRight.crossVectors(_physFwd, _physUp);
+                }
                 // Calculate deltas
                 const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
                 const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
