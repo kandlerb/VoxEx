@@ -10834,6 +10834,10 @@
             const THIRD_PERSON_DISTANCE = 4.0;  // Distance behind player (Z offset)
             const THIRD_PERSON_HEIGHT = 2.5;    // Height above player feet
             const THIRD_PERSON_LOOK_HEIGHT = 1.2; // Look at chest level
+            // Third-person orbit camera state
+            let thirdPersonOrbitPitch = 0;  // Accumulated pitch from mouse Y input
+            const ORBIT_PITCH_MIN = -Math.PI / 3;  // -60° (look up)
+            const ORBIT_PITCH_MAX = Math.PI / 3;   // +60° (look down)
             // Third-person debug state
             let thirdPersonDebugEnabled = true; // Set to false to disable logging
             let thirdPersonDebugThrottle = 0;
@@ -17159,6 +17163,18 @@
                     scene.add(controls.getObject());
                 }
 
+                // Third-person orbit camera: track mouse Y for pitch when in third-person
+                // PointerLockControls handles first-person, we handle third-person orbit
+                document.addEventListener('mousemove', (e) => {
+                    if (isThirdPerson && controls && controls.isLocked) {
+                        // Mouse Y controls orbit pitch (same sensitivity as PointerLockControls)
+                        const sensitivity = 0.002;
+                        thirdPersonOrbitPitch += e.movementY * sensitivity;
+                        // Clamp to prevent flipping
+                        thirdPersonOrbitPitch = Math.max(ORBIT_PITCH_MIN, Math.min(ORBIT_PITCH_MAX, thirdPersonOrbitPitch));
+                    }
+                });
+
                 // UI Elements
                 const blocker = document.getElementById("blocker");
                 const mainPauseMenu = document.getElementById("main-pause-menu");
@@ -22007,22 +22023,52 @@
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
                     if (isThirdPerson) {
-                        // In third-person: body at player position, camera offset behind
-                        // Camera is child of cameraRig, so camera.position is LOCAL offset
+                        // ORBIT CAMERA: Use mouse input for camera orbit around player
+                        // - Yaw from controls.getObject().rotation.y (handled by PointerLockControls)
+                        // - Pitch from thirdPersonOrbitPitch (tracked in our mousemove handler)
 
-                        // If moving, face movement direction; otherwise face controls direction
-                        let bodyYaw = controlsYaw;
-                        if (isMoving && (Math.abs(velX) > 0.01 || Math.abs(velZ) > 0.01)) {
-                            const moveAngle = Math.atan2(velX, -velZ);
-                            bodyYaw = controlsYaw + moveAngle;
-                        }
+                        // Read orbit angles
+                        const orbitYaw = controlsYaw;  // Mouse X controls horizontal orbit
+                        const orbitPitch = thirdPersonOrbitPitch;  // Mouse Y controls vertical orbit (tracked separately)
 
-                        // Position body at player's current world position (LIVE, not saved)
+                        // Calculate camera position on sphere around player
+                        const dist = THIRD_PERSON_DISTANCE;
+                        const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+
+                        // Spherical coordinates: use pitch for elevation, yaw for horizontal angle
+                        // Camera orbits behind player (+Z in local space when yaw=0)
+                        const horizontalDist = dist * Math.cos(orbitPitch);
+                        const verticalOffset = dist * Math.sin(orbitPitch) + heightOffset;
+
+                        // Position camera in LOCAL space (relative to cameraRig at player position)
+                        const camX = Math.sin(orbitYaw) * horizontalDist;
+                        const camY = verticalOffset;
+                        const camZ = Math.cos(orbitYaw) * horizontalDist;
+
+                        camera.position.set(camX, camY, camZ);
+
+                        // Look at player chest (local origin + look height offset)
+                        const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+                        camera.lookAt(0, lookY, 0);
+
+                        // Position body mesh at player world position
                         playerBodyMesh.position.set(
                             playerWorldPos.x,
                             playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND,
                             playerWorldPos.z
                         );
+
+                        // Body faces movement direction when moving, otherwise faces camera direction
+                        let bodyYaw;
+                        if (isMoving && (Math.abs(velX) > 0.01 || Math.abs(velZ) > 0.01)) {
+                            // Face movement direction (relative to world)
+                            const moveAngle = Math.atan2(velX, -velZ);
+                            bodyYaw = controlsYaw + moveAngle;
+                        } else {
+                            // Face away from camera (toward where camera is looking)
+                            bodyYaw = orbitYaw + Math.PI;
+                        }
+
                         // Smooth body rotation
                         playerBodyMesh.rotation.y = THREE.MathUtils.lerp(
                             playerBodyMesh.rotation.y,
@@ -22030,32 +22076,12 @@
                             0.15
                         );
 
-                        // Camera LOCAL offset (relative to controls object which moves with player)
-                        const localOffsetY = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
-                        const localOffsetZ = THIRD_PERSON_DISTANCE;
-
-                        // Smooth camera LOCAL position
-                        camera.position.x = THREE.MathUtils.lerp(camera.position.x, 0, 0.15);
-                        camera.position.y = THREE.MathUtils.lerp(camera.position.y, localOffsetY, 0.15);
-                        camera.position.z = THREE.MathUtils.lerp(camera.position.z, localOffsetZ, 0.15);
-
-                        // Calculate pitch to look down at player body
-                        const distToPlayer = localOffsetZ;
-                        const heightDiff = localOffsetY - THIRD_PERSON_LOOK_HEIGHT + PLAYER_EYE_HEIGHT_STAND;
-                        const pitchAngle = Math.atan2(heightDiff, distToPlayer);
-
-                        // Smooth camera LOCAL rotation
-                        // Yaw = PI to look backward (toward player), pitch to look down
-                        camera.rotation.x = THREE.MathUtils.lerp(camera.rotation.x, pitchAngle, 0.15);
-                        camera.rotation.y = THREE.MathUtils.lerp(camera.rotation.y, Math.PI, 0.15);
-                        camera.rotation.z = 0;
-
                         // Debug logging
                         logThirdPersonDebug('updatePlayerBody', {
                             playerWorldPos: `(${playerWorldPos.x.toFixed(1)}, ${playerWorldPos.y.toFixed(1)}, ${playerWorldPos.z.toFixed(1)})`,
-                            camLocalPos: `(${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)})`,
-                            controlsYaw: (controlsYaw * 180 / Math.PI).toFixed(1) + '°',
-                            bodyYaw: (bodyYaw * 180 / Math.PI).toFixed(1) + '°'
+                            camLocalPos: `(${camX.toFixed(1)}, ${camY.toFixed(1)}, ${camZ.toFixed(1)})`,
+                            orbitYaw: (orbitYaw * 180 / Math.PI).toFixed(1) + '°',
+                            orbitPitch: (orbitPitch * 180 / Math.PI).toFixed(1) + '°'
                         });
                     } else {
                         // In first-person: body follows camera, offset slightly forward for shadows
@@ -22106,8 +22132,8 @@
                 console.log(`[3P-DEBUG] Camera LOCAL pos: (${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)})`);
 
                 if (isThirdPerson) {
-                    // Entering third-person: camera will be positioned by updatePlayerBody
-                    // Camera is child of controls, so camera.position is LOCAL offset
+                    // Entering third-person: initialize orbit pitch to slightly look down at player
+                    thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
                     logDebug("[PlayerBody] Entering third-person mode");
                 } else {
                     // Exiting third-person: reset camera to LOCAL origin (first-person position)
