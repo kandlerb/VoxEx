@@ -10609,6 +10609,20 @@
             }
 
             let camera, scene, renderer, controls, raycaster;
+            let cameraRig = null; // Object3D that holds player world position; camera is child with local offset
+
+            /**
+             * Get the player's world position.
+             * With cameraRig: returns cameraRig.position (player world pos)
+             * Without cameraRig: returns controls.getObject().position (legacy)
+             * @returns {THREE.Vector3} Player world position
+             */
+            function getPlayerWorldPosition() {
+                if (cameraRig) {
+                    return cameraRig.position;
+                }
+                return controls ? controls.getObject().position : camera.position;
+            }
             let composer, renderPass, zombieScarePass, underwaterPass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
@@ -10838,17 +10852,18 @@
                 if (now - thirdPersonDebugThrottle < THIRD_PERSON_DEBUG_INTERVAL) return;
                 thirdPersonDebugThrottle = now;
 
-                const controlsObj = controls.getObject();
-                const playerWorldPos = controlsObj.position; // Live reference!
+                const playerWorldPos = getPlayerWorldPosition();
+                const controlsYaw = controls.getObject().rotation.y;
                 const camWorldDir = new THREE.Vector3();
                 camera.getWorldDirection(camWorldDir);
 
                 console.log(`[3P-DEBUG] ${label}`);
-                console.log(`  Player World Pos (LIVE): (${playerWorldPos.x.toFixed(2)}, ${playerWorldPos.y.toFixed(2)}, ${playerWorldPos.z.toFixed(2)})`);
-                console.log(`  Controls Yaw: ${(controlsObj.rotation.y * 180 / Math.PI).toFixed(1)}°`);
+                console.log(`  Player World Pos: (${playerWorldPos.x.toFixed(2)}, ${playerWorldPos.y.toFixed(2)}, ${playerWorldPos.z.toFixed(2)})`);
+                console.log(`  Controls Yaw: ${(controlsYaw * 180 / Math.PI).toFixed(1)}°`);
                 console.log(`  Camera LOCAL Pos: (${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)})`);
                 console.log(`  Camera Rotation: X=${(camera.rotation.x * 180 / Math.PI).toFixed(1)}°, Y=${(camera.rotation.y * 180 / Math.PI).toFixed(1)}°`);
                 console.log(`  Camera Direction: (${camWorldDir.x.toFixed(2)}, ${camWorldDir.y.toFixed(2)}, ${camWorldDir.z.toFixed(2)})`);
+                console.log(`  cameraRig exists: ${!!cameraRig}`);
                 if (data) {
                     console.log(`  Calculated Values:`, data);
                 }
@@ -14878,7 +14893,7 @@
                 const savePacket = {
                     seed: finalSeedDisplay || worldConfig.seed.toString(), // Consistent string format
                     player: {
-                        pos: controls.getObject().position,
+                        pos: getPlayerWorldPosition(),
                         rot: controls.getObject().rotation,
                     },
                     timestamp: Date.now(),
@@ -14944,7 +14959,9 @@
                     if (savePacket.player && typeof controls !== 'undefined') {
                         const pos = savePacket.player.pos;
                         const rot = savePacket.player.rot;
-                        controls.getObject().position.set(pos.x, pos.y, pos.z);
+                        // Set position on cameraRig if available, otherwise controls
+                        const posTarget = cameraRig || controls.getObject();
+                        posTarget.position.set(pos.x, pos.y, pos.z);
                         if (rot) {
                             controls.getObject().rotation.set(rot._x || 0, rot._y || 0, rot._z || 0, rot._order || 'YXZ');
                         }
@@ -15108,7 +15125,9 @@
                 document.getElementById("clear-cache-btn")?.addEventListener("click", async () => { if (confirm("Clear all cached world data? This will regenerate chunks on next load.")) { await clearChunkCache(); alert("Cache cleared!"); }});
                 // If we loaded a save, apply player position now that controls exist
                 if (loadedPlayerState) {
-                    controls.getObject().position.copy(loadedPlayerState.pos);
+                    // Set position on cameraRig if available, otherwise controls
+                    const posTarget = cameraRig || controls.getObject();
+                    posTarget.position.copy(loadedPlayerState.pos);
                     // Rotation is serialized with underscore prefixes (_x, _y, _z, _order)
                     const rot = loadedPlayerState.rot;
                     if (rot) {
@@ -16055,7 +16074,7 @@
                 const savePacket = {
                     seed: seedToSave,
                     player: {
-                        pos: controls.getObject().position,
+                        pos: getPlayerWorldPosition(),
                         rot: controls.getObject().rotation,
                     },
                     timestamp: Date.now(),
@@ -17105,7 +17124,41 @@
 
                 // 9. Controls & Pause Menu Logic
                 controls = new PointerLockControls(camera, document.body);
-                scene.add(controls.getObject());
+
+                // CRITICAL FIX: In modern Three.js PointerLockControls (r160+), controls.getObject()
+                // returns the camera itself, NOT a wrapper object. This means camera.position IS the
+                // player's world position. We cannot use camera.position for third-person offsets!
+                //
+                // Solution: Create a cameraRig Object3D to hold the player world position.
+                // Camera becomes child of cameraRig, so camera.position is LOCAL offset.
+                // Physics updates cameraRig.position (player world pos), not camera.position.
+
+                // Check if controls.getObject() returns camera directly (the bug condition)
+                if (controls.getObject() === camera) {
+                    console.log('[Controls] Detected modern PointerLockControls - creating camera rig');
+
+                    // 1. Create camera rig at current camera world position
+                    cameraRig = new THREE.Object3D();
+                    cameraRig.position.copy(camera.position); // Copy world position to rig
+                    cameraRig.rotation.copy(camera.rotation); // Copy rotation
+
+                    // 2. Reset camera to local origin (it will be child of rig)
+                    camera.position.set(0, 0, 0);
+
+                    // 3. Add camera as child of rig
+                    cameraRig.add(camera);
+
+                    // 4. Add rig to scene (not the camera directly)
+                    scene.add(cameraRig);
+
+                    console.log('[Controls] Camera rig created at:', cameraRig.position);
+                    console.log('[Controls] Camera local position:', camera.position);
+                } else {
+                    // Old-style PointerLockControls with wrapper object
+                    console.log('[Controls] Old-style PointerLockControls detected');
+                    scene.add(controls.getObject());
+                }
+
                 // UI Elements
                 const blocker = document.getElementById("blocker");
                 const mainPauseMenu = document.getElementById("main-pause-menu");
@@ -17134,7 +17187,9 @@
                             const loadResult = await loadWorld(select.value);
                             // Return to game
                             if (loadResult && loadResult.player) {
-                                controls.getObject().position.copy(loadResult.player.pos);
+                                // Set position on cameraRig if available, otherwise controls
+                                const posTarget = cameraRig || controls.getObject();
+                                posTarget.position.copy(loadResult.player.pos);
                                 // Rotation is serialized with underscore prefixes (_x, _y, _z, _order)
                                 const rot = loadResult.player.rot;
                                 if (rot) {
@@ -18795,7 +18850,7 @@
             }
             function updateDebugInfo(currentFps, avgFps) {
                 if (!isDebug) return;
-                const p = controls.getObject().position;
+                const p = getPlayerWorldPosition();
                 const overlay = document.getElementById("debug-overlay");
                 if (!overlay) return;
                 const cx = Math.floor(p.x / WORLD_DIMS.chunkSize);
@@ -18886,7 +18941,7 @@
 
                 // Add third-person debug info if in third-person mode
                 if (isThirdPerson && controls) {
-                    const playerWorldPos = controls.getObject().position;
+                    const playerWorldPos = getPlayerWorldPosition();
                     const camWorldDir = new THREE.Vector3();
                     camera.getWorldDirection(camWorldDir);
                     overlay.innerText += "\n--- 3P MODE ---" +
@@ -21214,7 +21269,7 @@
                 return null;
             }
             function spawnZombieNearPlayer() {
-                const origin = controls.getObject().position;
+                const origin = getPlayerWorldPosition();
                 for (let attempt = 0; attempt < 8; attempt++) {
                     const dist = THREE.MathUtils.lerp(ZOMBIE_CONFIG.spawnRadius * 0.5, ZOMBIE_CONFIG.spawnRadius, Math.random());
                     const ang = Math.random() * Math.PI * 2;
@@ -21348,7 +21403,7 @@
                     if (spawnZombieNearPlayer()) zombieSpawnTimer = 0;
                 }
                 // Cache frequently accessed values
-                const playerPos = controls.getObject().position;
+                const playerPos = getPlayerWorldPosition();
                 const dragFactor = Math.pow(0.02, dt);
                 const gravityDelta = SETTINGS.gravity * dt * 0.5;
                 const detectionRadiusSq = ZOMBIE_CONFIG.detectionRadius * ZOMBIE_CONFIG.detectionRadius;
@@ -21930,8 +21985,9 @@
             function updatePlayerBody(dt) {
                 if (!controls) return;
 
-                const controlsObj = controls.getObject();
-                const camPos = controlsObj.position;
+                // Get player world position from cameraRig (if available) or controls
+                const playerWorldPos = getPlayerWorldPosition();
+                const controlsYaw = controls.getObject().rotation.y;
 
                 // Get movement state
                 const velX = velocity.x;
@@ -21950,14 +22006,9 @@
 
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
-                    // camPos is controls.getObject().position - LIVE reference to player world position
-                    // It updates every frame as physics moves the player
-                    const playerWorldPos = camPos;
-                    const controlsYaw = controlsObj.rotation.y;
-
                     if (isThirdPerson) {
                         // In third-person: body at player position, camera offset behind
-                        // Camera is child of controls, so camera.position is LOCAL offset
+                        // Camera is child of cameraRig, so camera.position is LOCAL offset
 
                         // If moving, face movement direction; otherwise face controls direction
                         let bodyYaw = controlsYaw;
@@ -22049,7 +22100,7 @@
                 isThirdPerson = !isThirdPerson;
 
                 // Debug: log toggle
-                const playerWorldPos = controls.getObject().position;
+                const playerWorldPos = getPlayerWorldPosition();
                 console.log(`[3P-DEBUG] Third-person: ${isThirdPerson}`);
                 console.log(`[3P-DEBUG] Player WORLD pos: (${playerWorldPos.x.toFixed(2)}, ${playerWorldPos.y.toFixed(2)}, ${playerWorldPos.z.toFixed(2)})`);
                 console.log(`[3P-DEBUG] Camera LOCAL pos: (${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)})`);
@@ -24635,7 +24686,7 @@
                     updateShadowFrustumSize(currentRenderRadius);
                 }
                 // --- 2. Calculate Player Position ---
-                const pPos = controls.getObject().position;
+                const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
                 // Update state
@@ -24683,7 +24734,7 @@
                 let recomputedFrustum = false;
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
                 controls.getDirection(cameraDirTmp);
-                const playerPos = controls.getObject().position;
+                const playerPos = getPlayerWorldPosition();
                 // Precompute per-frame frustum values
                 const verticalFovRad = (camera.fov * Math.PI) / 180;
                 const horizontalFovRad = 2 * Math.atan(Math.tan(verticalFovRad / 2) * camera.aspect);
@@ -24824,7 +24875,7 @@
                 // --- BIOME CACHE CLEANUP ---
                 // Prevent memory leak by removing distant biome cells
                 if (biomeCellCache.size > 10000) {
-                    const pPos = controls.getObject().position;
+                    const pPos = getPlayerWorldPosition();
                     const playerCellX = Math.floor(pPos.x / BIOME_CELL_SIZE);
                     const playerCellZ = Math.floor(pPos.z / BIOME_CELL_SIZE);
                     // Iterate and delete distant cells
@@ -24845,7 +24896,7 @@
                 // --- PRIORITY: Sort queue by distance (closest chunks first) ---
                 // Calculate player chunk position for distance sorting
                 if (chunkBuildQueue.length > 1 && controls && controls.getObject) {
-                    const playerPos = controls.getObject().position;
+                    const playerPos = getPlayerWorldPosition();
                     const playerChunkX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
                     const playerChunkZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
                     // Update distance for all jobs and sort by distance (closest first)
@@ -24918,8 +24969,9 @@
                         releaseMeshForKey(key);
                         releaseMeshForKey(key + "_WATER");
                         // Rebuild chunk - calculate distance for LOD
-                        const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
-                        const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                        const playerWorldPos = getPlayerWorldPosition();
+                        const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
+                        const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                         const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
                         renderChunk(cx, cz, neighborDistSq);
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
@@ -25003,7 +25055,7 @@
             }
             function updateHighlight() {
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per physics step
-                const hit = pickVoxel(controls.getObject().position, controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
+                const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
                 if (hit) { outlineMesh.visible = true; outlineMesh.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5); } else outlineMesh.visible = false;
             }
             function ensureChunk(x, z) {
@@ -25013,8 +25065,9 @@
                 if (!chunks.has(key)) {
                     generateChunkData(cx, cz);
                     // Calculate distance for LOD
-                    const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
-                    const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                    const playerWorldPos = getPlayerWorldPosition();
+                    const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
+                    const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                     const distSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
                     renderChunk(cx, cz, distSq);
                 }
@@ -25063,7 +25116,7 @@
                 const smoothAngle = dayNightTime < 0.667 ? (dayNightTime / 0.667) * Math.PI : Math.PI + ((dayNightTime - 0.667) / 0.333) * Math.PI;
                 const smoothH = Math.sin(smoothAngle);
                 const smoothX = Math.cos(smoothAngle);
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 // Sun / Moon sprites
                 sunSprite.position.set(camPos.x + smoothX * 300, camPos.y + smoothH * 300, camPos.z);
                 moonSprite.position.set(camPos.x - smoothX * 280, camPos.y - smoothH * 280, camPos.z);
@@ -25251,7 +25304,7 @@
                 if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
                 // Apply gravity or flying or swimming
                 // Check if player's feet are in water (for treading water when head is above)
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 const feetY = Math.floor(camPos.y - 1.7); // Feet position (eye height ~1.7)
                 const feetInWater = getBlock(Math.floor(camPos.x), feetY, Math.floor(camPos.z)) === WATER;
                 const inWaterBody = isUnderwater || feetInWater || isTreadingWater;
@@ -25410,7 +25463,8 @@
                     );
                     const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
                     const stepDt = dt / collisionSteps;
-                    const obj = controls.getObject();
+                    // Use cameraRig for player position if available (modern PointerLockControls fix)
+                    const obj = cameraRig || controls.getObject();
                     // Smooth crouch transition
                     playerEyeHeight = THREE.MathUtils.lerp(
                         playerEyeHeight,
@@ -25504,7 +25558,7 @@
 
                 // Spawn smoke and flame particles for placed torches (nearby only for performance)
                 if (particleSystem && controls && SETTINGS.torchParticlesEnabled) {
-                    const playerPos = controls.getObject().position;
+                    const playerPos = getPlayerWorldPosition();
                     const smokeInterval = getTorchSmokeInterval();
                     const flameInterval = getTorchFlameInterval();
                     const PLACED_TORCH_PARTICLE_RADIUS = 24; // Only spawn particles for torches within this radius
@@ -25556,27 +25610,28 @@
 
                 // Update particle system (dt passed from animate loop for framerate independence)
                 if (particleSystem && controls) {
-                    particleSystem.update(dt, controls.getObject().position);
+                    const playerWorldPos = getPlayerWorldPosition();
+                    particleSystem.update(dt, playerWorldPos);
 
                     // Update footstep particles
                     const isMoving = moveForward || moveBackward || moveLeft || moveRight;
-                    updateFootstepParticles(time, controls.getObject().position, isMoving, canJump);
+                    updateFootstepParticles(time, playerWorldPos, isMoving, canJump);
                 }
 
                 // Update atmospheric effects
-                updateStars(time, dayNightTime, controls ? controls.getObject().position : null);
+                updateStars(time, dayNightTime, controls ? getPlayerWorldPosition() : null);
 
                 // Calculate sun Y position for cloud lighting
                 const sunAngle = dayNightTime * Math.PI * 2;
                 const sunY = Math.sin(sunAngle);
-                updateClouds(time, sunY, controls ? controls.getObject().position : null, dayNightTime);
+                updateClouds(time, sunY, controls ? getPlayerWorldPosition() : null, dayNightTime);
 
                 // Update water ripples
                 updateWaterRipples(dt);
 
                 // Update water velocity effects (wading, wake, bubbles)
                 if (controls) {
-                    updateWaterVelocityEffects(dt, controls.getObject().position, velocity);
+                    updateWaterVelocityEffects(dt, getPlayerWorldPosition(), velocity);
                 }
 
                 // Update color grading
@@ -25584,7 +25639,7 @@
 
                 // Update biome fog tinting
                 if (controls) {
-                    updateBiomeFogTint(controls.getObject().position);
+                    updateBiomeFogTint(getPlayerWorldPosition());
                 }
             }
             // Update volumetric lighting shader uniforms with light positions
@@ -25616,7 +25671,7 @@
             const _sampleDir = new THREE.Vector3();
 
             function getLightVisibility(lightWorldPos) {
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
 
                 // OPTIMIZATION: Reuse vector instead of allocating new one
                 _occlusionDir.subVectors(lightWorldPos, camPos).normalize();
@@ -25689,7 +25744,7 @@
             const _pointLightSampleDir = new THREE.Vector3();
 
             function getPointLightVisibility(lightWorldPos, maxRange = 64) {
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
 
                 // OPTIMIZATION: Calculate distance squared first (avoid sqrt)
                 const dx = camPos.x - lightWorldPos.x;
@@ -25784,7 +25839,7 @@
                 uniforms.nightFactor.value = nightFactor;
 
                 // Calculate depth below sea level (0 = at/above sea, 1 = deep underground)
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
                 const seaLevel = WORLD_DIMS.seaLevel;
                 const maxDepth = 40;
                 const depthBelow = Math.max(0, seaLevel - camPos.y);
@@ -26152,7 +26207,7 @@
             function updateUnderwaterState() {
                 if (!controls) return;
 
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 const eyeY = camPos.y;
                 const eyeX = Math.floor(camPos.x);
                 const eyeZ = Math.floor(camPos.z);
@@ -26439,7 +26494,7 @@
             function onMouseClick(e) {
                 if (!controls.isLocked) return;
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per click
-                const hit = pickVoxel(controls.getObject().position, controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
+                const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
                 if (hit) {
                     const { x, y, z, face } = hit;
                     if (e.button === 0) {
@@ -26448,7 +26503,7 @@
                         breakProgress = 0;
                     } else if (e.button === 2 && face) {
                         const nx = x + face[0], ny = y + face[1], nz = z + face[2];
-                        const pPos = controls.getObject().position;
+                        const pPos = getPlayerWorldPosition();
                         const overlaps = playerIntersectsBlock(
                             pPos.x - 0.4, pPos.y - 1.5, pPos.z - 0.4,
                             pPos.x + 0.4, pPos.y + 0.3, pPos.z + 0.4,
