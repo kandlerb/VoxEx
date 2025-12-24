@@ -10836,12 +10836,55 @@
             const THIRD_PERSON_LOOK_HEIGHT = 1.2; // Look at chest level
             // Third-person orbit camera state
             let thirdPersonOrbitPitch = 0;  // Accumulated pitch from mouse Y input
+            let thirdPersonOrbitYaw = 0;    // Accumulated yaw from mouse X input (tracked separately from PointerLockControls)
             const ORBIT_PITCH_MIN = -Math.PI / 3;  // -60° (look up)
             const ORBIT_PITCH_MAX = Math.PI / 3;   // +60° (look down)
             // Third-person debug state
-            let thirdPersonDebugEnabled = true; // Set to false to disable logging
+            let thirdPersonDebugEnabled = false; // Set to false to disable logging
             let thirdPersonDebugThrottle = 0;
             const THIRD_PERSON_DEBUG_INTERVAL = 500; // Log every 500ms
+
+            /**
+             * Apply third-person camera rotation to look at the player.
+             * Called from both mousemove handler and animation loop to ensure
+             * we override PointerLockControls' camera rotation.
+             */
+            function applyThirdPersonCameraRotation() {
+                if (!isThirdPerson || !camera) return;
+
+                // Use our tracked orbit angles (not PointerLockControls values)
+                const orbitYaw = thirdPersonOrbitYaw;
+                const orbitPitch = thirdPersonOrbitPitch;
+
+                // Calculate camera position on sphere around player
+                const dist = THIRD_PERSON_DISTANCE;
+                const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+                const horizontalDist = dist * Math.cos(orbitPitch);
+                const verticalOffset = dist * Math.sin(orbitPitch) + heightOffset;
+
+                const camX = Math.sin(orbitYaw) * horizontalDist;
+                const camY = verticalOffset;
+                const camZ = Math.cos(orbitYaw) * horizontalDist;
+
+                // Update camera LOCAL position (relative to cameraRig at player position)
+                camera.position.set(camX, camY, camZ);
+
+                // Calculate rotation to look at player (local origin + look height)
+                const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+                const dx = -camX;  // Direction from camera to player (at local origin)
+                const dy = lookY - camY;
+                const dz = -camZ;
+
+                const horizontalDistToTarget = Math.sqrt(dx * dx + dz * dz);
+                const lookYaw = Math.atan2(dx, dz);
+                const lookPitch = Math.atan2(-dy, horizontalDistToTarget);
+
+                // Apply rotation directly (overrides PointerLockControls)
+                camera.rotation.order = 'YXZ';
+                camera.rotation.x = lookPitch;
+                camera.rotation.y = lookYaw;
+                camera.rotation.z = 0;
+            }
 
             /**
              * Log third-person camera debug info (throttled to avoid spam).
@@ -17163,15 +17206,22 @@
                     scene.add(controls.getObject());
                 }
 
-                // Third-person orbit camera: track mouse Y for pitch when in third-person
-                // PointerLockControls handles first-person, we handle third-person orbit
+                // Third-person orbit camera: track mouse movement ourselves
+                // We must track BOTH yaw and pitch because PointerLockControls will
+                // overwrite camera.rotation with its own values on every mousemove
                 document.addEventListener('mousemove', (e) => {
                     if (isThirdPerson && controls && controls.isLocked) {
-                        // Mouse Y controls orbit pitch (same sensitivity as PointerLockControls)
                         const sensitivity = 0.002;
+                        // Track yaw (horizontal) and pitch (vertical) ourselves
+                        thirdPersonOrbitYaw -= e.movementX * sensitivity;
                         thirdPersonOrbitPitch += e.movementY * sensitivity;
-                        // Clamp to prevent flipping
+                        // Clamp pitch to prevent flipping
                         thirdPersonOrbitPitch = Math.max(ORBIT_PITCH_MIN, Math.min(ORBIT_PITCH_MAX, thirdPersonOrbitPitch));
+
+                        // CRITICAL: Apply camera rotation IMMEDIATELY to override PointerLockControls
+                        // PointerLockControls also has a mousemove handler that sets camera rotation,
+                        // so we must override it here in the same event, not wait for animation loop
+                        applyThirdPersonCameraRotation();
                     }
                 });
 
@@ -22023,51 +22073,9 @@
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
                     if (isThirdPerson) {
-                        // ORBIT CAMERA: Use mouse input for camera orbit around player
-                        // - Yaw from controls.getObject().rotation.y (handled by PointerLockControls)
-                        // - Pitch from thirdPersonOrbitPitch (tracked in our mousemove handler)
-
-                        // Read orbit angles
-                        const orbitYaw = controlsYaw;  // Mouse X controls horizontal orbit
-                        const orbitPitch = thirdPersonOrbitPitch;  // Mouse Y controls vertical orbit (tracked separately)
-
-                        // Calculate camera position on sphere around player
-                        const dist = THIRD_PERSON_DISTANCE;
-                        const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
-
-                        // Spherical coordinates: use pitch for elevation, yaw for horizontal angle
-                        // Camera orbits behind player (+Z in local space when yaw=0)
-                        const horizontalDist = dist * Math.cos(orbitPitch);
-                        const verticalOffset = dist * Math.sin(orbitPitch) + heightOffset;
-
-                        // Position camera in LOCAL space (relative to cameraRig at player position)
-                        const camX = Math.sin(orbitYaw) * horizontalDist;
-                        const camY = verticalOffset;
-                        const camZ = Math.cos(orbitYaw) * horizontalDist;
-
-                        camera.position.set(camX, camY, camZ);
-
-                        // Look at player chest - MUST convert local target to world space
-                        // camera.lookAt() works in WORLD coordinates, but camera is child of cameraRig
-                        // So we need to convert our local target (0, lookY, 0) to world position
-                        const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
-                        if (cameraRig) {
-                            // Convert local position to world position for lookAt
-                            const worldTarget = new THREE.Vector3(0, lookY, 0);
-                            cameraRig.localToWorld(worldTarget);
-                            camera.lookAt(worldTarget);
-                        } else {
-                            // Fallback: manual rotation calculation
-                            // Direction from camera to target (local origin offset by lookY)
-                            const dx = -camX;
-                            const dy = lookY - camY;
-                            const dz = -camZ;
-                            const horizontalDistToTarget = Math.sqrt(dx * dx + dz * dz);
-                            const lookYaw = Math.atan2(dx, dz);
-                            const lookPitch = Math.atan2(-dy, horizontalDistToTarget);
-                            camera.rotation.order = 'YXZ';
-                            camera.rotation.set(lookPitch, lookYaw, 0);
-                        }
+                        // Apply orbit camera position and rotation
+                        // This uses thirdPersonOrbitYaw and thirdPersonOrbitPitch (tracked in mousemove)
+                        applyThirdPersonCameraRotation();
 
                         // Position body mesh at player world position
                         playerBodyMesh.position.set(
@@ -22077,7 +22085,6 @@
                         );
 
                         // Body rotation: face movement direction when moving, camera direction when still
-                        // Use velocity magnitude with higher threshold to avoid jitter from tiny movements
                         const speed = Math.sqrt(velX * velX + velZ * velZ);
                         let targetBodyYaw;
 
@@ -22086,8 +22093,7 @@
                             targetBodyYaw = Math.atan2(velX, velZ);
                         } else {
                             // Standing still: face the direction camera is looking from
-                            // Camera orbits at orbitYaw, so body faces that direction
-                            targetBodyYaw = orbitYaw;
+                            targetBodyYaw = thirdPersonOrbitYaw;
                         }
 
                         // Helper to normalize angle to [-PI, PI]
@@ -22098,38 +22104,22 @@
                         };
 
                         // Smooth rotation with proper angle wrapping
-                        // IMPORTANT: Normalize currentYaw first to prevent accumulation past 360°
                         let currentYaw = normalizeAngle(playerBodyMesh.rotation.y);
-                        let diff = targetBodyYaw - currentYaw;
+                        let diff = normalizeAngle(targetBodyYaw - currentYaw);
 
-                        // Wrap difference to [-PI, PI] for shortest path interpolation
-                        diff = normalizeAngle(diff);
-
-                        // Apply lerp and normalize result to keep in [-PI, PI]
+                        // Apply lerp and normalize result
                         playerBodyMesh.rotation.y = normalizeAngle(currentYaw + diff * 0.15);
 
-                        // One-time debug: log body mesh properties
-                        if (!window._bodyMeshDebugDone) {
-                            console.log('[3P-DEBUG] Body Mesh Check:');
-                            console.log('  visible:', playerBodyMesh.visible);
-                            console.log('  parent:', playerBodyMesh.parent?.type);
-                            console.log('  in scene:', playerBodyMesh.parent === scene);
-                            console.log('  body layers mask:', playerBodyMesh.layers.mask);
-                            console.log('  camera layers mask:', camera.layers.mask);
-                            console.log('  cameraRig exists:', !!cameraRig);
-                            console.log('  position:', playerBodyMesh.position.toArray().map(v => v.toFixed(1)));
-                            window._bodyMeshDebugDone = true;
+                        // Debug logging (throttled)
+                        if (thirdPersonDebugEnabled) {
+                            const camDir = camera.getWorldDirection(mobTmpA);
+                            logThirdPersonDebug('updatePlayerBody', {
+                                orbitYaw: (thirdPersonOrbitYaw * 180 / Math.PI).toFixed(1) + '°',
+                                orbitPitch: (thirdPersonOrbitPitch * 180 / Math.PI).toFixed(1) + '°',
+                                camDir: `(${camDir.x.toFixed(2)}, ${camDir.y.toFixed(2)}, ${camDir.z.toFixed(2)})`,
+                                bodyYaw: (playerBodyMesh.rotation.y * 180 / Math.PI).toFixed(1) + '°'
+                            });
                         }
-
-                        // Debug logging with camera direction verification
-                        const camDir = camera.getWorldDirection(mobTmpA);
-                        logThirdPersonDebug('updatePlayerBody', {
-                            playerWorldPos: `(${playerWorldPos.x.toFixed(1)}, ${playerWorldPos.y.toFixed(1)}, ${playerWorldPos.z.toFixed(1)})`,
-                            camLocalPos: `(${camX.toFixed(1)}, ${camY.toFixed(1)}, ${camZ.toFixed(1)})`,
-                            camDir: `(${camDir.x.toFixed(2)}, ${camDir.y.toFixed(2)}, ${camDir.z.toFixed(2)})`,
-                            bodyYaw: (playerBodyMesh.rotation.y * 180 / Math.PI).toFixed(1) + '°',
-                            speed: speed.toFixed(2)
-                        });
                     } else {
                         // In first-person: body follows camera, offset slightly forward for shadows
                         const camDir = camera.getWorldDirection(mobTmpA);
@@ -22179,13 +22169,18 @@
                 console.log(`[3P-DEBUG] Camera LOCAL pos: (${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)})`);
 
                 if (isThirdPerson) {
-                    // Entering third-person: initialize orbit pitch to slightly look down at player
+                    // Entering third-person: initialize orbit angles
+                    // Capture current yaw from PointerLockControls before we override it
+                    thirdPersonOrbitYaw = controls.getObject().rotation.y;
                     thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
+                    // Apply immediately so camera doesn't snap
+                    applyThirdPersonCameraRotation();
                     logDebug("[PlayerBody] Entering third-person mode");
                 } else {
                     // Exiting third-person: reset camera to LOCAL origin (first-person position)
                     camera.position.set(0, 0, 0);
-                    camera.rotation.set(0, 0, 0);
+                    // Restore camera rotation to match our tracked yaw (for smooth transition)
+                    camera.rotation.set(0, thirdPersonOrbitYaw, 0, 'YXZ');
                     logDebug("[PlayerBody] Returning to first-person mode");
                 }
 
