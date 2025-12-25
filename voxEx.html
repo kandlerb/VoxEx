@@ -5172,6 +5172,7 @@
             const _box3Block = new THREE.Box3();
             const _vec3Min = new THREE.Vector3();
             const _vec3Max = new THREE.Vector3();
+            const _torchWorldPos = new THREE.Vector3();
 
             /**
              * Test AABB intersection between player bounds and a unit block using pooled Box3.
@@ -22047,6 +22048,12 @@
                 rightArmPivot.add(rightArmMesh);
                 rightArmPivot.position.set(armOffsetX, shoulderY, 0);
 
+                // Add torch holder at end of right arm (for third-person view)
+                const torchHolder = new THREE.Group();
+                torchHolder.position.set(0, -arm.height - 0.05, 0.08); // At hand position, slightly forward
+                torchHolder.name = 'torchHolder';
+                rightArmPivot.add(torchHolder);
+
                 // Left Leg - pivot at hip
                 const leftLegPivot = new THREE.Group();
                 const leftLegMesh = new THREE.Mesh(legGeometry, materials.leg);
@@ -22087,6 +22094,7 @@
                     rightArmMesh,
                     leftLegMesh,
                     rightLegMesh,
+                    torchHolder,
                 };
 
                 // Add all parts to group
@@ -22108,6 +22116,52 @@
                 });
 
                 logDebug("[PlayerBody] Built player mesh with proportions:", PLAYER_PROPORTIONS);
+                return group;
+            }
+
+            /**
+             * Create a simple torch model for third-person view.
+             * Smaller than the viewmodel torch, attached to player's hand.
+             * @returns {THREE.Group}
+             */
+            function createThirdPersonTorch() {
+                const group = new THREE.Group();
+
+                // Stick (smaller than viewmodel)
+                const stickGeo = new THREE.BoxGeometry(0.06, 0.35, 0.06);
+                const stickMat = new THREE.MeshLambertMaterial({ color: 0x4a3728 });
+                const stick = new THREE.Mesh(stickGeo, stickMat);
+                stick.position.y = 0.175;
+                stick.castShadow = true;
+                group.add(stick);
+
+                // Flame
+                const flameGeo = new THREE.BoxGeometry(0.08, 0.12, 0.08);
+                const flameMat = new THREE.MeshBasicMaterial({
+                    color: 0xff6600,
+                    transparent: true,
+                    opacity: 0.9
+                });
+                const flame = new THREE.Mesh(flameGeo, flameMat);
+                flame.position.y = 0.4;
+                flame.name = 'flame';
+                group.add(flame);
+
+                // Glow core
+                const glowGeo = new THREE.BoxGeometry(0.05, 0.06, 0.05);
+                const glowMat = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+                const glow = new THREE.Mesh(glowGeo, glowMat);
+                glow.position.y = 0.4;
+                group.add(glow);
+
+                // Set to layer 2 (player body layer)
+                group.traverse((child) => {
+                    child.layers.set(2);
+                });
+
+                group.visible = false; // Controlled by torch toggle
+                group.name = 'thirdPersonTorch';
+
                 return group;
             }
 
@@ -22442,6 +22496,19 @@
                 parts.head.rotation.x = smooth("headX", targetHeadX, 0.12);
                 parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
                 parts.body.rotation.x = smooth("bodyTilt", targetBodyTilt, 0.1);
+
+                // Offset leg pivot positions to follow tilted body hips
+                // When body tilts forward (positive rotation.x), hips move backward in Z
+                // Calculate hip offset: the hip joint is roughly at the bottom of the torso
+                const currentBodyTilt = parts.body.rotation.x;
+                const hipOffsetFromBodyCenter = PLAYER_PROPORTIONS.body.height * 0.4; // Distance from body center to hip
+                const legZOffset = -Math.sin(currentBodyTilt) * hipOffsetFromBodyCenter;
+
+                // Apply Z offset to leg pivots to keep them attached to tilted hips
+                const { leg, body, hipY } = PLAYER_PROPORTIONS;
+                const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
+                parts.leftLeg.position.set(-legOffsetX, hipY, legZOffset);
+                parts.rightLeg.position.set(legOffsetX, hipY, legZOffset);
             }
 
             /**
@@ -22642,8 +22709,9 @@
 
                 if (isThirdPerson) {
                     // Entering third-person: initialize orbit angles
-                    // Capture current yaw from cameraRig (player's facing direction)
-                    thirdPersonOrbitYaw = cameraRig ? cameraRig.rotation.y : controls.getObject().rotation.y;
+                    // Get yaw from camera.rotation.y - this is what PointerLockControls modifies directly
+                    // Don't use cameraRig.rotation.y because it was reset to 0 when exiting third-person
+                    thirdPersonOrbitYaw = camera.rotation.y;
                     thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
 
                     // Reset cameraRig rotation to identity so LOCAL = WORLD axes
@@ -22684,6 +22752,16 @@
                     playerArmsModel.visible = !isThirdPerson;
                 }
 
+                // Update torch visibility based on view mode
+                if (window.torchModel) {
+                    // Viewmodel torch only visible in first-person when active
+                    window.torchModel.visible = torchActive && !isThirdPerson;
+                }
+                if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                    // Third-person torch visible only in third-person when active
+                    playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
+                }
+
                 logDebug(`[PlayerBody] Third-person mode: ${isThirdPerson}`);
             }
 
@@ -22697,6 +22775,14 @@
                 // Build the body mesh
                 playerBodyMesh = buildPlayerMesh();
                 scene.add(playerBodyMesh);
+
+                // Create and attach third-person torch to right hand
+                const thirdPersonTorch = createThirdPersonTorch();
+                const torchParts = playerBodyMesh.userData.parts;
+                if (torchParts && torchParts.torchHolder) {
+                    torchParts.torchHolder.add(thirdPersonTorch);
+                    playerBodyMesh.userData.thirdPersonTorch = thirdPersonTorch;
+                }
 
                 // Build viewmodel arms and attach to camera
                 playerArmsModel = buildPlayerViewmodelArms();
@@ -26072,6 +26158,30 @@
                 // Torch flicker effect - use same intensity as placed torches (* 2)
                 if (torchActive && torchLight) {
                     torchLight.intensity = (SETTINGS.torchIntensity * 2) + Math.sin(time * 0.003) * 0.5;
+
+                    // Update torch light position based on view mode
+                    if (isThirdPerson) {
+                        // In third-person, reparent light to scene if needed
+                        if (torchLight.parent !== scene) {
+                            scene.add(torchLight);
+                        }
+                        // Update light position to player's hand
+                        if (playerBodyMesh && playerBodyMesh.userData.parts) {
+                            const holder = playerBodyMesh.userData.parts.torchHolder;
+                            if (holder) {
+                                holder.getWorldPosition(_torchWorldPos);
+                                _torchWorldPos.y += 0.4; // Offset to flame position
+                                torchLight.position.copy(_torchWorldPos);
+                            }
+                        }
+                    } else {
+                        // In first-person, reparent light back to torch group if needed
+                        if (window.torchModel && torchLight.parent !== window.torchModel) {
+                            window.torchModel.add(torchLight);
+                            torchLight.position.set(0, 0.165, 0); // Reset to viewmodel position
+                        }
+                    }
+
                     // Animate 3D torch flame
                     if (window.torchModel) {
                         const flame = window.torchModel.children[1];
@@ -27024,7 +27134,20 @@
                     case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); break;
                     case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); break;
                     case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); break;
-                    case "KeyF": torchActive = !torchActive; if (window.torchModel) { window.torchModel.visible = torchActive; } if (torchLight) { torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0; } break;
+                    case "KeyF":
+                        torchActive = !torchActive;
+                        // Viewmodel torch only visible in first-person
+                        if (window.torchModel) {
+                            window.torchModel.visible = torchActive && !isThirdPerson;
+                        }
+                        // Third-person torch visible only in third-person
+                        if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                            playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
+                        }
+                        if (torchLight) {
+                            torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0;
+                        }
+                        break;
                     case "KeyV": toggleThirdPerson(); break;
                 }
             };
