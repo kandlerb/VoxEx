@@ -1761,6 +1761,7 @@
                     <div class="control-row"><span>Select Block</span> <span class="key-badge">1-9</span></div>
                     <div class="control-row"><span>Toggle Debug</span> <span class="key-badge">~</span></div>
                     <div class="control-row"><span>Toggle Torch</span> <span class="key-badge">F</span></div>
+                    <div class="control-row"><span>Toggle View</span> <span class="key-badge">V</span></div>
                     <div class="control-row"><span>Open Inventory</span> <span class="key-badge">E</span></div>
                     <div class="control-row"><span>Quick Save</span> <span class="key-badge">F5</span></div>
                     <div class="control-row"><span>Quick Load</span> <span class="key-badge">F9</span></div>
@@ -5171,6 +5172,7 @@
             const _box3Block = new THREE.Box3();
             const _vec3Min = new THREE.Vector3();
             const _vec3Max = new THREE.Vector3();
+            const _torchWorldPos = new THREE.Vector3();
 
             /**
              * Test AABB intersection between player bounds and a unit block using pooled Box3.
@@ -10608,6 +10610,20 @@
             }
 
             let camera, scene, renderer, controls, raycaster;
+            let cameraRig = null; // Object3D that holds player world position; camera is child with local offset
+
+            /**
+             * Get the player's world position.
+             * With cameraRig: returns cameraRig.position (player world pos)
+             * Without cameraRig: returns controls.getObject().position (legacy)
+             * @returns {THREE.Vector3} Player world position
+             */
+            function getPlayerWorldPosition() {
+                if (cameraRig) {
+                    return cameraRig.position;
+                }
+                return controls ? controls.getObject().position : camera.position;
+            }
             let composer, renderPass, zombieScarePass, underwaterPass, volumetricLightPass;
             let sun, moon, skybox, skyMaterial, sunSprite, moonSprite, ambLight;
             let dayNightTime = 0.25;
@@ -10782,7 +10798,7 @@
                 detourSideBias: 0.65,
                 sidestepSpeed: 3.2,
             };
-            const ZOMBIE_EYE_HEIGHT = PLAYER_EYE_HEIGHT_STAND - 0.1;
+            const ZOMBIE_EYE_HEIGHT = 1.75; // Head sits flush on shoulders: shoulderY + head.height/2 = 1.5 + 0.25
             const ZOMBIE_PROPORTIONS = {
                 hipY: 0.75,
                 leg: { height: 0.75, thickness: 0.25 },
@@ -10791,6 +10807,207 @@
                 arm: { height: 0.75, thickness: 0.25 },
                 head: { size: 0.5, height: 0.5, centerY: ZOMBIE_EYE_HEIGHT },
             };
+            /**
+             * Player body proportions scaled to PLAYER_EYE_HEIGHT_STAND (1.8).
+             * Slightly taller than zombies for visual distinction.
+             * @type {{hipY: number, leg: {height: number, thickness: number}, body: {height: number, width: number, depth: number}, shoulderY: number, arm: {height: number, thickness: number}, head: {size: number, height: number, centerY: number}}}
+             */
+            const PLAYER_PROPORTIONS = {
+                hipY: 0.75,
+                leg: { height: 0.75, thickness: 0.25 },
+                body: { height: 0.75, width: 0.5, depth: 0.25 },
+                shoulderY: 1.5,
+                arm: { height: 0.75, thickness: 0.25 },
+                // Head sits flush on shoulders: shoulderY + head.height/2 = 1.5 + 0.25 = 1.75
+                head: { size: 0.5, height: 0.5, centerY: 1.75 },
+            };
+            // Player body state
+            let playerBodyMesh = null;
+            let playerArmsModel = null;
+            let isThirdPerson = false;
+            let playerWalkPhase = 0;
+            let playerIdleTimer = 0;
+            let playerPose = null;
+            let viewmodelWalkPhase = 0; // Separate phase for viewmodel arms
+            // Third-person camera settings (LOCAL offsets from controls object)
+            // Camera is child of controls.getObject(), so camera.position is LOCAL
+            // In first-person: camera.position = (0, 0, 0)
+            // In third-person: camera.position = (0, heightOffset, distance)
+            const THIRD_PERSON_DISTANCE = 4.0;  // Distance behind player (Z offset)
+            const THIRD_PERSON_HEIGHT = 2.5;    // Height above player feet
+            const THIRD_PERSON_LOOK_HEIGHT = 1.2; // Look at chest level
+            const THIRD_PERSON_CAM_BUFFER = 0.3;  // Buffer distance from blocks
+
+            // Scratch vectors for camera collision (avoid per-frame allocation)
+            const _camDesiredPos = new THREE.Vector3();
+            const _camPlayerPos = new THREE.Vector3();
+            const _camRayDir = new THREE.Vector3();
+
+            // Third-person orbit camera state
+            let thirdPersonOrbitPitch = 0;  // Accumulated pitch from mouse Y input
+            let thirdPersonOrbitYaw = 0;    // Accumulated yaw from mouse X input (tracked separately from PointerLockControls)
+            const ORBIT_PITCH_MIN = -Math.PI / 3;  // -60° (look up)
+            const ORBIT_PITCH_MAX = Math.PI / 3;   // +60° (look down)
+            // Third-person debug state
+            let thirdPersonDebugEnabled = false; // Set to false to disable logging
+            let thirdPersonDebugThrottle = 0;
+            const THIRD_PERSON_DEBUG_INTERVAL = 500; // Log every 500ms
+
+            /**
+             * Apply third-person camera rotation to look at the player.
+             * Called from both mousemove handler and animation loop to ensure
+             * we override PointerLockControls' camera rotation.
+             */
+            function applyThirdPersonCameraRotation() {
+                if (!isThirdPerson || !camera) return;
+
+                // Use our tracked orbit angles (not PointerLockControls values)
+                const orbitYaw = thirdPersonOrbitYaw;
+                const orbitPitch = thirdPersonOrbitPitch;
+
+                // Calculate desired camera position on sphere around player
+                const desiredDist = THIRD_PERSON_DISTANCE;
+                const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+                const horizontalDist = desiredDist * Math.cos(orbitPitch);
+                const verticalOffset = desiredDist * Math.sin(orbitPitch) + heightOffset;
+
+                const desiredCamX = Math.sin(orbitYaw) * horizontalDist;
+                const desiredCamY = verticalOffset;
+                const desiredCamZ = Math.cos(orbitYaw) * horizontalDist;
+
+                // Check for terrain collision and adjust distance if needed
+                let actualDist = desiredDist;
+                if (cameraRig) {
+                    const playerWorldPos = cameraRig.position;
+                    actualDist = getThirdPersonCameraDistance(
+                        playerWorldPos,
+                        desiredCamX,
+                        desiredCamY,
+                        desiredCamZ,
+                        desiredDist
+                    );
+                }
+
+                // Recalculate position with adjusted distance
+                const distRatio = actualDist / desiredDist;
+                const camX = desiredCamX * distRatio;
+                const camY = desiredCamY * distRatio;
+                const camZ = desiredCamZ * distRatio;
+
+                // Update camera LOCAL position (relative to cameraRig at player position)
+                camera.position.set(camX, camY, camZ);
+
+                // Calculate rotation to look at player (at local origin + look height offset)
+                const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
+
+                // YAW: To look toward origin from position (camX, camY, camZ):
+                // THREE.js forward at yaw θ is (-sin(θ), 0, -cos(θ))
+                // We want forward ∝ (-camX, 0, -camZ), so θ = atan2(camX, camZ)
+                const lookYaw = Math.atan2(camX, camZ);
+
+                // PITCH: Calculate vertical angle to look at target height
+                const dy = lookY - camY;  // Negative when looking down
+                const distToPlayer = Math.sqrt(camX * camX + camZ * camZ);
+                // Positive pitch = look up, negative pitch = look down
+                // When dy < 0 (target below), we want negative pitch
+                const lookPitch = Math.atan2(dy, distToPlayer);
+
+                // Apply rotation directly (overrides PointerLockControls)
+                camera.rotation.order = 'YXZ';
+                camera.rotation.x = lookPitch;
+                camera.rotation.y = lookYaw;
+                camera.rotation.z = 0;
+
+            }
+
+            /**
+             * Check for terrain collision between player and third-person camera.
+             * Returns adjusted distance if collision found, otherwise returns original distance.
+             * @param {THREE.Vector3} playerWorldPos - Player's world position
+             * @param {number} camX - Camera local X offset
+             * @param {number} camY - Camera local Y offset
+             * @param {number} camZ - Camera local Z offset
+             * @param {number} originalDist - Original distance from player
+             * @returns {number} Adjusted distance (may be shorter if collision found)
+             */
+            function getThirdPersonCameraDistance(playerWorldPos, camX, camY, camZ, originalDist) {
+                // Calculate desired camera world position
+                _camDesiredPos.set(
+                    playerWorldPos.x + camX,
+                    playerWorldPos.y + camY,
+                    playerWorldPos.z + camZ
+                );
+
+                // Ray from player to camera
+                _camPlayerPos.copy(playerWorldPos);
+                _camPlayerPos.y += THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND; // Start from look target
+
+                _camRayDir.subVectors(_camDesiredPos, _camPlayerPos).normalize();
+
+                // Step along ray checking for solid blocks
+                const stepSize = 0.25;
+                const maxSteps = Math.ceil(originalDist / stepSize);
+
+                for (let i = 1; i <= maxSteps; i++) {
+                    const t = i * stepSize;
+                    const checkX = Math.floor(_camPlayerPos.x + _camRayDir.x * t);
+                    const checkY = Math.floor(_camPlayerPos.y + _camRayDir.y * t);
+                    const checkZ = Math.floor(_camPlayerPos.z + _camRayDir.z * t);
+
+                    const block = getBlock(checkX, checkY, checkZ);
+
+                    // Check if solid (not air, water, or undefined/unloaded)
+                    if (block !== undefined && block !== AIR && block !== WATER) {
+                        // Found collision - return shortened distance with buffer
+                        return Math.max(0.5, t - THIRD_PERSON_CAM_BUFFER);
+                    }
+                }
+
+                // No collision - use original distance
+                return originalDist;
+            }
+
+            /**
+             * Log third-person camera debug info (throttled to avoid spam).
+             * @param {string} label - Debug label
+             * @param {Object} [data] - Additional data to log
+             */
+            function logThirdPersonDebug(label, data) {
+                if (!thirdPersonDebugEnabled || !isThirdPerson) return;
+                if (!controls) return;
+
+                const now = performance.now();
+                if (now - thirdPersonDebugThrottle < THIRD_PERSON_DEBUG_INTERVAL) return;
+                thirdPersonDebugThrottle = now;
+
+                const playerWorldPos = getPlayerWorldPosition();
+                const controlsYaw = controls.getObject().rotation.y;
+                const camWorldDir = new THREE.Vector3();
+                camera.getWorldDirection(camWorldDir);
+
+                console.log(`[3P-DEBUG] ${label}`);
+                console.log(`  Player World Pos: (${playerWorldPos.x.toFixed(2)}, ${playerWorldPos.y.toFixed(2)}, ${playerWorldPos.z.toFixed(2)})`);
+                console.log(`  Controls Yaw: ${(controlsYaw * 180 / Math.PI).toFixed(1)}°`);
+                console.log(`  Camera LOCAL Pos: (${camera.position.x.toFixed(2)}, ${camera.position.y.toFixed(2)}, ${camera.position.z.toFixed(2)})`);
+                console.log(`  Camera Rotation: X=${(camera.rotation.x * 180 / Math.PI).toFixed(1)}°, Y=${(camera.rotation.y * 180 / Math.PI).toFixed(1)}°`);
+                console.log(`  Camera Direction: (${camWorldDir.x.toFixed(2)}, ${camWorldDir.y.toFixed(2)}, ${camWorldDir.z.toFixed(2)})`);
+                console.log(`  cameraRig exists: ${!!cameraRig}`);
+                if (data) {
+                    console.log(`  Calculated Values:`, data);
+                }
+                if (playerBodyMesh) {
+                    console.log(`  Player Body:`);
+                    console.log(`    Position: (${playerBodyMesh.position.x.toFixed(2)}, ${playerBodyMesh.position.y.toFixed(2)}, ${playerBodyMesh.position.z.toFixed(2)})`);
+                    console.log(`    Rotation Y: ${(playerBodyMesh.rotation.y * 180 / Math.PI).toFixed(1)}°`);
+                }
+            }
+
+            // Make debug toggle accessible from console
+            window.toggleThirdPersonDebug = () => {
+                thirdPersonDebugEnabled = !thirdPersonDebugEnabled;
+                console.log(`[3P-DEBUG] Debug logging ${thirdPersonDebugEnabled ? 'ENABLED' : 'DISABLED'}`);
+            };
+
             const mobTmpA = new THREE.Vector3();
             const mobTmpB = new THREE.Vector3();
             const mobTmpC = new THREE.Vector3();
@@ -14804,7 +15021,7 @@
                 const savePacket = {
                     seed: finalSeedDisplay || worldConfig.seed.toString(), // Consistent string format
                     player: {
-                        pos: controls.getObject().position,
+                        pos: getPlayerWorldPosition(),
                         rot: controls.getObject().rotation,
                     },
                     timestamp: Date.now(),
@@ -14870,7 +15087,9 @@
                     if (savePacket.player && typeof controls !== 'undefined') {
                         const pos = savePacket.player.pos;
                         const rot = savePacket.player.rot;
-                        controls.getObject().position.set(pos.x, pos.y, pos.z);
+                        // Set position on cameraRig if available, otherwise controls
+                        const posTarget = cameraRig || controls.getObject();
+                        posTarget.position.set(pos.x, pos.y, pos.z);
                         if (rot) {
                             controls.getObject().rotation.set(rot._x || 0, rot._y || 0, rot._z || 0, rot._order || 'YXZ');
                         }
@@ -15034,7 +15253,9 @@
                 document.getElementById("clear-cache-btn")?.addEventListener("click", async () => { if (confirm("Clear all cached world data? This will regenerate chunks on next load.")) { await clearChunkCache(); alert("Cache cleared!"); }});
                 // If we loaded a save, apply player position now that controls exist
                 if (loadedPlayerState) {
-                    controls.getObject().position.copy(loadedPlayerState.pos);
+                    // Set position on cameraRig if available, otherwise controls
+                    const posTarget = cameraRig || controls.getObject();
+                    posTarget.position.copy(loadedPlayerState.pos);
                     // Rotation is serialized with underscore prefixes (_x, _y, _z, _order)
                     const rot = loadedPlayerState.rot;
                     if (rot) {
@@ -15981,7 +16202,7 @@
                 const savePacket = {
                     seed: seedToSave,
                     player: {
-                        pos: controls.getObject().position,
+                        pos: getPlayerWorldPosition(),
                         rot: controls.getObject().rotation,
                     },
                     timestamp: Date.now(),
@@ -16501,9 +16722,9 @@
                 glow.renderOrder = 9999; // Render last
                 glow.castShadow = false; // Glow doesn't cast shadows
                 torchGroup.add(glow);
-                // Position torch in bottom right of view (like Minecraft)
-                torchGroup.position.set(0.35, -0.35, -0.6);
-                torchGroup.rotation.set(0, 0, -0.3); // Slight tilt
+                // Position torch in bottom left of view (mirrored to match third-person right hand)
+                torchGroup.position.set(-0.35, -0.35, -0.6);
+                torchGroup.rotation.set(0, 0, 0.3); // Slight tilt (mirrored for left side)
                 torchGroup.visible = false; // Hidden by default
                 torchGroup.renderOrder = 9999; // Render absolutely last, after all transparent objects including water
                 torchGroup.layers.set(1);
@@ -16520,6 +16741,7 @@
                 // Note: initUVLookupTable() is now called inside initBlockOptimization() after uvMap is populated
                 initZombies();
                 initDebugGrid();
+                initPlayerBody();
                 // 6. Find Spawn (keep this unchanged)
                 let maxSpawnY = -1;
                 const candidates = [ { x: 0, z: 0 }, { x: -1, z: 0 }, { x: 0, z: -1 }, { x: -1, z: -1 }, ];
@@ -17030,7 +17252,60 @@
 
                 // 9. Controls & Pause Menu Logic
                 controls = new PointerLockControls(camera, document.body);
-                scene.add(controls.getObject());
+
+                // CRITICAL FIX: In modern Three.js PointerLockControls (r160+), controls.getObject()
+                // returns the camera itself, NOT a wrapper object. This means camera.position IS the
+                // player's world position. We cannot use camera.position for third-person offsets!
+                //
+                // Solution: Create a cameraRig Object3D to hold the player world position.
+                // Camera becomes child of cameraRig, so camera.position is LOCAL offset.
+                // Physics updates cameraRig.position (player world pos), not camera.position.
+
+                // Check if controls.getObject() returns camera directly (the bug condition)
+                if (controls.getObject() === camera) {
+                    console.log('[Controls] Detected modern PointerLockControls - creating camera rig');
+
+                    // 1. Create camera rig at current camera world position
+                    cameraRig = new THREE.Object3D();
+                    cameraRig.position.copy(camera.position); // Copy world position to rig
+                    cameraRig.rotation.copy(camera.rotation); // Copy rotation
+
+                    // 2. Reset camera to local origin (it will be child of rig)
+                    camera.position.set(0, 0, 0);
+
+                    // 3. Add camera as child of rig
+                    cameraRig.add(camera);
+
+                    // 4. Add rig to scene (not the camera directly)
+                    scene.add(cameraRig);
+
+                    console.log('[Controls] Camera rig created at:', cameraRig.position);
+                    console.log('[Controls] Camera local position:', camera.position);
+                } else {
+                    // Old-style PointerLockControls with wrapper object
+                    console.log('[Controls] Old-style PointerLockControls detected');
+                    scene.add(controls.getObject());
+                }
+
+                // Third-person orbit camera: track mouse movement ourselves
+                // We must track BOTH yaw and pitch because PointerLockControls will
+                // overwrite camera.rotation with its own values on every mousemove
+                document.addEventListener('mousemove', (e) => {
+                    if (isThirdPerson && controls && controls.isLocked) {
+                        const sensitivity = 0.002;
+                        // Track yaw (horizontal) and pitch (vertical) ourselves
+                        thirdPersonOrbitYaw -= e.movementX * sensitivity;
+                        thirdPersonOrbitPitch += e.movementY * sensitivity;
+                        // Clamp pitch to prevent flipping
+                        thirdPersonOrbitPitch = Math.max(ORBIT_PITCH_MIN, Math.min(ORBIT_PITCH_MAX, thirdPersonOrbitPitch));
+
+                        // CRITICAL: Apply camera rotation IMMEDIATELY to override PointerLockControls
+                        // PointerLockControls also has a mousemove handler that sets camera rotation,
+                        // so we must override it here in the same event, not wait for animation loop
+                        applyThirdPersonCameraRotation();
+                    }
+                });
+
                 // UI Elements
                 const blocker = document.getElementById("blocker");
                 const mainPauseMenu = document.getElementById("main-pause-menu");
@@ -17059,7 +17334,9 @@
                             const loadResult = await loadWorld(select.value);
                             // Return to game
                             if (loadResult && loadResult.player) {
-                                controls.getObject().position.copy(loadResult.player.pos);
+                                // Set position on cameraRig if available, otherwise controls
+                                const posTarget = cameraRig || controls.getObject();
+                                posTarget.position.copy(loadResult.player.pos);
                                 // Rotation is serialized with underscore prefixes (_x, _y, _z, _order)
                                 const rot = loadResult.player.rot;
                                 if (rot) {
@@ -18720,7 +18997,7 @@
             }
             function updateDebugInfo(currentFps, avgFps) {
                 if (!isDebug) return;
-                const p = controls.getObject().position;
+                const p = getPlayerWorldPosition();
                 const overlay = document.getElementById("debug-overlay");
                 if (!overlay) return;
                 const cx = Math.floor(p.x / WORLD_DIMS.chunkSize);
@@ -18808,6 +19085,18 @@
                     renderer.info.memory.geometries +
                     " | Textures: " +
                     renderer.info.memory.textures;
+
+                // Add third-person debug info if in third-person mode
+                if (isThirdPerson && controls) {
+                    const playerWorldPos = getPlayerWorldPosition();
+                    const camWorldDir = new THREE.Vector3();
+                    camera.getWorldDirection(camWorldDir);
+                    overlay.innerText += "\n--- 3P MODE ---" +
+                        "\nPlayer: (" + playerWorldPos.x.toFixed(1) + ", " + playerWorldPos.y.toFixed(1) + ", " + playerWorldPos.z.toFixed(1) + ")" +
+                        "\nCam LOCAL: (" + camera.position.x.toFixed(1) + ", " + camera.position.y.toFixed(1) + ", " + camera.position.z.toFixed(1) + ")" +
+                        "\nCam Dir: (" + camWorldDir.x.toFixed(2) + ", " + camWorldDir.y.toFixed(2) + ", " + camWorldDir.z.toFixed(2) + ")" +
+                        "\nCam Rot: X=" + (camera.rotation.x * 180 / Math.PI).toFixed(0) + "° Y=" + (camera.rotation.y * 180 / Math.PI).toFixed(0) + "°";
+                }
             }
             function initTextures() {
                 const cvs = document.createElement("canvas");
@@ -21127,7 +21416,7 @@
                 return null;
             }
             function spawnZombieNearPlayer() {
-                const origin = controls.getObject().position;
+                const origin = getPlayerWorldPosition();
                 for (let attempt = 0; attempt < 8; attempt++) {
                     const dist = THREE.MathUtils.lerp(ZOMBIE_CONFIG.spawnRadius * 0.5, ZOMBIE_CONFIG.spawnRadius, Math.random());
                     const ang = Math.random() * Math.PI * 2;
@@ -21261,7 +21550,7 @@
                     if (spawnZombieNearPlayer()) zombieSpawnTimer = 0;
                 }
                 // Cache frequently accessed values
-                const playerPos = controls.getObject().position;
+                const playerPos = getPlayerWorldPosition();
                 const dragFactor = Math.pow(0.02, dt);
                 const gravityDelta = SETTINGS.gravity * dt * 0.5;
                 const detectionRadiusSq = ZOMBIE_CONFIG.detectionRadius * ZOMBIE_CONFIG.detectionRadius;
@@ -21432,6 +21721,1184 @@
                 // Zombies now generate unique materials per-instance in buildZombieMesh()
                 // No pre-generated materials needed - each zombie is unique!
             }
+            // =====================================================
+            // PLAYER BODY SYSTEM
+            // =====================================================
+            // Player body uses the same voxel construction pattern as zombies
+            // with pivot groups for limb rotation and lerped animations.
+            // Layer 2 is used for the body (separate from world Layer 0 and viewmodel Layer 1).
+            // =====================================================
+
+            // Player appearance palettes (zombie-style quality)
+            const PLAYER_SKIN_COLORS = {
+                base: ["#e8beac", "#ddb59c", "#d9a693"],
+                shadow: ["#c99a78", "#c08a68", "#b57a58"],
+                highlight: ["#f5d4c2", "#f0c8b4", "#ebc0a8"]
+            };
+
+            const PLAYER_HAIR_PALETTES = [
+                { name: "brown", base: "#5b3d25", shadow: "#3f2a18", highlight: "#714d2f" },
+                { name: "black", base: "#2a2423", shadow: "#1a1615", highlight: "#3a322f" },
+                { name: "blonde", base: "#c2a152", shadow: "#9d7d37", highlight: "#e3c56f" },
+                { name: "red", base: "#8b3a1d", shadow: "#6e2a12", highlight: "#a54a2d" },
+            ];
+
+            const PLAYER_SHIRT_COLORS = {
+                base: ["#3a6ea5", "#3366a0", "#2d5a8a"],
+                shadow: ["#2d5a8a", "#254d78", "#1e4670"],
+                highlight: ["#4a7eb5", "#4278b0", "#3a72a8"]
+            };
+
+            const PLAYER_PANTS_COLORS = {
+                base: ["#4a4a4a", "#454545", "#404040"],
+                shadow: ["#3d3d3d", "#383838", "#333333"],
+                highlight: ["#555555", "#505050", "#4d4d4d"]
+            };
+
+            // Cache selected hair palette for consistency
+            let _selectedHairPalette = null;
+            function getPlayerHairPalette() {
+                if (!_selectedHairPalette) {
+                    _selectedHairPalette = PLAYER_HAIR_PALETTES[Math.floor(Math.random() * PLAYER_HAIR_PALETTES.length)];
+                }
+                return _selectedHairPalette;
+            }
+
+            /**
+             * Generate player skin texture for a body part.
+             * Uses zombie-style techniques for quality pixel art.
+             * @param {string} partType - "head", "body", "arm", or "leg"
+             * @returns {THREE.CanvasTexture}
+             */
+            function generatePlayerSkinTexture(partType) {
+                const PIXELS_PER_TILE = Math.max(8, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+
+                // Use zombie-style fillRoundedPixel for proper pixel boundaries
+                const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                // Use consistent hair color for this player
+                const hairPalette = getPlayerHairPalette();
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        let color;
+                        const v = y / PIXELS_PER_TILE;
+                        const u = x / PIXELS_PER_TILE;
+                        const r = Math.random();
+
+                        if (partType === "head") {
+                            // Hair on top ~30%, skin below with subtle shading
+                            if (v < 0.30) {
+                                // Hair with variation
+                                if (r > 0.7) color = hairPalette.highlight;
+                                else if (r > 0.3) color = hairPalette.base;
+                                else color = hairPalette.shadow;
+                            } else {
+                                // Skin with subtle shadow on edges
+                                const edgeFactor = Math.min(u, 1 - u, v - 0.3, 1 - v) * 4;
+                                if (edgeFactor < 0.3 || r > 0.75) {
+                                    color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                                } else if (r > 0.15) {
+                                    color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                                }
+                            }
+                        } else if (partType === "body") {
+                            // Entire torso is covered by shirt
+                            const isEdge = u < 0.15 || u > 0.85;
+
+                            if (isEdge || r > 0.8) {
+                                color = PLAYER_SHIRT_COLORS.shadow[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.shadow.length)];
+                            } else if (r > 0.2) {
+                                color = PLAYER_SHIRT_COLORS.base[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.base.length)];
+                            } else {
+                                color = PLAYER_SHIRT_COLORS.highlight[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.highlight.length)];
+                            }
+                        } else if (partType === "arm") {
+                            // Upper arm is sleeve, lower is skin (hand)
+                            const isSleeveArea = v < 0.55;
+                            const isEdge = u < 0.15 || u > 0.85;
+
+                            if (isSleeveArea) {
+                                // Sleeve with shading
+                                if (isEdge || r > 0.75) {
+                                    color = PLAYER_SHIRT_COLORS.shadow[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.shadow.length)];
+                                } else if (r > 0.2) {
+                                    color = PLAYER_SHIRT_COLORS.base[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SHIRT_COLORS.highlight[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.highlight.length)];
+                                }
+                            } else {
+                                // Skin (forearm/hand)
+                                if (isEdge || r > 0.7) {
+                                    color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                                } else if (r > 0.15) {
+                                    color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                                }
+                            }
+                        } else if (partType === "leg") {
+                            // Pants with edge shading
+                            const isEdge = u < 0.15 || u > 0.85;
+
+                            if (isEdge || r > 0.75) {
+                                color = PLAYER_PANTS_COLORS.shadow[Math.floor(Math.random() * PLAYER_PANTS_COLORS.shadow.length)];
+                            } else if (r > 0.2) {
+                                color = PLAYER_PANTS_COLORS.base[Math.floor(Math.random() * PLAYER_PANTS_COLORS.base.length)];
+                            } else {
+                                color = PLAYER_PANTS_COLORS.highlight[Math.floor(Math.random() * PLAYER_PANTS_COLORS.highlight.length)];
+                            }
+                        } else {
+                            color = PLAYER_SKIN_COLORS.base[0];
+                        }
+                        fillPixel(x, y, color);
+                    }
+                }
+
+                // Apply dithering for texture variation (like zombies)
+                applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.10);
+
+                const tex = new THREE.CanvasTexture(cvs);
+                tex.magFilter = THREE.NearestFilter;
+                tex.minFilter = THREE.NearestFilter;
+                registerPixelTexture(tex);
+                return tex;
+            }
+
+            /**
+             * Generate per-face head textures with face features on front.
+             * Returns array of 6 materials for BoxGeometry faces.
+             * Face order: +X (right), -X (left), +Y (top), -Y (bottom), +Z (front), -Z (back)
+             * @returns {THREE.MeshLambertMaterial[]}
+             */
+            function generatePlayerHeadMaterials() {
+                const PIXELS_PER_TILE = Math.max(8, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+
+                const hairPalette = getPlayerHairPalette();
+                const materials = [];
+
+                // Face indices: 0=right, 1=left, 2=top, 3=bottom, 4=front, 5=back
+                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                    const cvs = document.createElement("canvas");
+                    cvs.width = TILE_SIZE;
+                    cvs.height = TILE_SIZE;
+                    const ctx = cvs.getContext("2d");
+                    const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                    const isFront = faceIdx === 4;
+                    const isTop = faceIdx === 2;
+                    const isBottom = faceIdx === 3;
+                    const isSide = faceIdx === 0 || faceIdx === 1;
+                    const isBack = faceIdx === 5;
+
+                    // Hair extends further down on sides and back
+                    const hairLine = isTop ? PIXELS_PER_TILE :
+                                    isBottom ? 0 :
+                                    isSide ? Math.floor(PIXELS_PER_TILE * 0.45) :
+                                    isBack ? Math.floor(PIXELS_PER_TILE * 0.40) :
+                                    Math.floor(PIXELS_PER_TILE * 0.30); // front
+
+                    for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                        for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                            let color;
+                            const r = Math.random();
+                            const u = x / PIXELS_PER_TILE;
+
+                            if (isTop) {
+                                // Top of head is all hair
+                                if (r > 0.7) color = hairPalette.highlight;
+                                else if (r > 0.3) color = hairPalette.base;
+                                else color = hairPalette.shadow;
+                            } else if (isBottom) {
+                                // Bottom (chin/neck) is skin
+                                if (r > 0.7) color = PLAYER_SKIN_COLORS.shadow[0];
+                                else color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                            } else if (y < hairLine) {
+                                // Hair region
+                                if (r > 0.7) color = hairPalette.highlight;
+                                else if (r > 0.3) color = hairPalette.base;
+                                else color = hairPalette.shadow;
+                            } else {
+                                // Skin region with edge shading
+                                const edgeFactor = Math.min(u, 1 - u) * 4;
+                                if (edgeFactor < 0.3 || r > 0.75) {
+                                    color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                                } else if (r > 0.15) {
+                                    color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                                }
+                            }
+                            fillPixel(x, y, color);
+                        }
+                    }
+
+                    // Add face features on front face
+                    if (isFront) {
+                        const eyeY = Math.floor(PIXELS_PER_TILE * 0.42);
+                        const eyeLeftX = Math.floor(PIXELS_PER_TILE * 0.30);
+                        const eyeRightX = Math.floor(PIXELS_PER_TILE * 0.70);
+                        const mouthY = Math.floor(PIXELS_PER_TILE * 0.72);
+                        const mouthStartX = Math.floor(PIXELS_PER_TILE * 0.35);
+                        const mouthEndX = Math.floor(PIXELS_PER_TILE * 0.65);
+
+                        // Eyes (white with dark pupil)
+                        fillPixel(eyeLeftX, eyeY, "#ffffff");
+                        fillPixel(eyeLeftX, eyeY + 1, "#2a2a2a"); // pupil
+                        fillPixel(eyeRightX, eyeY, "#ffffff");
+                        fillPixel(eyeRightX, eyeY + 1, "#2a2a2a"); // pupil
+
+                        // Simple mouth line
+                        for (let mx = mouthStartX; mx <= mouthEndX; mx++) {
+                            fillPixel(mx, mouthY, "#8b5a5a");
+                        }
+                    }
+
+                    // Apply dithering
+                    applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.08);
+
+                    const tex = new THREE.CanvasTexture(cvs);
+                    tex.magFilter = THREE.NearestFilter;
+                    tex.minFilter = THREE.NearestFilter;
+                    registerPixelTexture(tex);
+
+                    materials.push(new THREE.MeshLambertMaterial({ map: tex }));
+                }
+
+                return materials;
+            }
+
+            /**
+             * Generate per-face arm textures.
+             * Side faces have sleeve-to-skin gradient, top cap is all shirt, bottom cap is all skin.
+             * Face order: +X (right), -X (left), +Y (top), -Y (bottom), +Z (front), -Z (back)
+             * @returns {THREE.MeshLambertMaterial[]}
+             */
+            function generatePlayerArmMaterials() {
+                const PIXELS_PER_TILE = Math.max(8, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+
+                const materials = [];
+
+                // Face indices: 0=right, 1=left, 2=top, 3=bottom, 4=front, 5=back
+                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                    const cvs = document.createElement("canvas");
+                    cvs.width = TILE_SIZE;
+                    cvs.height = TILE_SIZE;
+                    const ctx = cvs.getContext("2d");
+                    const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                    const isTop = faceIdx === 2;    // Shoulder end - all shirt
+                    const isBottom = faceIdx === 3; // Hand end - all skin
+
+                    for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                        for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                            const v = y / PIXELS_PER_TILE;
+                            const u = x / PIXELS_PER_TILE;
+                            const r = Math.random();
+                            let color;
+                            const isEdge = u < 0.15 || u > 0.85;
+
+                            if (isTop) {
+                                // Top cap (shoulder) - all shirt
+                                if (isEdge || r > 0.75) {
+                                    color = PLAYER_SHIRT_COLORS.shadow[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.shadow.length)];
+                                } else if (r > 0.2) {
+                                    color = PLAYER_SHIRT_COLORS.base[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SHIRT_COLORS.highlight[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.highlight.length)];
+                                }
+                            } else if (isBottom) {
+                                // Bottom cap (hand) - all skin
+                                if (isEdge || r > 0.7) {
+                                    color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                                } else if (r > 0.15) {
+                                    color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                                } else {
+                                    color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                                }
+                            } else {
+                                // Side faces - sleeve on top (~55%), skin on bottom
+                                const isSleeveArea = v < 0.55;
+
+                                if (isSleeveArea) {
+                                    if (isEdge || r > 0.75) {
+                                        color = PLAYER_SHIRT_COLORS.shadow[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.shadow.length)];
+                                    } else if (r > 0.2) {
+                                        color = PLAYER_SHIRT_COLORS.base[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.base.length)];
+                                    } else {
+                                        color = PLAYER_SHIRT_COLORS.highlight[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.highlight.length)];
+                                    }
+                                } else {
+                                    if (isEdge || r > 0.7) {
+                                        color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                                    } else if (r > 0.15) {
+                                        color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                                    } else {
+                                        color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                                    }
+                                }
+                            }
+                            fillPixel(x, y, color);
+                        }
+                    }
+
+                    applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.08);
+
+                    const tex = new THREE.CanvasTexture(cvs);
+                    tex.magFilter = THREE.NearestFilter;
+                    tex.minFilter = THREE.NearestFilter;
+                    registerPixelTexture(tex);
+
+                    materials.push(new THREE.MeshLambertMaterial({ map: tex }));
+                }
+
+                return materials;
+            }
+
+            /**
+             * Generate materials for player body parts.
+             * @returns {{head: THREE.MeshLambertMaterial[], body: THREE.MeshLambertMaterial, arm: THREE.MeshLambertMaterial[], leg: THREE.MeshLambertMaterial}}
+             */
+            function generatePlayerMaterials() {
+                return {
+                    head: generatePlayerHeadMaterials(), // Array of 6 materials for per-face texturing
+                    body: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("body") }),
+                    arm: generatePlayerArmMaterials(),   // Array of 6 materials for per-face texturing
+                    leg: new THREE.MeshLambertMaterial({ map: generatePlayerSkinTexture("leg") }),
+                };
+            }
+
+            /**
+             * Build the player body mesh with pivot groups for animation.
+             * Follows the same pattern as buildZombieMesh().
+             * @returns {THREE.Group} Player body mesh group
+             */
+            function buildPlayerMesh() {
+                const group = new THREE.Group();
+                const { head, body, leg, shoulderY, hipY, arm } = PLAYER_PROPORTIONS;
+                const materials = generatePlayerMaterials();
+
+                // Create geometries
+                const headGeometry = new THREE.BoxGeometry(head.size, head.height, head.size);
+                const bodyGeometry = new THREE.BoxGeometry(body.width, body.height, body.depth);
+                const armGeometry = new THREE.BoxGeometry(arm.thickness, arm.height, arm.thickness);
+                const legGeometry = new THREE.BoxGeometry(leg.thickness, leg.height, leg.thickness);
+
+                // Create meshes
+                const headMesh = new THREE.Mesh(headGeometry, materials.head);
+                const bodyMesh = new THREE.Mesh(bodyGeometry, materials.body);
+
+                // Calculate offsets - legs under torso, arms at sides
+                const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
+                const armOffsetX = body.width * 0.5 + arm.thickness * 0.5;
+
+                // Left Arm - pivot at shoulder
+                const leftArmPivot = new THREE.Group();
+                const leftArmMesh = new THREE.Mesh(armGeometry, materials.arm);
+                leftArmMesh.castShadow = false; // Disable to prevent torch self-shadowing
+                leftArmMesh.receiveShadow = true;
+                leftArmMesh.position.y = -arm.height * 0.5;
+                leftArmPivot.add(leftArmMesh);
+                leftArmPivot.position.set(-armOffsetX, shoulderY, 0);
+
+                // Right Arm - pivot at shoulder
+                const rightArmPivot = new THREE.Group();
+                const rightArmMesh = new THREE.Mesh(armGeometry, materials.arm);
+                rightArmMesh.castShadow = false; // Disable to prevent torch self-shadowing
+                rightArmMesh.receiveShadow = true;
+                rightArmMesh.position.y = -arm.height * 0.5;
+                rightArmPivot.add(rightArmMesh);
+                rightArmPivot.position.set(armOffsetX, shoulderY, 0);
+
+                // Add torch holder at end of right arm (for third-person view)
+                const torchHolder = new THREE.Group();
+                // Position at hand (end of arm), slightly forward
+                torchHolder.position.set(0, -arm.height + 0.05, 0.08);
+                // Rotate ~100 degrees on X-axis so torch points outward from hand
+                // Math.PI/2 = 90 degrees, plus 10 degrees (0.174 rad) for slight upward angle
+                torchHolder.rotation.set(Math.PI / 2 + 0.174, 0, 0);
+                torchHolder.name = 'torchHolder';
+                rightArmPivot.add(torchHolder);
+
+                // Left Leg - pivot at hip
+                const leftLegPivot = new THREE.Group();
+                const leftLegMesh = new THREE.Mesh(legGeometry, materials.leg);
+                leftLegMesh.castShadow = false; // Disable to prevent torch self-shadowing
+                leftLegMesh.receiveShadow = true;
+                leftLegMesh.position.y = -leg.height * 0.5;
+                leftLegPivot.add(leftLegMesh);
+                leftLegPivot.position.set(-legOffsetX, hipY, 0);
+
+                // Right Leg - pivot at hip
+                const rightLegPivot = new THREE.Group();
+                const rightLegMesh = new THREE.Mesh(legGeometry, materials.leg);
+                rightLegMesh.castShadow = false; // Disable to prevent torch self-shadowing
+                rightLegMesh.receiveShadow = true;
+                rightLegMesh.position.y = -leg.height * 0.5;
+                rightLegPivot.add(rightLegMesh);
+                rightLegPivot.position.set(legOffsetX, hipY, 0);
+
+                // Position head and body
+                headMesh.position.set(0, head.centerY, 0);
+                bodyMesh.position.set(0, hipY + body.height * 0.5, 0);
+
+                // Disable shadow casting to prevent torch self-shadowing
+                // Player body still receives shadows from world objects
+                headMesh.castShadow = false;
+                headMesh.receiveShadow = true;
+                bodyMesh.castShadow = false;
+                bodyMesh.receiveShadow = true;
+
+                // Store references for animation
+                const parts = {
+                    head: headMesh,
+                    body: bodyMesh,
+                    leftArm: leftArmPivot,
+                    rightArm: rightArmPivot,
+                    leftLeg: leftLegPivot,
+                    rightLeg: rightLegPivot,
+                    leftArmMesh,
+                    rightArmMesh,
+                    leftLegMesh,
+                    rightLegMesh,
+                    torchHolder,
+                };
+
+                // Add all parts to group
+                group.add(headMesh);
+                group.add(bodyMesh);
+                group.add(leftArmPivot);
+                group.add(rightArmPivot);
+                group.add(leftLegPivot);
+                group.add(rightLegPivot);
+
+                group.userData.parts = parts;
+                group.castShadow = false; // Disable to prevent torch self-shadowing
+                group.receiveShadow = true;
+
+                // Set to Layer 2 (player body layer) - set on ALL objects including groups
+                group.layers.set(2);  // Set the root group first
+                group.traverse((child) => {
+                    child.layers.set(2);  // Set ALL children (meshes AND groups)
+                });
+
+                logDebug("[PlayerBody] Built player mesh with proportions:", PLAYER_PROPORTIONS);
+                return group;
+            }
+
+            /**
+             * Create a torch model for player's hand (third-person view).
+             * Uses same style as world torches (createWorldTorch) but without built-in PointLight.
+             * @returns {THREE.Group}
+             */
+            function createThirdPersonTorch() {
+                const group = new THREE.Group();
+
+                // Torch stick - same as createWorldTorch
+                const stickGeo = new THREE.BoxGeometry(0.08, 0.5, 0.08);
+                const stickMat = new THREE.MeshLambertMaterial({ color: 0x4a2511 });
+                const stick = new THREE.Mesh(stickGeo, stickMat);
+                stick.position.set(0, 0, 0);
+                stick.castShadow = false; // Disable to prevent torch self-shadowing
+                stick.receiveShadow = true;
+                group.add(stick);
+
+                // Torch flame - same as createWorldTorch
+                const flameGeo = new THREE.BoxGeometry(0.08, 0.04, 0.08);
+                const flameMat = new THREE.MeshLambertMaterial({
+                    color: 0xffaa33,
+                    emissive: 0xffaa33,
+                    emissiveIntensity: 0.5
+                });
+                const flame = new THREE.Mesh(flameGeo, flameMat);
+                flame.position.set(0, 0.27, 0);
+                flame.castShadow = false;
+                flame.name = 'flame';
+                group.add(flame);
+
+                // Torch glow - same as createWorldTorch
+                const glowGeo = new THREE.BoxGeometry(0.08, 0.08, 0.08);
+                const glowMat = new THREE.MeshLambertMaterial({
+                    color: 0xffff66,
+                    emissive: 0xffff66,
+                    emissiveIntensity: 1.0
+                });
+                const glow = new THREE.Mesh(glowGeo, glowMat);
+                glow.position.set(0, 0.33, 0);
+                glow.castShadow = false;
+                glow.name = 'glow';
+                group.add(glow);
+
+                // No PointLight - we reparent the main torchLight
+
+                // Set to layer 2 (player body layer)
+                group.traverse((child) => {
+                    child.layers.set(2);
+                });
+
+                group.visible = false;
+                group.name = 'thirdPersonTorch';
+
+                return group;
+            }
+
+            /**
+             * Build viewmodel arms for first-person view.
+             * Similar to torch viewmodel: Layer 1, no depth test.
+             * @returns {THREE.Group} Viewmodel arms group
+             */
+            function buildPlayerViewmodelArms() {
+                const group = new THREE.Group();
+                const { arm } = PLAYER_PROPORTIONS;
+
+                // Create arm texture with enhanced quality (matching third-person body)
+                const PIXELS_PER_TILE = Math.max(8, Math.round(SETTINGS.textureResolution * 0.5));
+                const TILE_SIZE = PIXELS_PER_TILE * 2;
+                const cvs = document.createElement("canvas");
+                cvs.width = TILE_SIZE;
+                cvs.height = TILE_SIZE;
+                const ctx = cvs.getContext("2d");
+                const STEP = TILE_SIZE / PIXELS_PER_TILE;
+                const fillPixel = (x, y, color) => fillRoundedPixel(ctx, STEP, x, y, color);
+
+                for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                    for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                        const v = y / PIXELS_PER_TILE;
+                        const u = x / PIXELS_PER_TILE;
+                        const r = Math.random();
+                        let color;
+                        const isEdge = u < 0.15 || u > 0.85;
+
+                        if (v < 0.4) {
+                            // Sleeve with shading
+                            if (isEdge || r > 0.75) {
+                                color = PLAYER_SHIRT_COLORS.shadow[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.shadow.length)];
+                            } else if (r > 0.2) {
+                                color = PLAYER_SHIRT_COLORS.base[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.base.length)];
+                            } else {
+                                color = PLAYER_SHIRT_COLORS.highlight[Math.floor(Math.random() * PLAYER_SHIRT_COLORS.highlight.length)];
+                            }
+                        } else {
+                            // Skin with shading
+                            if (isEdge || r > 0.7) {
+                                color = PLAYER_SKIN_COLORS.shadow[Math.floor(Math.random() * PLAYER_SKIN_COLORS.shadow.length)];
+                            } else if (r > 0.15) {
+                                color = PLAYER_SKIN_COLORS.base[Math.floor(Math.random() * PLAYER_SKIN_COLORS.base.length)];
+                            } else {
+                                color = PLAYER_SKIN_COLORS.highlight[Math.floor(Math.random() * PLAYER_SKIN_COLORS.highlight.length)];
+                            }
+                        }
+                        fillPixel(x, y, color);
+                    }
+                }
+                applyPixelDither(ctx, PIXELS_PER_TILE, STEP, 0.08);
+
+                const tex = new THREE.CanvasTexture(cvs);
+                tex.magFilter = THREE.NearestFilter;
+                tex.minFilter = THREE.NearestFilter;
+                registerPixelTexture(tex);
+
+                const armMaterial = new THREE.MeshLambertMaterial({
+                    map: tex,
+                    depthTest: false,
+                    depthWrite: false,
+                });
+
+                // Arm geometry (sized for good viewmodel visibility)
+                const armGeo = new THREE.BoxGeometry(0.10, 0.40, 0.10);
+
+                // Left arm (visible in lower left of viewport)
+                const leftArmPivot = new THREE.Group();
+                const leftArm = new THREE.Mesh(armGeo, armMaterial);
+                leftArm.position.y = -0.20; // Offset down from pivot
+                leftArm.renderOrder = 9998;
+                leftArm.layers.set(1);
+                leftArmPivot.add(leftArm);
+                leftArmPivot.position.set(-0.35, -0.40, -0.35); // Further to edge of viewport
+                leftArmPivot.rotation.set(0.5, 0.3, 0.1); // Natural arm angle
+
+                // Right arm (visible in lower right of viewport)
+                const rightArmPivot = new THREE.Group();
+                const rightArm = new THREE.Mesh(armGeo, armMaterial.clone());
+                rightArm.position.y = -0.20; // Offset down from pivot
+                rightArm.renderOrder = 9998;
+                rightArm.layers.set(1);
+                rightArmPivot.add(rightArm);
+                rightArmPivot.position.set(0.35, -0.40, -0.35); // Further to edge of viewport
+                rightArmPivot.rotation.set(0.5, -0.3, -0.1); // Natural arm angle
+
+                group.add(leftArmPivot);
+                group.add(rightArmPivot);
+
+                group.userData.parts = {
+                    leftArm: leftArmPivot,
+                    rightArm: rightArmPivot,
+                    leftArmMesh: leftArm,
+                    rightArmMesh: rightArm,
+                };
+
+                group.layers.set(1);
+                group.renderOrder = 9998;
+                group.visible = true;
+
+                logDebug("[PlayerBody] Built viewmodel arms");
+                return group;
+            }
+
+            /**
+             * Animate player limbs based on movement state.
+             * Handles walking, sprinting, jumping, falling, swimming, flying, and crouching.
+             * @param {number} dt - Delta time in seconds
+             * @param {Object} state - Movement state flags
+             * @param {number} moveSpeed - Current horizontal movement speed
+             */
+            function animatePlayerLimbs(dt, state, moveSpeed) {
+                if (!playerBodyMesh) return;
+                const parts = playerBodyMesh.userData.parts;
+                if (!parts) return;
+
+                // Initialize pose cache with all rotation axes
+                if (!playerPose) {
+                    playerPose = {
+                        leftArmX: 0, rightArmX: 0,
+                        leftArmZ: 0, rightArmZ: 0,
+                        leftLegX: 0, rightLegX: 0,
+                        headX: 0,
+                        headY: PLAYER_PROPORTIONS.head.centerY,
+                        bodyY: PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5,
+                        bodyTilt: 0,
+                    };
+                }
+
+                // Smoothing function with frame-rate independence
+                const smooth = (key, target, factor = 0.18) => {
+                    playerPose[key] = THREE.MathUtils.lerp(playerPose[key], target, 1 - Math.pow(1 - factor, dt * 60));
+                    return playerPose[key];
+                };
+
+                // Animation targets
+                let targetArmLX = 0, targetArmRX = 0;
+                let targetArmLZ = 0, targetArmRZ = 0;
+                let targetLegLX = 0, targetLegRX = 0;
+                let targetHeadX = 0;
+                let targetHeadY = PLAYER_PROPORTIONS.head.centerY;
+                let targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5;
+                let targetBodyTilt = 0;
+
+                // Animation parameters
+                let strideRate = 3.5;
+                let armAmplitude = 0.5;
+                let legAmplitude = 0.5;
+
+                if (state.isSwimming) {
+                    // Swimming: breaststroke-like motion
+                    playerWalkPhase += dt * 2.5;
+                    const swimPhase = playerWalkPhase;
+
+                    // Arms reach forward then sweep back
+                    const armCycle = Math.sin(swimPhase);
+                    const armReach = Math.cos(swimPhase);
+                    // Arms go forward (negative) on reach, back (positive) on pull
+                    targetArmLX = armReach * 0.6;  // Cycles between forward reach and back pull
+                    targetArmRX = armReach * 0.6;
+                    // Arms spread out during the sweep
+                    targetArmLZ = -0.3 - armCycle * 0.4;  // Left arm sweeps left
+                    targetArmRZ = 0.3 + armCycle * 0.4;   // Right arm sweeps right
+
+                    // Legs kick alternately (flutter kick)
+                    const kick = Math.sin(swimPhase * 2.5) * 0.35;
+                    targetLegLX = kick;
+                    targetLegRX = -kick;  // Opposite leg
+
+                    // Body horizontal in water
+                    targetBodyTilt = 0.3;
+                    // Head UP to breathe/see (negative = up)
+                    targetHeadX = -0.25;
+
+                } else if (state.isTreadingWater) {
+                    // Treading water: gentle sculling motion
+                    playerIdleTimer += dt;
+                    const bob = Math.sin(playerIdleTimer * 2) * 0.15;
+                    const scull = Math.sin(playerIdleTimer * 3) * 0.2;
+
+                    // Arms scull at sides (slight forward angle for treading)
+                    targetArmLX = -0.15 + scull * 0.15;  // Slight forward sculling motion
+                    targetArmRX = -0.15 - scull * 0.15;
+                    targetArmLZ = -0.5 + bob * 0.1;  // Arms out to sides
+                    targetArmRZ = 0.5 - bob * 0.1;
+
+                    // Legs do gentle eggbeater kick
+                    targetLegLX = 0.15 + bob * 0.25;
+                    targetLegRX = 0.15 - bob * 0.25;
+
+                    // Head stays up to breathe
+                    targetHeadX = -0.1;
+
+                } else if (state.inWater && !state.isMoving) {
+                    // Floating in water but not moving - relaxed float
+                    playerIdleTimer += dt;
+                    const float = Math.sin(playerIdleTimer * 1.5) * 0.1;
+
+                    // Arms relaxed out to sides
+                    targetArmLX = 0.1;  // Slightly back
+                    targetArmRX = 0.1;
+                    targetArmLZ = -0.4 + float;  // Float out to sides
+                    targetArmRZ = 0.4 - float;
+
+                    // Legs relaxed, slightly back
+                    targetLegLX = 0.2 + float * 0.5;
+                    targetLegRX = 0.2 - float * 0.5;
+
+                    // Head up
+                    targetHeadX = -0.1;
+
+                } else if (state.isFlying) {
+                    // Flying: superman pose with subtle movement
+                    playerIdleTimer += dt;
+                    const flyBob = Math.sin(playerIdleTimer * 2) * 0.08;
+
+                    if (state.isMoving) {
+                        // Moving while flying - arms swept BACK (positive X), body tilted forward
+                        targetArmLX = 0.8;   // POSITIVE = arms back
+                        targetArmRX = 0.8;
+                        targetArmLZ = -0.15 + flyBob;  // Arms slightly out to sides
+                        targetArmRZ = 0.15 - flyBob;
+                        targetBodyTilt = 0.4;  // Lean forward (superman diving pose)
+                        targetHeadX = -0.35;   // NEGATIVE = head UP to look forward while body is tilted
+                    } else {
+                        // Hovering - arms out to sides, relaxed
+                        targetArmLX = 0.2 + flyBob;   // Slightly back
+                        targetArmRX = 0.2 - flyBob;
+                        targetArmLZ = -0.5;  // Arms spread out
+                        targetArmRZ = 0.5;
+                        targetHeadX = 0;     // Head neutral when hovering
+                    }
+
+                    // Legs trail behind (positive = back)
+                    targetLegLX = 0.4 + flyBob * 0.3;
+                    targetLegRX = 0.4 - flyBob * 0.3;
+
+                } else if (state.isJumping) {
+                    // Jumping: arms swing up and back, legs tuck
+                    const jumpProgress = Math.min(1, Math.max(0, state.velocityY / 8));
+
+                    // Arms swing UP and BACK (positive = back)
+                    targetArmLX = 0.7 * jumpProgress;
+                    targetArmRX = 0.7 * jumpProgress;
+                    // Arms also go slightly out
+                    targetArmLZ = -0.2 * jumpProgress;
+                    targetArmRZ = 0.2 * jumpProgress;
+
+                    // Legs tuck forward slightly (negative = forward tuck)
+                    targetLegLX = -0.3 * jumpProgress;
+                    targetLegRX = -0.3 * jumpProgress;
+
+                    // Body extends upward (slight backward lean)
+                    targetBodyTilt = -0.15 * jumpProgress;
+                    // Head looks slightly up
+                    targetHeadX = -0.1 * jumpProgress;
+
+                } else if (state.isFalling) {
+                    // Falling: arms out and up for balance, legs spread
+                    const fallIntensity = Math.min(1, Math.abs(state.velocityY) / 12);
+
+                    // Arms out to sides and slightly up/back for windmilling balance
+                    targetArmLZ = -0.7 * fallIntensity;  // Arms spread wide
+                    targetArmRZ = 0.7 * fallIntensity;
+                    targetArmLX = 0.4 * fallIntensity;   // Arms angled back/up
+                    targetArmRX = 0.4 * fallIntensity;
+
+                    // Legs spread apart and slightly forward (bracing)
+                    targetLegLX = -0.15 * fallIntensity;
+                    targetLegRX = -0.15 * fallIntensity;
+
+                    // Head looks down to see where falling
+                    targetHeadX = 0.2 * fallIntensity;
+
+                } else if (state.isMoving) {
+                    // Walking or running animation
+                    if (state.isSprinting) {
+                        strideRate = 7.0;
+                        armAmplitude = 0.85;
+                        legAmplitude = 0.75;
+                        targetBodyTilt = 0.15; // Lean forward when sprinting
+                        targetHeadX = -0.1;    // Head slightly up to counteract body lean
+                    } else if (state.isCrouching) {
+                        strideRate = 2.0;
+                        armAmplitude = 0.25;
+                        legAmplitude = 0.35;
+                        // Lower body when crouching
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                    }
+
+                    playerWalkPhase += dt * strideRate;
+                    const swing = Math.sin(playerWalkPhase);
+                    const counter = Math.cos(playerWalkPhase);
+
+                    // Arms and legs swing in opposition
+                    targetArmLX = swing * armAmplitude;
+                    targetArmRX = -swing * armAmplitude;
+                    targetLegLX = -counter * legAmplitude;
+                    targetLegRX = counter * legAmplitude;
+
+                    // Subtle arm Z-rotation for more natural swing
+                    targetArmLZ = swing * 0.1;
+                    targetArmRZ = -swing * 0.1;
+
+                } else {
+                    // Idle animation - subtle breathing
+                    playerIdleTimer += dt;
+                    const breathe = Math.sin(playerIdleTimer * 1.2) * 0.04;
+                    targetHeadY = PLAYER_PROPORTIONS.head.centerY + breathe * 0.5;
+
+                    // Subtle arm sway
+                    targetArmLX = Math.sin(playerIdleTimer * 0.8) * 0.06;
+                    targetArmRX = Math.sin(playerIdleTimer * 0.8 + 0.5) * 0.06;
+
+                    if (state.isCrouching) {
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                    }
+                }
+
+                // Override right arm position when holding torch
+                if (torchActive && isThirdPerson) {
+                    // Extend right arm forward to hold torch out
+                    // Negative X = arm forward, positive Z = arm out to side slightly
+                    targetArmRX = -0.8;  // Arm extended forward
+                    targetArmRZ = 0.15;  // Slightly out to the side
+                }
+
+                // Apply smoothed rotations
+                parts.leftArm.rotation.x = smooth("leftArmX", targetArmLX);
+                parts.rightArm.rotation.x = smooth("rightArmX", targetArmRX);
+                parts.leftArm.rotation.z = smooth("leftArmZ", targetArmLZ, 0.15);
+                parts.rightArm.rotation.z = smooth("rightArmZ", targetArmRZ, 0.15);
+                parts.leftLeg.rotation.x = smooth("leftLegX", targetLegLX, 0.12);
+                parts.rightLeg.rotation.x = smooth("rightLegX", targetLegRX, 0.12);
+                parts.head.position.y = smooth("headY", targetHeadY, 0.15);
+                parts.head.rotation.x = smooth("headX", targetHeadX, 0.12);
+                parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
+                parts.body.rotation.x = smooth("bodyTilt", targetBodyTilt, 0.1);
+
+                // Offset leg pivot positions to follow tilted body hips
+                // When body tilts forward (positive rotation.x), hips move backward in Z
+                // Calculate hip offset: the hip joint is roughly at the bottom of the torso
+                const currentBodyTilt = parts.body.rotation.x;
+                const hipOffsetFromBodyCenter = PLAYER_PROPORTIONS.body.height * 0.4; // Distance from body center to hip
+                const legZOffset = -Math.sin(currentBodyTilt) * hipOffsetFromBodyCenter;
+
+                // Apply Z offset to leg pivots to keep them attached to tilted hips
+                const { leg, body, hipY } = PLAYER_PROPORTIONS;
+                const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
+                parts.leftLeg.position.set(-legOffsetX, hipY, legZOffset);
+                parts.rightLeg.position.set(legOffsetX, hipY, legZOffset);
+            }
+
+            /**
+             * Animate viewmodel arms based on movement.
+             * Uses separate viewmodelWalkPhase to avoid double-speed animation.
+             * @param {number} dt - Delta time
+             * @param {Object} state - Movement state
+             */
+            function animateViewmodelArms(dt, state) {
+                if (!playerArmsModel) return;
+                const parts = playerArmsModel.userData.parts;
+                if (!parts) return;
+
+                let bobAmplitude = 0;
+                let bobSpeed = 0;
+                let swayAmount = 0;
+
+                if (state.isSwimming) {
+                    bobAmplitude = 0.08;
+                    bobSpeed = 2.5;
+                    swayAmount = 0.03;
+                } else if (state.isFlying && state.isMoving) {
+                    bobAmplitude = 0.02;
+                    bobSpeed = 2;
+                } else if (state.isMoving) {
+                    bobAmplitude = state.isSprinting ? 0.06 : 0.03;
+                    bobSpeed = state.isSprinting ? 7 : 4;
+                    swayAmount = state.isSprinting ? 0.02 : 0.01;
+                }
+
+                if (bobSpeed > 0) {
+                    viewmodelWalkPhase += dt * bobSpeed;
+                    const bob = Math.sin(viewmodelWalkPhase) * bobAmplitude;
+                    const sway = Math.cos(viewmodelWalkPhase * 0.5) * swayAmount;
+
+                    if (parts.leftArm) {
+                        parts.leftArm.position.y = -0.40 + bob;
+                        parts.leftArm.rotation.x = 0.5 + bob * 2;
+                        parts.leftArm.rotation.z = 0.1 + sway;
+                    }
+                    if (parts.rightArm) {
+                        parts.rightArm.position.y = -0.40 - bob * 0.5;
+                        parts.rightArm.rotation.x = 0.5 - bob * 2;
+                        parts.rightArm.rotation.z = -0.1 - sway;
+                    }
+                }
+            }
+
+            /**
+             * Update player body position and animation each frame.
+             * Handles both first-person and third-person camera modes.
+             * @param {number} dt - Delta time in seconds
+             */
+            function updatePlayerBody(dt) {
+                if (!controls) return;
+
+                // Get player world position from cameraRig (if available) or controls
+                const playerWorldPos = getPlayerWorldPosition();
+                const controlsYaw = controls.getObject().rotation.y;
+
+                // Get movement state
+                const velX = velocity.x;
+                const velZ = velocity.z;
+                const horizontalSpeedSq = velX * velX + velZ * velZ;
+                const isMoving = horizontalSpeedSq > 0.01;
+                const moveSpeed = Math.sqrt(horizontalSpeedSq);
+
+                // Calculate feet water state for animation
+                const feetY = Math.floor(playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND);
+                const localFeetInWater = getBlock(Math.floor(playerWorldPos.x), feetY, Math.floor(playerWorldPos.z)) === WATER;
+
+                // Determine water state
+                const inWater = isUnderwater || localFeetInWater || isTreadingWater;
+                const isSwimming = inWater && isMoving;
+
+                // Determine jump/fall state (only when not flying or swimming)
+                const isFalling = !canJump && velocity.y < -0.5 && !isFlying && !inWater;
+                const isJumping = !canJump && velocity.y > 0.5 && !isFlying && !inWater;
+
+                const state = {
+                    isMoving,
+                    isSprinting: isSprinting && isMoving && !inWater,
+                    isCrouching: isCrouching && !inWater && !isFlying,
+                    isJumping,
+                    isFalling,
+                    isFlying,
+                    isSwimming,
+                    inWater,
+                    isTreadingWater: isTreadingWater && !isMoving,
+                    velocityY: velocity.y,
+                };
+
+                // Update body mesh position and rotation
+                if (playerBodyMesh) {
+                    if (isThirdPerson) {
+                        // Apply orbit camera position and rotation
+                        // This uses thirdPersonOrbitYaw and thirdPersonOrbitPitch (tracked in mousemove)
+                        applyThirdPersonCameraRotation();
+
+                        // Position body mesh at player world position
+                        playerBodyMesh.position.set(
+                            playerWorldPos.x,
+                            playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND,
+                            playerWorldPos.z
+                        );
+
+                        // Body rotation: face movement direction when moving, camera direction when still
+                        // IMPORTANT: velocity.x/z are INPUT-space (relative to camera), need to transform to world-space
+
+                        // Calculate world-space velocity (same transform as physics code uses)
+                        const yaw = thirdPersonOrbitYaw;
+                        const fwdX = -Math.sin(yaw);
+                        const fwdZ = -Math.cos(yaw);
+                        const rightX = Math.cos(yaw);
+                        const rightZ = -Math.sin(yaw);
+                        // Transform: worldVel = forward * (-inputZ) + right * (inputX)
+                        const worldVelX = fwdX * -velZ + rightX * velX;
+                        const worldVelZ = fwdZ * -velZ + rightZ * velX;
+                        const worldSpeed = Math.sqrt(worldVelX * worldVelX + worldVelZ * worldVelZ);
+
+                        let targetBodyYaw;
+
+                        if (worldSpeed > 0.5) {
+                            // Moving: face world-space movement direction
+                            targetBodyYaw = Math.atan2(worldVelX, worldVelZ);
+                        } else {
+                            // Standing still: face the direction player would be looking (orbit direction)
+                            // Camera at (sin(yaw)*d, y, cos(yaw)*d), direction to player: (-sin(yaw), 0, -cos(yaw))
+                            // Body should face this direction = yaw + π
+                            targetBodyYaw = yaw + Math.PI;
+                        }
+
+                        // Helper to normalize angle to [-PI, PI]
+                        const normalizeAngle = (angle) => {
+                            while (angle > Math.PI) angle -= Math.PI * 2;
+                            while (angle < -Math.PI) angle += Math.PI * 2;
+                            return angle;
+                        };
+
+                        // Smooth rotation with proper angle wrapping
+                        let currentYaw = normalizeAngle(playerBodyMesh.rotation.y);
+                        let diff = normalizeAngle(targetBodyYaw - currentYaw);
+
+                        // Apply lerp and normalize result
+                        playerBodyMesh.rotation.y = normalizeAngle(currentYaw + diff * 0.15);
+
+                        // Debug logging (throttled)
+                        if (thirdPersonDebugEnabled) {
+                            const camDir = camera.getWorldDirection(mobTmpA);
+                            logThirdPersonDebug('updatePlayerBody', {
+                                orbitYaw: (thirdPersonOrbitYaw * 180 / Math.PI).toFixed(1) + '°',
+                                orbitPitch: (thirdPersonOrbitPitch * 180 / Math.PI).toFixed(1) + '°',
+                                camDir: `(${camDir.x.toFixed(2)}, ${camDir.y.toFixed(2)}, ${camDir.z.toFixed(2)})`,
+                                bodyYaw: (playerBodyMesh.rotation.y * 180 / Math.PI).toFixed(1) + '°'
+                            });
+                        }
+                    } else {
+                        // In first-person: body follows camera, offset slightly forward for shadows
+                        const camDir = camera.getWorldDirection(mobTmpA);
+                        const bodyYaw = Math.atan2(camDir.x, camDir.z);
+
+                        // Position body at camera location, offset forward for better shadow
+                        playerBodyMesh.position.set(
+                            playerWorldPos.x + camDir.x * 0.2,
+                            playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND,
+                            playerWorldPos.z + camDir.z * 0.2
+                        );
+                        playerBodyMesh.rotation.y = bodyYaw;
+                    }
+
+                    // Animate limbs
+                    animatePlayerLimbs(dt, state, moveSpeed);
+
+                    // Toggle head visibility based on view mode
+                    const parts = playerBodyMesh.userData.parts;
+                    if (parts && parts.head) {
+                        parts.head.visible = isThirdPerson;
+                    }
+                }
+
+                // Update viewmodel arms (only in first-person)
+                if (playerArmsModel) {
+                    playerArmsModel.visible = !isThirdPerson;
+                    if (!isThirdPerson) {
+                        animateViewmodelArms(dt, state);
+                    }
+                }
+            }
+
+            /**
+             * Toggle between first-person and third-person view.
+             * Handles camera positioning and visibility changes.
+             */
+            function toggleThirdPerson() {
+                if (!controls) return;
+
+                isThirdPerson = !isThirdPerson;
+
+                if (isThirdPerson) {
+                    // Entering third-person: initialize orbit angles
+                    // Get yaw from camera.rotation.y - this is what PointerLockControls modifies directly
+                    // Don't use cameraRig.rotation.y because it was reset to 0 when exiting third-person
+                    thirdPersonOrbitYaw = camera.rotation.y;
+                    thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
+
+                    // Reset cameraRig rotation to identity so LOCAL = WORLD axes
+                    if (cameraRig) {
+                        cameraRig.rotation.set(0, 0, 0);
+                    }
+
+                    // Apply immediately so camera doesn't snap
+                    applyThirdPersonCameraRotation();
+                    logDebug("[PlayerBody] Entering third-person mode");
+                } else {
+                    // Exiting third-person: reset camera to first-person position and orientation
+                    camera.position.set(0, 0, 0);
+
+                    // CRITICAL: Keep cameraRig.rotation at identity (as set when entering third-person)
+                    // PointerLockControls modifies camera.rotation directly - if cameraRig also has rotation,
+                    // the two rotations compound and controls become broken.
+                    //
+                    // Set camera.rotation to match the current orbit direction (horizontal only, pitch 0)
+                    // so player continues facing the same direction.
+                    // PointerLockControls will take over from here on mouse movement.
+                    camera.rotation.order = 'YXZ';
+                    camera.rotation.set(0, thirdPersonOrbitYaw, 0);
+
+                    logDebug("[PlayerBody] Returning to first-person mode");
+                }
+
+                // Update body head visibility
+                if (playerBodyMesh) {
+                    const parts = playerBodyMesh.userData.parts;
+                    if (parts && parts.head) {
+                        parts.head.visible = isThirdPerson;
+                    }
+                }
+
+                // Update viewmodel arms visibility
+                if (playerArmsModel) {
+                    playerArmsModel.visible = !isThirdPerson;
+                }
+
+                // Update torch visibility based on view mode
+                if (window.torchModel) {
+                    // Viewmodel torch only visible in first-person when active
+                    window.torchModel.visible = torchActive && !isThirdPerson;
+                }
+                if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                    // Third-person torch visible only in third-person when active
+                    playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
+                }
+
+                logDebug(`[PlayerBody] Third-person mode: ${isThirdPerson}`);
+            }
+
+            /**
+             * Initialize the player body system.
+             * Called from initGame() after scene setup.
+             */
+            function initPlayerBody() {
+                logDebug("[PlayerBody] Initializing player body system...");
+
+                // Build the body mesh
+                playerBodyMesh = buildPlayerMesh();
+                scene.add(playerBodyMesh);
+
+                // Create and attach third-person torch to right hand
+                const thirdPersonTorch = createThirdPersonTorch();
+                const torchParts = playerBodyMesh.userData.parts;
+                if (torchParts && torchParts.torchHolder) {
+                    torchParts.torchHolder.add(thirdPersonTorch);
+                    playerBodyMesh.userData.thirdPersonTorch = thirdPersonTorch;
+                }
+
+                // Build viewmodel arms and attach to camera
+                playerArmsModel = buildPlayerViewmodelArms();
+                camera.add(playerArmsModel);
+
+                // Hide head in first-person mode
+                const parts = playerBodyMesh.userData.parts;
+                if (parts && parts.head) {
+                    parts.head.visible = false;
+                }
+
+                // NOTE: Camera layer 2 is managed by the render loop:
+                // - First-person: camera.layers.set(0) - body not visible (shadows still cast)
+                // - Third-person: camera.layers.set(0) then enable(2) - body visible
+                // Don't permanently enable layer 2 here as it would show body in first-person
+
+                logDebug("[PlayerBody] Player body system initialized");
+            }
+
             // =====================================================
             // TERRAIN GENERATION GLOBAL FUNCTIONS
             // =====================================================
@@ -23959,7 +25426,7 @@
                     updateShadowFrustumSize(currentRenderRadius);
                 }
                 // --- 2. Calculate Player Position ---
-                const pPos = controls.getObject().position;
+                const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
                 // Update state
@@ -24007,7 +25474,7 @@
                 let recomputedFrustum = false;
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
                 controls.getDirection(cameraDirTmp);
-                const playerPos = controls.getObject().position;
+                const playerPos = getPlayerWorldPosition();
                 // Precompute per-frame frustum values
                 const verticalFovRad = (camera.fov * Math.PI) / 180;
                 const horizontalFovRad = 2 * Math.atan(Math.tan(verticalFovRad / 2) * camera.aspect);
@@ -24148,7 +25615,7 @@
                 // --- BIOME CACHE CLEANUP ---
                 // Prevent memory leak by removing distant biome cells
                 if (biomeCellCache.size > 10000) {
-                    const pPos = controls.getObject().position;
+                    const pPos = getPlayerWorldPosition();
                     const playerCellX = Math.floor(pPos.x / BIOME_CELL_SIZE);
                     const playerCellZ = Math.floor(pPos.z / BIOME_CELL_SIZE);
                     // Iterate and delete distant cells
@@ -24169,7 +25636,7 @@
                 // --- PRIORITY: Sort queue by distance (closest chunks first) ---
                 // Calculate player chunk position for distance sorting
                 if (chunkBuildQueue.length > 1 && controls && controls.getObject) {
-                    const playerPos = controls.getObject().position;
+                    const playerPos = getPlayerWorldPosition();
                     const playerChunkX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
                     const playerChunkZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
                     // Update distance for all jobs and sort by distance (closest first)
@@ -24242,8 +25709,9 @@
                         releaseMeshForKey(key);
                         releaseMeshForKey(key + "_WATER");
                         // Rebuild chunk - calculate distance for LOD
-                        const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
-                        const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                        const playerWorldPos = getPlayerWorldPosition();
+                        const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
+                        const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                         const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
                         renderChunk(cx, cz, neighborDistSq);
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
@@ -24327,7 +25795,7 @@
             }
             function updateHighlight() {
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per physics step
-                const hit = pickVoxel(controls.getObject().position, controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
+                const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
                 if (hit) { outlineMesh.visible = true; outlineMesh.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5); } else outlineMesh.visible = false;
             }
             function ensureChunk(x, z) {
@@ -24337,8 +25805,9 @@
                 if (!chunks.has(key)) {
                     generateChunkData(cx, cz);
                     // Calculate distance for LOD
-                    const pcx = controls && controls.getObject ? Math.floor(controls.getObject().position.x / WORLD_DIMS.chunkSize) : 0;
-                    const pcz = controls && controls.getObject ? Math.floor(controls.getObject().position.z / WORLD_DIMS.chunkSize) : 0;
+                    const playerWorldPos = getPlayerWorldPosition();
+                    const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
+                    const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                     const distSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
                     renderChunk(cx, cz, distSq);
                 }
@@ -24387,7 +25856,7 @@
                 const smoothAngle = dayNightTime < 0.667 ? (dayNightTime / 0.667) * Math.PI : Math.PI + ((dayNightTime - 0.667) / 0.333) * Math.PI;
                 const smoothH = Math.sin(smoothAngle);
                 const smoothX = Math.cos(smoothAngle);
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 // Sun / Moon sprites
                 sunSprite.position.set(camPos.x + smoothX * 300, camPos.y + smoothH * 300, camPos.z);
                 moonSprite.position.set(camPos.x - smoothX * 280, camPos.y - smoothH * 280, camPos.z);
@@ -24575,7 +26044,7 @@
                 if (Math.abs(velocity.z) < 0.001) velocity.z = 0;
                 // Apply gravity or flying or swimming
                 // Check if player's feet are in water (for treading water when head is above)
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 const feetY = Math.floor(camPos.y - 1.7); // Feet position (eye height ~1.7)
                 const feetInWater = getBlock(Math.floor(camPos.x), feetY, Math.floor(camPos.z)) === WATER;
                 const inWaterBody = isUnderwater || feetInWater || isTreadingWater;
@@ -24660,10 +26129,18 @@
             // Apply a single collision step (axis-sweep collision resolution)
             function applyCollisionStep(obj, stepDt) {
                 // Get movement directions
-                controls.getDirection(_physFwd);
-                _physFwd.y = 0;
-                _physFwd.normalize();
-                _physRight.crossVectors(_physFwd, _physUp);
+                // In third-person, camera looks backward so controls.getDirection() is wrong
+                // Use thirdPersonOrbitYaw for consistent movement direction
+                if (isThirdPerson) {
+                    const yaw = thirdPersonOrbitYaw;
+                    _physFwd.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+                    _physRight.set(Math.cos(yaw), 0, -Math.sin(yaw));
+                } else {
+                    controls.getDirection(_physFwd);
+                    _physFwd.y = 0;
+                    _physFwd.normalize();
+                    _physRight.crossVectors(_physFwd, _physUp);
+                }
                 // Calculate deltas
                 const dX = (_physFwd.x * -velocity.z + _physRight.x * velocity.x) * stepDt;
                 const dZ = (_physFwd.z * -velocity.z + _physRight.z * velocity.x) * stepDt;
@@ -24721,7 +26198,8 @@
                     );
                     const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
                     const stepDt = dt / collisionSteps;
-                    const obj = controls.getObject();
+                    // Use cameraRig for player position if available (modern PointerLockControls fix)
+                    const obj = cameraRig || controls.getObject();
                     // Smooth crouch transition
                     playerEyeHeight = THREE.MathUtils.lerp(
                         playerEyeHeight,
@@ -24762,8 +26240,12 @@
                 return Math.max(50, 200 / SETTINGS.torchFlameSpawnRate);
             }
 
-            // Update visual effects (torch, FOV, camera)
-            function updateVisualEffects(time) {
+            /**
+             * Update visual effects (torch, FOV, camera, particles).
+             * @param {number} time - Current time in milliseconds
+             * @param {number} dt - Delta time in seconds since last frame
+             */
+            function updateVisualEffects(time, dt) {
                 // FOV changes for sprint
                 const targetFOV = isSprinting && !isFlying && controls.isLocked ?
                     SETTINGS.sprintFOV : SETTINGS.normalFOV;
@@ -24773,8 +26255,32 @@
                 // Torch flicker effect - use same intensity as placed torches (* 2)
                 if (torchActive && torchLight) {
                     torchLight.intensity = (SETTINGS.torchIntensity * 2) + Math.sin(time * 0.003) * 0.5;
-                    // Animate 3D torch flame
-                    if (window.torchModel) {
+
+                    // Update torch light position based on view mode
+                    if (isThirdPerson) {
+                        // In third-person, reparent light to scene if needed
+                        if (torchLight.parent !== scene) {
+                            scene.add(torchLight);
+                        }
+                        // Update light position to flame location
+                        if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                            const handTorch = playerBodyMesh.userData.thirdPersonTorch;
+                            const flame = handTorch.children[1]; // flame is second child (index 1)
+                            if (flame) {
+                                flame.getWorldPosition(_torchWorldPos);
+                                torchLight.position.copy(_torchWorldPos);
+                            }
+                        }
+                    } else {
+                        // In first-person, reparent light back to torch group if needed
+                        if (window.torchModel && torchLight.parent !== window.torchModel) {
+                            window.torchModel.add(torchLight);
+                            torchLight.position.set(0, 0.165, 0); // Reset to viewmodel position
+                        }
+                    }
+
+                    // Animate viewmodel torch flame (first-person only)
+                    if (window.torchModel && !isThirdPerson) {
                         const flame = window.torchModel.children[1];
                         const glow = window.torchModel.children[2];
                         if (flame && glow) {
@@ -24783,12 +26289,43 @@
                             const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
                             glow.scale.set(glowScale, glowScale, glowScale);
                         }
+                    }
 
-                        // Spawn torch smoke and flame particles on separate timers
-                        if (particleSystem) {
-                            const flameWorldPos = new THREE.Vector3();
-                            flame.getWorldPosition(flameWorldPos);
+                    // Animate third-person hand torch flame
+                    if (isThirdPerson && playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                        const handTorch = playerBodyMesh.userData.thirdPersonTorch;
+                        const flame = handTorch.children[1];
+                        const glow = handTorch.children[2];
+                        if (flame && glow) {
+                            const flameScale = 1.0 + Math.sin(time * 0.001) * 0.03 + Math.sin(time * 0.0023) * 0.01;
+                            flame.scale.set(flameScale, flameScale, flameScale);
+                            const glowScale = 1.0 + Math.sin(time * 0.0015) * 0.04 + Math.sin(time * 0.0031) * 0.015;
+                            glow.scale.set(glowScale, glowScale, glowScale);
+                        }
+                    }
 
+                    // Spawn torch smoke and flame particles on separate timers
+                    if (particleSystem) {
+                        // Get flame position based on view mode
+                        let flameWorldPos;
+                        if (isThirdPerson && playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                            // In third-person, use hand torch flame position
+                            const handTorch = playerBodyMesh.userData.thirdPersonTorch;
+                            const handFlame = handTorch.children[1]; // flame is second child
+                            if (handFlame) {
+                                flameWorldPos = new THREE.Vector3();
+                                handFlame.getWorldPosition(flameWorldPos);
+                            }
+                        } else if (window.torchModel) {
+                            // In first-person, use viewmodel torch flame position
+                            const flame = window.torchModel.children[1];
+                            if (flame) {
+                                flameWorldPos = new THREE.Vector3();
+                                flame.getWorldPosition(flameWorldPos);
+                            }
+                        }
+
+                        if (flameWorldPos) {
                             // Smoke particles (slower spawn rate)
                             const smokeInterval = getTorchSmokeInterval();
                             if (time - lastTorchSmokeTime > smokeInterval) {
@@ -24811,7 +26348,7 @@
 
                 // Spawn smoke and flame particles for placed torches (nearby only for performance)
                 if (particleSystem && controls && SETTINGS.torchParticlesEnabled) {
-                    const playerPos = controls.getObject().position;
+                    const playerPos = getPlayerWorldPosition();
                     const smokeInterval = getTorchSmokeInterval();
                     const flameInterval = getTorchFlameInterval();
                     const PLACED_TORCH_PARTICLE_RADIUS = 24; // Only spawn particles for torches within this radius
@@ -24861,32 +26398,30 @@
                     }
                 }
 
-                // Calculate dt for atmospheric updates
-                const dt = 1 / 60; // Approximate frame time
-
-                // Update particle system
+                // Update particle system (dt passed from animate loop for framerate independence)
                 if (particleSystem && controls) {
-                    particleSystem.update(dt, controls.getObject().position);
+                    const playerWorldPos = getPlayerWorldPosition();
+                    particleSystem.update(dt, playerWorldPos);
 
                     // Update footstep particles
                     const isMoving = moveForward || moveBackward || moveLeft || moveRight;
-                    updateFootstepParticles(time, controls.getObject().position, isMoving, canJump);
+                    updateFootstepParticles(time, playerWorldPos, isMoving, canJump);
                 }
 
                 // Update atmospheric effects
-                updateStars(time, dayNightTime, controls ? controls.getObject().position : null);
+                updateStars(time, dayNightTime, controls ? getPlayerWorldPosition() : null);
 
                 // Calculate sun Y position for cloud lighting
                 const sunAngle = dayNightTime * Math.PI * 2;
                 const sunY = Math.sin(sunAngle);
-                updateClouds(time, sunY, controls ? controls.getObject().position : null, dayNightTime);
+                updateClouds(time, sunY, controls ? getPlayerWorldPosition() : null, dayNightTime);
 
                 // Update water ripples
                 updateWaterRipples(dt);
 
                 // Update water velocity effects (wading, wake, bubbles)
                 if (controls) {
-                    updateWaterVelocityEffects(dt, controls.getObject().position, velocity);
+                    updateWaterVelocityEffects(dt, getPlayerWorldPosition(), velocity);
                 }
 
                 // Update color grading
@@ -24894,7 +26429,7 @@
 
                 // Update biome fog tinting
                 if (controls) {
-                    updateBiomeFogTint(controls.getObject().position);
+                    updateBiomeFogTint(getPlayerWorldPosition());
                 }
             }
             // Update volumetric lighting shader uniforms with light positions
@@ -24926,7 +26461,7 @@
             const _sampleDir = new THREE.Vector3();
 
             function getLightVisibility(lightWorldPos) {
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
 
                 // OPTIMIZATION: Reuse vector instead of allocating new one
                 _occlusionDir.subVectors(lightWorldPos, camPos).normalize();
@@ -24999,7 +26534,7 @@
             const _pointLightSampleDir = new THREE.Vector3();
 
             function getPointLightVisibility(lightWorldPos, maxRange = 64) {
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
 
                 // OPTIMIZATION: Calculate distance squared first (avoid sqrt)
                 const dx = camPos.x - lightWorldPos.x;
@@ -25094,7 +26629,7 @@
                 uniforms.nightFactor.value = nightFactor;
 
                 // Calculate depth below sea level (0 = at/above sea, 1 = deep underground)
-                const camPos = controls ? controls.getObject().position : camera.position;
+                const camPos = getPlayerWorldPosition();
                 const seaLevel = WORLD_DIMS.seaLevel;
                 const maxDepth = 40;
                 const depthBelow = Math.max(0, seaLevel - camPos.y);
@@ -25406,34 +26941,45 @@
                 // Always use composer - bypassing causes color/lighting changes
                 const useComposer = true;
 
-                // Two-pass rendering for torch viewmodel
-                if (torchActive && window.torchModel) {
-                    // Pass 1: Render world (Layer 0)
+                // Two-pass rendering for torch/arms viewmodel
+                if ((torchActive && window.torchModel) || (playerArmsModel && !isThirdPerson)) {
+                    // Pass 1: Render world (Layer 0), body only in third-person (Layer 2)
                     camera.layers.set(0);
+                    if (isThirdPerson) {
+                        camera.layers.enable(2); // Body only visible in third-person
+                    }
                     if (useComposer) {
                         composer.render();
                     } else {
                         // OPTIMIZATION: Direct render when no post effects active
                         renderer.render(scene, camera);
                     }
-                    // Pass 2: Render viewmodel (Layer 1) on top
-                    camera.layers.set(1);
-                    renderer.autoClear = false;
-                    renderer.clearDepth();
-                    renderer.render(scene, camera);
-                    renderer.autoClear = true;
-                    // Re-enable both layers
+                    // Pass 2: Render viewmodel (Layer 1) on top - only in first-person
+                    if (!isThirdPerson) {
+                        camera.layers.set(1);
+                        renderer.autoClear = false;
+                        renderer.clearDepth();
+                        renderer.render(scene, camera);
+                        renderer.autoClear = true;
+                    }
+                    // Re-enable all layers
                     camera.layers.enable(0);
                     camera.layers.enable(1);
+                    camera.layers.enable(2);
                 } else {
-                    // Single-pass rendering
-                    camera.layers.enableAll();
+                    // Single-pass rendering (no torch/viewmodel active)
+                    camera.layers.set(0);
+                    if (isThirdPerson) {
+                        camera.layers.enable(2); // Body only visible in third-person
+                    }
                     if (useComposer) {
                         composer.render();
                     } else {
-                        // OPTIMIZATION: Direct render when no post effects active
                         renderer.render(scene, camera);
                     }
+                    camera.layers.enable(0);
+                    camera.layers.enable(1);
+                    camera.layers.enable(2);
                 }
                 perfMonitor.end("rendering", renderStart);
             }
@@ -25441,7 +26987,7 @@
             function updateUnderwaterState() {
                 if (!controls) return;
 
-                const camPos = controls.getObject().position;
+                const camPos = getPlayerWorldPosition();
                 const eyeY = camPos.y;
                 const eyeX = Math.floor(camPos.x);
                 const eyeZ = Math.floor(camPos.z);
@@ -25590,9 +27136,10 @@
                     if (isDebug && shouldUpdateDebugUI()) updateDebugInfo(fpsInstant, fpsAvg);
                     if (isDebug) updatePerfOverlay(); // Update performance overlay
                     updateMovementIndicators();
-                    updateVisualEffects(time);
+                    updateVisualEffects(time, clampedDt);
                     // Entity and material updates
                     updateZombies(clampedDt);
+                    updatePlayerBody(clampedDt);
                     flushMaterialUpdates();
                     // OPTIMIZATION: Process scheduled and incremental updates
                     scheduledUpdates.process();
@@ -25705,7 +27252,21 @@
                     case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); break;
                     case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); break;
                     case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); break;
-                    case "KeyF": torchActive = !torchActive; if (window.torchModel) { window.torchModel.visible = torchActive; } if (torchLight) { torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0; } break;
+                    case "KeyF":
+                        torchActive = !torchActive;
+                        // Viewmodel torch only visible in first-person
+                        if (window.torchModel) {
+                            window.torchModel.visible = torchActive && !isThirdPerson;
+                        }
+                        // Third-person torch visible only in third-person
+                        if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                            playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
+                        }
+                        if (torchLight) {
+                            torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0;
+                        }
+                        break;
+                    case "KeyV": toggleThirdPerson(); break;
                 }
             };
             function onKeyUp(e) {
@@ -25726,7 +27287,7 @@
             function onMouseClick(e) {
                 if (!controls.isLocked) return;
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per click
-                const hit = pickVoxel(controls.getObject().position, controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
+                const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
                 if (hit) {
                     const { x, y, z, face } = hit;
                     if (e.button === 0) {
@@ -25735,7 +27296,7 @@
                         breakProgress = 0;
                     } else if (e.button === 2 && face) {
                         const nx = x + face[0], ny = y + face[1], nz = z + face[2];
-                        const pPos = controls.getObject().position;
+                        const pPos = getPlayerWorldPosition();
                         const overlaps = playerIntersectsBlock(
                             pPos.x - 0.4, pPos.y - 1.5, pPos.z - 0.4,
                             pPos.x + 0.4, pPos.y + 0.3, pPos.z + 0.4,
