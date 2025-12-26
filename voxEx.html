@@ -10835,6 +10835,13 @@
             const THIRD_PERSON_DISTANCE = 4.0;  // Distance behind player (Z offset)
             const THIRD_PERSON_HEIGHT = 2.5;    // Height above player feet
             const THIRD_PERSON_LOOK_HEIGHT = 1.2; // Look at chest level
+            const THIRD_PERSON_CAM_BUFFER = 0.3;  // Buffer distance from blocks
+
+            // Scratch vectors for camera collision (avoid per-frame allocation)
+            const _camDesiredPos = new THREE.Vector3();
+            const _camPlayerPos = new THREE.Vector3();
+            const _camRayDir = new THREE.Vector3();
+
             // Third-person orbit camera state
             let thirdPersonOrbitPitch = 0;  // Accumulated pitch from mouse Y input
             let thirdPersonOrbitYaw = 0;    // Accumulated yaw from mouse X input (tracked separately from PointerLockControls)
@@ -10857,15 +10864,34 @@
                 const orbitYaw = thirdPersonOrbitYaw;
                 const orbitPitch = thirdPersonOrbitPitch;
 
-                // Calculate camera position on sphere around player
-                const dist = THIRD_PERSON_DISTANCE;
+                // Calculate desired camera position on sphere around player
+                const desiredDist = THIRD_PERSON_DISTANCE;
                 const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
-                const horizontalDist = dist * Math.cos(orbitPitch);
-                const verticalOffset = dist * Math.sin(orbitPitch) + heightOffset;
+                const horizontalDist = desiredDist * Math.cos(orbitPitch);
+                const verticalOffset = desiredDist * Math.sin(orbitPitch) + heightOffset;
 
-                const camX = Math.sin(orbitYaw) * horizontalDist;
-                const camY = verticalOffset;
-                const camZ = Math.cos(orbitYaw) * horizontalDist;
+                const desiredCamX = Math.sin(orbitYaw) * horizontalDist;
+                const desiredCamY = verticalOffset;
+                const desiredCamZ = Math.cos(orbitYaw) * horizontalDist;
+
+                // Check for terrain collision and adjust distance if needed
+                let actualDist = desiredDist;
+                if (cameraRig) {
+                    const playerWorldPos = cameraRig.position;
+                    actualDist = getThirdPersonCameraDistance(
+                        playerWorldPos,
+                        desiredCamX,
+                        desiredCamY,
+                        desiredCamZ,
+                        desiredDist
+                    );
+                }
+
+                // Recalculate position with adjusted distance
+                const distRatio = actualDist / desiredDist;
+                const camX = desiredCamX * distRatio;
+                const camY = desiredCamY * distRatio;
+                const camZ = desiredCamZ * distRatio;
 
                 // Update camera LOCAL position (relative to cameraRig at player position)
                 camera.position.set(camX, camY, camZ);
@@ -10891,6 +10917,53 @@
                 camera.rotation.y = lookYaw;
                 camera.rotation.z = 0;
 
+            }
+
+            /**
+             * Check for terrain collision between player and third-person camera.
+             * Returns adjusted distance if collision found, otherwise returns original distance.
+             * @param {THREE.Vector3} playerWorldPos - Player's world position
+             * @param {number} camX - Camera local X offset
+             * @param {number} camY - Camera local Y offset
+             * @param {number} camZ - Camera local Z offset
+             * @param {number} originalDist - Original distance from player
+             * @returns {number} Adjusted distance (may be shorter if collision found)
+             */
+            function getThirdPersonCameraDistance(playerWorldPos, camX, camY, camZ, originalDist) {
+                // Calculate desired camera world position
+                _camDesiredPos.set(
+                    playerWorldPos.x + camX,
+                    playerWorldPos.y + camY,
+                    playerWorldPos.z + camZ
+                );
+
+                // Ray from player to camera
+                _camPlayerPos.copy(playerWorldPos);
+                _camPlayerPos.y += THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND; // Start from look target
+
+                _camRayDir.subVectors(_camDesiredPos, _camPlayerPos).normalize();
+
+                // Step along ray checking for solid blocks
+                const stepSize = 0.25;
+                const maxSteps = Math.ceil(originalDist / stepSize);
+
+                for (let i = 1; i <= maxSteps; i++) {
+                    const t = i * stepSize;
+                    const checkX = Math.floor(_camPlayerPos.x + _camRayDir.x * t);
+                    const checkY = Math.floor(_camPlayerPos.y + _camRayDir.y * t);
+                    const checkZ = Math.floor(_camPlayerPos.z + _camRayDir.z * t);
+
+                    const block = getBlock(checkX, checkY, checkZ);
+
+                    // Check if solid (not air, water, or undefined/unloaded)
+                    if (block !== undefined && block !== AIR && block !== WATER) {
+                        // Found collision - return shortened distance with buffer
+                        return Math.max(0.5, t - THIRD_PERSON_CAM_BUFFER);
+                    }
+                }
+
+                // No collision - use original distance
+                return originalDist;
             }
 
             /**
