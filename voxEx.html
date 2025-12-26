@@ -10853,6 +10853,24 @@
             let thirdPersonDebugThrottle = 0;
             const THIRD_PERSON_DEBUG_INTERVAL = 500; // Log every 500ms
 
+            // Dynamic zoom distance (modified by scroll wheel)
+            const THIRD_PERSON_DISTANCE_MIN = 2.0;
+            const THIRD_PERSON_DISTANCE_MAX = 8.0;
+            let thirdPersonDistance = 4.0;  // Current zoom distance
+
+            // Smooth camera follow
+            const _smoothCamPos = new THREE.Vector3();
+            let smoothCamInitialized = false;
+            const CAM_SMOOTH_FACTOR = 0.15;  // Lower = more lag
+
+            // Landing impact animation
+            let wasAirborne = false;
+            let landingImpact = 0;  // 0-1, decays over time
+            let landingVelocity = 0;  // Velocity at moment of landing
+
+            // Mining arm swing
+            let miningSwingPhase = 0;
+
             /**
              * Apply third-person camera rotation to look at the player.
              * Called from both mousemove handler and animation loop to ensure
@@ -10866,7 +10884,7 @@
                 const orbitPitch = thirdPersonOrbitPitch;
 
                 // Calculate desired camera position on sphere around player
-                const desiredDist = THIRD_PERSON_DISTANCE;
+                const desiredDist = thirdPersonDistance;  // Use dynamic zoom distance
                 const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
                 const horizontalDist = desiredDist * Math.cos(orbitPitch);
                 const verticalOffset = desiredDist * Math.sin(orbitPitch) + heightOffset;
@@ -10894,20 +10912,31 @@
                 const camY = desiredCamY * distRatio;
                 const camZ = desiredCamZ * distRatio;
 
+                // Smooth camera follow (lerp toward target)
+                if (!smoothCamInitialized) {
+                    _smoothCamPos.set(camX, camY, camZ);
+                    smoothCamInitialized = true;
+                } else {
+                    _smoothCamPos.x += (camX - _smoothCamPos.x) * CAM_SMOOTH_FACTOR;
+                    _smoothCamPos.y += (camY - _smoothCamPos.y) * CAM_SMOOTH_FACTOR;
+                    _smoothCamPos.z += (camZ - _smoothCamPos.z) * CAM_SMOOTH_FACTOR;
+                }
+
                 // Update camera LOCAL position (relative to cameraRig at player position)
-                camera.position.set(camX, camY, camZ);
+                camera.position.copy(_smoothCamPos);
 
                 // Calculate rotation to look at player (at local origin + look height offset)
+                // Use smoothed camera position for look direction
                 const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
 
-                // YAW: To look toward origin from position (camX, camY, camZ):
+                // YAW: To look toward origin from smoothed camera position
                 // THREE.js forward at yaw θ is (-sin(θ), 0, -cos(θ))
-                // We want forward ∝ (-camX, 0, -camZ), so θ = atan2(camX, camZ)
-                const lookYaw = Math.atan2(camX, camZ);
+                // We want forward ∝ (-smoothX, 0, -smoothZ), so θ = atan2(smoothX, smoothZ)
+                const lookYaw = Math.atan2(_smoothCamPos.x, _smoothCamPos.z);
 
-                // PITCH: Calculate vertical angle to look at target height
-                const dy = lookY - camY;  // Negative when looking down
-                const distToPlayer = Math.sqrt(camX * camX + camZ * camZ);
+                // PITCH: Calculate vertical angle to look at target height from smoothed position
+                const dy = lookY - _smoothCamPos.y;  // Negative when looking down
+                const distToPlayer = Math.sqrt(_smoothCamPos.x * _smoothCamPos.x + _smoothCamPos.z * _smoothCamPos.z);
                 // Positive pitch = look up, negative pitch = look down
                 // When dy < 0 (target below), we want negative pitch
                 const lookPitch = Math.atan2(dy, distToPlayer);
@@ -22122,6 +22151,13 @@
                 rightArmPivot.add(rightArmMesh);
                 rightArmPivot.position.set(armOffsetX, shoulderY, 0);
 
+                // Add block holder at end of right arm (for held block display)
+                const blockHolder = new THREE.Group();
+                blockHolder.position.set(0, -arm.height + 0.05, 0.12);
+                blockHolder.rotation.set(0.3, 0.2, 0);  // Slight angle for visibility
+                blockHolder.name = 'blockHolder';
+                rightArmPivot.add(blockHolder);
+
                 // Add torch holder at end of right arm (for third-person view)
                 const torchHolder = new THREE.Group();
                 // Position at hand (end of arm), slightly forward
@@ -22174,6 +22210,7 @@
                     leftLegMesh,
                     rightLegMesh,
                     torchHolder,
+                    blockHolder,
                 };
 
                 // Add all parts to group
@@ -22252,6 +22289,69 @@
                 group.name = 'thirdPersonTorch';
 
                 return group;
+            }
+
+            /**
+             * Create a small block mesh for displaying held block in third-person.
+             * @param {number} blockId - The block ID to display
+             * @returns {THREE.Mesh|null} Block mesh or null if air
+             */
+            function createHeldBlockMesh(blockId) {
+                if (blockId === BLOCKS.AIR || blockId === AIR) return null;
+
+                const size = 0.22;  // Small block in hand
+                const geometry = new THREE.BoxGeometry(size, size, size);
+
+                // Get block config for texturing
+                const blockConfig = BLOCK_CONFIG[blockId];
+                if (!blockConfig) return null;
+
+                const uvs = geometry.attributes.uv;
+                const tileSize = 1 / NUM_TILES;
+
+                // Use the side tile or 'all' tile for display
+                const tileIndex = blockConfig.tiles?.side ?? blockConfig.tiles?.all ?? 0;
+                const uOffset = tileIndex * tileSize;
+
+                // Remap all UVs to this tile
+                for (let i = 0; i < uvs.count; i++) {
+                    const u = uvs.getX(i);
+                    uvs.setX(i, uOffset + u * tileSize);
+                }
+                uvs.needsUpdate = true;
+
+                const mesh = new THREE.Mesh(geometry, chunkMaterial);
+                mesh.layers.set(2);  // Player body layer
+                mesh.castShadow = false;
+                mesh.receiveShadow = true;
+                return mesh;
+            }
+
+            /**
+             * Update the held block display in third-person.
+             * @param {number} blockId - The new block ID to display
+             */
+            function updateHeldBlock(blockId) {
+                if (!playerBodyMesh) return;
+                const parts = playerBodyMesh.userData.parts;
+                if (!parts || !parts.blockHolder) return;
+
+                // Remove old block mesh
+                while (parts.blockHolder.children.length > 0) {
+                    const child = parts.blockHolder.children[0];
+                    parts.blockHolder.remove(child);
+                    if (child.geometry) child.geometry.dispose();
+                }
+
+                // Add new block mesh (skip if torch block - player holds actual torch)
+                if (blockId !== BLOCKS.TORCH && blockId !== TORCH) {
+                    const blockMesh = createHeldBlockMesh(blockId);
+                    if (blockMesh) {
+                        parts.blockHolder.add(blockMesh);
+                    }
+                }
+
+                playerBodyMesh.userData.heldBlockId = blockId;
             }
 
             /**
@@ -22377,6 +22477,7 @@
                         leftLegX: 0, rightLegX: 0,
                         headX: 0,
                         headY: PLAYER_PROPORTIONS.head.centerY,
+                        headYaw: 0,  // Head yaw for camera tracking
                         bodyY: PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5,
                         bodyTilt: 0,
                     };
@@ -22582,6 +22683,24 @@
                     targetArmRZ = 0.15;  // Slightly out to the side
                 }
 
+                // Mining arm swing (overrides other right arm poses)
+                if (isThirdPerson && breakProgress > 0) {
+                    miningSwingPhase += dt * 12;
+                    const swing = Math.sin(miningSwingPhase) * 0.6;
+                    targetArmRX = -0.7 + swing;
+                    targetArmRZ = 0.1;
+                } else if (!state.isSwimming && !state.isFlying) {
+                    miningSwingPhase = 0;
+                }
+
+                // Apply landing impact to legs and body
+                if (landingImpact > 0) {
+                    const impactBend = landingImpact * 0.5;
+                    targetLegLX -= impactBend;
+                    targetLegRX -= impactBend;
+                    targetBodyY -= landingImpact * 0.15;
+                }
+
                 // Apply smoothed rotations
                 parts.leftArm.rotation.x = smooth("leftArmX", targetArmLX);
                 parts.rightArm.rotation.x = smooth("rightArmX", targetArmRX);
@@ -22591,6 +22710,21 @@
                 parts.rightLeg.rotation.x = smooth("rightLegX", targetLegRX, 0.12);
                 parts.head.position.y = smooth("headY", targetHeadY, 0.15);
                 parts.head.rotation.x = smooth("headX", targetHeadX, 0.12);
+
+                // Head tracks camera direction in third-person
+                if (isThirdPerson) {
+                    const bodyYaw = playerBodyMesh.rotation.y;
+                    let headYawOffset = thirdPersonOrbitYaw - bodyYaw + Math.PI;
+                    // Normalize to -PI to PI
+                    while (headYawOffset > Math.PI) headYawOffset -= Math.PI * 2;
+                    while (headYawOffset < -Math.PI) headYawOffset += Math.PI * 2;
+                    // Clamp head rotation to ±70 degrees
+                    headYawOffset = Math.max(-1.22, Math.min(1.22, headYawOffset));
+                    parts.head.rotation.y = smooth("headYaw", headYawOffset, 0.15);
+                } else {
+                    parts.head.rotation.y = smooth("headYaw", 0, 0.15);
+                }
+
                 parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
                 parts.body.rotation.x = smooth("bodyTilt", targetBodyTilt, 0.1);
 
@@ -22697,6 +22831,21 @@
                     isTreadingWater: isTreadingWater && !isMoving,
                     velocityY: velocity.y,
                 };
+
+                // Detect landing (was airborne, now grounded)
+                const isAirborne = isJumping || isFalling || isFlying;
+                if (wasAirborne && !isAirborne && canJump) {
+                    landingImpact = Math.min(1, Math.abs(landingVelocity) / 15);
+                }
+                if (isAirborne) {
+                    landingVelocity = velocity.y;
+                }
+                wasAirborne = isAirborne;
+
+                // Decay landing impact
+                if (landingImpact > 0) {
+                    landingImpact = Math.max(0, landingImpact - dt * 4);
+                }
 
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
@@ -22810,6 +22959,8 @@
                     // Don't use cameraRig.rotation.y because it was reset to 0 when exiting third-person
                     thirdPersonOrbitYaw = camera.rotation.y;
                     thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
+                    smoothCamInitialized = false;  // Reset smooth follow
+                    thirdPersonDistance = 4.0;     // Reset zoom to default
 
                     // Reset cameraRig rotation to identity so LOCAL = WORLD axes
                     if (cameraRig) {
@@ -22895,6 +23046,11 @@
                 // - First-person: camera.layers.set(0) - body not visible (shadows still cast)
                 // - Third-person: camera.layers.set(0) then enable(2) - body visible
                 // Don't permanently enable layer 2 here as it would show body in first-person
+
+                // Initialize held block display
+                if (typeof updateHeldBlock === 'function') {
+                    updateHeldBlock(selectedBlockId);
+                }
 
                 logDebug("[PlayerBody] Player body system initialized");
             }
@@ -27243,15 +27399,15 @@
                     case "KeyC": if (isFlying) { flyDown = true; } else { isCrouching = true; playerEyeHeight = 1.4; } break;
                     case "ShiftLeft": isSprinting = true; break;
                     case "ShiftRight": isSprinting = true; break;
-                    case "Digit1": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[0]; currentHotbarSlot = 1; highlightSlot(1); break;
-                    case "Digit2": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[1]; currentHotbarSlot = 2; highlightSlot(2); break;
-                    case "Digit3": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[2]; currentHotbarSlot = 3; highlightSlot(3); break;
-                    case "Digit4": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[3]; currentHotbarSlot = 4; highlightSlot(4); break;
-                    case "Digit5": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[4]; currentHotbarSlot = 5; highlightSlot(5); break;
-                    case "Digit6": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[5]; currentHotbarSlot = 6; highlightSlot(6); break;
-                    case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); break;
-                    case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); break;
-                    case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); break;
+                    case "Digit1": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[0]; currentHotbarSlot = 1; highlightSlot(1); updateHeldBlock(selectedBlockId); break;
+                    case "Digit2": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[1]; currentHotbarSlot = 2; highlightSlot(2); updateHeldBlock(selectedBlockId); break;
+                    case "Digit3": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[2]; currentHotbarSlot = 3; highlightSlot(3); updateHeldBlock(selectedBlockId); break;
+                    case "Digit4": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[3]; currentHotbarSlot = 4; highlightSlot(4); updateHeldBlock(selectedBlockId); break;
+                    case "Digit5": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[4]; currentHotbarSlot = 5; highlightSlot(5); updateHeldBlock(selectedBlockId); break;
+                    case "Digit6": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[5]; currentHotbarSlot = 6; highlightSlot(6); updateHeldBlock(selectedBlockId); break;
+                    case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); updateHeldBlock(selectedBlockId); break;
+                    case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); updateHeldBlock(selectedBlockId); break;
+                    case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); updateHeldBlock(selectedBlockId); break;
                     case "KeyF":
                         torchActive = !torchActive;
                         // Viewmodel torch only visible in first-person
@@ -27325,11 +27481,23 @@
             }
             const onMouseWheel = function (event) {
                 event.preventDefault();
-                // OPTIMIZATION: Use hoisted HOTBAR_SLOT_TO_BLOCK array instead of creating per scroll
+
+                // In third-person: scroll zooms camera
+                if (isThirdPerson) {
+                    if (event.deltaY > 0) {
+                        thirdPersonDistance = Math.min(THIRD_PERSON_DISTANCE_MAX, thirdPersonDistance + 0.5);
+                    } else if (event.deltaY < 0) {
+                        thirdPersonDistance = Math.max(THIRD_PERSON_DISTANCE_MIN, thirdPersonDistance - 0.5);
+                    }
+                    return;
+                }
+
+                // In first-person: scroll changes hotbar slot
                 if (event.deltaY > 0) { currentHotbarSlot++; if (currentHotbarSlot > 9) currentHotbarSlot = 1;
                 } else if (event.deltaY < 0) { currentHotbarSlot--; if (currentHotbarSlot < 1) currentHotbarSlot = 9; }
                 selectedBlockId = HOTBAR_SLOT_TO_BLOCK[currentHotbarSlot - 1];
                 highlightSlot(currentHotbarSlot);
+                updateHeldBlock(selectedBlockId);
             };
             function onWindowResize() {
                 camera.aspect = window.innerWidth / window.innerHeight;
