@@ -10853,6 +10853,24 @@
             let thirdPersonDebugThrottle = 0;
             const THIRD_PERSON_DEBUG_INTERVAL = 500; // Log every 500ms
 
+            // Dynamic zoom distance (modified by scroll wheel)
+            const THIRD_PERSON_DISTANCE_MIN = 2.0;
+            const THIRD_PERSON_DISTANCE_MAX = 8.0;
+            let thirdPersonDistance = 4.0;  // Current zoom distance
+
+            // Smooth camera follow
+            const _smoothCamPos = new THREE.Vector3();
+            let smoothCamInitialized = false;
+            const CAM_SMOOTH_FACTOR = 0.15;  // Lower = more lag
+
+            // Landing impact animation
+            let wasAirborne = false;
+            let landingImpact = 0;  // 0-1, decays over time
+            let landingVelocity = 0;  // Velocity at moment of landing
+
+            // Mining arm swing
+            let miningSwingPhase = 0;
+
             /**
              * Apply third-person camera rotation to look at the player.
              * Called from both mousemove handler and animation loop to ensure
@@ -10866,14 +10884,28 @@
                 const orbitPitch = thirdPersonOrbitPitch;
 
                 // Calculate desired camera position on sphere around player
-                const desiredDist = THIRD_PERSON_DISTANCE;
+                const desiredDist = thirdPersonDistance;  // Use dynamic zoom distance
                 const heightOffset = THIRD_PERSON_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
                 const horizontalDist = desiredDist * Math.cos(orbitPitch);
                 const verticalOffset = desiredDist * Math.sin(orbitPitch) + heightOffset;
 
-                const desiredCamX = Math.sin(orbitYaw) * horizontalDist;
+                // Calculate base camera position on sphere
+                let desiredCamX = Math.sin(orbitYaw) * horizontalDist;
                 const desiredCamY = verticalOffset;
-                const desiredCamZ = Math.cos(orbitYaw) * horizontalDist;
+                let desiredCamZ = Math.cos(orbitYaw) * horizontalDist;
+
+                // Over-shoulder offset: offset to player's right when camera is behind
+                // Calculate how "behind" the camera is (1.0 = directly behind, 0.0 = in front)
+                // Camera is behind when orbitYaw is near 0 (cosine near 1)
+                const behindFactor = Math.max(0, Math.cos(orbitYaw));  // 1 when behind, 0 when side, negative when front
+                const shoulderOffset = 0.5 * behindFactor;  // Max 0.5 blocks to the right
+
+                // Apply shoulder offset perpendicular to camera direction (player's right = camera's left when behind)
+                // Right vector from camera position: perpendicular to (camX, 0, camZ) = (-camZ, 0, camX) normalized
+                const rightX = -Math.cos(orbitYaw);
+                const rightZ = Math.sin(orbitYaw);
+                desiredCamX += rightX * shoulderOffset;
+                desiredCamZ += rightZ * shoulderOffset;
 
                 // Check for terrain collision and adjust distance if needed
                 let actualDist = desiredDist;
@@ -10894,20 +10926,31 @@
                 const camY = desiredCamY * distRatio;
                 const camZ = desiredCamZ * distRatio;
 
+                // Smooth camera follow (lerp toward target)
+                if (!smoothCamInitialized) {
+                    _smoothCamPos.set(camX, camY, camZ);
+                    smoothCamInitialized = true;
+                } else {
+                    _smoothCamPos.x += (camX - _smoothCamPos.x) * CAM_SMOOTH_FACTOR;
+                    _smoothCamPos.y += (camY - _smoothCamPos.y) * CAM_SMOOTH_FACTOR;
+                    _smoothCamPos.z += (camZ - _smoothCamPos.z) * CAM_SMOOTH_FACTOR;
+                }
+
                 // Update camera LOCAL position (relative to cameraRig at player position)
-                camera.position.set(camX, camY, camZ);
+                camera.position.copy(_smoothCamPos);
 
                 // Calculate rotation to look at player (at local origin + look height offset)
+                // Use smoothed camera position for look direction
                 const lookY = THIRD_PERSON_LOOK_HEIGHT - PLAYER_EYE_HEIGHT_STAND;
 
-                // YAW: To look toward origin from position (camX, camY, camZ):
+                // YAW: To look toward origin from smoothed camera position
                 // THREE.js forward at yaw θ is (-sin(θ), 0, -cos(θ))
-                // We want forward ∝ (-camX, 0, -camZ), so θ = atan2(camX, camZ)
-                const lookYaw = Math.atan2(camX, camZ);
+                // We want forward ∝ (-smoothX, 0, -smoothZ), so θ = atan2(smoothX, smoothZ)
+                const lookYaw = Math.atan2(_smoothCamPos.x, _smoothCamPos.z);
 
-                // PITCH: Calculate vertical angle to look at target height
-                const dy = lookY - camY;  // Negative when looking down
-                const distToPlayer = Math.sqrt(camX * camX + camZ * camZ);
+                // PITCH: Calculate vertical angle to look at target height from smoothed position
+                const dy = lookY - _smoothCamPos.y;  // Negative when looking down
+                const distToPlayer = Math.sqrt(_smoothCamPos.x * _smoothCamPos.x + _smoothCamPos.z * _smoothCamPos.z);
                 // Positive pitch = look up, negative pitch = look down
                 // When dy < 0 (target below), we want negative pitch
                 const lookPitch = Math.atan2(dy, distToPlayer);
@@ -12240,6 +12283,62 @@
                             );
                         }
                     }, 120);
+                }
+            }
+
+            /**
+             * Spawns dust particles when player lands on ground.
+             * Color is based on the block landed on.
+             * @param {number} x - X position.
+             * @param {number} y - Y position (ground level).
+             * @param {number} z - Z position.
+             * @param {number} impactVelocity - Vertical velocity at impact (negative).
+             * @param {number} blockId - Block type landed on.
+             */
+            function spawnLandingDust(x, y, z, impactVelocity, blockId) {
+                if (!particleSystem) return;
+
+                const impactSpeed = Math.abs(impactVelocity);
+                if (impactSpeed < 5) return;  // Only spawn for significant impacts
+
+                // Get dust color based on block type
+                let r = 0.6, g = 0.5, b = 0.4;  // Default brown/dirt
+                if (blockId === GRASS || blockId === BLOCKS.GRASS) {
+                    r = 0.45; g = 0.55; b = 0.35;  // Greenish
+                } else if (blockId === STONE || blockId === BLOCKS.STONE) {
+                    r = 0.55; g = 0.55; b = 0.55;  // Gray
+                } else if (blockId === SAND || blockId === BLOCKS.SAND) {
+                    r = 0.85; g = 0.8; b = 0.6;  // Sandy
+                } else if (blockId === SNOW || blockId === BLOCKS.SNOW) {
+                    r = 0.95; g = 0.95; b = 1.0;  // White
+                }
+
+                const particleCount = Math.ceil(Math.min(impactSpeed, 15) / 3);
+                const sizeBase = 0.12;
+
+                for (let i = 0; i < particleCount; i++) {
+                    const spreadAngle = Math.random() * Math.PI * 2;
+                    const outVelocity = (0.5 + impactSpeed * 0.1) * (0.3 + Math.random() * 0.7);
+                    const upVelocity = (0.3 + impactSpeed * 0.1) * (0.3 + Math.random() * 0.5);
+
+                    particleSystem.spawn(
+                        x + (Math.random() - 0.5) * 0.5,
+                        y + 0.1,
+                        z + (Math.random() - 0.5) * 0.5,
+                        {
+                            vx: Math.cos(spreadAngle) * outVelocity,
+                            vy: upVelocity,
+                            vz: Math.sin(spreadAngle) * outVelocity,
+                            r: r + (Math.random() - 0.5) * 0.1,
+                            g: g + (Math.random() - 0.5) * 0.1,
+                            b: b + (Math.random() - 0.5) * 0.1,
+                            a: 0.6,
+                            size: sizeBase * (0.7 + Math.random() * 0.6),
+                            life: 0.4 + Math.random() * 0.3,
+                            gravity: 8,
+                            type: 'dust'
+                        }
+                    );
                 }
             }
 
@@ -22113,6 +22212,13 @@
                 leftArmPivot.add(leftArmMesh);
                 leftArmPivot.position.set(-armOffsetX, shoulderY, 0);
 
+                // Add torch holder to LEFT arm (torch in left hand)
+                const torchHolder = new THREE.Group();
+                torchHolder.position.set(0, -arm.height + 0.05, 0.08);
+                torchHolder.rotation.set(Math.PI / 2 + 0.174, 0, 0);
+                torchHolder.name = 'torchHolder';
+                leftArmPivot.add(torchHolder);
+
                 // Right Arm - pivot at shoulder
                 const rightArmPivot = new THREE.Group();
                 const rightArmMesh = new THREE.Mesh(armGeometry, materials.arm);
@@ -22122,15 +22228,12 @@
                 rightArmPivot.add(rightArmMesh);
                 rightArmPivot.position.set(armOffsetX, shoulderY, 0);
 
-                // Add torch holder at end of right arm (for third-person view)
-                const torchHolder = new THREE.Group();
-                // Position at hand (end of arm), slightly forward
-                torchHolder.position.set(0, -arm.height + 0.05, 0.08);
-                // Rotate ~100 degrees on X-axis so torch points outward from hand
-                // Math.PI/2 = 90 degrees, plus 10 degrees (0.174 rad) for slight upward angle
-                torchHolder.rotation.set(Math.PI / 2 + 0.174, 0, 0);
-                torchHolder.name = 'torchHolder';
-                rightArmPivot.add(torchHolder);
+                // Add block holder to RIGHT arm (block in right hand)
+                const blockHolder = new THREE.Group();
+                blockHolder.position.set(0, -arm.height + 0.05, 0.12);
+                blockHolder.rotation.set(0.3, -0.2, 0);  // Mirror rotation for right hand
+                blockHolder.name = 'blockHolder';
+                rightArmPivot.add(blockHolder);
 
                 // Left Leg - pivot at hip
                 const leftLegPivot = new THREE.Group();
@@ -22174,6 +22277,7 @@
                     leftLegMesh,
                     rightLegMesh,
                     torchHolder,
+                    blockHolder,
                 };
 
                 // Add all parts to group
@@ -22252,6 +22356,69 @@
                 group.name = 'thirdPersonTorch';
 
                 return group;
+            }
+
+            /**
+             * Create a small block mesh for displaying held block in third-person.
+             * @param {number} blockId - The block ID to display
+             * @returns {THREE.Mesh|null} Block mesh or null if air
+             */
+            function createHeldBlockMesh(blockId) {
+                if (blockId === BLOCKS.AIR || blockId === AIR) return null;
+
+                const size = 0.22;  // Small block in hand
+                const geometry = new THREE.BoxGeometry(size, size, size);
+
+                // Get block config for texturing
+                const blockConfig = BLOCK_CONFIG[blockId];
+                if (!blockConfig) return null;
+
+                const uvs = geometry.attributes.uv;
+                const tileSize = 1 / NUM_TILES;
+
+                // Use the side tile or 'all' tile for display
+                const tileIndex = blockConfig.tiles?.side ?? blockConfig.tiles?.all ?? 0;
+                const uOffset = tileIndex * tileSize;
+
+                // Remap all UVs to this tile
+                for (let i = 0; i < uvs.count; i++) {
+                    const u = uvs.getX(i);
+                    uvs.setX(i, uOffset + u * tileSize);
+                }
+                uvs.needsUpdate = true;
+
+                const mesh = new THREE.Mesh(geometry, chunkMaterial);
+                mesh.layers.set(2);  // Player body layer
+                mesh.castShadow = false;
+                mesh.receiveShadow = true;
+                return mesh;
+            }
+
+            /**
+             * Update the held block display in third-person.
+             * @param {number} blockId - The new block ID to display
+             */
+            function updateHeldBlock(blockId) {
+                if (!playerBodyMesh) return;
+                const parts = playerBodyMesh.userData.parts;
+                if (!parts || !parts.blockHolder) return;
+
+                // Remove old block mesh
+                while (parts.blockHolder.children.length > 0) {
+                    const child = parts.blockHolder.children[0];
+                    parts.blockHolder.remove(child);
+                    if (child.geometry) child.geometry.dispose();
+                }
+
+                // Add new block mesh (skip if torch block - player holds actual torch)
+                if (blockId !== BLOCKS.TORCH && blockId !== TORCH) {
+                    const blockMesh = createHeldBlockMesh(blockId);
+                    if (blockMesh) {
+                        parts.blockHolder.add(blockMesh);
+                    }
+                }
+
+                playerBodyMesh.userData.heldBlockId = blockId;
             }
 
             /**
@@ -22377,6 +22544,7 @@
                         leftLegX: 0, rightLegX: 0,
                         headX: 0,
                         headY: PLAYER_PROPORTIONS.head.centerY,
+                        headYaw: 0,  // Head yaw for camera tracking
                         bodyY: PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5,
                         bodyTilt: 0,
                     };
@@ -22491,38 +22659,47 @@
                     targetLegRX = 0.4 - flyBob * 0.3;
 
                 } else if (state.isJumping) {
-                    // Jumping: arms swing up and back, legs tuck
+                    // Jumping: dynamic arm swing and leg tuck
                     const jumpProgress = Math.min(1, Math.max(0, state.velocityY / 8));
 
-                    // Arms swing UP and BACK (positive = back)
-                    targetArmLX = 0.7 * jumpProgress;
-                    targetArmRX = 0.7 * jumpProgress;
-                    // Arms also go slightly out
-                    targetArmLZ = -0.2 * jumpProgress;
-                    targetArmRZ = 0.2 * jumpProgress;
+                    // Arms swing up and slightly back for momentum
+                    targetArmLX = 0.5 * jumpProgress;
+                    targetArmRX = 0.5 * jumpProgress;
+                    // Arms spread out more for balance
+                    targetArmLZ = -0.35 * jumpProgress;
+                    targetArmRZ = 0.35 * jumpProgress;
 
-                    // Legs tuck forward slightly (negative = forward tuck)
-                    targetLegLX = -0.3 * jumpProgress;
-                    targetLegRX = -0.3 * jumpProgress;
+                    // Legs tuck up (knees bend) during ascent
+                    targetLegLX = -0.4 * jumpProgress;
+                    targetLegRX = -0.4 * jumpProgress;
 
-                    // Body extends upward (slight backward lean)
-                    targetBodyTilt = -0.15 * jumpProgress;
-                    // Head looks slightly up
-                    targetHeadX = -0.1 * jumpProgress;
+                    // Asymmetric leg tuck for more natural look
+                    targetLegLX -= 0.1 * jumpProgress;
+
+                    // Body extends upward
+                    targetBodyTilt = -0.1 * jumpProgress;
+                    targetHeadX = -0.15 * jumpProgress;
 
                 } else if (state.isFalling) {
-                    // Falling: arms out and up for balance, legs spread
+                    // Falling: increasing panic as fall speed increases
                     const fallIntensity = Math.min(1, Math.abs(state.velocityY) / 12);
+                    const flail = Math.sin(playerIdleTimer * 8) * fallIntensity * 0.2;
+                    playerIdleTimer += dt;
 
-                    // Arms out to sides and slightly up/back for windmilling balance
-                    targetArmLZ = -0.7 * fallIntensity;  // Arms spread wide
+                    // Arms flail for balance (more at higher speeds)
+                    targetArmLX = -0.4 * fallIntensity + flail;
+                    targetArmRX = -0.4 * fallIntensity - flail;
+                    targetArmLZ = -0.7 * fallIntensity;
                     targetArmRZ = 0.7 * fallIntensity;
-                    targetArmLX = 0.4 * fallIntensity;   // Arms angled back/up
-                    targetArmRX = 0.4 * fallIntensity;
 
-                    // Legs spread apart and slightly forward (bracing)
-                    targetLegLX = -0.15 * fallIntensity;
-                    targetLegRX = -0.15 * fallIntensity;
+                    // Legs spread and kick slightly
+                    targetLegLX = 0.3 * fallIntensity + flail * 0.5;
+                    targetLegRX = 0.3 * fallIntensity - flail * 0.5;
+                    targetLegLZ = -0.2 * fallIntensity;
+                    targetLegRZ = 0.2 * fallIntensity;
+
+                    // Body leans back slightly
+                    targetBodyTilt = -0.1 * fallIntensity;
 
                     // Head looks down to see where falling
                     targetHeadX = 0.2 * fallIntensity;
@@ -22537,11 +22714,23 @@
                         targetHeadX = -0.1;    // Head slightly up to counteract body lean
                     } else if (state.isCrouching) {
                         strideRate = 2.0;
-                        armAmplitude = 0.25;
-                        legAmplitude = 0.35;
-                        // Lower body when crouching
-                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
-                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                        armAmplitude = 0.2;
+                        legAmplitude = 0.25;
+
+                        // Proper crouch: bend knees, lean forward slightly
+                        // Knees bend forward (positive X rotation)
+                        targetLegLX = 0.6;  // Knees bent forward
+                        targetLegRX = 0.6;
+
+                        // Body leans forward slightly
+                        targetBodyTilt = 0.2;
+
+                        // Head compensates to look forward
+                        targetHeadX = -0.15;
+
+                        // Lower body slightly (less than before - knees do the work)
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.08;
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.1;
                     }
 
                     playerWalkPhase += dt * strideRate;
@@ -22553,6 +22742,13 @@
                     targetArmRX = -swing * armAmplitude;
                     targetLegLX = -counter * legAmplitude;
                     targetLegRX = counter * legAmplitude;
+
+                    // Knee bend effect: when leg swings back, bend knee more
+                    // This simulates the natural knee lift during walking
+                    const leftKneeBend = Math.max(0, counter) * legAmplitude * 0.3;
+                    const rightKneeBend = Math.max(0, -counter) * legAmplitude * 0.3;
+                    targetLegLX += leftKneeBend * 0.5;
+                    targetLegRX += rightKneeBend * 0.5;
 
                     // Subtle arm Z-rotation for more natural swing
                     targetArmLZ = swing * 0.1;
@@ -22569,17 +22765,48 @@
                     targetArmRX = Math.sin(playerIdleTimer * 0.8 + 0.5) * 0.06;
 
                     if (state.isCrouching) {
-                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.25;
-                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.15;
+                        // Idle crouch: knees bent, body slightly forward
+                        targetLegLX = 0.5;
+                        targetLegRX = 0.5;
+                        targetBodyTilt = 0.15;
+                        targetHeadX = -0.1;
+                        targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5 - 0.05;
+                        targetHeadY = PLAYER_PROPORTIONS.head.centerY - 0.08;
                     }
                 }
 
-                // Override right arm position when holding torch
+                // Override LEFT arm position when holding torch (torch now in left hand)
                 if (torchActive && isThirdPerson) {
-                    // Extend right arm forward to hold torch out
-                    // Negative X = arm forward, positive Z = arm out to side slightly
-                    targetArmRX = -0.8;  // Arm extended forward
-                    targetArmRZ = 0.15;  // Slightly out to the side
+                    // Extend left arm forward to hold torch out
+                    // Negative X = arm forward, negative Z = arm out to side slightly (mirror of right)
+                    targetArmLX = -0.8;  // Arm extended forward
+                    targetArmLZ = -0.15;  // Slightly out to the side (mirrored)
+                }
+
+                // Mining arm swing (overrides other right arm poses)
+                if (isThirdPerson && breakProgress > 0) {
+                    miningSwingPhase += dt * 12;
+                    const swing = Math.sin(miningSwingPhase) * 0.6;
+                    targetArmRX = -0.7 + swing;
+                    targetArmRZ = 0.1;
+                } else if (!state.isSwimming && !state.isFlying) {
+                    miningSwingPhase = 0;
+                }
+
+                // Apply landing impact - full body reaction
+                if (landingImpact > 0) {
+                    const impactBend = landingImpact * 0.7;  // Strong knee bend
+                    // Legs bend forward at knees
+                    targetLegLX += impactBend;
+                    targetLegRX += impactBend;
+                    // Body drops and tilts forward
+                    targetBodyY -= landingImpact * 0.15;
+                    targetBodyTilt += landingImpact * 0.2;
+                    // Arms swing forward to balance
+                    targetArmLX -= landingImpact * 0.3;
+                    targetArmRX -= landingImpact * 0.3;
+                    // Head compensates to stay level
+                    targetHeadX -= landingImpact * 0.15;
                 }
 
                 // Apply smoothed rotations
@@ -22591,21 +22818,43 @@
                 parts.rightLeg.rotation.x = smooth("rightLegX", targetLegRX, 0.12);
                 parts.head.position.y = smooth("headY", targetHeadY, 0.15);
                 parts.head.rotation.x = smooth("headX", targetHeadX, 0.12);
+
+                // Head tracks camera direction in third-person
+                if (isThirdPerson) {
+                    const bodyYaw = playerBodyMesh.rotation.y;
+                    let headYawOffset = thirdPersonOrbitYaw - bodyYaw + Math.PI;
+                    // Normalize to -PI to PI
+                    while (headYawOffset > Math.PI) headYawOffset -= Math.PI * 2;
+                    while (headYawOffset < -Math.PI) headYawOffset += Math.PI * 2;
+
+                    // If camera is past ±75° (1.31 rad), head looks forward
+                    const HEAD_TRACK_LIMIT = 1.31;  // ~75 degrees
+                    if (Math.abs(headYawOffset) > HEAD_TRACK_LIMIT) {
+                        headYawOffset = 0;  // Look forward in body direction
+                    }
+                    parts.head.rotation.y = smooth("headYaw", headYawOffset, 0.15);
+                } else {
+                    parts.head.rotation.y = smooth("headYaw", 0, 0.15);
+                }
+
                 parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
                 parts.body.rotation.x = smooth("bodyTilt", targetBodyTilt, 0.1);
 
                 // Offset leg pivot positions to follow tilted body hips
-                // When body tilts forward (positive rotation.x), hips move backward in Z
-                // Calculate hip offset: the hip joint is roughly at the bottom of the torso
                 const currentBodyTilt = parts.body.rotation.x;
-                const hipOffsetFromBodyCenter = PLAYER_PROPORTIONS.body.height * 0.4; // Distance from body center to hip
+                const hipOffsetFromBodyCenter = PLAYER_PROPORTIONS.body.height * 0.4;
+
+                // Z offset: hips move backward when leaning forward
                 const legZOffset = -Math.sin(currentBodyTilt) * hipOffsetFromBodyCenter;
 
-                // Apply Z offset to leg pivots to keep them attached to tilted hips
+                // Y offset: hips move UP when body tilts (rotation around body center)
+                // This closes the gap between legs and torso during flying
+                const legYOffset = (1 - Math.cos(currentBodyTilt)) * hipOffsetFromBodyCenter * 0.5;
+
                 const { leg, body, hipY } = PLAYER_PROPORTIONS;
                 const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
-                parts.leftLeg.position.set(-legOffsetX, hipY, legZOffset);
-                parts.rightLeg.position.set(legOffsetX, hipY, legZOffset);
+                parts.leftLeg.position.set(-legOffsetX, hipY + legYOffset, legZOffset);
+                parts.rightLeg.position.set(legOffsetX, hipY + legYOffset, legZOffset);
             }
 
             /**
@@ -22698,6 +22947,38 @@
                     velocityY: velocity.y,
                 };
 
+                // Detect landing (was airborne, now grounded)
+                const isAirborne = isJumping || isFalling || isFlying;
+                if (wasAirborne && !isAirborne && canJump) {
+                    landingImpact = Math.min(1, Math.abs(landingVelocity) / 15);
+
+                    // Spawn dust particles on landing
+                    if (Math.abs(landingVelocity) > 5) {
+                        const feetY = Math.floor(playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND);
+                        const groundBlockId = getBlock(
+                            Math.floor(playerWorldPos.x),
+                            feetY,
+                            Math.floor(playerWorldPos.z)
+                        );
+                        spawnLandingDust(
+                            playerWorldPos.x,
+                            feetY + 1,
+                            playerWorldPos.z,
+                            landingVelocity,
+                            groundBlockId
+                        );
+                    }
+                }
+                if (isAirborne) {
+                    landingVelocity = velocity.y;
+                }
+                wasAirborne = isAirborne;
+
+                // Decay landing impact
+                if (landingImpact > 0) {
+                    landingImpact = Math.max(0, landingImpact - dt * 4);
+                }
+
                 // Update body mesh position and rotation
                 if (playerBodyMesh) {
                     if (isThirdPerson) {
@@ -22726,18 +23007,6 @@
                         const worldVelZ = fwdZ * -velZ + rightZ * velX;
                         const worldSpeed = Math.sqrt(worldVelX * worldVelX + worldVelZ * worldVelZ);
 
-                        let targetBodyYaw;
-
-                        if (worldSpeed > 0.5) {
-                            // Moving: face world-space movement direction
-                            targetBodyYaw = Math.atan2(worldVelX, worldVelZ);
-                        } else {
-                            // Standing still: face the direction player would be looking (orbit direction)
-                            // Camera at (sin(yaw)*d, y, cos(yaw)*d), direction to player: (-sin(yaw), 0, -cos(yaw))
-                            // Body should face this direction = yaw + π
-                            targetBodyYaw = yaw + Math.PI;
-                        }
-
                         // Helper to normalize angle to [-PI, PI]
                         const normalizeAngle = (angle) => {
                             while (angle > Math.PI) angle -= Math.PI * 2;
@@ -22745,12 +23014,19 @@
                             return angle;
                         };
 
-                        // Smooth rotation with proper angle wrapping
                         let currentYaw = normalizeAngle(playerBodyMesh.rotation.y);
-                        let diff = normalizeAngle(targetBodyYaw - currentYaw);
 
-                        // Apply lerp and normalize result
-                        playerBodyMesh.rotation.y = normalizeAngle(currentYaw + diff * 0.15);
+                        if (worldSpeed > 0.5) {
+                            // Moving: body faces MOVEMENT direction (where WASD is pushing)
+                            const targetBodyYaw = Math.atan2(worldVelX, worldVelZ);
+
+                            let diff = normalizeAngle(targetBodyYaw - currentYaw);
+
+                            // Smooth rotation toward movement direction
+                            playerBodyMesh.rotation.y = normalizeAngle(currentYaw + diff * 0.2);
+                        }
+                        // When stationary: body stays put, head does the tracking
+                        // (no else clause - body rotation unchanged)
 
                         // Debug logging (throttled)
                         if (thirdPersonDebugEnabled) {
@@ -22810,6 +23086,8 @@
                     // Don't use cameraRig.rotation.y because it was reset to 0 when exiting third-person
                     thirdPersonOrbitYaw = camera.rotation.y;
                     thirdPersonOrbitPitch = 0.2;  // Small downward angle (radians)
+                    smoothCamInitialized = false;  // Reset smooth follow
+                    thirdPersonDistance = 4.0;     // Reset zoom to default
 
                     // Reset cameraRig rotation to identity so LOCAL = WORLD axes
                     if (cameraRig) {
@@ -22895,6 +23173,11 @@
                 // - First-person: camera.layers.set(0) - body not visible (shadows still cast)
                 // - Third-person: camera.layers.set(0) then enable(2) - body visible
                 // Don't permanently enable layer 2 here as it would show body in first-person
+
+                // Initialize held block display
+                if (typeof updateHeldBlock === 'function') {
+                    updateHeldBlock(selectedBlockId);
+                }
 
                 logDebug("[PlayerBody] Player body system initialized");
             }
@@ -27243,15 +27526,27 @@
                     case "KeyC": if (isFlying) { flyDown = true; } else { isCrouching = true; playerEyeHeight = 1.4; } break;
                     case "ShiftLeft": isSprinting = true; break;
                     case "ShiftRight": isSprinting = true; break;
-                    case "Digit1": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[0]; currentHotbarSlot = 1; highlightSlot(1); break;
-                    case "Digit2": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[1]; currentHotbarSlot = 2; highlightSlot(2); break;
-                    case "Digit3": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[2]; currentHotbarSlot = 3; highlightSlot(3); break;
-                    case "Digit4": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[3]; currentHotbarSlot = 4; highlightSlot(4); break;
-                    case "Digit5": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[4]; currentHotbarSlot = 5; highlightSlot(5); break;
-                    case "Digit6": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[5]; currentHotbarSlot = 6; highlightSlot(6); break;
-                    case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); break;
-                    case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); break;
-                    case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); break;
+                    case "Digit1": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[0]; currentHotbarSlot = 1; highlightSlot(1); updateHeldBlock(selectedBlockId); break;
+                    case "Digit2": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[1]; currentHotbarSlot = 2; highlightSlot(2); updateHeldBlock(selectedBlockId); break;
+                    case "Digit3": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[2]; currentHotbarSlot = 3; highlightSlot(3); updateHeldBlock(selectedBlockId); break;
+                    case "Digit4": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[3]; currentHotbarSlot = 4; highlightSlot(4); updateHeldBlock(selectedBlockId); break;
+                    case "Digit5": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[4]; currentHotbarSlot = 5; highlightSlot(5); updateHeldBlock(selectedBlockId); break;
+                    case "Digit6": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[5]; currentHotbarSlot = 6; highlightSlot(6); updateHeldBlock(selectedBlockId); break;
+                    case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); updateHeldBlock(selectedBlockId); break;
+                    case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); updateHeldBlock(selectedBlockId); break;
+                    case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); updateHeldBlock(selectedBlockId); break;
+                    case "Minus":
+                    case "NumpadSubtract":
+                        if (isThirdPerson) {
+                            thirdPersonDistance = Math.min(THIRD_PERSON_DISTANCE_MAX, thirdPersonDistance + 0.5);
+                        }
+                        break;
+                    case "Equal":
+                    case "NumpadAdd":
+                        if (isThirdPerson) {
+                            thirdPersonDistance = Math.max(THIRD_PERSON_DISTANCE_MIN, thirdPersonDistance - 0.5);
+                        }
+                        break;
                     case "KeyF":
                         torchActive = !torchActive;
                         // Viewmodel torch only visible in first-person
@@ -27325,11 +27620,13 @@
             }
             const onMouseWheel = function (event) {
                 event.preventDefault();
-                // OPTIMIZATION: Use hoisted HOTBAR_SLOT_TO_BLOCK array instead of creating per scroll
+
+                // Scroll always changes hotbar slot (zoom is now on - and = keys)
                 if (event.deltaY > 0) { currentHotbarSlot++; if (currentHotbarSlot > 9) currentHotbarSlot = 1;
                 } else if (event.deltaY < 0) { currentHotbarSlot--; if (currentHotbarSlot < 1) currentHotbarSlot = 9; }
                 selectedBlockId = HOTBAR_SLOT_TO_BLOCK[currentHotbarSlot - 1];
                 highlightSlot(currentHotbarSlot);
+                updateHeldBlock(selectedBlockId);
             };
             function onWindowResize() {
                 camera.aspect = window.innerWidth / window.innerHeight;
