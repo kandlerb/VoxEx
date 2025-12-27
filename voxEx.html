@@ -10851,6 +10851,8 @@
             let isThirdPerson = false;
             let playerWalkPhase = 0;
             let playerIdleTimer = 0;
+            let targetStrideRate = 3.5;  // Target stride rate for smooth transitions
+            let currentStrideRate = 3.5; // Current stride rate (smoothed)
             let playerPose = null;
             let viewmodelWalkPhase = 0; // Separate phase for viewmodel arms
             // Third-person camera settings (LOCAL offsets from controls object)
@@ -22875,6 +22877,7 @@
                         headY: PLAYER_PROPORTIONS.head.centerY,
                         headYaw: 0,  // Head yaw for camera tracking
                         bodyY: PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5,
+                        bodyX: 0,    // Lateral body offset for sway
                         bodyTilt: 0,
                     };
                 }
@@ -22892,6 +22895,7 @@
                 let targetHeadX = 0;
                 let targetHeadY = PLAYER_PROPORTIONS.head.centerY;
                 let targetBodyY = PLAYER_PROPORTIONS.hipY + PLAYER_PROPORTIONS.body.height * 0.5;
+                let targetBodyX = 0;   // Lateral body offset for hip sway
                 let targetBodyTilt = 0;
 
                 // Joint bend targets (positive = bend forward/inward)
@@ -22900,8 +22904,7 @@
                 let targetLeftElbow = 0;
                 let targetRightElbow = 0;
 
-                // Animation parameters
-                let strideRate = 3.5;
+                // Animation parameters (strideRate uses module-scope targetStrideRate/currentStrideRate)
                 let armAmplitude = 0.5;
                 let legAmplitude = 0.5;
 
@@ -23055,13 +23058,13 @@
                 } else if (state.isMoving) {
                     // Walking or running animation
                     if (state.isSprinting) {
-                        strideRate = 7.0;
+                        targetStrideRate = 7.0;
                         armAmplitude = 0.85;
                         legAmplitude = 0.75;
                         targetBodyTilt = 0.15;
                         targetHeadX = -0.1;
                     } else if (state.isCrouching) {
-                        strideRate = 2.5;
+                        targetStrideRate = 2.5;
                         armAmplitude = 0.15;
                         legAmplitude = 0.0;  // IK handles leg movement, not swing
 
@@ -23082,11 +23085,25 @@
                         targetArmRX = 0.2;
                         targetLeftElbow = 0.3;
                         targetRightElbow = 0.3;
+                    } else {
+                        targetStrideRate = 3.5;  // Normal walking
                     }
 
-                    playerWalkPhase += dt * strideRate;
+                    // Smooth stride rate transitions for natural acceleration
+                    currentStrideRate = THREE.MathUtils.lerp(currentStrideRate, targetStrideRate, 1 - Math.pow(0.1, dt));
+
+                    playerWalkPhase += dt * currentStrideRate;
                     const swing = Math.sin(playerWalkPhase);
                     const counter = Math.cos(playerWalkPhase);
+
+                    // Hip vertical bob at 2× leg frequency, scaled by speed
+                    const bobIntensity = state.isSprinting ? 0.06 : 0.04;
+                    const hipBob = Math.abs(Math.sin(playerWalkPhase * 2)) * bobIntensity * (moveSpeed / 4);
+                    targetBodyY -= hipBob;  // Subtract to bob DOWN on each step
+
+                    // Lateral sway - weight shifts toward stance leg
+                    const lateralSway = Math.sin(playerWalkPhase) * 0.02 * (moveSpeed / 4);
+                    targetBodyX = lateralSway;
 
                     // Hip rotation (thigh swing)
                     if (!state.isCrouching) {
@@ -23094,34 +23111,53 @@
                         targetLegRX = swing * legAmplitude;
                     }
 
-                    // Knee bend - bends when leg swings forward, straightens when back
-                    // REDUCE walking knee bend when crouching (knees already bent)
-                    const walkKneeFactor = state.isCrouching ? 0.3 : 0.8;
-                    targetLeftKnee += Math.max(0, swing) * walkKneeFactor;
-                    targetRightKnee += Math.max(0, -swing) * walkKneeFactor;
+                    // Knee bend follows leg swing with phase offset (follow-through)
+                    const kneePhase = playerWalkPhase - 0.3;  // Slight phase delay
+                    const kneeFactor = state.isCrouching ? 0.3 : 0.8;
+                    targetLeftKnee += Math.max(0, Math.sin(kneePhase)) * kneeFactor;
+                    targetRightKnee += Math.max(0, Math.sin(kneePhase + Math.PI)) * kneeFactor;
 
                     // Arm swing with elbow bend
                     targetArmLX += swing * armAmplitude;
                     targetArmRX += -swing * armAmplitude;
 
-                    // Elbow bend - REDUCE when crouching (arms already forward)
-                    const walkElbowFactor = state.isCrouching ? 0.15 : 0.3;
-                    targetLeftElbow += Math.abs(swing) * walkElbowFactor;
-                    targetRightElbow += Math.abs(swing) * walkElbowFactor;
+                    // Elbow bend peaks slightly after arm reaches max extension
+                    const elbowPhase = playerWalkPhase - 0.2;
+                    const elbowFactor = state.isCrouching ? 0.15 : 0.35;
+                    targetLeftElbow += (0.15 + Math.max(0, Math.sin(elbowPhase)) * elbowFactor);
+                    targetRightElbow += (0.15 + Math.max(0, Math.sin(elbowPhase + Math.PI)) * elbowFactor);
 
                     // Subtle arm Z-rotation for more natural swing
                     targetArmLZ = -swing * 0.1;
                     targetArmRZ = swing * 0.1;
 
                 } else {
-                    // Idle animation - subtle breathing
+                    // Idle animation - breathing + weight shifting + micro-movements
                     playerIdleTimer += dt;
-                    const breathe = Math.sin(playerIdleTimer * 1.2) * 0.04;
-                    targetHeadY = PLAYER_PROPORTIONS.head.centerY + breathe * 0.5;
 
-                    // Subtle arm sway
-                    targetArmLX = Math.sin(playerIdleTimer * 0.8) * 0.06;
-                    targetArmRX = Math.sin(playerIdleTimer * 0.8 + 0.5) * 0.06;
+                    // Reset stride rate for smooth walk resumption
+                    targetStrideRate = 3.5;
+                    currentStrideRate = THREE.MathUtils.lerp(currentStrideRate, targetStrideRate, 1 - Math.pow(0.3, dt));
+
+                    // Breathing: chest expansion + slight rise
+                    const breathCycle = Math.sin(playerIdleTimer * 0.4 * Math.PI);
+                    const breath = (breathCycle + 1) * 0.5;  // 0 to 1
+                    targetHeadY = PLAYER_PROPORTIONS.head.centerY + breath * 0.015;
+
+                    // Weight shift: slow lateral sway (different frequency than breathing)
+                    const shiftCycle = Math.sin(playerIdleTimer * 0.15 * Math.PI);
+                    const lateralShift = shiftCycle * 0.012;
+                    targetBodyX = lateralShift;
+
+                    // Arm micro-movements: slight asymmetric sway
+                    targetArmLX = 0.03 + Math.sin(playerIdleTimer * 0.5) * 0.04;
+                    targetArmRX = 0.03 + Math.sin(playerIdleTimer * 0.5 + 0.7) * 0.04;
+                    targetArmLZ = Math.sin(playerIdleTimer * 0.3) * 0.02;
+                    targetArmRZ = -Math.sin(playerIdleTimer * 0.3 + 0.5) * 0.02;
+
+                    // Subtle elbow relaxation
+                    targetLeftElbow = 0.08 + Math.abs(Math.sin(playerIdleTimer * 0.4)) * 0.05;
+                    targetRightElbow = 0.08 + Math.abs(Math.sin(playerIdleTimer * 0.4 + 0.3)) * 0.05;
 
                     if (state.isCrouching) {
                         // IK idle crouch: thighs UP, knees bent to compensate
@@ -23134,6 +23170,7 @@
                         targetBodyTilt = 0.12;
                         targetHeadX = -0.08;
 
+                        // Override arm positions for crouch
                         targetArmLX = 0.15;
                         targetArmRX = 0.15;
                         targetLeftElbow = 0.25;
@@ -23228,6 +23265,7 @@
                 }
 
                 parts.body.position.y = smooth("bodyY", targetBodyY, 0.15);
+                parts.body.position.x = smooth("bodyX", targetBodyX, 0.15);
                 parts.body.rotation.x = smooth("bodyTilt", targetBodyTilt, 0.1);
 
                 // Offset leg pivot positions to follow tilted body hips
