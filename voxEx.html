@@ -1934,6 +1934,7 @@
             <div class="buttons">
                 <button onclick="copyPoseToClipboard()">Copy Pose</button>
                 <button onclick="resetPose()">Reset</button>
+                <button onclick="testCrouchPose()">Crouch</button>
             </div>
         </div>
         <div id="loading-spinner">
@@ -11082,6 +11083,48 @@
                 // Head sits flush on shoulders: shoulderY + head.height/2 = 1.5 + 0.25 = 1.75
                 head: { size: 0.5, height: 0.5, centerY: 1.75 },
             };
+
+            /**
+             * Crouch pose parameters for biomechanically accurate crouching.
+             * Based on: footY = (hipY - drop) - thigh×cos(θ_hip) - shin×cos(θ_hip + θ_knee) = 0
+             */
+            const CROUCH_PARAMS = {
+                // Leg angles for foot planting
+                hipAngle: 0.40,      // Thigh forward rotation (~23°)
+                kneeAngle: 0.85,     // Knee bend (~49°)
+
+                // Pelvis drop calculated from leg geometry
+                // drop = hipY - thigh×cos(hipAngle) - shin×cos(hipAngle + kneeAngle)
+                // drop = 0.75 - 0.40×cos(0.40) - 0.35×cos(1.25) ≈ 0.27
+                get pelvisDrop() {
+                    const p = PLAYER_PROPORTIONS;
+                    return p.hipY - p.leg.thighHeight * Math.cos(this.hipAngle)
+                                  - p.leg.shinHeight * Math.cos(this.hipAngle + this.kneeAngle);
+                },
+
+                // Spine lean distribution (total ~0.28 rad / 16°)
+                // Lower gets most (hip flexion), upper gets least
+                lowerSpineLean: 0.12,   // ~7° - pelvis tilt
+                midSpineLean: 0.10,     // ~6° - primary bend
+                upperSpineLean: 0.06,   // ~3° - chest
+
+                // Head pitch to maintain forward gaze
+                // Compensates for total spine lean (~0.28) with slight upward look
+                get headPitch() {
+                    return -(this.lowerSpineLean + this.midSpineLean + this.upperSpineLean) + 0.08;
+                },
+
+                // Arm pose
+                elbowBend: 0.35,
+                armForward: 0.12,
+                armSpread: 0.06,
+
+                // Movement modifiers
+                strideRate: 2.0,
+                legAmplitude: 0.12,
+                armAmplitude: 0.08,
+            };
+
             // Player body state
             let playerBodyMesh = null;
             let playerArmsModel = null;
@@ -23559,43 +23602,44 @@
                         targetBodyTilt = 0.15;
                         targetHeadX = -0.1;
                     } else if (state.isCrouching) {
-                        targetStrideRate = 2.5;
-                        armAmplitude = 0.12;
-                        legAmplitude = 0.15;  // Very subtle leg swing when crouched
+                        const C = CROUCH_PARAMS;
 
-                        // === PROPER IK CROUCH ===
-                        // Knee bends forward, thigh rotates to compensate, foot stays planted
+                        // Movement parameters
+                        targetStrideRate = C.strideRate;
+                        armAmplitude = C.armAmplitude;
+                        legAmplitude = C.legAmplitude;
 
-                        // Leg angles (calculated to keep foot near ground)
-                        const hipAngle = 0.45;   // Thigh rotates forward ~26°
-                        const kneeAngle = 0.65;  // Knee bends forward ~37°
+                        // === PELVIS DROP ===
+                        // Lower the whole body by dropping lowerSpine
+                        targetBodyY = PLAYER_PROPORTIONS.hipY - C.pelvisDrop;
 
-                        targetLegLX = hipAngle;   // Thighs rotate FORWARD (positive)
-                        targetLegRX = hipAngle;
-                        targetLeftKnee = kneeAngle;
-                        targetRightKnee = kneeAngle;
+                        // === DISTRIBUTED SPINE LEAN ===
+                        // Set spine targets directly (bypasses targetBodyTilt distribution)
+                        targetLowerSpineX = C.lowerSpineLean;
+                        targetMidSpineX = C.midSpineLean;
+                        targetUpperSpineX = C.upperSpineLean;
 
-                        // Body drops to match lowered hip position
-                        // Drop = thighHeight * (1 - cos(hipAngle)) ≈ 0.18
-                        const { leg } = PLAYER_PROPORTIONS;
-                        const bodyDrop = leg.thighHeight * (1 - Math.cos(hipAngle));
-                        targetBodyY -= bodyDrop;
+                        // Clear bodyTilt so it doesn't double-add
+                        targetBodyTilt = 0;
 
-                        // Body tilts forward
-                        targetBodyTilt = 0.20;
+                        // === LEG ANGLES ===
+                        targetLegLX = C.hipAngle;
+                        targetLegRX = C.hipAngle;
+                        targetLeftKnee = C.kneeAngle;
+                        targetRightKnee = C.kneeAngle;
 
-                        // Head compensates: moves forward, drops slightly, counter-rotates to face horizon
-                        targetHeadZ = 0.12;  // Move forward
-                        targetHeadY -= 0.08; // Drop slightly (less than body)
-                        targetHeadX = -targetBodyTilt + 0.05;  // Counter-rotate body tilt, slight look up
+                        // === HEAD STABILIZATION ===
+                        // Counter-rotate to maintain forward gaze
+                        targetHeadX = C.headPitch;
+                        targetHeadZ = 0.08;  // Slight forward for alertness
 
-                        // Arms bend at elbows, stay with shoulders
-                        targetArmLX = 0.10;
-                        targetArmRX = 0.10;
-                        targetArmLZ = 0.08;   // Slight outward
-                        targetArmRZ = -0.08;
-                        targetLeftElbow = 0.35;
-                        targetRightElbow = 0.35;
+                        // === ARMS ===
+                        targetArmLX = C.armForward;
+                        targetArmRX = C.armForward;
+                        targetArmLZ = C.armSpread;
+                        targetArmRZ = -C.armSpread;
+                        targetLeftElbow = C.elbowBend;
+                        targetRightElbow = C.elbowBend;
                     } else {
                         targetStrideRate = 3.5;  // Normal walking
                     }
@@ -23624,6 +23668,9 @@
                         // Crouching: swing around the forward-angled base position
                         targetLegLX += -swing * legAmplitude;
                         targetLegRX += swing * legAmplitude;
+                        // Subtle knee variation during crouch walk
+                        targetLeftKnee += Math.abs(swing) * 0.08;
+                        targetRightKnee += Math.abs(-swing) * 0.08;
                     }
 
                     // Knee bend follows leg swing with phase offset (follow-through)
@@ -23675,28 +23722,36 @@
                     targetRightElbow = 0.08 + Math.abs(Math.sin(playerIdleTimer * 0.4 + 0.3)) * 0.05;
 
                     if (state.isCrouching) {
-                        // IK idle crouch - same geometry as walking crouch
-                        const hipAngle = 0.42;   // Slightly less than walking
-                        const kneeAngle = 0.60;
+                        const C = CROUCH_PARAMS;
 
-                        targetLegLX = hipAngle;
-                        targetLegRX = hipAngle;
-                        targetLeftKnee = kneeAngle;
-                        targetRightKnee = kneeAngle;
+                        // Same pose as walking crouch
+                        targetBodyY = PLAYER_PROPORTIONS.hipY - C.pelvisDrop;
 
-                        const { leg } = PLAYER_PROPORTIONS;
-                        const bodyDrop = leg.thighHeight * (1 - Math.cos(hipAngle));
-                        targetBodyY -= bodyDrop;
+                        // Spine lean
+                        targetLowerSpineX = C.lowerSpineLean;
+                        targetMidSpineX = C.midSpineLean;
+                        targetUpperSpineX = C.upperSpineLean;
+                        targetBodyTilt = 0;
 
-                        targetBodyTilt = 0.18;
-                        targetHeadZ = 0.10;
-                        targetHeadY -= 0.06;
-                        targetHeadX = -targetBodyTilt + 0.05;
+                        // Legs
+                        targetLegLX = C.hipAngle;
+                        targetLegRX = C.hipAngle;
+                        targetLeftKnee = C.kneeAngle;
+                        targetRightKnee = C.kneeAngle;
 
-                        targetArmLX = 0.08;
-                        targetArmRX = 0.08;
-                        targetLeftElbow = 0.30;
-                        targetRightElbow = 0.30;
+                        // Head
+                        targetHeadX = C.headPitch;
+                        targetHeadZ = 0.06;
+
+                        // Arms slightly more relaxed
+                        targetArmLX = C.armForward * 0.7;
+                        targetArmRX = C.armForward * 0.7;
+                        targetLeftElbow = C.elbowBend * 0.9;
+                        targetRightElbow = C.elbowBend * 0.9;
+
+                        // Subtle breathing while crouched
+                        const breathCycle = Math.sin(playerIdleTimer * 0.5 * Math.PI);
+                        targetMidSpineX += breathCycle * 0.015;
                     }
                 }
 
@@ -23723,14 +23778,18 @@
                     const impact = landingImpact;
 
                     // Deep knee bend to absorb impact
-                    targetLegLX += impact * 0.2;   // Thighs rotate slightly forward
+                    targetLegLX += impact * 0.2;
                     targetLegRX += impact * 0.2;
-                    targetLeftKnee += impact * 1.2;  // Strong knee bend!
+                    targetLeftKnee += impact * 1.2;
                     targetRightKnee += impact * 1.2;
 
-                    // Body drops and leans
+                    // Body drops
                     targetBodyY -= impact * 0.12;
-                    targetBodyTilt += impact * 0.25;
+
+                    // Distribute impact across spine (instead of just bodyTilt)
+                    targetLowerSpineX += impact * 0.15;
+                    targetMidSpineX += impact * 0.10;
+                    targetUpperSpineX += impact * 0.05;
 
                     // Arms swing forward for balance
                     targetArmLX -= impact * 0.4;
@@ -23738,7 +23797,8 @@
                     targetLeftElbow += impact * 0.5;
                     targetRightElbow += impact * 0.5;
 
-                    targetHeadX -= impact * 0.15;
+                    // Head compensates
+                    targetHeadX -= impact * 0.20;
                 }
 
                 // Apply smoothed rotations to primary joints
@@ -24136,6 +24196,35 @@
                 Object.entries(defaults).forEach(([name, val]) => setSlider(name, val));
                 applyPoseFromSliders();
                 logDebug('[PoseDebug] Pose reset to T-pose');
+            }
+
+            /**
+             * Apply crouch pose values to debug sliders for testing
+             */
+            function testCrouchPose() {
+                const C = CROUCH_PARAMS;
+                const segmentHeight = PLAYER_PROPORTIONS.body.segmentHeight;
+                const headLocalY = segmentHeight + PLAYER_PROPORTIONS.head.height * 0.5;
+
+                setSlider('bodyY', PLAYER_PROPORTIONS.hipY - C.pelvisDrop);
+                setSlider('lowerSpineX', C.lowerSpineLean);
+                setSlider('midSpineX', C.midSpineLean);
+                setSlider('upperSpineX', C.upperSpineLean);
+                setSlider('headY', headLocalY);
+                setSlider('headZ', 0.06);
+                setSlider('headX', C.headPitch);
+                setSlider('leftLegX', C.hipAngle);
+                setSlider('rightLegX', C.hipAngle);
+                setSlider('leftKnee', C.kneeAngle);
+                setSlider('rightKnee', C.kneeAngle);
+                setSlider('leftArmX', C.armForward);
+                setSlider('rightArmX', C.armForward);
+                setSlider('leftArmZ', C.armSpread);
+                setSlider('rightArmZ', -C.armSpread);
+                setSlider('leftElbow', C.elbowBend);
+                setSlider('rightElbow', C.elbowBend);
+                applyPoseFromSliders();
+                logDebug('[PoseDebug] Applied crouch pose');
             }
 
             /**
