@@ -21338,7 +21338,13 @@
                 registerPixelTexture(tex);
                 return { material: new THREE.MeshLambertMaterial({ map: tex, transparent: false }), layout: { waistEnd, torsoEnd, seamRows }, };
             }
-            function applyTorsoSegmentUVs(geometry, layout) {
+            /**
+             * Apply UV mapping for torso segments.
+             * @param {THREE.BoxGeometry} geometry - The geometry to modify
+             * @param {Object} layout - UV layout with waistEnd, torsoEnd sections
+             * @param {string} [segment='full'] - 'lower', 'mid', 'upper', or 'full' (default)
+             */
+            function applyTorsoSegmentUVs(geometry, layout, segment = 'full') {
                 if (!geometry || !geometry.attributes.uv) return;
                 const uvAttr = geometry.attributes.uv;
                 const { waistEnd, torsoEnd } = layout;
@@ -21347,17 +21353,10 @@
                 // progressively shrink/rotate the torso texture and create the twisting artifact.
                 if (!geometry.userData.baseTorsoUV) { geometry.userData.baseTorsoUV = uvAttr.array.slice();
                 } else { uvAttr.array.set(geometry.userData.baseTorsoUV); }
-                // Preserve each face's original winding but remap vertical bands so waist/torso/neck stay aligned.
-                const remapSideV = (v) => { if (v <= 0.333) { return THREE.MathUtils.lerp(0, waistEnd, v / 0.333);
-                    } else if (v <= 0.666) { return THREE.MathUtils.lerp(waistEnd, torsoEnd, (v - 0.333) / 0.333); }
-                    return THREE.MathUtils.lerp(torsoEnd, 1, (v - 0.666) / 0.334);
-                };
-                // Compact neck/waist spans to avoid collapsing faces into a single UV line (causes texture twisting).
-                const neckStart = THREE.MathUtils.clamp(torsoEnd + (1 - torsoEnd) * 0.35, torsoEnd, 0.94);
-                const neckEnd = Math.min(1, neckStart + Math.max(0.06, (1 - neckStart) * 0.6));
-                const waistStart = Math.max(0, waistEnd * 0.18);
-                const waistEndBand = Math.min(waistEnd * 0.95, waistStart + Math.max(0.08, waistEnd * 0.55));
-                const remapFaceRange = (faceIndex, uRange, vRange, vMapper = null) => { const base = faceIndex * 4;
+
+                // Helper to remap a face's UVs
+                const remapFaceRange = (faceIndex, uRange, vRange, vMapper = null) => {
+                    const base = faceIndex * 4;
                     for (let i = 0; i < 4; i++) {
                         const u = uvAttr.getX(base + i);
                         const v = uvAttr.getY(base + i);
@@ -21367,14 +21366,56 @@
                         uvAttr.setXY(base + i, mappedU, mappedV);
                     }
                 };
-                // Sides keep their U orientation but get segmented V bands.
-                remapFaceRange(0, [0, 1], [0, 1], remapSideV); // right
-                remapFaceRange(1, [0, 1], [0, 1], remapSideV); // left
-                remapFaceRange(4, [0, 1], [0, 1], remapSideV); // front
-                remapFaceRange(5, [0, 1], [0, 1], remapSideV); // back
-                // Top pulls from neck, bottom from waist/pants. Keep a small V span to avoid smearing.
-                remapFaceRange(2, [0, 1], [neckStart, neckEnd]);
-                remapFaceRange(3, [0, 1], [waistStart, waistEndBand]);
+
+                if (segment === 'full') {
+                    // Original behavior: full body mesh with 3 bands
+                    const remapSideV = (v) => {
+                        if (v <= 0.333) { return THREE.MathUtils.lerp(0, waistEnd, v / 0.333); }
+                        else if (v <= 0.666) { return THREE.MathUtils.lerp(waistEnd, torsoEnd, (v - 0.333) / 0.333); }
+                        return THREE.MathUtils.lerp(torsoEnd, 1, (v - 0.666) / 0.334);
+                    };
+                    // Compact neck/waist spans to avoid collapsing faces into a single UV line
+                    const neckStart = THREE.MathUtils.clamp(torsoEnd + (1 - torsoEnd) * 0.35, torsoEnd, 0.94);
+                    const neckEnd = Math.min(1, neckStart + Math.max(0.06, (1 - neckStart) * 0.6));
+                    const waistStart = Math.max(0, waistEnd * 0.18);
+                    const waistEndBand = Math.min(waistEnd * 0.95, waistStart + Math.max(0.08, waistEnd * 0.55));
+                    // Sides get segmented V bands
+                    remapFaceRange(0, [0, 1], [0, 1], remapSideV); // right
+                    remapFaceRange(1, [0, 1], [0, 1], remapSideV); // left
+                    remapFaceRange(4, [0, 1], [0, 1], remapSideV); // front
+                    remapFaceRange(5, [0, 1], [0, 1], remapSideV); // back
+                    // Top/bottom caps
+                    remapFaceRange(2, [0, 1], [neckStart, neckEnd]);
+                    remapFaceRange(3, [0, 1], [waistStart, waistEndBand]);
+                } else {
+                    // Segment-specific UV: map entire segment to its band
+                    let vStart, vEnd;
+                    if (segment === 'lower') {
+                        // Lower spine = waist/belt area (bottom third of texture)
+                        vStart = 0;
+                        vEnd = waistEnd;
+                    } else if (segment === 'mid') {
+                        // Mid spine = torso/shirt area (middle third)
+                        vStart = waistEnd;
+                        vEnd = torsoEnd;
+                    } else if (segment === 'upper') {
+                        // Upper spine = chest/neck area (top third)
+                        vStart = torsoEnd;
+                        vEnd = 1;
+                    } else {
+                        // Unknown segment, use full range
+                        vStart = 0;
+                        vEnd = 1;
+                    }
+                    // Map all side faces to the segment's V range
+                    remapFaceRange(0, [0, 1], [vStart, vEnd]); // right
+                    remapFaceRange(1, [0, 1], [vStart, vEnd]); // left
+                    remapFaceRange(4, [0, 1], [vStart, vEnd]); // front
+                    remapFaceRange(5, [0, 1], [vStart, vEnd]); // back
+                    // Top/bottom caps also use segment band
+                    remapFaceRange(2, [0, 1], [vStart + (vEnd - vStart) * 0.7, vEnd]); // top
+                    remapFaceRange(3, [0, 1], [vStart, vStart + (vEnd - vStart) * 0.3]); // bottom
+                }
                 uvAttr.needsUpdate = true;
             }
             function generateZombieArmSegmentTexture(skinColors, segment, clothingPalette, clothingOverlay, torsoLayout) {
@@ -21674,22 +21715,77 @@
                 applyThighMaterialBands(thighGeo);
                 applyShinMaterialBands(shinGeo);
 
+                // Spine segment dimensions (body split into 3 equal parts)
+                const segmentHeight = body.segmentHeight;  // 0.25 each
+
                 let parts = group.userData.parts;
                 if (!parts) {
-                    // Create body parts with unique materials
-                    const headMesh = new THREE.Mesh(new THREE.BoxGeometry(head.size, head.height, head.size), headMaterials);
-                    const bodyGeometry = new THREE.BoxGeometry(body.width, body.height, body.depth);
-                    applyTorsoSegmentUVs(bodyGeometry, bodyUVLayout);
-                    const bodyMesh = new THREE.Mesh(bodyGeometry, bodyMaterial);
+                    // =============================================
+                    // SPINE HIERARCHY: lower → mid → upper
+                    // =============================================
 
+                    // Lower spine pivot (pelvis) - at hip level, root of spine chain
+                    const lowerSpinePivot = new THREE.Group();
+                    lowerSpinePivot.position.set(0, hipY, 0);
+
+                    // Lower spine mesh (pelvis/lower back)
+                    const lowerSpineGeo = new THREE.BoxGeometry(body.width, segmentHeight, body.depth);
+                    applyTorsoSegmentUVs(lowerSpineGeo, bodyUVLayout, 'lower');
+                    const lowerSpineMesh = new THREE.Mesh(lowerSpineGeo, bodyMaterial);
+                    lowerSpineMesh.position.y = segmentHeight * 0.5;
+                    lowerSpineMesh.castShadow = true;
+                    lowerSpineMesh.receiveShadow = true;
+                    lowerSpinePivot.add(lowerSpineMesh);
+
+                    // Mid spine pivot - at top of lower segment
+                    const midSpinePivot = new THREE.Group();
+                    midSpinePivot.position.y = segmentHeight;
+                    lowerSpinePivot.add(midSpinePivot);
+
+                    // Mid spine mesh (abdomen)
+                    const midSpineGeo = new THREE.BoxGeometry(body.width, segmentHeight, body.depth);
+                    applyTorsoSegmentUVs(midSpineGeo, bodyUVLayout, 'mid');
+                    const midSpineMesh = new THREE.Mesh(midSpineGeo, bodyMaterial);
+                    midSpineMesh.position.y = segmentHeight * 0.5;
+                    midSpineMesh.castShadow = true;
+                    midSpineMesh.receiveShadow = true;
+                    midSpinePivot.add(midSpineMesh);
+
+                    // Upper spine pivot - at top of mid segment
+                    const upperSpinePivot = new THREE.Group();
+                    upperSpinePivot.position.y = segmentHeight;
+                    midSpinePivot.add(upperSpinePivot);
+
+                    // Upper spine mesh (chest/shoulders)
+                    const upperSpineGeo = new THREE.BoxGeometry(body.width, segmentHeight, body.depth);
+                    applyTorsoSegmentUVs(upperSpineGeo, bodyUVLayout, 'upper');
+                    const upperSpineMesh = new THREE.Mesh(upperSpineGeo, bodyMaterial);
+                    upperSpineMesh.position.y = segmentHeight * 0.5;
+                    upperSpineMesh.castShadow = true;
+                    upperSpineMesh.receiveShadow = true;
+                    upperSpinePivot.add(upperSpineMesh);
+
+                    // =============================================
+                    // HEAD - attached to upper spine
+                    // =============================================
+                    const headMesh = new THREE.Mesh(new THREE.BoxGeometry(head.size, head.height, head.size), headMaterials);
+                    const headLocalY = segmentHeight + head.height * 0.5;  // Top of chest + half head
+                    headMesh.position.y = headLocalY;
+                    headMesh.castShadow = true;
+                    headMesh.receiveShadow = true;
+                    upperSpinePivot.add(headMesh);
+
+                    // =============================================
+                    // ARMS - attached to upper spine (shoulders)
+                    // =============================================
                     const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
                     const armOffsetX = body.width * 0.5 + arm.thickness * 0.5;
+                    const shoulderLocalY = segmentHeight;  // Top of upper spine segment
 
-                    // ========================================
                     // Left Arm - TWO SEGMENTS with elbow joint
-                    // ========================================
                     const leftArmPivot = new THREE.Group();
-                    leftArmPivot.position.set(armOffsetX, shoulderY, 0);
+                    leftArmPivot.position.set(armOffsetX, shoulderLocalY, 0);
+                    upperSpinePivot.add(leftArmPivot);
 
                     const leftUpperArmMesh = new THREE.Mesh(upperArmGeo, armMaterials);
                     leftUpperArmMesh.position.y = -arm.upperHeight * 0.5;
@@ -21707,11 +21803,10 @@
                     leftForearmMesh.receiveShadow = true;
                     leftElbowPivot.add(leftForearmMesh);
 
-                    // =========================================
                     // Right Arm - TWO SEGMENTS with elbow joint
-                    // =========================================
                     const rightArmPivot = new THREE.Group();
-                    rightArmPivot.position.set(-armOffsetX, shoulderY, 0);
+                    rightArmPivot.position.set(-armOffsetX, shoulderLocalY, 0);
+                    upperSpinePivot.add(rightArmPivot);
 
                     const rightUpperArmMesh = new THREE.Mesh(upperArmGeo, armMaterials);
                     rightUpperArmMesh.position.y = -arm.upperHeight * 0.5;
@@ -21729,11 +21824,14 @@
                     rightForearmMesh.receiveShadow = true;
                     rightElbowPivot.add(rightForearmMesh);
 
-                    // ========================================
+                    // =============================================
+                    // LEGS - attached to lower spine (hips)
+                    // =============================================
+
                     // Left Leg - TWO SEGMENTS with knee joint
-                    // ========================================
                     const leftLegPivot = new THREE.Group();
-                    leftLegPivot.position.set(legOffsetX, hipY, 0);
+                    leftLegPivot.position.set(legOffsetX, 0, 0);  // At lowerSpinePivot origin (hip level)
+                    lowerSpinePivot.add(leftLegPivot);
 
                     const leftThighMesh = new THREE.Mesh(thighGeo, legMaterials);
                     leftThighMesh.position.y = -leg.thighHeight * 0.5;
@@ -21751,11 +21849,10 @@
                     leftShinMesh.receiveShadow = true;
                     leftKneePivot.add(leftShinMesh);
 
-                    // =========================================
                     // Right Leg - TWO SEGMENTS with knee joint
-                    // =========================================
                     const rightLegPivot = new THREE.Group();
-                    rightLegPivot.position.set(-legOffsetX, hipY, 0);
+                    rightLegPivot.position.set(-legOffsetX, 0, 0);
+                    lowerSpinePivot.add(rightLegPivot);
 
                     const rightThighMesh = new THREE.Mesh(thighGeo, legMaterials);
                     rightThighMesh.position.y = -leg.thighHeight * 0.5;
@@ -21773,14 +21870,23 @@
                     rightShinMesh.receiveShadow = true;
                     rightKneePivot.add(rightShinMesh);
 
-                    // Position body parts (head and body don't need pivots)
-                    headMesh.position.set(0, head.centerY, 0);
-                    bodyMesh.position.set(0, hipY + body.height * 0.5, 0);
+                    // Add spine chain to group (single root, everything else follows hierarchy)
+                    group.add(lowerSpinePivot);
 
-                    // Store references to pivot groups for animation (includes joint pivots)
+                    // Store references to parts for animation
                     parts = {
+                        // Spine segments (NEW articulated spine)
+                        lowerSpine: lowerSpinePivot,
+                        midSpine: midSpinePivot,
+                        upperSpine: upperSpinePivot,
+                        // Keep 'body' as alias to lowerSpine for backward compatibility
+                        body: lowerSpinePivot,
+                        // Spine meshes for material updates
+                        lowerSpineMesh,
+                        midSpineMesh,
+                        upperSpineMesh,
+                        // Head
                         head: headMesh,
-                        body: bodyMesh,
                         // Arms with elbow joints
                         leftArm: leftArmPivot,
                         leftElbow: leftElbowPivot,
@@ -21801,21 +21907,18 @@
                         rightThighMesh,
                         rightShinMesh,
                     };
-
-                    // Add all parts to the group
-                    headMesh.castShadow = true;
-                    headMesh.receiveShadow = true;
-                    bodyMesh.castShadow = true;
-                    bodyMesh.receiveShadow = true;
-                    group.add(headMesh);
-                    group.add(bodyMesh);
-                    group.add(leftArmPivot);
-                    group.add(rightArmPivot);
-                    group.add(leftLegPivot);
-                    group.add(rightLegPivot);
                     group.userData.parts = parts;
                 } else {
-                    // Reusing pooled zombie - update references
+                    // Reusing pooled zombie - update materials on spine segments
+                    if (parts.lowerSpineMesh) parts.lowerSpineMesh.material = bodyMaterial;
+                    if (parts.midSpineMesh) parts.midSpineMesh.material = bodyMaterial;
+                    if (parts.upperSpineMesh) parts.upperSpineMesh.material = bodyMaterial;
+
+                    // Update UVs on all spine segments
+                    if (parts.lowerSpineMesh?.geometry) applyTorsoSegmentUVs(parts.lowerSpineMesh.geometry, bodyUVLayout, 'lower');
+                    if (parts.midSpineMesh?.geometry) applyTorsoSegmentUVs(parts.midSpineMesh.geometry, bodyUVLayout, 'mid');
+                    if (parts.upperSpineMesh?.geometry) applyTorsoSegmentUVs(parts.upperSpineMesh.geometry, bodyUVLayout, 'upper');
+
                     // Get mesh references from the articulated structure
                     const leftUpperArmMesh = parts.leftUpperArmMesh || parts.leftArm.children[0];
                     const leftForearmMesh = parts.leftForearmMesh || (parts.leftElbow ? parts.leftElbow.children[0] : null);
@@ -21837,33 +21940,45 @@
                     if (rightShinMesh) rightShinMesh.material = legMaterials;
                 }
 
-                // Ensure pivots stay aligned when reusing pooled zombies
+                // Reset spine hierarchy positions and rotations
                 const legOffsetX = body.width * 0.5 - leg.thickness * 0.5;
                 const armOffsetX = body.width * 0.5 + arm.thickness * 0.5;
-                parts.leftArm.position.set(armOffsetX, shoulderY, 0);
-                parts.rightArm.position.set(-armOffsetX, shoulderY, 0);
-                parts.leftLeg.position.set(legOffsetX, hipY, 0);
-                parts.rightLeg.position.set(-legOffsetX, hipY, 0);
+                const shoulderLocalY = segmentHeight;  // Top of upper spine segment
+                const headLocalY = segmentHeight + head.height * 0.5;
 
-                // Reset joint rotations for pooled zombies
+                // Reset spine chain
+                if (parts.lowerSpine) {
+                    parts.lowerSpine.position.set(0, hipY, 0);
+                    parts.lowerSpine.rotation.set(0, 0, 0);
+                }
+                if (parts.midSpine) {
+                    parts.midSpine.position.y = segmentHeight;
+                    parts.midSpine.rotation.set(0, 0, 0);
+                }
+                if (parts.upperSpine) {
+                    parts.upperSpine.position.y = segmentHeight;
+                    parts.upperSpine.rotation.set(0, 0, 0);
+                }
+
+                // Reset head (relative to upper spine)
+                parts.head.position.set(0, headLocalY, 0);
+                parts.head.material = headMaterials;
+
+                // Reset arms (relative to upper spine)
+                parts.leftArm.position.set(armOffsetX, shoulderLocalY, 0);
+                parts.rightArm.position.set(-armOffsetX, shoulderLocalY, 0);
                 parts.leftArm.rotation.set(0, 0, 0);
                 parts.rightArm.rotation.set(0, 0, 0);
-                parts.leftLeg.rotation.set(0, 0, 0);
-                parts.rightLeg.rotation.set(0, 0, 0);
                 if (parts.leftElbow) parts.leftElbow.rotation.set(0, 0, 0);
                 if (parts.rightElbow) parts.rightElbow.rotation.set(0, 0, 0);
+
+                // Reset legs (relative to lower spine at origin)
+                parts.leftLeg.position.set(legOffsetX, 0, 0);
+                parts.rightLeg.position.set(-legOffsetX, 0, 0);
+                parts.leftLeg.rotation.set(0, 0, 0);
+                parts.rightLeg.rotation.set(0, 0, 0);
                 if (parts.leftKnee) parts.leftKnee.rotation.set(0, 0, 0);
                 if (parts.rightKnee) parts.rightKnee.rotation.set(0, 0, 0);
-
-                parts.head.position.set(0, head.centerY, 0);
-                parts.body.position.set(0, hipY + body.height * 0.5, 0);
-
-                // Refresh materials for pooled zombies so each spawn stays unique
-                parts.head.material = headMaterials;
-                parts.body.material = bodyMaterial;
-
-                // Re-apply torso UV layout so each zombie keeps its unique waist/torso/neck proportions
-                applyTorsoSegmentUVs(parts.body.geometry, bodyUVLayout);
 
                 group.visible = true;
                 group.castShadow = true;
@@ -21964,6 +22079,9 @@
             function animateZombieLimbs(mob, dt, state, moveSpeed = 0) {
                 const parts = mob.userData.parts;
                 if (!parts) return;
+                // Spine segment dimensions
+                const segmentHeight = ZOMBIE_PROPORTIONS.body.segmentHeight;
+                const headLocalY = segmentHeight + ZOMBIE_PROPORTIONS.head.height * 0.5;
                 // Keep a cached pose for smoothing so fast speed changes don't jitter limbs
                 const pose = mob.userData.pose || {
                     leftArm: 0,
@@ -21975,7 +22093,11 @@
                     leftKnee: 0,     // Knee joint
                     rightKnee: 0,
                     headX: 0,
-                    headY: ZOMBIE_PROPORTIONS.head.centerY,
+                    headY: headLocalY,  // Local to upper spine
+                    // Spine segments
+                    lowerSpineX: 0, lowerSpineZ: 0,
+                    midSpineX: 0, midSpineZ: 0,
+                    upperSpineX: 0, upperSpineZ: 0,
                 };
                 mob.userData.pose = pose;
                 const strideRate = THREE.MathUtils.clamp(1.2 + moveSpeed * 0.35, 1.2, 4.2);
@@ -21990,7 +22112,11 @@
                 let targetLegL = 0, targetLegR = 0;
                 let targetKneeL = 0, targetKneeR = 0;
                 let targetHeadX = 0;
-                let targetHeadY = ZOMBIE_PROPORTIONS.head.centerY;
+                let targetHeadY = headLocalY;  // Local to upper spine
+                // Spine targets
+                let targetLowerSpineX = 0, targetLowerSpineZ = 0;
+                let targetMidSpineX = 0, targetMidSpineZ = 0;
+                let targetUpperSpineX = 0, targetUpperSpineZ = 0;
 
                 if (state === "attack") {
                     // Attacking: arms swing aggressively with elbow bend
@@ -22004,6 +22130,10 @@
                     // Slight knee bend during attack stance
                     targetKneeL = 0.2;
                     targetKneeR = 0.2;
+                    // Spine lunges forward during attack
+                    targetLowerSpineX = 0.1;
+                    targetMidSpineX = 0.15;
+                    targetUpperSpineX = 0.2;
                 } else if (state === "chase") {
                     // Chasing: running with knee and elbow bend
                     const phase = mob.userData.walkPhase * 4;
@@ -22027,6 +22157,14 @@
                     targetElbowR = 0.3 + Math.abs(swing) * 0.3;
 
                     targetHeadX = -0.08;
+
+                    // Spine forward lean and sway during chase
+                    targetLowerSpineX = 0.08;
+                    targetMidSpineX = 0.06;
+                    targetUpperSpineX = 0.04;
+                    // Lateral sway synced with arm swing
+                    targetLowerSpineZ = swing * 0.04;
+                    targetMidSpineZ = -swing * 0.02;
                 } else if (state === "wander") {
                     // Wandering: shambling walk with slight knee bend
                     const phase = mob.userData.walkPhase * 3;
@@ -22048,15 +22186,23 @@
                     // Elbows bent in zombie reaching pose
                     targetElbowL = 0.4;
                     targetElbowR = 0.4;
+
+                    // Shambling spine sway
+                    targetLowerSpineZ = swing * 0.05;
+                    targetMidSpineZ = -swing * 0.03;
+                    targetUpperSpineX = 0.03;  // Slight forward hunch
                 } else {
                     // Idle: subtle movement with relaxed joints
                     mob.userData.idleTimer += dt;
                     const idlePhase = mob.userData.idleTimer * 0.8;
-                    targetHeadY = ZOMBIE_PROPORTIONS.head.centerY + Math.sin(mob.userData.idleTimer * 1.2) * 0.04;
+                    targetHeadY = headLocalY + Math.sin(mob.userData.idleTimer * 1.2) * 0.04;
                     targetArmL = -0.3 + Math.sin(idlePhase) * 0.08;
                     targetArmR = -0.3 + Math.sin(idlePhase + 1) * 0.08;
                     targetElbowL = 0.35;
                     targetElbowR = 0.35;
+                    // Subtle idle spine sway
+                    targetLowerSpineZ = Math.sin(idlePhase * 0.5) * 0.02;
+                    targetUpperSpineX = Math.sin(idlePhase * 0.7) * 0.02;
                 }
 
                 // Apply smoothed rotations to primary joints
@@ -22081,6 +22227,20 @@
                 }
                 if (parts.rightElbow) {
                     parts.rightElbow.rotation.x = smooth("rightElbow", -Math.max(0, targetElbowR), 0.12);
+                }
+
+                // Apply spine rotations (for articulated spine hierarchy)
+                if (parts.lowerSpine) {
+                    parts.lowerSpine.rotation.x = smooth("lowerSpineX", targetLowerSpineX, 0.1);
+                    parts.lowerSpine.rotation.z = smooth("lowerSpineZ", targetLowerSpineZ, 0.1);
+                }
+                if (parts.midSpine) {
+                    parts.midSpine.rotation.x = smooth("midSpineX", targetMidSpineX, 0.1);
+                    parts.midSpine.rotation.z = smooth("midSpineZ", targetMidSpineZ, 0.1);
+                }
+                if (parts.upperSpine) {
+                    parts.upperSpine.rotation.x = smooth("upperSpineX", targetUpperSpineX, 0.1);
+                    parts.upperSpine.rotation.z = smooth("upperSpineZ", targetUpperSpineZ, 0.1);
                 }
             }
             function updateZombies(dt) {
