@@ -11143,6 +11143,99 @@
                 legBackwardKnee: 0.436,   // 25°
             };
 
+            /**
+             * Flight head lean parameters - spring-based interpolation for natural motion.
+             * Head leans upward toward horizon when flying + moving.
+             */
+            const FLIGHT_HEAD_LEAN = {
+                target: -0.26,      // 15° upward (negative X = look up)
+                halflife: 0.12,     // Spring halflife in seconds
+            };
+
+            // Flight head lean spring state (module-scope for persistence across frames)
+            let flightHeadLeanCurrent = 0;   // Current head pitch offset in radians
+            let flightHeadLeanVelocity = 0;  // Spring velocity
+
+            /**
+             * Flying sprint pose parameters - dramatic forward-leaning superman pose.
+             * Applied when flying AND sprinting for maximum speed visual.
+             * All rotation values in radians.
+             */
+            const FLYING_SPRINT_POSE = {
+                halflife: 0.15,  // Spring halflife for smooth transitions
+                // Root/pelvis
+                bodyY: 0.75,
+                // Spine segments (dramatic 60° + 5° + 5° = 70° total forward lean)
+                lowerSpineX: 1.047,   // 60° forward lean (pelvis leads)
+                midSpineX: 0.087,     // 5° additional
+                upperSpineX: 0.087,   // 5° additional
+                // Head (looking up toward horizon, compensating for body lean)
+                headY: 0.45,
+                headZ: 0,
+                headX: -0.820,        // -47° pitch (looking up)
+                // Arms (asymmetric - left swept back, right relaxed forward)
+                leftArmX: -2.793,     // -160° swept back
+                leftArmZ: 0.087,      // 5° spread
+                leftElbow: 0.122,     // 7° slight bend
+                rightArmX: 0.349,     // 20° relaxed forward
+                rightArmZ: -0.087,    // -5° spread
+                rightElbow: 0.698,    // 40° bent elbow
+                // Legs (asymmetric - left extended back, right bent forward)
+                leftLegX: 0.384,      // 22° extended back
+                leftKnee: 0.175,      // 10° slight bend
+                rightLegX: -0.873,    // -50° bent forward
+                rightKnee: 1.326,     // 76° strong knee bend
+            };
+
+            // Flying sprint pose spring state (for smooth transitions)
+            let flyingSprintPose = {
+                bodyY: 0.75,
+                lowerSpineX: 0, midSpineX: 0, upperSpineX: 0,
+                headY: 0.5, headZ: 0.1, headX: 0,
+                leftArmX: 0, leftArmZ: 0, leftElbow: 0,
+                rightArmX: 0, rightArmZ: 0, rightElbow: 0,
+                leftLegX: 0, leftKnee: 0,
+                rightLegX: 0, rightKnee: 0,
+            };
+            let flyingSprintVelocity = {
+                bodyY: 0,
+                lowerSpineX: 0, midSpineX: 0, upperSpineX: 0,
+                headY: 0, headZ: 0, headX: 0,
+                leftArmX: 0, leftArmZ: 0, leftElbow: 0,
+                rightArmX: 0, rightArmZ: 0, rightElbow: 0,
+                leftLegX: 0, leftKnee: 0,
+                rightLegX: 0, rightKnee: 0,
+            };
+
+            /**
+             * Exact critically damped spring function for smooth animation without overshoot.
+             * Uses exponential decay to guarantee convergence without oscillation.
+             * @param {number} current - Current value
+             * @param {number} velocity - Current velocity
+             * @param {number} target - Target value
+             * @param {number} halflife - Time to reach halfway to target (seconds)
+             * @param {number} dt - Delta time in seconds
+             * @returns {{value: number, velocity: number}} New value and velocity
+             */
+            function springDamper(current, velocity, target, halflife, dt) {
+                // Compute damping coefficient from halflife
+                const y = (4.0 * Math.LN2) / halflife;
+                const halfY = y * 0.5;
+
+                // Compute spring terms
+                const j0 = current - target;
+                const j1 = velocity + j0 * halfY;
+
+                // Exponential decay factor (critically damped)
+                const eydt = Math.exp(-halfY * dt);
+
+                // Compute new position and velocity
+                const newValue = eydt * (j0 + j1 * dt) + target;
+                const newVelocity = eydt * (velocity - j1 * halfY * dt);
+
+                return { value: newValue, velocity: newVelocity };
+            }
+
             // Player body state
             let playerBodyMesh = null;
             let playerArmsModel = null;
@@ -23466,6 +23559,63 @@
                     return playerPose[key];
                 };
 
+                // Update flight head lean spring (spring-based for smooth transitions)
+                const isFlyingAndMoving = state.isFlying && state.isMoving;
+                const headLeanTarget = isFlyingAndMoving ? FLIGHT_HEAD_LEAN.target : 0;
+                const springResult = springDamper(
+                    flightHeadLeanCurrent,
+                    flightHeadLeanVelocity,
+                    headLeanTarget,
+                    FLIGHT_HEAD_LEAN.halflife,
+                    dt
+                );
+                flightHeadLeanCurrent = springResult.value;
+                flightHeadLeanVelocity = springResult.velocity;
+
+                // Update flying sprint pose springs (for smooth transitions to/from sprint pose)
+                const isFlyingSprinting = state.isFlying && state.isMoving && state.isSprinting;
+                const FSP = FLYING_SPRINT_POSE;
+                const sprintHalflife = FSP.halflife;
+
+                // Helper to update a single spring value
+                const updateSpring = (key, target) => {
+                    const result = springDamper(
+                        flyingSprintPose[key],
+                        flyingSprintVelocity[key],
+                        isFlyingSprinting ? target : 0,
+                        sprintHalflife,
+                        dt
+                    );
+                    flyingSprintPose[key] = result.value;
+                    flyingSprintVelocity[key] = result.velocity;
+                };
+
+                // Base flying pose values (for delta calculation)
+                const BASE_FLY = {
+                    lowerSpineX: 0, midSpineX: 0, upperSpineX: 0,
+                    headX: 0,  // Will use flightHeadLeanCurrent separately
+                    leftArmX: 0.8, leftArmZ: 0.15, leftElbow: 0.2,
+                    rightArmX: 0.8, rightArmZ: -0.15, rightElbow: 0.2,
+                    leftLegX: 0.4, leftKnee: 0.15,
+                    rightLegX: -0.5, rightKnee: 1.1,
+                };
+
+                // Update springs with DELTA targets (sprint - base) for smooth blending
+                updateSpring('lowerSpineX', FSP.lowerSpineX - BASE_FLY.lowerSpineX);
+                updateSpring('midSpineX', FSP.midSpineX - BASE_FLY.midSpineX);
+                updateSpring('upperSpineX', FSP.upperSpineX - BASE_FLY.upperSpineX);
+                updateSpring('headX', FSP.headX);  // Head uses separate base (flightHeadLeanCurrent)
+                updateSpring('leftArmX', FSP.leftArmX - BASE_FLY.leftArmX);
+                updateSpring('leftArmZ', FSP.leftArmZ - BASE_FLY.leftArmZ);
+                updateSpring('leftElbow', FSP.leftElbow - BASE_FLY.leftElbow);
+                updateSpring('rightArmX', FSP.rightArmX - BASE_FLY.rightArmX);
+                updateSpring('rightArmZ', FSP.rightArmZ - BASE_FLY.rightArmZ);
+                updateSpring('rightElbow', FSP.rightElbow - BASE_FLY.rightElbow);
+                updateSpring('leftLegX', FSP.leftLegX - BASE_FLY.leftLegX);
+                updateSpring('leftKnee', FSP.leftKnee - BASE_FLY.leftKnee);
+                updateSpring('rightLegX', FSP.rightLegX - BASE_FLY.rightLegX);
+                updateSpring('rightKnee', FSP.rightKnee - BASE_FLY.rightKnee);
+
                 // Animation targets (hip/shoulder rotations)
                 let targetArmLX = 0, targetArmRX = 0;
                 let targetArmLZ = 0, targetArmRZ = 0;
@@ -23564,38 +23714,60 @@
                     targetHeadX = -0.1;
 
                 } else if (state.isFlying) {
-                    // Flying: superman pose with subtle movement
+                    // Flying: superman pose with smooth sprint blending via springs
+                    // Springs store DELTA from base flying pose, targeting (sprint-base) when sprinting, 0 otherwise
                     playerIdleTimer += dt;
                     const flyBob = Math.sin(playerIdleTimer * 2) * 0.08;
 
+                    // Spine lean: base 0 + spring delta (when sprinting: delta = 1.047, otherwise: 0)
+                    targetLowerSpineX = flyingSprintPose.lowerSpineX;
+                    targetMidSpineX = flyingSprintPose.midSpineX;
+                    targetUpperSpineX = flyingSprintPose.upperSpineX;
+
                     if (state.isMoving) {
-                        // Superman flying pose
-                        targetArmLX = 0.8;
-                        targetArmRX = 0.8;
-                        targetArmLZ = 0.15 - flyBob;
-                        targetArmRZ = -0.15 + flyBob;
-                        targetLeftElbow = 0.2;  // Slight elbow bend
-                        targetRightElbow = 0.2;
-                        targetBodyTilt = 0.4;
-                        targetHeadX = 0.4;  // Tilt DOWN to look FORWARD (counters body tilt)
-                        targetHeadZ = headLocalZ + 0.15; // Head moves forward with body tilt
+                        // Flying + moving pose (with sprint blend)
+                        // Arms: base (0.8, 0.15/-0.15, 0.2) + spring delta
+                        targetArmLX = 0.8 + flyingSprintPose.leftArmX;
+                        targetArmRX = 0.8 + flyingSprintPose.rightArmX;
+                        targetArmLZ = 0.15 - flyBob + flyingSprintPose.leftArmZ;
+                        targetArmRZ = -0.15 + flyBob + flyingSprintPose.rightArmZ;
+                        targetLeftElbow = 0.2 + flyingSprintPose.leftElbow;
+                        targetRightElbow = 0.2 + flyingSprintPose.rightElbow;
+
+                        // Legs: base (0.4/-0.5, 0.15/1.1) + spring delta
+                        targetLegLX = 0.4 + flyBob * 0.2 + flyingSprintPose.leftLegX;
+                        targetLegRX = -0.5 + flyBob * 0.2 + flyingSprintPose.rightLegX;
+                        targetLeftKnee = 0.15 + flyingSprintPose.leftKnee;
+                        targetRightKnee = 1.1 + flyingSprintPose.rightKnee;
+
+                        // Body tilt: reduce as sprint lean increases (sprint uses spine segments)
+                        const sprintBlend = Math.abs(flyingSprintPose.lowerSpineX) / 1.047;
+                        targetBodyTilt = 0.4 * (1 - sprintBlend);
+
+                        // Head: base flight lean + sprint head delta
+                        targetHeadX = flightHeadLeanCurrent + flyingSprintPose.headX;
+                        targetHeadZ = headLocalZ;
+                        // Blend head Y toward sprint value
+                        targetHeadY = headLocalY + (FLYING_SPRINT_POSE.headY - headLocalY) * sprintBlend;
                     } else {
-                        // Hovering
-                        targetArmLX = 0.2 + flyBob;
-                        targetArmRX = 0.2 - flyBob;
-                        targetArmLZ = 0.5;
-                        targetArmRZ = -0.5;
-                        targetLeftElbow = 0.3;
-                        targetRightElbow = 0.3;
-                        targetHeadX = 0;
+                        // Hovering pose (with sprint blend for smooth transitions)
+                        targetArmLX = 0.2 + flyBob + flyingSprintPose.leftArmX;
+                        targetArmRX = 0.2 - flyBob + flyingSprintPose.rightArmX;
+                        targetArmLZ = 0.5 + flyingSprintPose.leftArmZ;
+                        targetArmRZ = -0.5 + flyingSprintPose.rightArmZ;
+                        targetLeftElbow = 0.3 + flyingSprintPose.leftElbow;
+                        targetRightElbow = 0.3 + flyingSprintPose.rightElbow;
+
+                        // Hovering legs + sprint blend
+                        targetLegLX = flyingSprintPose.leftLegX;
+                        targetLegRX = flyingSprintPose.rightLegX;
+                        targetLeftKnee = flyingSprintPose.leftKnee;
+                        targetRightKnee = flyingSprintPose.rightKnee;
+
+                        // Head uses flight lean + sprint blend
+                        targetHeadX = flightHeadLeanCurrent + flyingSprintPose.headX;
                         targetHeadZ = headLocalZ;
                     }
-
-                    // Superman pose: left leg trails back, right knee pulled UP toward chest
-                    targetLegLX = 0.4 + flyBob * 0.2;    // Left leg trails behind (positive = back when body tilted)
-                    targetLegRX = -0.5 + flyBob * 0.2;   // Right thigh pulls UP/forward (NEGATIVE = toward chest)
-                    targetLeftKnee = 0.15;   // Left knee almost straight, leg trails
-                    targetRightKnee = 1.1;   // Right knee bent strongly, shin tucked up
 
                 } else if (state.isJumping) {
                     // Jumping: dynamic arm swing and leg tuck
