@@ -11286,10 +11286,38 @@
             let smoothCamInitialized = false;
             const CAM_SMOOTH_FACTOR = 0.15;  // Lower = more lag
 
-            // Landing impact animation
+            // Landing impact animation - spring-based system
             let wasAirborne = false;
-            let landingImpact = 0;  // 0-1, decays over time
-            let landingVelocity = 0;  // Velocity at moment of landing
+            let landingVelocity = 0;  // Velocity at moment of landing (tracked while airborne)
+
+            // Impact absorption spring state (compression values, negative = compress)
+            let impactKneeCompress = 0;
+            let impactKneeVelocity = 0;
+            let impactHipDrop = 0;
+            let impactHipVelocity = 0;
+            let impactSpineCompress = 0;
+            let impactSpineVelocity = 0;
+            let impactArmSwing = 0;
+            let impactArmVelocity = 0;
+            let impactHeadCounter = 0;
+            let impactHeadVelocity = 0;
+
+            // Impact absorption parameters
+            const IMPACT_ABSORPTION = {
+                halflife: 0.25,              // Recovery time (slightly slower than other springs)
+                kneeMultiplier: 0.12,        // How much knees bend per m/s of impact
+                hipMultiplier: 0.015,        // How much hips drop per m/s of impact
+                spineMultiplier: 0.025,      // How much spine compresses per m/s of impact
+                armMultiplier: 0.05,         // How much arms swing forward per m/s of impact
+                headMultiplier: 0.025,       // How much head counter-rotates per m/s of impact
+                maxKneeBend: 1.4,            // Maximum additional knee bend (radians, ~80°)
+                maxHipDrop: 0.20,            // Maximum hip drop (units)
+                maxSpineCompress: 0.20,      // Maximum spine compression (radians, ~12°)
+                maxArmSwing: 0.5,            // Maximum arm forward swing (radians, ~30°)
+                maxHeadCounter: 0.25,        // Maximum head counter-rotation (radians, ~15°)
+                velocityThreshold: 2.0,      // Minimum fall velocity to trigger effect (m/s)
+                velocityScale: 8.0,          // Velocity multiplier for impulse injection
+            };
 
             // Mining arm swing
             let miningSwingPhase = 0;
@@ -24036,32 +24064,38 @@
                     miningSwingPhase = 0;
                 }
 
-                // Apply landing impact - full body reaction with deep knee bend
-                if (landingImpact > 0) {
-                    const impact = landingImpact;
+                // Apply landing impact - spring-based joint compression
+                // Spring values are negative (compression) when active
+                const hasImpact = impactKneeCompress < -0.001 || impactHipDrop < -0.001 ||
+                                  impactSpineCompress < -0.001 || impactArmSwing < -0.001 ||
+                                  impactHeadCounter > 0.001;
+                if (hasImpact) {
+                    // Deep knee bend to absorb impact (both knees compress equally)
+                    // Hip flex slightly forward with knee bend
+                    const kneeAmount = Math.abs(impactKneeCompress);
+                    targetLegLX += kneeAmount * 0.15;  // Hip flexes forward with knee
+                    targetLegRX += kneeAmount * 0.15;
+                    targetLeftKnee += kneeAmount;
+                    targetRightKnee += kneeAmount;
 
-                    // Deep knee bend to absorb impact
-                    targetLegLX += impact * 0.2;
-                    targetLegRX += impact * 0.2;
-                    targetLeftKnee += impact * 1.2;
-                    targetRightKnee += impact * 1.2;
+                    // Body drops (hip spring)
+                    targetBodyY += impactHipDrop;  // impactHipDrop is negative
 
-                    // Body drops
-                    targetBodyY -= impact * 0.12;
-
-                    // Distribute impact across spine (instead of just bodyTilt)
-                    targetLowerSpineX += impact * 0.15;
-                    targetMidSpineX += impact * 0.10;
-                    targetUpperSpineX += impact * 0.05;
+                    // Distribute impact across spine (biomechanically: lower spine absorbs most)
+                    const spineAmount = Math.abs(impactSpineCompress);
+                    targetLowerSpineX += spineAmount * 0.6;   // Lower spine: 60%
+                    targetMidSpineX += spineAmount * 0.3;     // Mid spine: 30%
+                    targetUpperSpineX += spineAmount * 0.1;   // Upper spine: 10%
 
                     // Arms swing forward for balance
-                    targetArmLX -= impact * 0.4;
-                    targetArmRX -= impact * 0.4;
-                    targetLeftElbow += impact * 0.5;
-                    targetRightElbow += impact * 0.5;
+                    const armAmount = Math.abs(impactArmSwing);
+                    targetArmLX -= armAmount;
+                    targetArmRX -= armAmount;
+                    targetLeftElbow += armAmount * 1.0;   // Elbows bend with arm swing
+                    targetRightElbow += armAmount * 1.0;
 
-                    // Head compensates
-                    targetHeadX -= impact * 0.20;
+                    // Head counter-rotates to stay stable (looks up slightly)
+                    targetHeadX -= impactHeadCounter;
                 }
 
                 // Apply smoothed rotations to primary joints
@@ -24587,10 +24621,24 @@
                 // Detect landing (was airborne, now grounded)
                 const isAirborne = isJumping || isFalling || isFlying;
                 if (wasAirborne && !isAirborne && canJump) {
-                    landingImpact = Math.min(1, Math.abs(landingVelocity) / 15);
+                    // Calculate impact speed (positive = falling)
+                    const impactSpeed = Math.max(0, -landingVelocity);
+
+                    // Inject velocity impulses into impact springs if above threshold
+                    if (impactSpeed > IMPACT_ABSORPTION.velocityThreshold) {
+                        const IA = IMPACT_ABSORPTION;
+                        const scale = IA.velocityScale;
+
+                        // Inject negative velocity (compress direction) proportional to impact
+                        impactKneeVelocity -= Math.min(impactSpeed * IA.kneeMultiplier * scale, IA.maxKneeBend * 4);
+                        impactHipVelocity -= Math.min(impactSpeed * IA.hipMultiplier * scale, IA.maxHipDrop * 4);
+                        impactSpineVelocity -= Math.min(impactSpeed * IA.spineMultiplier * scale, IA.maxSpineCompress * 4);
+                        impactArmVelocity -= Math.min(impactSpeed * IA.armMultiplier * scale, IA.maxArmSwing * 4);
+                        impactHeadVelocity += Math.min(impactSpeed * IA.headMultiplier * scale, IA.maxHeadCounter * 4);
+                    }
 
                     // Spawn dust particles on landing
-                    if (Math.abs(landingVelocity) > 5) {
+                    if (impactSpeed > 5) {
                         const feetY = Math.floor(playerWorldPos.y - PLAYER_EYE_HEIGHT_STAND);
                         const groundBlockId = getBlock(
                             Math.floor(playerWorldPos.x),
@@ -24611,9 +24659,36 @@
                 }
                 wasAirborne = isAirborne;
 
-                // Decay landing impact
-                if (landingImpact > 0) {
-                    landingImpact = Math.max(0, landingImpact - dt * 4);
+                // Update landing impact absorption springs (always spring back toward 0)
+                const IA = IMPACT_ABSORPTION;
+
+                const kneeResult = springDamper(impactKneeCompress, impactKneeVelocity, 0, IA.halflife, dt);
+                impactKneeCompress = THREE.MathUtils.clamp(kneeResult.value, -IA.maxKneeBend, 0);
+                impactKneeVelocity = kneeResult.velocity;
+
+                const hipResult = springDamper(impactHipDrop, impactHipVelocity, 0, IA.halflife, dt);
+                impactHipDrop = THREE.MathUtils.clamp(hipResult.value, -IA.maxHipDrop, 0);
+                impactHipVelocity = hipResult.velocity;
+
+                const spineResult = springDamper(impactSpineCompress, impactSpineVelocity, 0, IA.halflife, dt);
+                impactSpineCompress = THREE.MathUtils.clamp(spineResult.value, -IA.maxSpineCompress, 0);
+                impactSpineVelocity = spineResult.velocity;
+
+                const armResult = springDamper(impactArmSwing, impactArmVelocity, 0, IA.halflife, dt);
+                impactArmSwing = THREE.MathUtils.clamp(armResult.value, -IA.maxArmSwing, 0);
+                impactArmVelocity = armResult.velocity;
+
+                const headResult = springDamper(impactHeadCounter, impactHeadVelocity, 0, IA.halflife, dt);
+                impactHeadCounter = THREE.MathUtils.clamp(headResult.value, 0, IA.maxHeadCounter);
+                impactHeadVelocity = headResult.velocity;
+
+                // Reset impact springs when flying or swimming (no landing impact in these states)
+                if (state.isFlying || state.isSwimming || state.inWater) {
+                    impactKneeCompress = 0; impactKneeVelocity = 0;
+                    impactHipDrop = 0; impactHipVelocity = 0;
+                    impactSpineCompress = 0; impactSpineVelocity = 0;
+                    impactArmSwing = 0; impactArmVelocity = 0;
+                    impactHeadCounter = 0; impactHeadVelocity = 0;
                 }
 
                 // Update body mesh position and rotation
