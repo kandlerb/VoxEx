@@ -11132,38 +11132,47 @@
             };
 
             /**
-             * Crouch pose parameters - user-tested values from pose debug mode.
+             * Crouch pose parameters - asymmetric pose for natural weight distribution.
              * Uses fixed pelvisDrop with synchronized smooth factors for body/legs.
              */
             const CROUCH_PARAMS = {
-                // Fixed pelvis drop - tested value from pose debug
-                pelvisDrop: 0.25,     // Root Y goes from 0.75 to 0.50
+                // Fixed pelvis drop - bodyY goes from 0.75 to 0.50
+                pelvisDrop: 0.25,
 
-                // Leg angles: Hip: -55° = -0.96 rad, Knee: 65° = 1.13 rad
-                hipAngle: -0.96,      // -55° thighs forward
-                kneeAngle: 1.13,      // 65° knee bend
-                legSplay: 0.12,       // ~7° outward spread each leg for stability
+                // Spine rotations - forward lean distributed across segments
+                lowerSpineLean: 0.2793,   // 16°
+                midSpineLean: 0.3840,     // 22°
+                upperSpineLean: 0.3840,   // 22°
 
-                // Spine: Lower 0°, Mid 15°, Upper 15°
-                lowerSpineLean: 0,        // 0° - pelvis stays level
-                midSpineLean: 0.262,      // 15° - abdomen bends forward
-                upperSpineLean: 0.262,    // 15° - chest follows
+                // Head position and rotation
+                headY: 0.450,
+                headZ: 0.080,
+                headPitch: -0.7505,       // -43° looking up to compensate
 
-                // Head: Y 0.45, Z 0.05, Pitch -30°
-                headY: 0.45,              // Local Y position
-                headPitch: -0.524,        // -30° looking up to compensate
-                headZ: 0.05,              // Slight forward
+                // Left arm - more forward, supporting position
+                leftArmX: -1.0472,        // -60°
+                leftArmZ: 0.1396,         // 8°
+                leftElbow: 0.7854,        // 45°
 
-                // Arms: Swing -15°, Spread -5°, Elbow 30°
-                armForward: -0.262,       // -15° forward
-                armSpreadL: -0.087,       // -5°
-                armSpreadR: 0.087,        // opposite spread
-                elbowBend: 0.524,         // 30° elbow bend
+                // Right arm - relaxed
+                rightArmX: -0.2618,       // -15°
+                rightArmZ: -0.1396,       // -8°
+                rightElbow: 0.8378,       // 48°
 
-                // Movement - doubled stride rate, wider gait
+                // Left leg - more forward, weight-bearing
+                leftHipAngle: -1.1694,    // -67°
+                leftLegSplay: 0.1745,     // 10°
+                leftKnee: 0.8378,         // 48°
+
+                // Right leg - less forward, extended
+                rightHipAngle: -0.8029,   // -46°
+                rightLegSplay: -0.1745,   // -10°
+                rightKnee: 1.3788,        // 79°
+
+                // Movement - stride rate and amplitude for crouch-walking
                 strideRate: 4.0,
-                legAmplitude: 0.25,
-                armAmplitude: 0.12,
+                legAmplitude: 0.20,       // Reduced for smaller steps
+                armAmplitude: 0.10,
             };
 
             const SPRINT_PARAMS = {
@@ -11192,6 +11201,87 @@
             };
 
             /**
+             * Pose constraint limits to prevent body part interpenetration.
+             * Values are in radians. Constraints are applied after animation targets
+             * are calculated but before smoothing.
+             */
+            const POSE_CONSTRAINTS = {
+                // Knee bend limit based on hip angle
+                // When hip rotates forward (negative), reduce max knee bend
+                // Formula: maxKnee = baseMax + hipAngle * scaleFactor (clamped)
+                knee: {
+                    maxBend: 1.4,        // ~80° absolute max knee bend
+                    minBend: 0,          // No backward knee bend
+                    // When hip is at -1.0 rad (forward), knee max reduces by 0.6 rad
+                    hipInfluence: 0.6,   // How much hip angle affects knee limit
+                },
+                // Elbow bend limits
+                elbow: {
+                    maxBend: 2.5,        // ~143° max elbow bend (full flexion)
+                    minBend: 0,          // No hyperextension
+                },
+                // Arm swing limits (X rotation at shoulder)
+                arm: {
+                    maxForward: 3.14,    // 180° forward
+                    maxBackward: -0.8,   // ~46° backward
+                    maxSpread: 1.57,     // 90° outward (Z rotation)
+                },
+                // Leg swing limits (X rotation at hip)
+                leg: {
+                    maxForward: -1.57,   // 90° forward (negative = forward)
+                    maxBackward: 0.8,    // ~46° backward
+                    maxSplay: 0.5,       // ~29° outward spread
+                },
+                // Head rotation limits
+                head: {
+                    maxPitch: 1.0,       // ~57° down
+                    minPitch: -1.0,      // ~57° up
+                    maxYaw: 1.4,         // ~80° turn
+                },
+            };
+
+            /**
+             * Apply geometric constraints to animation targets to prevent body part interpenetration.
+             * Modifies target values in-place based on relationships between joints.
+             * @param {Object} targets - Object containing all target values to constrain
+             */
+            function applyPoseConstraints(targets) {
+                const C = POSE_CONSTRAINTS;
+
+                // Knee constraint: limit bend based on hip angle
+                // When hip rotates forward (negative X), the thigh comes toward chest
+                // So we must reduce how much the knee can bend to prevent shin-chest collision
+                const leftHipForward = Math.max(0, -targets.leftLegX);  // 0 when leg back, positive when forward
+                const rightHipForward = Math.max(0, -targets.rightLegX);
+
+                // Calculate dynamic knee limits (more hip forward = less knee bend allowed)
+                const leftKneeMax = Math.max(0.1, C.knee.maxBend - leftHipForward * C.knee.hipInfluence);
+                const rightKneeMax = Math.max(0.1, C.knee.maxBend - rightHipForward * C.knee.hipInfluence);
+
+                targets.leftKnee = THREE.MathUtils.clamp(targets.leftKnee, C.knee.minBend, leftKneeMax);
+                targets.rightKnee = THREE.MathUtils.clamp(targets.rightKnee, C.knee.minBend, rightKneeMax);
+
+                // Elbow constraints
+                targets.leftElbow = THREE.MathUtils.clamp(targets.leftElbow, C.elbow.minBend, C.elbow.maxBend);
+                targets.rightElbow = THREE.MathUtils.clamp(targets.rightElbow, C.elbow.minBend, C.elbow.maxBend);
+
+                // Arm swing constraints
+                targets.leftArmX = THREE.MathUtils.clamp(targets.leftArmX, C.arm.maxBackward, C.arm.maxForward);
+                targets.rightArmX = THREE.MathUtils.clamp(targets.rightArmX, C.arm.maxBackward, C.arm.maxForward);
+                targets.leftArmZ = THREE.MathUtils.clamp(targets.leftArmZ, -C.arm.maxSpread, C.arm.maxSpread);
+                targets.rightArmZ = THREE.MathUtils.clamp(targets.rightArmZ, -C.arm.maxSpread, C.arm.maxSpread);
+
+                // Leg swing constraints
+                targets.leftLegX = THREE.MathUtils.clamp(targets.leftLegX, C.leg.maxForward, C.leg.maxBackward);
+                targets.rightLegX = THREE.MathUtils.clamp(targets.rightLegX, C.leg.maxForward, C.leg.maxBackward);
+                targets.leftLegZ = THREE.MathUtils.clamp(targets.leftLegZ, -C.leg.maxSplay, C.leg.maxSplay);
+                targets.rightLegZ = THREE.MathUtils.clamp(targets.rightLegZ, -C.leg.maxSplay, C.leg.maxSplay);
+
+                // Head rotation constraints
+                targets.headX = THREE.MathUtils.clamp(targets.headX, C.head.minPitch, C.head.maxPitch);
+            }
+
+            /**
              * Flight head lean parameters - spring-based interpolation for natural motion.
              * Head leans upward toward horizon when flying + moving.
              */
@@ -11203,37 +11293,6 @@
             // Flight head lean spring state (module-scope for persistence across frames)
             let flightHeadLeanCurrent = 0;   // Current head pitch offset in radians
             let flightHeadLeanVelocity = 0;  // Spring velocity
-
-            /**
-             * Flying sprint pose parameters - dramatic forward-leaning superman pose.
-             * Applied when flying AND sprinting for maximum speed visual.
-             * All rotation values in radians.
-             */
-            const FLYING_SPRINT_POSE = {
-                halflife: 0.15,  // Spring halflife for smooth transitions
-                // Root/pelvis
-                bodyY: 0.75,
-                // Spine segments (dramatic 60° + 5° + 5° = 70° total forward lean)
-                lowerSpineX: 1.047,   // 60° forward lean (pelvis leads)
-                midSpineX: 0.087,     // 5° additional
-                upperSpineX: 0.087,   // 5° additional
-                // Head (looking up toward horizon, compensating for body lean)
-                headY: 0.45,
-                headZ: 0,
-                headX: -0.820,        // -47° pitch (looking up)
-                // Arms (asymmetric - left swept back, right relaxed forward)
-                leftArmX: -2.793,     // -160° swept back
-                leftArmZ: 0.087,      // 5° spread
-                leftElbow: 0.122,     // 7° slight bend
-                rightArmX: 0.349,     // 20° relaxed forward
-                rightArmZ: -0.087,    // -5° spread
-                rightElbow: 0.698,    // 40° bent elbow
-                // Legs (asymmetric - left extended back, right bent forward)
-                leftLegX: 0.384,      // 22° extended back
-                leftKnee: 0.175,      // 10° slight bend
-                rightLegX: -0.873,    // -50° bent forward
-                rightKnee: 1.326,     // 76° strong knee bend
-            };
 
             /**
              * Pose presets for debug mode. Values in radians for rotations, units for positions.
@@ -11258,12 +11317,12 @@
                     rightArmX: -0.7, rightArmZ: 0, rightElbow: 1.05, leftLegX: -1.047, leftLegZ: 0, leftKnee: 0.35,
                     rightLegX: 0.785, rightLegZ: 0, rightKnee: 1.4,
                 },
-                // Crouching poses
+                // Crouching poses (asymmetric for natural weight distribution)
                 crouch_idle: {
-                    bodyY: 0.5, lowerSpineX: 0, lowerSpineZ: 0, midSpineX: 0.262, midSpineZ: 0, upperSpineX: 0.262, upperSpineZ: 0,
-                    headY: 0.45, headZ: 0.05, headX: -0.524, leftArmX: -0.262, leftArmZ: -0.087, leftElbow: 0.524,
-                    rightArmX: -0.262, rightArmZ: 0.087, rightElbow: 0.524, leftLegX: -0.96, leftLegZ: 0.12, leftKnee: 1.13,
-                    rightLegX: -0.96, rightLegZ: -0.12, rightKnee: 1.13,
+                    bodyY: 0.50, lowerSpineX: 0.2793, lowerSpineZ: 0, midSpineX: 0.384, midSpineZ: 0, upperSpineX: 0.384, upperSpineZ: 0,
+                    headY: 0.45, headZ: 0.08, headX: -0.7505, leftArmX: -1.0472, leftArmZ: 0.1396, leftElbow: 0.7854,
+                    rightArmX: -0.2618, rightArmZ: -0.1396, rightElbow: 0.8378, leftLegX: -1.1694, leftLegZ: 0.1745, leftKnee: 0.8378,
+                    rightLegX: -0.8029, rightLegZ: -0.1745, rightKnee: 1.3788,
                 },
                 crouch_walk: {
                     bodyY: 0.5, lowerSpineX: 0.1, lowerSpineZ: 0, midSpineX: 0.262, midSpineZ: 0, upperSpineX: 0.262, upperSpineZ: 0,
@@ -11300,14 +11359,14 @@
                 jumping: {
                     bodyY: 0.75, lowerSpineX: -0.1, lowerSpineZ: 0, midSpineX: 0, midSpineZ: 0, upperSpineX: 0, upperSpineZ: 0,
                     headY: 0.5, headZ: 0.1, headX: -0.15, leftArmX: 0.5, leftArmZ: 0.35, leftElbow: 0.5,
-                    rightArmX: 0.5, rightArmZ: -0.35, rightElbow: 0.5, leftLegX: -0.3, leftLegZ: 0, leftKnee: 0.6,
-                    rightLegX: -0.4, rightLegZ: 0, rightKnee: 0.5,
+                    rightArmX: 0.5, rightArmZ: -0.35, rightElbow: 0.5, leftLegX: -0.3, leftLegZ: 0, leftKnee: 0.25,
+                    rightLegX: -0.4, rightLegZ: 0, rightKnee: 0.2,
                 },
                 falling: {
                     bodyY: 0.75, lowerSpineX: 0.1, lowerSpineZ: 0, midSpineX: 0, midSpineZ: 0, upperSpineX: 0, upperSpineZ: 0,
                     headY: 0.5, headZ: 0.1, headX: -0.15, leftArmX: -0.3, leftArmZ: 0.6, leftElbow: 0.5,
-                    rightArmX: -0.3, rightArmZ: -0.6, rightElbow: 0.5, leftLegX: -0.3, leftLegZ: 0.15, leftKnee: 0.5,
-                    rightLegX: -0.3, rightLegZ: -0.15, rightKnee: 0.5,
+                    rightArmX: -0.3, rightArmZ: -0.6, rightElbow: 0.5, leftLegX: -0.3, leftLegZ: 0.15, leftKnee: 0.25,
+                    rightLegX: -0.3, rightLegZ: -0.15, rightKnee: 0.25,
                 },
                 landing: {
                     bodyY: 0.55, lowerSpineX: 0.2, lowerSpineZ: 0, midSpineX: 0.1, midSpineZ: 0, upperSpineX: 0.05, upperSpineZ: 0,
@@ -11446,6 +11505,15 @@
             POSE_PRESETS.knockdown_pushup = KNOCKDOWN_KEYFRAMES[4].pose;
             POSE_PRESETS.knockdown_kneel = KNOCKDOWN_KEYFRAMES[5].pose;
 
+            /**
+             * Flying sprint pose parameters - derived from POSE_PRESETS.fly_sprint.
+             * Applied when flying AND sprinting for maximum speed visual.
+             */
+            const FLYING_SPRINT_POSE = {
+                halflife: 0.15,  // Spring halflife for smooth transitions
+                ...POSE_PRESETS.fly_sprint,
+            };
+
             // Flying sprint pose spring state (for smooth transitions)
             let flyingSprintPose = {
                 bodyY: 0.75,
@@ -11493,6 +11561,55 @@
                 const newVelocity = eydt * (velocity - j1 * halfY * dt);
 
                 return { value: newValue, velocity: newVelocity };
+            }
+
+            /**
+             * Module-scope smoothing function for pose interpolation.
+             * Avoids per-frame function allocation when called from animation loops.
+             * @param {Object} poseCache - The pose object to update (e.g., playerPose or mob.userData.pose)
+             * @param {string} key - The key in the pose object to smooth
+             * @param {number} target - Target value to interpolate towards
+             * @param {number} factor - Smoothing factor (default 0.18)
+             * @param {number} dt - Delta time in seconds
+             * @returns {number} The smoothed value
+             */
+            function smoothPose(poseCache, key, target, factor, dt) {
+                poseCache[key] = THREE.MathUtils.lerp(poseCache[key], target, 1 - Math.pow(1 - factor, dt * 60));
+                return poseCache[key];
+            }
+
+            // Animation state tracking for timer resets on state transitions
+            let lastAnimState = null;
+
+            // Base flying pose values - derived from POSE_PRESETS.fly_forward
+            const BASE_FLY = {
+                ...POSE_PRESETS.fly_forward,
+                headX: 0,  // Head uses flightHeadLeanCurrent separately, not preset value
+            };
+
+            /**
+             * Checks if flying sprint springs have settled (all values near zero).
+             * Used to skip spring updates when not needed.
+             * @param {Object} pose - Flying sprint pose state
+             * @param {Object} velocity - Flying sprint velocity state
+             * @param {number} threshold - Threshold for considering settled (default 0.001)
+             * @returns {boolean} True if springs have settled
+             */
+            function flyingSprintSpringsSettled(pose, velocity, threshold = 0.001) {
+                return Math.abs(pose.lowerSpineX) < threshold && Math.abs(velocity.lowerSpineX) < threshold &&
+                       Math.abs(pose.midSpineX) < threshold && Math.abs(velocity.midSpineX) < threshold &&
+                       Math.abs(pose.upperSpineX) < threshold && Math.abs(velocity.upperSpineX) < threshold &&
+                       Math.abs(pose.headX) < threshold && Math.abs(velocity.headX) < threshold &&
+                       Math.abs(pose.leftArmX) < threshold && Math.abs(velocity.leftArmX) < threshold &&
+                       Math.abs(pose.leftArmZ) < threshold && Math.abs(velocity.leftArmZ) < threshold &&
+                       Math.abs(pose.leftElbow) < threshold && Math.abs(velocity.leftElbow) < threshold &&
+                       Math.abs(pose.rightArmX) < threshold && Math.abs(velocity.rightArmX) < threshold &&
+                       Math.abs(pose.rightArmZ) < threshold && Math.abs(velocity.rightArmZ) < threshold &&
+                       Math.abs(pose.rightElbow) < threshold && Math.abs(velocity.rightElbow) < threshold &&
+                       Math.abs(pose.leftLegX) < threshold && Math.abs(velocity.leftLegX) < threshold &&
+                       Math.abs(pose.leftKnee) < threshold && Math.abs(velocity.leftKnee) < threshold &&
+                       Math.abs(pose.rightLegX) < threshold && Math.abs(velocity.rightLegX) < threshold &&
+                       Math.abs(pose.rightKnee) < threshold && Math.abs(velocity.rightKnee) < threshold;
             }
 
             // Player body state
@@ -11570,31 +11687,31 @@
             let knockdownTime = 0;  // Current time in animation (0 to KNOCKDOWN_TOTAL_DURATION)
             let playerControlsDisabled = false;
 
-            // Impact absorption parameters (linear scaling, high threshold)
+            // Impact absorption parameters (dampened for subtle landings)
             const IMPACT_ABSORPTION = {
-                // Recovery halflife per joint (staged recovery)
-                legBendHalflife: 0.35,       // Leg bend (knee + hip together)
-                legSplayHalflife: 0.30,      // Leg spread recovery
-                hipHalflife: 0.33,           // Hip Y drop
-                spineHalflife: 0.28,         // Spine compression
-                armHalflife: 0.25,           // Arm swing
-                headHalflife: 0.20,          // Head counter (fastest)
-                // Compression multipliers - used with linear scaling
-                legBendMultiplier: 0.4,      // Radians of leg bend per scaled unit
-                legSplayMultiplier: 0.06,    // Leg spread
-                hipMultiplier: 0.08,         // Units of hip drop
-                spineMultiplier: 0.10,       // Radians of spine bend
-                armMultiplier: 0.15,         // Radians of arm swing
-                headMultiplier: 0.08,        // Radians of head counter
-                // Maximum limits - conservative to prevent clipping
-                maxLegBend: 0.7,             // ~40° max (applies to both knee and hip)
-                maxLegSplay: 0.10,           // Max leg splay
-                maxHipDrop: 0.15,            // Max hip drop in units
-                maxSpineCompress: 0.20,      // ~11° max spine compression
-                maxArmSwing: 0.35,           // ~20° max arm forward swing
-                maxHeadCounter: 0.15,        // ~9° max head counter-rotation
-                velocityThreshold: 5.0,      // Below ~0.4 block falls have no effect
-                knockdownVelocity: 18.0,     // ~15+ block fall triggers knockdown
+                // Recovery halflife per joint (staged recovery) - faster recovery
+                legBendHalflife: 0.20,       // Was 0.35 - faster leg recovery
+                legSplayHalflife: 0.18,      // Was 0.30
+                hipHalflife: 0.20,           // Was 0.33
+                spineHalflife: 0.18,         // Was 0.28
+                armHalflife: 0.15,           // Was 0.25
+                headHalflife: 0.12,          // Was 0.20
+                // Compression multipliers - significantly reduced
+                legBendMultiplier: 0.15,     // Was 0.4 - much gentler leg bend
+                legSplayMultiplier: 0.02,    // Was 0.06
+                hipMultiplier: 0.03,         // Was 0.08
+                spineMultiplier: 0.04,       // Was 0.10
+                armMultiplier: 0.06,         // Was 0.15
+                headMultiplier: 0.03,        // Was 0.08
+                // Maximum limits - conservative to prevent any clipping
+                maxLegBend: 0.35,            // Was 0.7 - halved
+                maxLegSplay: 0.05,           // Was 0.10
+                maxHipDrop: 0.08,            // Was 0.15
+                maxSpineCompress: 0.10,      // Was 0.20
+                maxArmSwing: 0.15,           // Was 0.35
+                maxHeadCounter: 0.08,        // Was 0.15
+                velocityThreshold: 9.0,      // Was 5.0 - normal jumps no longer trigger
+                knockdownVelocity: 18.0,     // Unchanged - still triggers on big falls
             };
 
             // Mining arm swing
@@ -22747,10 +22864,6 @@
                 mob.userData.pose = pose;
                 const strideRate = THREE.MathUtils.clamp(1.2 + moveSpeed * 0.35, 1.2, 4.2);
                 mob.userData.walkPhase += dt * strideRate;
-                const smooth = (key, target, factor = 0.18) => {
-                    pose[key] = THREE.MathUtils.lerp(pose[key], target, 1 - Math.pow(1 - factor, dt * 60));
-                    return pose[key];
-                };
 
                 let targetArmL = 0, targetArmR = 0;
                 let targetElbowL = 0, targetElbowR = 0;
@@ -22851,41 +22964,41 @@
                 }
 
                 // Apply smoothed rotations to primary joints
-                parts.leftArm.rotation.x = smooth("leftArm", targetArmL);
-                parts.rightArm.rotation.x = smooth("rightArm", targetArmR);
-                parts.leftLeg.rotation.x = smooth("leftLeg", targetLegL, 0.12);
-                parts.rightLeg.rotation.x = smooth("rightLeg", targetLegR, 0.12);
-                parts.head.rotation.x = smooth("headX", targetHeadX, 0.2);
-                parts.head.position.y = smooth("headY", targetHeadY, 0.2);
+                parts.leftArm.rotation.x = smoothPose(pose, "leftArm", targetArmL, 0.18, dt);
+                parts.rightArm.rotation.x = smoothPose(pose, "rightArm", targetArmR, 0.18, dt);
+                parts.leftLeg.rotation.x = smoothPose(pose, "leftLeg", targetLegL, 0.12, dt);
+                parts.rightLeg.rotation.x = smoothPose(pose, "rightLeg", targetLegR, 0.12, dt);
+                parts.head.rotation.x = smoothPose(pose, "headX", targetHeadX, 0.2, dt);
+                parts.head.position.y = smoothPose(pose, "headY", targetHeadY, 0.2, dt);
 
                 // Apply joint rotations (knees and elbows) with clamping
                 if (parts.leftKnee) {
-                    parts.leftKnee.rotation.x = smooth("leftKnee", Math.max(0, targetKneeL), 0.15);
+                    parts.leftKnee.rotation.x = smoothPose(pose, "leftKnee", Math.max(0, targetKneeL), 0.15, dt);
                 }
                 if (parts.rightKnee) {
-                    parts.rightKnee.rotation.x = smooth("rightKnee", Math.max(0, targetKneeR), 0.15);
+                    parts.rightKnee.rotation.x = smoothPose(pose, "rightKnee", Math.max(0, targetKneeR), 0.15, dt);
                 }
                 // Elbows: NEGATIVE X = bend backward toward body (natural elbow direction)
                 // Positive target values become negative rotations
                 if (parts.leftElbow) {
-                    parts.leftElbow.rotation.x = smooth("leftElbow", -Math.max(0, targetElbowL), 0.12);
+                    parts.leftElbow.rotation.x = smoothPose(pose, "leftElbow", -Math.max(0, targetElbowL), 0.12, dt);
                 }
                 if (parts.rightElbow) {
-                    parts.rightElbow.rotation.x = smooth("rightElbow", -Math.max(0, targetElbowR), 0.12);
+                    parts.rightElbow.rotation.x = smoothPose(pose, "rightElbow", -Math.max(0, targetElbowR), 0.12, dt);
                 }
 
                 // Apply spine rotations (for articulated spine hierarchy)
                 if (parts.lowerSpine) {
-                    parts.lowerSpine.rotation.x = smooth("lowerSpineX", targetLowerSpineX, 0.1);
-                    parts.lowerSpine.rotation.z = smooth("lowerSpineZ", targetLowerSpineZ, 0.1);
+                    parts.lowerSpine.rotation.x = smoothPose(pose, "lowerSpineX", targetLowerSpineX, 0.1, dt);
+                    parts.lowerSpine.rotation.z = smoothPose(pose, "lowerSpineZ", targetLowerSpineZ, 0.1, dt);
                 }
                 if (parts.midSpine) {
-                    parts.midSpine.rotation.x = smooth("midSpineX", targetMidSpineX, 0.1);
-                    parts.midSpine.rotation.z = smooth("midSpineZ", targetMidSpineZ, 0.1);
+                    parts.midSpine.rotation.x = smoothPose(pose, "midSpineX", targetMidSpineX, 0.1, dt);
+                    parts.midSpine.rotation.z = smoothPose(pose, "midSpineZ", targetMidSpineZ, 0.1, dt);
                 }
                 if (parts.upperSpine) {
-                    parts.upperSpine.rotation.x = smooth("upperSpineX", targetUpperSpineX, 0.1);
-                    parts.upperSpine.rotation.z = smooth("upperSpineZ", targetUpperSpineZ, 0.1);
+                    parts.upperSpine.rotation.x = smoothPose(pose, "upperSpineX", targetUpperSpineX, 0.1, dt);
+                    parts.upperSpine.rotation.z = smoothPose(pose, "upperSpineZ", targetUpperSpineZ, 0.1, dt);
                 }
             }
             function updateZombies(dt) {
@@ -24036,11 +24149,18 @@
                 if (playerPose.leftLegZ === undefined) playerPose.leftLegZ = 0;
                 if (playerPose.rightLegZ === undefined) playerPose.rightLegZ = 0;
 
-                // Smoothing function with frame-rate independence
-                const smooth = (key, target, factor = 0.18) => {
-                    playerPose[key] = THREE.MathUtils.lerp(playerPose[key], target, 1 - Math.pow(1 - factor, dt * 60));
-                    return playerPose[key];
-                };
+                // Determine current animation state category for timer resets
+                const currentAnimState = state.isFlying ? 'flying' :
+                                         state.isSwimming ? 'swimming' :
+                                         state.isTreadingWater ? 'treading' :
+                                         (state.inWater && !state.isMoving) ? 'floating' :
+                                         state.isFalling ? 'falling' :
+                                         state.isMoving ? 'moving' : 'idle';
+                if (lastAnimState !== null && lastAnimState !== currentAnimState) {
+                    // Reset timer on state transition for smooth animation restarts
+                    playerIdleTimer = 0;
+                }
+                lastAnimState = currentAnimState;
 
                 // Update flight head lean spring (spring-based for smooth transitions)
                 const isFlyingAndMoving = state.isFlying && state.isMoving;
@@ -24055,49 +24175,42 @@
                 flightHeadLeanCurrent = springResult.value;
                 flightHeadLeanVelocity = springResult.velocity;
 
-                // Update flying sprint pose springs (for smooth transitions to/from sprint pose)
+                // Update flying sprint pose springs (only when needed - flying or springs still settling)
                 const isFlyingSprinting = state.isFlying && state.isMoving && state.isSprinting;
-                const FSP = FLYING_SPRINT_POSE;
-                const sprintHalflife = FSP.halflife;
+                const needsFlyingSpringUpdate = state.isFlying || !flyingSprintSpringsSettled(flyingSprintPose, flyingSprintVelocity);
 
-                // Helper to update a single spring value
-                const updateSpring = (key, target) => {
-                    const result = springDamper(
-                        flyingSprintPose[key],
-                        flyingSprintVelocity[key],
-                        isFlyingSprinting ? target : 0,
-                        sprintHalflife,
-                        dt
-                    );
-                    flyingSprintPose[key] = result.value;
-                    flyingSprintVelocity[key] = result.velocity;
-                };
+                if (needsFlyingSpringUpdate) {
+                    const FSP = FLYING_SPRINT_POSE;
+                    const sprintHalflife = FSP.halflife;
 
-                // Base flying pose values (for delta calculation)
-                const BASE_FLY = {
-                    lowerSpineX: 0.4, midSpineX: 0, upperSpineX: 0,  // Added spine lean from fly_forward preset
-                    headX: 0,  // Will use flightHeadLeanCurrent separately
-                    leftArmX: 0.8, leftArmZ: 0.15, leftElbow: 0.2,
-                    rightArmX: 0.8, rightArmZ: -0.15, rightElbow: 0.2,
-                    leftLegX: 0.4, leftKnee: 0.15,
-                    rightLegX: -0.5, rightKnee: 1.1,
-                };
+                    // Update springs with DELTA targets (sprint - base) for smooth blending
+                    const updateFlyingSpring = (key, targetDelta) => {
+                        const result = springDamper(
+                            flyingSprintPose[key],
+                            flyingSprintVelocity[key],
+                            isFlyingSprinting ? targetDelta : 0,
+                            sprintHalflife,
+                            dt
+                        );
+                        flyingSprintPose[key] = result.value;
+                        flyingSprintVelocity[key] = result.velocity;
+                    };
 
-                // Update springs with DELTA targets (sprint - base) for smooth blending
-                updateSpring('lowerSpineX', FSP.lowerSpineX - BASE_FLY.lowerSpineX);
-                updateSpring('midSpineX', FSP.midSpineX - BASE_FLY.midSpineX);
-                updateSpring('upperSpineX', FSP.upperSpineX - BASE_FLY.upperSpineX);
-                updateSpring('headX', FSP.headX);  // Head uses separate base (flightHeadLeanCurrent)
-                updateSpring('leftArmX', FSP.leftArmX - BASE_FLY.leftArmX);
-                updateSpring('leftArmZ', FSP.leftArmZ - BASE_FLY.leftArmZ);
-                updateSpring('leftElbow', FSP.leftElbow - BASE_FLY.leftElbow);
-                updateSpring('rightArmX', FSP.rightArmX - BASE_FLY.rightArmX);
-                updateSpring('rightArmZ', FSP.rightArmZ - BASE_FLY.rightArmZ);
-                updateSpring('rightElbow', FSP.rightElbow - BASE_FLY.rightElbow);
-                updateSpring('leftLegX', FSP.leftLegX - BASE_FLY.leftLegX);
-                updateSpring('leftKnee', FSP.leftKnee - BASE_FLY.leftKnee);
-                updateSpring('rightLegX', FSP.rightLegX - BASE_FLY.rightLegX);
-                updateSpring('rightKnee', FSP.rightKnee - BASE_FLY.rightKnee);
+                    updateFlyingSpring('lowerSpineX', FSP.lowerSpineX - BASE_FLY.lowerSpineX);
+                    updateFlyingSpring('midSpineX', FSP.midSpineX - BASE_FLY.midSpineX);
+                    updateFlyingSpring('upperSpineX', FSP.upperSpineX - BASE_FLY.upperSpineX);
+                    updateFlyingSpring('headX', FSP.headX);  // Head uses separate base (flightHeadLeanCurrent)
+                    updateFlyingSpring('leftArmX', FSP.leftArmX - BASE_FLY.leftArmX);
+                    updateFlyingSpring('leftArmZ', FSP.leftArmZ - BASE_FLY.leftArmZ);
+                    updateFlyingSpring('leftElbow', FSP.leftElbow - BASE_FLY.leftElbow);
+                    updateFlyingSpring('rightArmX', FSP.rightArmX - BASE_FLY.rightArmX);
+                    updateFlyingSpring('rightArmZ', FSP.rightArmZ - BASE_FLY.rightArmZ);
+                    updateFlyingSpring('rightElbow', FSP.rightElbow - BASE_FLY.rightElbow);
+                    updateFlyingSpring('leftLegX', FSP.leftLegX - BASE_FLY.leftLegX);
+                    updateFlyingSpring('leftKnee', FSP.leftKnee - BASE_FLY.leftKnee);
+                    updateFlyingSpring('rightLegX', FSP.rightLegX - BASE_FLY.rightLegX);
+                    updateFlyingSpring('rightKnee', FSP.rightKnee - BASE_FLY.rightKnee);
+                }
 
                 // Animation targets (hip/shoulder rotations)
                 let targetArmLX = 0, targetArmRX = 0;
@@ -24128,64 +24241,66 @@
 
                 if (state.isSwimming) {
                     // Swimming forward - from swim_forward preset
+                    const P = POSE_PRESETS.swim_forward;
                     playerWalkPhase += dt * 2.5;
                     const swimPhase = playerWalkPhase;
 
                     // Spine - from swim_forward preset
-                    targetLowerSpineX = 0.8;
-                    targetMidSpineX = 0.1;
+                    targetLowerSpineX = P.lowerSpineX;
+                    targetMidSpineX = P.midSpineX;
 
                     const armCycle = Math.sin(swimPhase);
                     const armReach = Math.cos(swimPhase);
 
                     // Arms - asymmetric base from preset
-                    targetArmLX = 1.2 * armReach;       // Was 0.6
-                    targetArmRX = -0.3 + armReach * 0.6;
-                    targetArmLZ = 0.2 + armCycle * 0.3;  // Was 0.3 + 0.4
-                    targetArmRZ = -0.2 - armCycle * 0.3;
+                    targetArmLX = P.leftArmX * armReach;
+                    targetArmRX = P.rightArmX + armReach * 0.6;
+                    targetArmLZ = P.leftArmZ + armCycle * 0.3;
+                    targetArmRZ = P.rightArmZ - armCycle * 0.3;
 
-                    targetLeftElbow = 0.1 + Math.max(0, -armReach) * 0.4;   // Was 0.6
-                    targetRightElbow = 0.5 + Math.max(0, -armReach) * 0.3;
+                    targetLeftElbow = P.leftElbow + Math.max(0, -armReach) * 0.4;
+                    targetRightElbow = P.rightElbow + Math.max(0, -armReach) * 0.3;
 
                     // Legs - from preset
                     const kick = Math.sin(swimPhase * 2.5) * 0.25;
-                    targetLegLX = 0.3 + kick;           // Was just kick
-                    targetLegRX = -0.2 - kick;          // Was -kick
+                    targetLegLX = P.leftLegX + kick;
+                    targetLegRX = P.rightLegX - kick;
 
-                    targetLeftKnee = 0.2 + Math.abs(kick) * 0.2;   // Was 0.3
-                    targetRightKnee = 0.4 + Math.abs(kick) * 0.2;  // Was 0.3
+                    targetLeftKnee = P.leftKnee + Math.abs(kick) * 0.2;
+                    targetRightKnee = P.rightKnee + Math.abs(kick) * 0.2;
 
                     targetBodyTilt = 0;  // Using direct spine now
-                    targetHeadX = -0.5;  // Was -0.25
+                    targetHeadX = P.headX;
 
                 } else if (state.isTreadingWater) {
                     // Treading water - from swim_idle_surface preset
+                    const P = POSE_PRESETS.swim_idle_surface;
                     playerIdleTimer += dt;
                     const bob = Math.sin(playerIdleTimer * 2) * 0.15;
                     const scull = Math.sin(playerIdleTimer * 3) * 0.2;
 
                     // Spine - from swim_idle_surface preset
-                    targetLowerSpineX = 0.2;
-                    targetUpperSpineX = -0.1;
+                    targetLowerSpineX = P.lowerSpineX;
+                    targetUpperSpineX = P.upperSpineX;
 
                     // Arms - from preset with animation
-                    targetArmLX = 0.1 + scull * 0.15;   // Was -0.15
-                    targetArmRX = 0.1 - scull * 0.15;   // Was -0.15
-                    targetArmLZ = 0.7 - bob * 0.1;      // Was 0.5
-                    targetArmRZ = -0.7 + bob * 0.1;     // Was -0.5
+                    targetArmLX = P.leftArmX + scull * 0.15;
+                    targetArmRX = P.rightArmX - scull * 0.15;
+                    targetArmLZ = P.leftArmZ - bob * 0.1;
+                    targetArmRZ = P.rightArmZ + bob * 0.1;
 
-                    targetLeftElbow = 0.4;
-                    targetRightElbow = 0.4;
+                    targetLeftElbow = P.leftElbow;
+                    targetRightElbow = P.rightElbow;
 
                     // Legs - from preset with animation
-                    targetLegLX = -0.3 + bob * 0.25;    // Was 0.15
-                    targetLegRX = -0.5 - bob * 0.25;    // Was 0.15
-                    targetLegLZ = 0.2;                   // Add leg splay
-                    targetLegRZ = -0.2;
-                    targetLeftKnee = 0.8 + bob * 0.2;   // Was 0.5
-                    targetRightKnee = 1.0 - bob * 0.2;  // Was 0.5
+                    targetLegLX = P.leftLegX + bob * 0.25;
+                    targetLegRX = P.rightLegX - bob * 0.25;
+                    targetLegLZ = P.leftLegZ;
+                    targetLegRZ = P.rightLegZ;
+                    targetLeftKnee = P.leftKnee + bob * 0.2;
+                    targetRightKnee = P.rightKnee - bob * 0.2;
 
-                    targetHeadX = -0.2;                  // Was -0.1
+                    targetHeadX = P.headX;
 
                 } else if (state.inWater && !state.isMoving) {
                     // Floating in water but not moving - relaxed float
@@ -24218,20 +24333,21 @@
                     targetUpperSpineX = BASE_FLY.upperSpineX + flyingSprintPose.upperSpineX;
 
                     if (state.isMoving) {
-                        // Flying + moving pose (with sprint blend)
-                        // Arms: base (0.8, 0.15/-0.15, 0.2) + spring delta
-                        targetArmLX = 0.8 + flyingSprintPose.leftArmX;
-                        targetArmRX = 0.8 + flyingSprintPose.rightArmX;
-                        targetArmLZ = 0.15 - flyBob + flyingSprintPose.leftArmZ;
-                        targetArmRZ = -0.15 + flyBob + flyingSprintPose.rightArmZ;
-                        targetLeftElbow = 0.2 + flyingSprintPose.leftElbow;
-                        targetRightElbow = 0.2 + flyingSprintPose.rightElbow;
+                        // Flying + moving pose (with sprint blend) - from fly_forward preset
+                        const B = BASE_FLY;
+                        // Arms: base from preset + spring delta
+                        targetArmLX = B.leftArmX + flyingSprintPose.leftArmX;
+                        targetArmRX = B.rightArmX + flyingSprintPose.rightArmX;
+                        targetArmLZ = B.leftArmZ - flyBob + flyingSprintPose.leftArmZ;
+                        targetArmRZ = B.rightArmZ + flyBob + flyingSprintPose.rightArmZ;
+                        targetLeftElbow = B.leftElbow + flyingSprintPose.leftElbow;
+                        targetRightElbow = B.rightElbow + flyingSprintPose.rightElbow;
 
-                        // Legs: base (0.4/-0.5, 0.15/1.1) + spring delta
-                        targetLegLX = 0.4 + flyBob * 0.2 + flyingSprintPose.leftLegX;
-                        targetLegRX = -0.5 + flyBob * 0.2 + flyingSprintPose.rightLegX;
-                        targetLeftKnee = 0.15 + flyingSprintPose.leftKnee;
-                        targetRightKnee = 1.1 + flyingSprintPose.rightKnee;
+                        // Legs: base from preset + spring delta
+                        targetLegLX = B.leftLegX + flyBob * 0.2 + flyingSprintPose.leftLegX;
+                        targetLegRX = B.rightLegX + flyBob * 0.2 + flyingSprintPose.rightLegX;
+                        targetLeftKnee = B.leftKnee + flyingSprintPose.leftKnee;
+                        targetRightKnee = B.rightKnee + flyingSprintPose.rightKnee;
 
                         // Spine set directly via BASE_FLY, don't add bodyTilt
                         targetBodyTilt = 0;
@@ -24243,20 +24359,20 @@
                         const sprintBlend = Math.abs(flyingSprintPose.lowerSpineX) / 1.047;
                         targetHeadY = headLocalY + (FLYING_SPRINT_POSE.headY - headLocalY) * sprintBlend;
                     } else {
-                        // Hovering pose (with sprint blend for smooth transitions)
-                        targetArmLX = 0.2 + flyBob + flyingSprintPose.leftArmX;
-                        targetArmRX = 0.2 - flyBob + flyingSprintPose.rightArmX;
-                        targetArmLZ = 0.5 + flyingSprintPose.leftArmZ;
-                        targetArmRZ = -0.5 + flyingSprintPose.rightArmZ;
-                        targetLeftElbow = 0.3 + flyingSprintPose.leftElbow;
-                        targetRightElbow = 0.3 + flyingSprintPose.rightElbow;
+                        // Hovering pose - from fly_idle preset (with sprint blend for smooth transitions)
+                        const H = POSE_PRESETS.fly_idle;
+                        targetArmLX = H.leftArmX + flyBob + flyingSprintPose.leftArmX;
+                        targetArmRX = H.rightArmX - flyBob + flyingSprintPose.rightArmX;
+                        targetArmLZ = H.leftArmZ + flyingSprintPose.leftArmZ;
+                        targetArmRZ = H.rightArmZ + flyingSprintPose.rightArmZ;
+                        targetLeftElbow = H.leftElbow + flyingSprintPose.leftElbow;
+                        targetRightElbow = H.rightElbow + flyingSprintPose.rightElbow;
 
-                        // Hovering legs: relaxed floating pose - legs naturally hanging down
-                        // Both legs slightly forward with natural knee bend, asymmetric for interest
-                        targetLegLX = -0.25 + flyBob * 0.1 + flyingSprintPose.leftLegX;   // Left leg slightly forward
-                        targetLegRX = -0.35 + flyBob * 0.1 + flyingSprintPose.rightLegX;  // Right leg bit more forward
-                        targetLeftKnee = 0.4 + flyingSprintPose.leftKnee;                  // Gentle knee bend
-                        targetRightKnee = 0.6 + flyingSprintPose.rightKnee;                // Slightly more bent
+                        // Hovering legs: from fly_idle preset
+                        targetLegLX = H.leftLegX + flyBob * 0.1 + flyingSprintPose.leftLegX;
+                        targetLegRX = H.rightLegX + flyBob * 0.1 + flyingSprintPose.rightLegX;
+                        targetLeftKnee = H.leftKnee + flyingSprintPose.leftKnee;
+                        targetRightKnee = H.rightKnee + flyingSprintPose.rightKnee;
 
                         // Head uses flight lean + sprint blend
                         targetHeadX = flightHeadLeanCurrent + flyingSprintPose.headX;
@@ -24265,61 +24381,63 @@
 
                 } else if (state.isJumping) {
                     // Jumping: dynamic arm swing and leg tuck - from jumping preset
+                    const P = POSE_PRESETS.jumping;
                     const jumpProgress = Math.min(1, Math.max(0, state.velocityY / 8));
 
-                    // Spine - from jumping preset (direct spine, not bodyTilt)
-                    targetLowerSpineX = -0.1 * jumpProgress;
+                    // Spine - from jumping preset
+                    targetLowerSpineX = P.lowerSpineX * jumpProgress;
 
                     // Arms up for momentum
-                    targetArmLX = 0.5 * jumpProgress;
-                    targetArmRX = 0.5 * jumpProgress;
-                    targetArmLZ = 0.35 * jumpProgress;
-                    targetArmRZ = -0.35 * jumpProgress;
-                    targetLeftElbow = 0.5 * jumpProgress;
-                    targetRightElbow = 0.5 * jumpProgress;
+                    targetArmLX = P.leftArmX * jumpProgress;
+                    targetArmRX = P.rightArmX * jumpProgress;
+                    targetArmLZ = P.leftArmZ * jumpProgress;
+                    targetArmRZ = P.rightArmZ * jumpProgress;
+                    targetLeftElbow = P.leftElbow * jumpProgress;
+                    targetRightElbow = P.rightElbow * jumpProgress;
 
                     // Legs tuck with knee bend
-                    targetLegLX = -0.3 * jumpProgress;
-                    targetLegRX = -0.4 * jumpProgress;
-                    targetLeftKnee = 0.6 * jumpProgress;
-                    targetRightKnee = 0.5 * jumpProgress;
+                    targetLegLX = P.leftLegX * jumpProgress;
+                    targetLegRX = P.rightLegX * jumpProgress;
+                    targetLeftKnee = P.leftKnee * jumpProgress;
+                    targetRightKnee = P.rightKnee * jumpProgress;
 
-                    // Remove leg splay - preset has 0
-                    targetLegLZ = 0;
-                    targetLegRZ = 0;
+                    // Leg splay from preset
+                    targetLegLZ = P.leftLegZ * jumpProgress;
+                    targetLegRZ = P.rightLegZ * jumpProgress;
 
-                    targetBodyTilt = 0;  // Using direct spine now
-                    targetHeadX = -0.15 * jumpProgress;
+                    targetBodyTilt = 0;  // Using direct spine
+                    targetHeadX = P.headX * jumpProgress;
 
                 } else if (state.isFalling) {
                     // Falling: bracing for impact - from falling preset
+                    const P = POSE_PRESETS.falling;
+                    playerIdleTimer += dt;  // Increment first to avoid one-frame delay in flail animation
                     const fallIntensity = Math.min(1, Math.abs(state.velocityY) / 12);
                     const flail = Math.sin(playerIdleTimer * 8) * fallIntensity * 0.15;
-                    playerIdleTimer += dt;
 
                     // Spine - from falling preset (direct spine, not bodyTilt)
-                    targetLowerSpineX = 0.1 * fallIntensity;
+                    targetLowerSpineX = P.lowerSpineX * fallIntensity;
 
                     // Arms out for balance
-                    targetArmLX = -0.3 * fallIntensity + flail;
-                    targetArmRX = -0.3 * fallIntensity - flail;
-                    targetArmLZ = 0.6 * fallIntensity;
-                    targetArmRZ = -0.6 * fallIntensity;
-                    targetLeftElbow = 0.5 * fallIntensity;
-                    targetRightElbow = 0.5 * fallIntensity;
+                    targetArmLX = P.leftArmX * fallIntensity + flail;
+                    targetArmRX = P.rightArmX * fallIntensity - flail;
+                    targetArmLZ = P.leftArmZ * fallIntensity;
+                    targetArmRZ = P.rightArmZ * fallIntensity;
+                    targetLeftElbow = P.leftElbow * fallIntensity;
+                    targetRightElbow = P.rightElbow * fallIntensity;
 
-                    // Legs brace for impact
-                    targetLegLX = -0.3 * fallIntensity + flail * 0.3;
-                    targetLegRX = -0.3 * fallIntensity - flail * 0.3;
-                    targetLeftKnee = 0.5 * fallIntensity;
-                    targetRightKnee = 0.5 * fallIntensity;
+                    // Legs brace for impact (reduced knee bend to prevent clipping)
+                    targetLegLX = P.leftLegX * fallIntensity + flail * 0.3;
+                    targetLegRX = P.rightLegX * fallIntensity - flail * 0.3;
+                    targetLeftKnee = P.leftKnee * fallIntensity;
+                    targetRightKnee = P.rightKnee * fallIntensity;
 
                     // Leg splay - from falling preset
-                    targetLegLZ = 0.15 * fallIntensity;
-                    targetLegRZ = -0.15 * fallIntensity;
+                    targetLegLZ = P.leftLegZ * fallIntensity;
+                    targetLegRZ = P.rightLegZ * fallIntensity;
 
                     targetBodyTilt = 0;  // Using direct spine now
-                    targetHeadX = -0.15 * fallIntensity;
+                    targetHeadX = P.headX * fallIntensity;
 
                 } else if (state.isMoving) {
                     // Walking or running animation
@@ -24353,15 +24471,15 @@
                         targetUpperSpineX = C.upperSpineLean;
                         targetBodyTilt = 0;
 
-                        // Base leg pose (walking adds to this)
-                        targetLegLX = C.hipAngle;
-                        targetLegRX = C.hipAngle;
-                        targetLeftKnee = C.kneeAngle;
-                        targetRightKnee = C.kneeAngle;
+                        // Asymmetric leg pose (walking adds to this)
+                        targetLegLX = C.leftHipAngle;
+                        targetLegRX = C.rightHipAngle;
+                        targetLeftKnee = C.leftKnee;
+                        targetRightKnee = C.rightKnee;
 
-                        // Leg splay for wider crouch stance
-                        targetLegLZ = C.legSplay || 0;    // Left leg outward (positive Z)
-                        targetLegRZ = -(C.legSplay || 0); // Right leg outward (negative Z)
+                        // Leg splay - asymmetric for natural stance
+                        targetLegLZ = C.leftLegSplay;
+                        targetLegRZ = C.rightLegSplay;
 
                         // Head
                         targetHeadX = C.headPitch;
@@ -24370,13 +24488,13 @@
                             targetHeadY = C.headY;
                         }
 
-                        // Arms
-                        targetArmLX = C.armForward;
-                        targetArmRX = C.armForward;
-                        targetArmLZ = C.armSpreadL;
-                        targetArmRZ = C.armSpreadR;
-                        targetLeftElbow = C.elbowBend;
-                        targetRightElbow = C.elbowBend;
+                        // Asymmetric arms
+                        targetArmLX = C.leftArmX;
+                        targetArmRX = C.rightArmX;
+                        targetArmLZ = C.leftArmZ;
+                        targetArmRZ = C.rightArmZ;
+                        targetLeftElbow = C.leftElbow;
+                        targetRightElbow = C.rightElbow;
                     } else {
                         targetStrideRate = 7.0;  // Normal walking (doubled)
                     }
@@ -24472,6 +24590,11 @@
                     targetStrideRate = 7.0;
                     currentStrideRate = THREE.MathUtils.lerp(currentStrideRate, targetStrideRate, 1 - Math.pow(0.3, dt));
 
+                    // Cache redundant trig calculations for performance
+                    const sinHalf = Math.sin(playerIdleTimer * 0.5);
+                    const sinPoint3 = Math.sin(playerIdleTimer * 0.3);
+                    const sinPoint4 = Math.sin(playerIdleTimer * 0.4);
+
                     // Breathing: chest expansion + slight rise
                     const breathCycle = Math.sin(playerIdleTimer * 0.4 * Math.PI);
                     const breath = (breathCycle + 1) * 0.5;  // 0 to 1
@@ -24482,14 +24605,14 @@
                     const lateralShift = shiftCycle * 0.012;
                     targetBodyX = lateralShift;
 
-                    // Arm micro-movements: slight asymmetric sway
-                    targetArmLX = 0.03 + Math.sin(playerIdleTimer * 0.5) * 0.04;
+                    // Arm micro-movements: slight asymmetric sway (using cached sin values)
+                    targetArmLX = 0.03 + sinHalf * 0.04;
                     targetArmRX = 0.03 + Math.sin(playerIdleTimer * 0.5 + 0.7) * 0.04;
-                    targetArmLZ = Math.sin(playerIdleTimer * 0.3) * 0.02;
+                    targetArmLZ = sinPoint3 * 0.02;
                     targetArmRZ = -Math.sin(playerIdleTimer * 0.3 + 0.5) * 0.02;
 
-                    // Subtle elbow relaxation
-                    targetLeftElbow = 0.08 + Math.abs(Math.sin(playerIdleTimer * 0.4)) * 0.05;
+                    // Subtle elbow relaxation (using cached sin values)
+                    targetLeftElbow = 0.08 + Math.abs(sinPoint4) * 0.05;
                     targetRightElbow = 0.08 + Math.abs(Math.sin(playerIdleTimer * 0.4 + 0.3)) * 0.05;
 
                     if (state.isCrouching) {
@@ -24504,11 +24627,15 @@
                         targetUpperSpineX = C.upperSpineLean;
                         targetBodyTilt = 0;  // Clear so it doesn't double-add
 
-                        // Symmetric legs
-                        targetLegLX = C.hipAngle;
-                        targetLegRX = C.hipAngle;
-                        targetLeftKnee = C.kneeAngle;
-                        targetRightKnee = C.kneeAngle;
+                        // Asymmetric legs
+                        targetLegLX = C.leftHipAngle;
+                        targetLegRX = C.rightHipAngle;
+                        targetLeftKnee = C.leftKnee;
+                        targetRightKnee = C.rightKnee;
+
+                        // Leg splay
+                        targetLegLZ = C.leftLegSplay;
+                        targetLegRZ = C.rightLegSplay;
 
                         // Head
                         targetHeadX = C.headPitch;
@@ -24517,13 +24644,13 @@
                             targetHeadY = C.headY;
                         }
 
-                        // Arms
-                        targetArmLX = C.armForward;
-                        targetArmRX = C.armForward;
-                        targetArmLZ = C.armSpreadL;
-                        targetArmRZ = C.armSpreadR;
-                        targetLeftElbow = C.elbowBend;
-                        targetRightElbow = C.elbowBend;
+                        // Asymmetric arms
+                        targetArmLX = C.leftArmX;
+                        targetArmRX = C.rightArmX;
+                        targetArmLZ = C.leftArmZ;
+                        targetArmRZ = C.rightArmZ;
+                        targetLeftElbow = C.leftElbow;
+                        targetRightElbow = C.rightElbow;
 
                         // Subtle breathing
                         const breathCycle = Math.sin(playerIdleTimer * 0.5 * Math.PI);
@@ -24554,39 +24681,70 @@
                                   impactHipDrop < -0.01 || impactSpineCompress < -0.01 ||
                                   impactArmSwing < -0.01 || impactHeadCounter > 0.01;
 
-                // Apply smoothed rotations to primary joints
-                parts.leftArm.rotation.x = smooth("leftArmX", targetArmLX);
-                parts.rightArm.rotation.x = smooth("rightArmX", targetArmRX);
-                parts.leftArm.rotation.z = smooth("leftArmZ", targetArmLZ, 0.15);
-                parts.rightArm.rotation.z = smooth("rightArmZ", targetArmRZ, 0.15);
-                // Legs and knees use same smooth factor as bodyY for synchronized crouch
-                parts.leftLeg.rotation.x = smooth("leftLegX", targetLegLX, 0.12);
-                parts.rightLeg.rotation.x = smooth("rightLegX", targetLegRX, 0.12);
-                // Leg splay (Z rotation) for crouch/landing
-                parts.leftLeg.rotation.z = smooth("leftLegZ", targetLegLZ, 0.12);
-                parts.rightLeg.rotation.z = smooth("rightLegZ", targetLegRZ, 0.12);
+                // Apply geometric constraints to prevent body part interpenetration
+                const constrained = {
+                    leftLegX: targetLegLX,
+                    rightLegX: targetLegRX,
+                    leftKnee: targetLeftKnee,
+                    rightKnee: targetRightKnee,
+                    leftArmX: targetArmLX,
+                    rightArmX: targetArmRX,
+                    leftArmZ: targetArmLZ,
+                    rightArmZ: targetArmRZ,
+                    leftElbow: targetLeftElbow,
+                    rightElbow: targetRightElbow,
+                    leftLegZ: targetLegLZ,
+                    rightLegZ: targetLegRZ,
+                    headX: targetHeadX,
+                };
+                applyPoseConstraints(constrained);
+                targetLegLX = constrained.leftLegX;
+                targetLegRX = constrained.rightLegX;
+                targetLeftKnee = constrained.leftKnee;
+                targetRightKnee = constrained.rightKnee;
+                targetArmLX = constrained.leftArmX;
+                targetArmRX = constrained.rightArmX;
+                targetArmLZ = constrained.leftArmZ;
+                targetArmRZ = constrained.rightArmZ;
+                targetLeftElbow = constrained.leftElbow;
+                targetRightElbow = constrained.rightElbow;
+                targetLegLZ = constrained.leftLegZ;
+                targetLegRZ = constrained.rightLegZ;
+                targetHeadX = constrained.headX;
 
-                parts.head.position.y = smooth("headY", targetHeadY, 0.15);
-                parts.head.position.z = smooth("headZ", targetHeadZ, 0.15);
-                parts.head.rotation.x = smooth("headX", targetHeadX, 0.12);
+                // Apply smoothed rotations to primary joints
+                parts.leftArm.rotation.x = smoothPose(playerPose, "leftArmX", targetArmLX, 0.18, dt);
+                parts.rightArm.rotation.x = smoothPose(playerPose, "rightArmX", targetArmRX, 0.18, dt);
+                parts.leftArm.rotation.z = smoothPose(playerPose, "leftArmZ", targetArmLZ, 0.15, dt);
+                parts.rightArm.rotation.z = smoothPose(playerPose, "rightArmZ", targetArmRZ, 0.15, dt);
+                // Legs and knees use same smooth factor as bodyY for synchronized crouch
+                parts.leftLeg.rotation.x = smoothPose(playerPose, "leftLegX", targetLegLX, 0.12, dt);
+                parts.rightLeg.rotation.x = smoothPose(playerPose, "rightLegX", targetLegRX, 0.12, dt);
+                // Leg splay (Z rotation) for crouch/landing
+                parts.leftLeg.rotation.z = smoothPose(playerPose, "leftLegZ", targetLegLZ, 0.12, dt);
+                parts.rightLeg.rotation.z = smoothPose(playerPose, "rightLegZ", targetLegRZ, 0.12, dt);
+
+                parts.head.position.y = smoothPose(playerPose, "headY", targetHeadY, 0.15, dt);
+                parts.head.position.z = smoothPose(playerPose, "headZ", targetHeadZ, 0.15, dt);
+                parts.head.rotation.x = smoothPose(playerPose, "headX", targetHeadX, 0.12, dt);
 
                 // Apply joint rotations (knees and elbows)
                 // Knees: positive = bend forward (natural knee direction)
                 // Clamp to prevent backward knee bend
                 if (parts.leftKnee) {
-                    parts.leftKnee.rotation.x = smooth("leftKneeX", Math.max(0, targetLeftKnee), 0.12);
+                    parts.leftKnee.rotation.x = smoothPose(playerPose, "leftKneeX", Math.max(0, targetLeftKnee), 0.12, dt);
                 }
                 if (parts.rightKnee) {
-                    parts.rightKnee.rotation.x = smooth("rightKneeX", Math.max(0, targetRightKnee), 0.12);
+                    parts.rightKnee.rotation.x = smoothPose(playerPose, "rightKneeX", Math.max(0, targetRightKnee), 0.12, dt);
                 }
 
                 // Elbows: NEGATIVE X = bend backward toward body (natural elbow direction)
                 // Positive target values become negative rotations
                 if (parts.leftElbow) {
-                    parts.leftElbow.rotation.x = smooth("leftElbowX", -Math.max(0, targetLeftElbow), 0.12);
+                    parts.leftElbow.rotation.x = smoothPose(playerPose, "leftElbowX", -Math.max(0, targetLeftElbow), 0.12, dt);
                 }
                 if (parts.rightElbow) {
-                    parts.rightElbow.rotation.x = smooth("rightElbowX", -Math.max(0, targetRightElbow), 0.12);
+                    parts.rightElbow.rotation.x = smoothPose(playerPose, "rightElbowX", -Math.max(0, targetRightElbow), 0.12, dt);
                 }
 
                 // Head tracks camera direction in third-person
@@ -24600,14 +24758,14 @@
                     if (Math.abs(headYawOffset) > HEAD_TRACK_LIMIT) {
                         headYawOffset = 0;
                     }
-                    parts.head.rotation.y = smooth("headYaw", headYawOffset, 0.15);
+                    parts.head.rotation.y = smoothPose(playerPose, "headYaw", headYawOffset, 0.15, dt);
                 } else {
-                    parts.head.rotation.y = smooth("headYaw", 0, 0.15);
+                    parts.head.rotation.y = smoothPose(playerPose, "headYaw", 0, 0.15, dt);
                 }
 
                 // Apply spine positions (bodyY uses same factor as legs for synchronized crouch)
-                parts.lowerSpine.position.y = smooth("bodyY", targetBodyY, 0.12);
-                parts.lowerSpine.position.x = smooth("bodyX", targetBodyX, 0.15);
+                parts.lowerSpine.position.y = smoothPose(playerPose, "bodyY", targetBodyY, 0.12, dt);
+                parts.lowerSpine.position.x = smoothPose(playerPose, "bodyX", targetBodyX, 0.15, dt);
 
                 // Distribute body tilt across spine segments for natural bending
                 // Lower spine gets most bend (hips lead), upper gets least
@@ -24615,12 +24773,12 @@
                 const spineTiltMid = targetMidSpineX + targetBodyTilt * 0.3;
                 const spineTiltUpper = targetUpperSpineX + targetBodyTilt * 0.2;
 
-                parts.lowerSpine.rotation.x = smooth("lowerSpineX", spineTiltLower, 0.1);
-                parts.lowerSpine.rotation.z = smooth("lowerSpineZ", targetLowerSpineZ, 0.1);
-                parts.midSpine.rotation.x = smooth("midSpineX", spineTiltMid, 0.1);
-                parts.midSpine.rotation.z = smooth("midSpineZ", targetMidSpineZ, 0.1);
-                parts.upperSpine.rotation.x = smooth("upperSpineX", spineTiltUpper, 0.1);
-                parts.upperSpine.rotation.z = smooth("upperSpineZ", targetUpperSpineZ, 0.1);
+                parts.lowerSpine.rotation.x = smoothPose(playerPose, "lowerSpineX", spineTiltLower, 0.1, dt);
+                parts.lowerSpine.rotation.z = smoothPose(playerPose, "lowerSpineZ", targetLowerSpineZ, 0.1, dt);
+                parts.midSpine.rotation.x = smoothPose(playerPose, "midSpineX", spineTiltMid, 0.1, dt);
+                parts.midSpine.rotation.z = smoothPose(playerPose, "midSpineZ", targetMidSpineZ, 0.1, dt);
+                parts.upperSpine.rotation.x = smoothPose(playerPose, "upperSpineX", spineTiltUpper, 0.1, dt);
+                parts.upperSpine.rotation.z = smoothPose(playerPose, "upperSpineZ", targetUpperSpineZ, 0.1, dt);
 
                 // Apply landing impact DIRECTLY to mesh AFTER smooth() for immediate response
                 // Also update playerPose so smooth() knows where we are (prevents snap-back)
@@ -25279,8 +25437,8 @@
                         // Subtract threshold - falls below this have ZERO effect
                         const effectiveSpeed = impactSpeed - IA.velocityThreshold;
 
-                        // Linear scaling with gentle coefficient
-                        const scaledImpact = effectiveSpeed * 0.08;
+                        // Linear scaling with very gentle coefficient (was 0.08)
+                        const scaledImpact = effectiveSpeed * 0.03;
 
                         // Apply to each component
                         impactLegBend = Math.min(scaledImpact * IA.legBendMultiplier, IA.maxLegBend);
