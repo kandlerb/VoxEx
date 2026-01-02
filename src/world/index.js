@@ -1,19 +1,29 @@
 /**
  * World module barrel export.
- * Provides world-related functionality including lighting.
+ * Provides world-related functionality including lighting and generation.
  * @module world
  */
 
 // =====================================================
-// LIGHTING SUBMODULE
+// CHUNK DATA STRUCTURE (Phase 5)
+// =====================================================
+export * from './Chunk.js';
+
+// =====================================================
+// LIGHTING SUBMODULE (Phase 4)
 // =====================================================
 // All lighting exports are available through World.* namespace
 export * from './lighting/index.js';
 
 // =====================================================
+// GENERATION SUBMODULE (Phase 5)
+// =====================================================
+// Terrain generation, biomes, trees, caves
+export * from './generation/index.js';
+
+// =====================================================
 // FUTURE SUBMODULES
 // =====================================================
 // These will be added in future phases:
-// - generation/ (terrain, biomes, structures)
 // - chunks/ (chunk management, streaming)
 // - entities/ (mobs, players)
