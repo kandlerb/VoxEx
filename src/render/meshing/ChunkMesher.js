@@ -411,5 +411,5 @@ export function disposeChunkGeometry(geometry) {
     }
 }
 
-export { getBlockUV, getTileForFace, getFaceNormal };
+export { getTileForFace, getFaceNormal };
 export default { buildChunkMesh, disposeChunkGeometry, getBlockUV };
