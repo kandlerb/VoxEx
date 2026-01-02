@@ -114,3 +114,27 @@ export function isValidWorldY(y) {
 export function getBlockIndex(lx, ly, lz) {
     return (ly * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize) + (lz * WORLD_DIMS.chunkSize) + lx;
 }
+
+// =====================================================
+// RE-EXPORTED DIMENSION CONSTANTS
+// =====================================================
+// These are re-exported from WORLD_DIMS for convenience.
+// Many modules import these directly for cleaner code.
+
+/** Chunk size in blocks (X and Z dimensions) */
+export const CHUNK_SIZE = WORLD_DIMS.chunkSize;
+
+/** Chunk height in blocks (Y dimension) */
+export const CHUNK_HEIGHT = WORLD_DIMS.chunkHeight;
+
+/** Y offset for world coordinate conversion */
+export const Y_OFFSET = WORLD_DIMS.yOffset;
+
+/** Sea level height */
+export const SEA_LEVEL = WORLD_DIMS.seaLevel;
+
+/** Chunk size squared (for 2D layer calculations) */
+export const CHUNK_SIZE_SQUARED = CHUNK_SIZE * CHUNK_SIZE;
+
+/** Total blocks per chunk (volume) */
+export const CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
