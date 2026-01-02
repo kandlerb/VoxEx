@@ -21,6 +21,9 @@ import * as Physics from './physics/index.js';
 // World imports (Phase 4)
 import * as World from './world/index.js';
 
+// Entity imports (Phase 6)
+import * as Entities from './entities/index.js';
+
 // Three.js imports
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -35,6 +38,7 @@ console.log('Phase 2: Optimization & Persistence Modules');
 console.log('Phase 3: Input & Physics Modules');
 console.log('Phase 4: World & Lighting Modules');
 console.log('Phase 5: Terrain Generation Modules');
+console.log('Phase 6: Entity System Modules');
 console.log('');
 
 // Core Constants
@@ -234,6 +238,28 @@ console.log('Biome at (100,100):', testBiome?.name || 'unknown');
 const testGenChunk = World.createChunkData();
 console.log('Chunk blocks length:', testGenChunk.blocks.length, '(expected:', 16 * 16 * 320, ')');
 console.log('Chunk has skyLight:', testGenChunk.skyLight instanceof Uint8Array);
+console.log('');
+
+// Entities Module (Phase 6)
+console.log('%c Entities Module (Phase 6) ', 'background: #9b59b6; color: white;');
+console.log('Entity:', typeof Entities.Entity === 'function' ? '✓' : '✗');
+console.log('EntityManager:', typeof Entities.EntityManager === 'function' ? '✓' : '✗');
+console.log('PlayerController:', typeof Entities.PlayerController === 'function' ? '✓' : '✗');
+console.log('PlayerAnimation:', typeof Entities.PlayerAnimation === 'function' ? '✓' : '✗');
+console.log('Zombie:', typeof Entities.Zombie === 'function' ? '✓' : '✗');
+console.log('ZombieAI:', typeof Entities.ZombieAI === 'function' ? '✓' : '✗');
+
+// Test entity creation
+const testPlayer = new Entities.PlayerController(0, 64, 0);
+console.log('PlayerController created at y:', testPlayer.y);
+console.log('Player walk speed:', testPlayer.walkSpeed);
+
+const testZombie = new Entities.Zombie(10, 64, 10);
+console.log('Zombie created with health:', testZombie.health);
+console.log('Zombie AI state:', testZombie.ai.state);
+
+const testEntityMgr = new Entities.EntityManager();
+console.log('EntityManager max zombies:', testEntityMgr.maxZombies);
 console.log('');
 
 // Three.js
@@ -567,6 +593,72 @@ const tests = [
         expected: true,
         actual: typeof World.forEachCanopyVoxel === 'function',
     },
+    // Phase 6 tests - Entity System
+    {
+        name: 'Entity class exists',
+        expected: true,
+        actual: typeof Entities.Entity === 'function',
+    },
+    {
+        name: 'EntityManager class exists',
+        expected: true,
+        actual: typeof Entities.EntityManager === 'function',
+    },
+    {
+        name: 'PlayerController class exists',
+        expected: true,
+        actual: typeof Entities.PlayerController === 'function',
+    },
+    {
+        name: 'PlayerAnimation class exists',
+        expected: true,
+        actual: typeof Entities.PlayerAnimation === 'function',
+    },
+    {
+        name: 'Zombie class exists',
+        expected: true,
+        actual: typeof Entities.Zombie === 'function',
+    },
+    {
+        name: 'ZombieAI class exists',
+        expected: true,
+        actual: typeof Entities.ZombieAI === 'function',
+    },
+    {
+        name: 'PlayerController has correct defaults',
+        expected: true,
+        actual: (() => {
+            const p = new Entities.PlayerController();
+            return p.walkSpeed > 0 && p.height > 0 && p.eyeHeight > 0;
+        })(),
+    },
+    {
+        name: 'Zombie has AI controller',
+        expected: true,
+        actual: (() => {
+            const z = new Entities.Zombie(0, 64, 0);
+            return z.ai instanceof Entities.ZombieAI;
+        })(),
+    },
+    {
+        name: 'EntityManager can spawn zombie',
+        expected: true,
+        actual: (() => {
+            const em = new Entities.EntityManager();
+            const result = em.spawnZombie(0, 64, 0);
+            return result.success && em.getZombieCount() === 1;
+        })(),
+    },
+    {
+        name: 'EntityManager pools despawned zombies',
+        expected: true,
+        actual: (() => {
+            const em = new Entities.EntityManager();
+            const result = em.spawnZombie(0, 64, 0);
+            em.despawnZombie(result.entity);
+            return em.getZombieCount() === 0 && em.getPoolSize() === 1;
+        })(),
+    },
 ];
 
 let passed = 0;
@@ -619,7 +711,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; max-width: 1000px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; max-width: 1100px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(233, 30, 99, 0.2); border: 1px solid #e91e63; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #e91e63;">Persistence</div>
                     <div style="font-size: 11px; color: #888;">RLE Compression</div>
@@ -644,6 +736,10 @@ if (container) {
                     <div style="font-size: 14px; font-weight: bold; color: #27ae60;">Generation</div>
                     <div style="font-size: 11px; color: #888;">Terrain & Trees</div>
                 </div>
+                <div style="background: rgba(142, 68, 173, 0.2); border: 1px solid #8e44ad; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #8e44ad;">Entities</div>
+                    <div style="font-size: 11px; color: #888;">Player & Mobs</div>
+                </div>
             </div>
 
             <div style="margin-top: 32px; padding: 16px 24px; background: rgba(0,0,0,0.3); border-radius: 8px;">
@@ -656,11 +752,11 @@ if (container) {
             </div>
 
             <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phases 1-5 Complete
+                Three.js r${THREE.REVISION} • Phases 1-6 Complete
             </div>
 
             <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
-                Next phases: Extract render, entity, and UI systems to complete the modular architecture
+                Next phases: Extract render and UI systems to complete the modular architecture
             </div>
         </div>
     `;
@@ -677,6 +773,7 @@ window.VoxEx = {
     Input,
     Physics,
     World,
+    Entities,
     THREE,
 };
 
