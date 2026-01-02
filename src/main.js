@@ -1,6 +1,6 @@
 /**
  * VoxEx - Modular Voxel Engine
- * Main entry point for Phases 1-5 - Core, Optimization, Input, Physics, World/Lighting & Terrain Generation
+ * Main entry point for Phases 1-7 - Core, Optimization, Input, Physics, World/Lighting, Entities & Render
  * @module main
  */
 
@@ -24,6 +24,9 @@ import * as World from './world/index.js';
 // Entity imports (Phase 6)
 import * as Entities from './entities/index.js';
 
+// Render imports (Phase 7)
+import * as Render from './render/index.js';
+
 // Three.js imports
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -39,6 +42,7 @@ console.log('Phase 3: Input & Physics Modules');
 console.log('Phase 4: World & Lighting Modules');
 console.log('Phase 5: Terrain Generation Modules');
 console.log('Phase 6: Entity System Modules');
+console.log('Phase 7: Render System Modules');
 console.log('');
 
 // Core Constants
@@ -260,6 +264,37 @@ console.log('Zombie AI state:', testZombie.ai.state);
 
 const testEntityMgr = new Entities.EntityManager();
 console.log('EntityManager max zombies:', testEntityMgr.maxZombies);
+console.log('');
+
+// Render Module (Phase 7)
+console.log('%c Render Module (Phase 7) ', 'background: #e74c3c; color: white;');
+console.log('RenderEngine:', typeof Render.RenderEngine === 'function' ? '✓' : '✗');
+console.log('createTextureAtlas:', typeof Render.createTextureAtlas === 'function' ? '✓' : '✗');
+console.log('createTerrainMaterial:', typeof Render.createTerrainMaterial === 'function' ? '✓' : '✗');
+console.log('createWaterMaterial:', typeof Render.createWaterMaterial === 'function' ? '✓' : '✗');
+console.log('buildChunkMesh:', typeof Render.buildChunkMesh === 'function' ? '✓' : '✗');
+console.log('DayNightCycle:', typeof Render.DayNightCycle === 'function' ? '✓' : '✗');
+console.log('PostProcessingManager:', typeof Render.PostProcessingManager === 'function' ? '✓' : '✗');
+console.log('createTorchViewmodel:', typeof Render.createTorchViewmodel === 'function' ? '✓' : '✗');
+console.log('createWorldTorch:', typeof Render.createWorldTorch === 'function' ? '✓' : '✗');
+console.log('shouldRenderFace:', typeof Render.shouldRenderFace === 'function' ? '✓' : '✗');
+
+// Test texture atlas
+const testAtlas = Render.createTextureAtlas(16);
+console.log('Texture atlas created:', testAtlas.texture instanceof THREE.Texture ? '✓' : '✗');
+console.log('Atlas canvas width:', testAtlas.canvas.width, '(expected:', 17 * 64, ')');
+
+// Test day/night cycle
+const testDayNight = new Render.DayNightCycle();
+testDayNight.setPreset('noon');
+console.log('DayNightCycle time at noon:', testDayNight.time);
+console.log('Is night at noon:', testDayNight.isNight());
+testDayNight.setPreset('midnight');
+console.log('Is night at midnight:', testDayNight.isNight());
+
+// Test torch model
+const testTorch = Render.createTorchViewmodel();
+console.log('Torch viewmodel children:', testTorch.children.length, '(expected: 4 - stick, flame, glow, light)');
 console.log('');
 
 // Three.js
@@ -659,6 +694,114 @@ const tests = [
             return em.getZombieCount() === 0 && em.getPoolSize() === 1;
         })(),
     },
+    // Phase 7 tests - Render System
+    {
+        name: 'RenderEngine class exists',
+        expected: true,
+        actual: typeof Render.RenderEngine === 'function',
+    },
+    {
+        name: 'createTextureAtlas function exists',
+        expected: true,
+        actual: typeof Render.createTextureAtlas === 'function',
+    },
+    {
+        name: 'createTerrainMaterial function exists',
+        expected: true,
+        actual: typeof Render.createTerrainMaterial === 'function',
+    },
+    {
+        name: 'createWaterMaterial function exists',
+        expected: true,
+        actual: typeof Render.createWaterMaterial === 'function',
+    },
+    {
+        name: 'buildChunkMesh function exists',
+        expected: true,
+        actual: typeof Render.buildChunkMesh === 'function',
+    },
+    {
+        name: 'shouldRenderFace function exists',
+        expected: true,
+        actual: typeof Render.shouldRenderFace === 'function',
+    },
+    {
+        name: 'DayNightCycle class exists',
+        expected: true,
+        actual: typeof Render.DayNightCycle === 'function',
+    },
+    {
+        name: 'DayNightCycle noon is not night',
+        expected: false,
+        actual: (() => {
+            const dn = new Render.DayNightCycle();
+            dn.setPreset('noon');
+            return dn.isNight();
+        })(),
+    },
+    {
+        name: 'DayNightCycle midnight is night',
+        expected: true,
+        actual: (() => {
+            const dn = new Render.DayNightCycle();
+            dn.setPreset('midnight');
+            return dn.isNight();
+        })(),
+    },
+    {
+        name: 'DayNightCycle time at noon is 0.5',
+        expected: 0.5,
+        actual: (() => {
+            const dn = new Render.DayNightCycle();
+            dn.setPreset('noon');
+            return dn.time;
+        })(),
+    },
+    {
+        name: 'PostProcessingManager class exists',
+        expected: true,
+        actual: typeof Render.PostProcessingManager === 'function',
+    },
+    {
+        name: 'createTorchViewmodel function exists',
+        expected: true,
+        actual: typeof Render.createTorchViewmodel === 'function',
+    },
+    {
+        name: 'createWorldTorch function exists',
+        expected: true,
+        actual: typeof Render.createWorldTorch === 'function',
+    },
+    {
+        name: 'Torch viewmodel has expected children',
+        expected: 4,
+        actual: testTorch.children.length,
+    },
+    {
+        name: 'Texture atlas creates valid THREE.Texture',
+        expected: true,
+        actual: testAtlas.texture instanceof THREE.Texture,
+    },
+    {
+        name: 'Texture atlas has correct width',
+        expected: 17 * 64,
+        actual: testAtlas.canvas.width,
+    },
+    {
+        name: 'FACE_DIRECTIONS has 6 entries',
+        expected: 6,
+        actual: Render.FACE_DIRECTIONS?.length ?? 0,
+    },
+    {
+        name: 'VignetteShader exists',
+        expected: true,
+        actual: typeof Render.VignetteShader === 'object',
+    },
+    {
+        name: 'DesaturationShader exists',
+        expected: true,
+        actual: typeof Render.DesaturationShader === 'object',
+    },
 ];
 
 let passed = 0;
@@ -711,7 +854,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(7, 1fr); gap: 12px; max-width: 1100px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; max-width: 700px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(233, 30, 99, 0.2); border: 1px solid #e91e63; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #e91e63;">Persistence</div>
                     <div style="font-size: 11px; color: #888;">RLE Compression</div>
@@ -728,6 +871,9 @@ if (container) {
                     <div style="font-size: 14px; font-weight: bold; color: #e67e22;">Physics</div>
                     <div style="font-size: 11px; color: #888;">AABB & Raycast</div>
                 </div>
+            </div>
+
+            <div style="margin-top: 12px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; max-width: 700px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(52, 152, 219, 0.2); border: 1px solid #3498db; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #3498db;">Lighting</div>
                     <div style="font-size: 11px; color: #888;">Sky & Block Light</div>
@@ -739,6 +885,10 @@ if (container) {
                 <div style="background: rgba(142, 68, 173, 0.2); border: 1px solid #8e44ad; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #8e44ad;">Entities</div>
                     <div style="font-size: 11px; color: #888;">Player & Mobs</div>
+                </div>
+                <div style="background: rgba(231, 76, 60, 0.2); border: 1px solid #e74c3c; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #e74c3c;">Render</div>
+                    <div style="font-size: 11px; color: #888;">Textures & Mesh</div>
                 </div>
             </div>
 
@@ -752,11 +902,11 @@ if (container) {
             </div>
 
             <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phases 1-6 Complete
+                Three.js r${THREE.REVISION} • Phases 1-7 Complete
             </div>
 
             <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
-                Next phases: Extract render and UI systems to complete the modular architecture
+                Next phase: Extract UI system to complete the modular architecture
             </div>
         </div>
     `;
@@ -774,6 +924,7 @@ window.VoxEx = {
     Physics,
     World,
     Entities,
+    Render,
     THREE,
 };
 
