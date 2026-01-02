@@ -328,5 +328,4 @@ export class PostProcessingManager {
     }
 }
 
-export { VignetteShader, DesaturationShader, ColorGradingShader };
 export default PostProcessingManager;
