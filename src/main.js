@@ -1,6 +1,6 @@
 /**
  * VoxEx - Modular Voxel Engine
- * Main entry point for Phase 1 & 2 - Core and Optimization modules
+ * Main entry point for Phase 1, 2 & 3 - Core, Optimization, Input & Physics modules
  * @module main
  */
 
@@ -14,6 +14,10 @@ import * as Optimization from './optimization/index.js';
 import * as Persistence from './persistence/index.js';
 import * as Audio from './audio/index.js';
 
+// Input & Physics imports (Phase 3)
+import * as Input from './input/index.js';
+import * as Physics from './physics/index.js';
+
 // Three.js imports
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -25,6 +29,7 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 console.log('%c VoxEx Modular Architecture ', 'background: #ff6b35; color: white; font-size: 16px; padding: 4px 8px;');
 console.log('Phase 1: Core Configuration Modules');
 console.log('Phase 2: Optimization & Persistence Modules');
+console.log('Phase 3: Input & Physics Modules');
 console.log('');
 
 // Core Constants
@@ -104,6 +109,41 @@ console.log('initAudio:', typeof Audio.initAudio === 'function' ? '✓' : '✗')
 console.log('playFormula:', typeof Audio.playFormula === 'function' ? '✓' : '✗');
 console.log('playTone:', typeof Audio.playTone === 'function' ? '✓' : '✗');
 console.log('formulas registry:', typeof Audio.formulas === 'object' ? '✓' : '✗');
+console.log('');
+
+// Input Module (Phase 3)
+console.log('%c Input Module (Phase 3) ', 'background: #9b59b6; color: white;');
+console.log('InputManager:', typeof Input.InputManager === 'function' ? '✓' : '✗');
+console.log('DEFAULT_BINDINGS:', typeof Input.DEFAULT_BINDINGS === 'object' ? '✓' : '✗');
+console.log('Forward binding:', Input.DEFAULT_BINDINGS.forward);
+console.log('getKeyDisplayName:', typeof Input.getKeyDisplayName === 'function' ? '✓' : '✗');
+console.log('getKeyDisplayName("KeyW"):', Input.getKeyDisplayName('KeyW'));
+console.log('getKeyDisplayName("Space"):', Input.getKeyDisplayName('Space'));
+console.log('getKeyDisplayName("Backquote"):', Input.getKeyDisplayName('Backquote'));
+console.log('validateBinding:', typeof Input.validateBinding === 'function' ? '✓' : '✗');
+console.log('');
+
+// Physics Module (Phase 3)
+console.log('%c Physics Module (Phase 3) ', 'background: #e67e22; color: white;');
+console.log('createAABB:', typeof Physics.createAABB === 'function' ? '✓' : '✗');
+console.log('createBlockAABB:', typeof Physics.createBlockAABB === 'function' ? '✓' : '✗');
+console.log('intersectsAABB:', typeof Physics.intersectsAABB === 'function' ? '✓' : '✗');
+console.log('raycastVoxels:', typeof Physics.raycastVoxels === 'function' ? '✓' : '✗');
+console.log('pickVoxel:', typeof Physics.pickVoxel === 'function' ? '✓' : '✗');
+console.log('playerIntersectsBlock:', typeof Physics.playerIntersectsBlock === 'function' ? '✓' : '✗');
+console.log('entityIntersectsBlock:', typeof Physics.entityIntersectsBlock === 'function' ? '✓' : '✗');
+
+// Test AABB intersection
+const boxA = Physics.createAABB(0, 0, 0, 1, 1, 1);
+const boxB = Physics.createAABB(0.5, 0.5, 0.5, 1, 1, 1);
+const boxC = Physics.createAABB(5, 5, 5, 1, 1, 1);
+console.log('AABB A intersects B:', Physics.intersectsAABB(boxA, boxB)); // true
+console.log('AABB A intersects C:', Physics.intersectsAABB(boxA, boxC)); // false
+
+// Test raycast (mock solid block check)
+const mockIsSolid = (x, y, z) => (x === 5 && y === 0 && z === 0);
+const hit = Physics.raycastVoxels(0, 0.5, 0, 1, 0, 0, 10, mockIsSolid);
+console.log('Raycast hit:', hit.hit, 'at x:', hit.x);
 console.log('');
 
 // Three.js
@@ -196,6 +236,112 @@ const tests = [
         expected: 18,
         actual: Optimization.getCachedFaceVertices(0, 1, 0).length,
     },
+    // Phase 3 tests - Input
+    {
+        name: 'InputManager class exists',
+        expected: true,
+        actual: typeof Input.InputManager === 'function',
+    },
+    {
+        name: 'DEFAULT_BINDINGS has forward key',
+        expected: 'KeyW',
+        actual: Input.DEFAULT_BINDINGS.forward,
+    },
+    {
+        name: 'DEFAULT_BINDINGS has jump key',
+        expected: 'Space',
+        actual: Input.DEFAULT_BINDINGS.jump,
+    },
+    {
+        name: 'getKeyDisplayName converts KeyW',
+        expected: 'W',
+        actual: Input.getKeyDisplayName('KeyW'),
+    },
+    {
+        name: 'getKeyDisplayName converts Backquote',
+        expected: '~',
+        actual: Input.getKeyDisplayName('Backquote'),
+    },
+    {
+        name: 'validateBinding detects no conflict',
+        expected: true,
+        actual: Input.validateBinding(Input.DEFAULT_BINDINGS, 'forward', 'KeyQ').valid,
+    },
+    // Phase 3 tests - Physics AABB
+    {
+        name: 'createAABB returns valid box',
+        expected: true,
+        actual: (() => {
+            const box = Physics.createAABB(0, 0, 0, 1, 1, 1);
+            return box.minX === -1 && box.maxX === 1 && box.minY === -1 && box.maxY === 1;
+        })(),
+    },
+    {
+        name: 'createBlockAABB returns unit cube',
+        expected: true,
+        actual: (() => {
+            const box = Physics.createBlockAABB(5, 10, 15);
+            return box.minX === 5 && box.maxX === 6 && box.minY === 10 && box.maxY === 11;
+        })(),
+    },
+    {
+        name: 'AABB intersection works (overlapping)',
+        expected: true,
+        actual: Physics.intersectsAABB(boxA, boxB),
+    },
+    {
+        name: 'AABB intersection works (non-overlapping)',
+        expected: false,
+        actual: Physics.intersectsAABB(boxA, boxC),
+    },
+    {
+        name: 'containsPoint works',
+        expected: true,
+        actual: Physics.containsPoint(boxA, 0, 0, 0),
+    },
+    // Phase 3 tests - Physics Collision
+    {
+        name: 'playerIntersectsBlock detects collision',
+        expected: true,
+        actual: Physics.playerIntersectsBlock(-0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 0, 0, 0),
+    },
+    {
+        name: 'playerIntersectsBlock detects no collision',
+        expected: false,
+        actual: Physics.playerIntersectsBlock(-0.5, -0.5, -0.5, 0.5, 0.5, 0.5, 10, 10, 10),
+    },
+    {
+        name: 'getOverlappingBlocks returns array',
+        expected: true,
+        actual: Array.isArray(Physics.getOverlappingBlocks(0.5, 0.5, 0.5, 1, 2)),
+    },
+    // Phase 3 tests - Physics Raycast
+    {
+        name: 'Raycast finds solid block',
+        expected: true,
+        actual: hit.hit && hit.x === 5,
+    },
+    {
+        name: 'Raycast misses when no solid blocks',
+        expected: false,
+        actual: Physics.raycastVoxels(0, 0, 0, 1, 0, 0, 10, () => false).hit,
+    },
+    {
+        name: 'pickVoxel returns correct format',
+        expected: true,
+        actual: (() => {
+            const result = Physics.pickVoxel({ x: 0, y: 0.5, z: 0 }, { x: 1, y: 0, z: 0 }, 10, mockIsSolid);
+            return result !== null && Array.isArray(result.face) && result.face.length === 3;
+        })(),
+    },
+    {
+        name: 'getPlacementPosition returns adjacent block',
+        expected: true,
+        actual: (() => {
+            const pos = Physics.getPlacementPosition(hit);
+            return pos !== null && pos.x === hit.x + hit.nx;
+        })(),
+    },
 ];
 
 let passed = 0;
@@ -248,7 +394,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; max-width: 400px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; max-width: 800px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(233, 30, 99, 0.2); border: 1px solid #e91e63; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #e91e63;">Persistence</div>
                     <div style="font-size: 11px; color: #888;">RLE Compression</div>
@@ -257,6 +403,14 @@ if (container) {
                     <div style="font-size: 14px; font-weight: bold; color: #00bcd4;">Audio</div>
                     <div style="font-size: 11px; color: #888;">Formula Player</div>
                 </div>
+                <div style="background: rgba(155, 89, 182, 0.2); border: 1px solid #9b59b6; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #9b59b6;">Input</div>
+                    <div style="font-size: 11px; color: #888;">Keys & Mouse</div>
+                </div>
+                <div style="background: rgba(230, 126, 34, 0.2); border: 1px solid #e67e22; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #e67e22;">Physics</div>
+                    <div style="font-size: 11px; color: #888;">AABB & Raycast</div>
+                </div>
             </div>
 
             <div style="margin-top: 32px; padding: 16px 24px; background: rgba(0,0,0,0.3); border-radius: 8px;">
@@ -264,11 +418,15 @@ if (container) {
                 <div style="color: #fff; font-size: 20px; font-family: monospace;">${Config.WORLD_DIMS.chunkSize} × ${Config.WORLD_DIMS.chunkSize} × ${Config.WORLD_DIMS.chunkHeight}</div>
             </div>
 
-            <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phase 1 & 2 Complete
+            <div style="margin-top: 24px; padding: 12px 20px; background: rgba(121, 85, 72, 0.3); border-radius: 8px;">
+                <div style="color: #795548; font-size: 14px; font-weight: bold;">${passed}/${tests.length} Tests Passed</div>
             </div>
 
-            <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 400px; text-align: center;">
+            <div style="margin-top: 32px; color: #666; font-size: 12px;">
+                Three.js r${THREE.REVISION} • Phase 1, 2 & 3 Complete
+            </div>
+
+            <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
                 Next phases: Extract render, world, entity, and UI systems to complete the modular architecture
             </div>
         </div>
@@ -283,6 +441,8 @@ window.VoxEx = {
     Optimization,
     Persistence,
     Audio,
+    Input,
+    Physics,
     THREE,
 };
 
