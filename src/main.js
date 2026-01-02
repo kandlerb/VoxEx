@@ -1,6 +1,6 @@
 /**
  * VoxEx - Modular Voxel Engine
- * Main entry point for Phase 1, 2 & 3 - Core, Optimization, Input & Physics modules
+ * Main entry point for Phase 1, 2, 3 & 4 - Core, Optimization, Input, Physics & World/Lighting modules
  * @module main
  */
 
@@ -18,6 +18,9 @@ import * as Audio from './audio/index.js';
 import * as Input from './input/index.js';
 import * as Physics from './physics/index.js';
 
+// World imports (Phase 4)
+import * as World from './world/index.js';
+
 // Three.js imports
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -30,6 +33,7 @@ console.log('%c VoxEx Modular Architecture ', 'background: #ff6b35; color: white
 console.log('Phase 1: Core Configuration Modules');
 console.log('Phase 2: Optimization & Persistence Modules');
 console.log('Phase 3: Input & Physics Modules');
+console.log('Phase 4: World & Lighting Modules');
 console.log('');
 
 // Core Constants
@@ -144,6 +148,50 @@ console.log('AABB A intersects C:', Physics.intersectsAABB(boxA, boxC)); // fals
 const mockIsSolid = (x, y, z) => (x === 5 && y === 0 && z === 0);
 const hit = Physics.raycastVoxels(0, 0.5, 0, 1, 0, 0, 10, mockIsSolid);
 console.log('Raycast hit:', hit.hit, 'at x:', hit.x);
+console.log('');
+
+// World/Lighting Module (Phase 4)
+console.log('%c World/Lighting Module (Phase 4) ', 'background: #3498db; color: white;');
+
+// Lighting constants
+console.log('MAX_LIGHT:', World.MAX_LIGHT);
+console.log('MIN_LIGHT:', World.MIN_LIGHT);
+console.log('TORCH_LIGHT_DEFAULT:', World.TORCH_LIGHT_DEFAULT);
+console.log('NEIGHBOR_OFFSETS:', World.NEIGHBOR_OFFSETS.length, 'directions');
+
+// Core lighting functions
+console.log('calculateChunkSunlight:', typeof World.calculateChunkSunlight === 'function' ? '✓' : '✗');
+console.log('calculateBlockLight:', typeof World.calculateBlockLight === 'function' ? '✓' : '✗');
+console.log('LightingEngine:', typeof World.LightingEngine === 'function' ? '✓' : '✗');
+console.log('SunlightTask:', typeof World.SunlightTask === 'function' ? '✓' : '✗');
+
+// Cross-chunk lighting
+console.log('propagateLightFromNeighbors:', typeof World.propagateLightFromNeighbors === 'function' ? '✓' : '✗');
+console.log('propagateLightFromEdgesInward:', typeof World.propagateLightFromEdgesInward === 'function' ? '✓' : '✗');
+
+// Light propagation utilities
+console.log('posToIndex:', typeof World.posToIndex === 'function' ? '✓' : '✗');
+console.log('indexToPos:', typeof World.indexToPos === 'function' ? '✓' : '✗');
+console.log('getCombinedLight:', typeof World.getCombinedLight === 'function' ? '✓' : '✗');
+
+// Test LightingEngine instantiation
+const lightEngine = new World.LightingEngine();
+console.log('LightingEngine instantiated:', lightEngine !== null ? '✓' : '✗');
+console.log('LightingEngine.getTorchLightLevel():', lightEngine.getTorchLightLevel());
+
+// Test lighting calculation on empty chunk
+const testLightChunk = {
+    blocks: new Uint8Array(16 * 16 * 320),
+    skyLight: null,
+    blockLight: null
+};
+testLightChunk.blocks.fill(Core.AIR);
+lightEngine.calculateChunkLighting(testLightChunk, 16, 320);
+
+// Verify top of chunk has full sunlight
+const topIndex = World.posToIndex(0, 319, 0);
+const topLight = testLightChunk.skyLight[topIndex];
+console.log('Empty chunk top skylight:', topLight, '(expected: 15)');
 console.log('');
 
 // Three.js
@@ -342,6 +390,66 @@ const tests = [
             return pos !== null && pos.x === hit.x + hit.nx;
         })(),
     },
+    // Phase 4 tests - World/Lighting
+    {
+        name: 'MAX_LIGHT is 15',
+        expected: 15,
+        actual: World.MAX_LIGHT,
+    },
+    {
+        name: 'MIN_LIGHT is 1',
+        expected: 1,
+        actual: World.MIN_LIGHT,
+    },
+    {
+        name: 'LightingEngine class exists',
+        expected: true,
+        actual: typeof World.LightingEngine === 'function',
+    },
+    {
+        name: 'calculateChunkSunlight exists',
+        expected: true,
+        actual: typeof World.calculateChunkSunlight === 'function',
+    },
+    {
+        name: 'calculateBlockLight exists',
+        expected: true,
+        actual: typeof World.calculateBlockLight === 'function',
+    },
+    {
+        name: 'SunlightTask class exists',
+        expected: true,
+        actual: typeof World.SunlightTask === 'function',
+    },
+    {
+        name: 'Empty chunk has full skylight at top',
+        expected: 15,
+        actual: topLight,
+    },
+    {
+        name: 'posToIndex and indexToPos round-trip',
+        expected: true,
+        actual: (() => {
+            const index = World.posToIndex(5, 100, 7);
+            const pos = World.indexToPos(index);
+            return pos.x === 5 && pos.y === 100 && pos.z === 7;
+        })(),
+    },
+    {
+        name: 'getCombinedLight returns max of inputs',
+        expected: 12,
+        actual: World.getCombinedLight(10, 12),
+    },
+    {
+        name: 'NEIGHBOR_OFFSETS has 6 directions',
+        expected: 6,
+        actual: World.NEIGHBOR_OFFSETS.length,
+    },
+    {
+        name: 'LightingEngine torch level is valid',
+        expected: true,
+        actual: lightEngine.getTorchLightLevel() >= 0 && lightEngine.getTorchLightLevel() <= 15,
+    },
 ];
 
 let passed = 0;
@@ -394,7 +502,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; max-width: 800px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; max-width: 900px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(233, 30, 99, 0.2); border: 1px solid #e91e63; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #e91e63;">Persistence</div>
                     <div style="font-size: 11px; color: #888;">RLE Compression</div>
@@ -411,6 +519,10 @@ if (container) {
                     <div style="font-size: 14px; font-weight: bold; color: #e67e22;">Physics</div>
                     <div style="font-size: 11px; color: #888;">AABB & Raycast</div>
                 </div>
+                <div style="background: rgba(52, 152, 219, 0.2); border: 1px solid #3498db; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #3498db;">World</div>
+                    <div style="font-size: 11px; color: #888;">Sky & Block Light</div>
+                </div>
             </div>
 
             <div style="margin-top: 32px; padding: 16px 24px; background: rgba(0,0,0,0.3); border-radius: 8px;">
@@ -423,11 +535,11 @@ if (container) {
             </div>
 
             <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phase 1, 2 & 3 Complete
+                Three.js r${THREE.REVISION} • Phase 1, 2, 3 & 4 Complete
             </div>
 
             <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
-                Next phases: Extract render, world, entity, and UI systems to complete the modular architecture
+                Next phases: Extract render, terrain generation, entity, and UI systems to complete the modular architecture
             </div>
         </div>
     `;
@@ -443,6 +555,7 @@ window.VoxEx = {
     Audio,
     Input,
     Physics,
+    World,
     THREE,
 };
 
