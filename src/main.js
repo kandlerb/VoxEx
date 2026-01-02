@@ -1,6 +1,6 @@
 /**
  * VoxEx - Modular Voxel Engine
- * Main entry point for Phase 1, 2, 3 & 4 - Core, Optimization, Input, Physics & World/Lighting modules
+ * Main entry point for Phases 1-5 - Core, Optimization, Input, Physics, World/Lighting & Terrain Generation
  * @module main
  */
 
@@ -34,6 +34,7 @@ console.log('Phase 1: Core Configuration Modules');
 console.log('Phase 2: Optimization & Persistence Modules');
 console.log('Phase 3: Input & Physics Modules');
 console.log('Phase 4: World & Lighting Modules');
+console.log('Phase 5: Terrain Generation Modules');
 console.log('');
 
 // Core Constants
@@ -192,6 +193,47 @@ lightEngine.calculateChunkLighting(testLightChunk, 16, 320);
 const topIndex = World.posToIndex(0, 319, 0);
 const topLight = testLightChunk.skyLight[topIndex];
 console.log('Empty chunk top skylight:', topLight, '(expected: 15)');
+console.log('');
+
+// Terrain Generation Module (Phase 5)
+console.log('%c Terrain Generation Module (Phase 5) ', 'background: #27ae60; color: white;');
+
+// Chunk utilities
+console.log('createChunkData:', typeof World.createChunkData === 'function' ? '✓' : '✗');
+console.log('getChunkKey:', typeof World.getChunkKey === 'function' ? '✓' : '✗');
+console.log('parseChunkKey:', typeof World.parseChunkKey === 'function' ? '✓' : '✗');
+console.log('globalToChunk:', typeof World.globalToChunk === 'function' ? '✓' : '✗');
+console.log('globalToLocal:', typeof World.globalToLocal === 'function' ? '✓' : '✗');
+console.log('GEN_PASS flags:', typeof World.GEN_PASS === 'object' ? '✓' : '✗');
+
+// TerrainGenerator
+console.log('TerrainGenerator:', typeof World.TerrainGenerator === 'function' ? '✓' : '✗');
+console.log('ChunkGenerator:', typeof World.ChunkGenerator === 'function' ? '✓' : '✗');
+
+// Cave generation
+console.log('precalculateCaveNoise:', typeof World.precalculateCaveNoise === 'function' ? '✓' : '✗');
+console.log('isCaveAt:', typeof World.isCaveAt === 'function' ? '✓' : '✗');
+
+// Surface decoration
+console.log('ELEVATION thresholds:', typeof World.ELEVATION === 'object' ? '✓' : '✗');
+console.log('analyzeSlopeAt:', typeof World.analyzeSlopeAt === 'function' ? '✓' : '✗');
+
+// Tree generation
+console.log('generateTreesForChunk:', typeof World.generateTreesForChunk === 'function' ? '✓' : '✗');
+console.log('forEachCanopyVoxel:', typeof World.forEachCanopyVoxel === 'function' ? '✓' : '✗');
+
+// Test chunk generation
+console.log('Testing chunk generation...');
+const terrainGen = new World.TerrainGenerator({ seed: 12345 });
+const testHeight = terrainGen.getHeightAt(100, 100);
+console.log('Terrain height at (100,100):', testHeight);
+const testBiome = terrainGen.getBiomeAt(100, 100);
+console.log('Biome at (100,100):', testBiome?.name || 'unknown');
+
+// Test chunk data structure
+const testGenChunk = World.createChunkData();
+console.log('Chunk blocks length:', testGenChunk.blocks.length, '(expected:', 16 * 16 * 320, ')');
+console.log('Chunk has skyLight:', testGenChunk.skyLight instanceof Uint8Array);
 console.log('');
 
 // Three.js
@@ -450,6 +492,81 @@ const tests = [
         expected: true,
         actual: lightEngine.getTorchLightLevel() >= 0 && lightEngine.getTorchLightLevel() <= 15,
     },
+    // Phase 5 tests - Terrain Generation
+    {
+        name: 'TerrainGenerator class exists',
+        expected: true,
+        actual: typeof World.TerrainGenerator === 'function',
+    },
+    {
+        name: 'ChunkGenerator class exists',
+        expected: true,
+        actual: typeof World.ChunkGenerator === 'function',
+    },
+    {
+        name: 'createChunkData returns valid structure',
+        expected: true,
+        actual: (() => {
+            const chunk = World.createChunkData();
+            return chunk.blocks instanceof Uint8Array && chunk.blocks.length === 16 * 16 * 320;
+        })(),
+    },
+    {
+        name: 'getChunkKey formats correctly',
+        expected: '5,-3',
+        actual: World.getChunkKey(5, -3),
+    },
+    {
+        name: 'parseChunkKey parses correctly',
+        expected: true,
+        actual: (() => {
+            const { cx, cz } = World.parseChunkKey('5,-3');
+            return cx === 5 && cz === -3;
+        })(),
+    },
+    {
+        name: 'globalToChunk converts correctly',
+        expected: true,
+        actual: (() => {
+            const { cx, cz } = World.globalToChunk(35, -20);
+            return cx === 2 && cz === -2;
+        })(),
+    },
+    {
+        name: 'GEN_PASS.ALL equals 31',
+        expected: 31,
+        actual: World.GEN_PASS.ALL,
+    },
+    {
+        name: 'TerrainGenerator produces valid height',
+        expected: true,
+        actual: testHeight >= 0 && testHeight < 320,
+    },
+    {
+        name: 'TerrainGenerator returns biome with name',
+        expected: true,
+        actual: testBiome !== null && typeof testBiome.name === 'string',
+    },
+    {
+        name: 'ELEVATION thresholds defined',
+        expected: true,
+        actual: World.ELEVATION && World.ELEVATION.SNOW_LINE === 190,
+    },
+    {
+        name: 'precalculateCaveNoise exists',
+        expected: true,
+        actual: typeof World.precalculateCaveNoise === 'function',
+    },
+    {
+        name: 'generateTreesForChunk exists',
+        expected: true,
+        actual: typeof World.generateTreesForChunk === 'function',
+    },
+    {
+        name: 'forEachCanopyVoxel exists',
+        expected: true,
+        actual: typeof World.forEachCanopyVoxel === 'function',
+    },
 ];
 
 let passed = 0;
@@ -502,7 +619,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; max-width: 900px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 24px; display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; max-width: 1000px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(233, 30, 99, 0.2); border: 1px solid #e91e63; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #e91e63;">Persistence</div>
                     <div style="font-size: 11px; color: #888;">RLE Compression</div>
@@ -520,8 +637,12 @@ if (container) {
                     <div style="font-size: 11px; color: #888;">AABB & Raycast</div>
                 </div>
                 <div style="background: rgba(52, 152, 219, 0.2); border: 1px solid #3498db; border-radius: 8px; padding: 12px; text-align: center;">
-                    <div style="font-size: 14px; font-weight: bold; color: #3498db;">World</div>
+                    <div style="font-size: 14px; font-weight: bold; color: #3498db;">Lighting</div>
                     <div style="font-size: 11px; color: #888;">Sky & Block Light</div>
+                </div>
+                <div style="background: rgba(39, 174, 96, 0.2); border: 1px solid #27ae60; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #27ae60;">Generation</div>
+                    <div style="font-size: 11px; color: #888;">Terrain & Trees</div>
                 </div>
             </div>
 
@@ -535,11 +656,11 @@ if (container) {
             </div>
 
             <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phase 1, 2, 3 & 4 Complete
+                Three.js r${THREE.REVISION} • Phases 1-5 Complete
             </div>
 
             <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
-                Next phases: Extract render, terrain generation, entity, and UI systems to complete the modular architecture
+                Next phases: Extract render, entity, and UI systems to complete the modular architecture
             </div>
         </div>
     `;
