@@ -27,6 +27,9 @@ import * as Entities from './entities/index.js';
 // Render imports (Phase 7)
 import * as Render from './render/index.js';
 
+// UI imports (Phase 8)
+import * as UI from './ui/index.js';
+
 // Three.js imports
 import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -43,6 +46,7 @@ console.log('Phase 4: World & Lighting Modules');
 console.log('Phase 5: Terrain Generation Modules');
 console.log('Phase 6: Entity System Modules');
 console.log('Phase 7: Render System Modules');
+console.log('Phase 8: UI System Modules');
 console.log('');
 
 // Core Constants
@@ -295,6 +299,29 @@ console.log('Is night at midnight:', testDayNight.isNight());
 // Test torch model
 const testTorch = Render.createTorchViewmodel();
 console.log('Torch viewmodel children:', testTorch.children.length, '(expected: 4 - stick, flame, glow, light)');
+console.log('');
+
+// UI Module (Phase 8)
+console.log('%c UI Module (Phase 8 - Final!) ', 'background: #9b59b6; color: white;');
+console.log('UIManager:', typeof UI.UIManager === 'function' ? '✓' : '✗');
+console.log('createCrosshair:', typeof UI.createCrosshair === 'function' ? '✓' : '✗');
+console.log('createHotbar:', typeof UI.createHotbar === 'function' ? '✓' : '✗');
+console.log('createDebugOverlay:', typeof UI.createDebugOverlay === 'function' ? '✓' : '✗');
+console.log('createMainMenu:', typeof UI.createMainMenu === 'function' ? '✓' : '✗');
+console.log('createPauseMenu:', typeof UI.createPauseMenu === 'function' ? '✓' : '✗');
+console.log('createSettingsMenu:', typeof UI.createSettingsMenu === 'function' ? '✓' : '✗');
+console.log('createInventoryScreen:', typeof UI.createInventoryScreen === 'function' ? '✓' : '✗');
+console.log('createLoadingOverlay:', typeof UI.createLoadingOverlay === 'function' ? '✓' : '✗');
+
+// Test UI element creation
+const testCrosshair = UI.createCrosshair();
+console.log('Crosshair created:', testCrosshair instanceof HTMLElement);
+
+const testHotbar = UI.createHotbar(9);
+console.log('Hotbar slots:', testHotbar.children.length);
+
+const testStatusIndicators = UI.createStatusIndicators();
+console.log('StatusIndicators has sprint:', testStatusIndicators.querySelector('#indicator-sprint') !== null);
 console.log('');
 
 // Three.js
@@ -802,6 +829,87 @@ const tests = [
         expected: true,
         actual: typeof Render.DesaturationShader === 'object',
     },
+    // Phase 8 tests - UI System
+    {
+        name: 'UIManager class exists',
+        expected: true,
+        actual: typeof UI.UIManager === 'function',
+    },
+    {
+        name: 'createCrosshair exists',
+        expected: true,
+        actual: typeof UI.createCrosshair === 'function',
+    },
+    {
+        name: 'createHotbar exists',
+        expected: true,
+        actual: typeof UI.createHotbar === 'function',
+    },
+    {
+        name: 'createDebugOverlay exists',
+        expected: true,
+        actual: typeof UI.createDebugOverlay === 'function',
+    },
+    {
+        name: 'createStatusIndicators exists',
+        expected: true,
+        actual: typeof UI.createStatusIndicators === 'function',
+    },
+    {
+        name: 'createMainMenu exists',
+        expected: true,
+        actual: typeof UI.createMainMenu === 'function',
+    },
+    {
+        name: 'createPauseMenu exists',
+        expected: true,
+        actual: typeof UI.createPauseMenu === 'function',
+    },
+    {
+        name: 'createSettingsMenu exists',
+        expected: true,
+        actual: typeof UI.createSettingsMenu === 'function',
+    },
+    {
+        name: 'createInventoryScreen exists',
+        expected: true,
+        actual: typeof UI.createInventoryScreen === 'function',
+    },
+    {
+        name: 'createLoadingOverlay exists',
+        expected: true,
+        actual: typeof UI.createLoadingOverlay === 'function',
+    },
+    {
+        name: 'createChunkIndicator exists',
+        expected: true,
+        actual: typeof UI.createChunkIndicator === 'function',
+    },
+    {
+        name: 'Crosshair returns HTMLElement',
+        expected: true,
+        actual: testCrosshair instanceof HTMLElement,
+    },
+    {
+        name: 'Hotbar has 9 slots',
+        expected: 9,
+        actual: testHotbar.children.length,
+    },
+    {
+        name: 'StatusIndicators has sprint indicator',
+        expected: true,
+        actual: testStatusIndicators.querySelector('#indicator-sprint') !== null,
+    },
+    {
+        name: 'StatusIndicators has crouch indicator',
+        expected: true,
+        actual: testStatusIndicators.querySelector('#indicator-crouch') !== null,
+    },
+    {
+        name: 'StatusIndicators has flight indicator',
+        expected: true,
+        actual: testStatusIndicators.querySelector('#indicator-flight') !== null,
+    },
 ];
 
 let passed = 0;
@@ -873,7 +981,7 @@ if (container) {
                 </div>
             </div>
 
-            <div style="margin-top: 12px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; max-width: 700px; width: 100%; padding: 0 20px;">
+            <div style="margin-top: 12px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; max-width: 875px; width: 100%; padding: 0 20px;">
                 <div style="background: rgba(52, 152, 219, 0.2); border: 1px solid #3498db; border-radius: 8px; padding: 12px; text-align: center;">
                     <div style="font-size: 14px; font-weight: bold; color: #3498db;">Lighting</div>
                     <div style="font-size: 11px; color: #888;">Sky & Block Light</div>
@@ -890,6 +998,10 @@ if (container) {
                     <div style="font-size: 14px; font-weight: bold; color: #e74c3c;">Render</div>
                     <div style="font-size: 11px; color: #888;">Textures & Mesh</div>
                 </div>
+                <div style="background: rgba(103, 58, 183, 0.2); border: 1px solid #673ab7; border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 14px; font-weight: bold; color: #673ab7;">UI</div>
+                    <div style="font-size: 11px; color: #888;">HUD & Menus</div>
+                </div>
             </div>
 
             <div style="margin-top: 32px; padding: 16px 24px; background: rgba(0,0,0,0.3); border-radius: 8px;">
@@ -902,11 +1014,11 @@ if (container) {
             </div>
 
             <div style="margin-top: 32px; color: #666; font-size: 12px;">
-                Three.js r${THREE.REVISION} • Phases 1-7 Complete
+                Three.js r${THREE.REVISION} • All 8 Phases Complete!
             </div>
 
-            <div style="margin-top: 24px; color: #444; font-size: 11px; max-width: 500px; text-align: center;">
-                Next phase: Extract UI system to complete the modular architecture
+            <div style="margin-top: 24px; color: #4caf50; font-size: 13px; max-width: 500px; text-align: center;">
+                Modular architecture extraction complete - all systems ready for integration
             </div>
         </div>
     `;
@@ -925,6 +1037,7 @@ window.VoxEx = {
     World,
     Entities,
     Render,
+    UI,
     THREE,
 };
 
