@@ -27,7 +27,8 @@ export function createMainMenu(callbacks) {
     menu.style.cssText = `
         position: fixed;
         inset: 0;
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: blur(4px);
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -39,11 +40,11 @@ export function createMainMenu(callbacks) {
     const title = document.createElement('h1');
     title.textContent = 'VoxEx';
     title.style.cssText = `
-        font-size: 72px;
-        color: #ff6b35;
-        text-shadow: 4px 4px 0px #000;
+        font-size: 48px;
+        color: #4caf50;
+        text-shadow: 2px 2px 0px #000;
         margin-bottom: 40px;
-        font-family: 'Arial Black', sans-serif;
+        font-family: 'Segoe UI', sans-serif;
     `;
     menu.appendChild(title);
 
@@ -102,23 +103,25 @@ export function createMenuButton(text, onClick) {
     const button = document.createElement('button');
     button.textContent = text;
     button.style.cssText = `
-        width: 250px;
-        padding: 16px 32px;
+        width: 100%;
+        padding: 12px;
         font-size: 18px;
-        background: rgba(255, 255, 255, 0.1);
-        border: 2px solid rgba(255, 255, 255, 0.2);
+        background: #333;
+        border: 1px solid #555;
         color: white;
         cursor: pointer;
-        border-radius: 8px;
+        border-radius: 6px;
         transition: all 0.2s;
     `;
     button.addEventListener('mouseenter', () => {
-        button.style.background = 'rgba(255, 255, 255, 0.2)';
-        button.style.borderColor = 'rgba(255, 255, 255, 0.4)';
+        button.style.background = '#4caf50';
+        button.style.borderColor = '#4caf50';
+        button.style.transform = 'scale(1.02)';
     });
     button.addEventListener('mouseleave', () => {
-        button.style.background = 'rgba(255, 255, 255, 0.1)';
-        button.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+        button.style.background = '#333';
+        button.style.borderColor = '#555';
+        button.style.transform = 'scale(1)';
     });
     button.addEventListener('click', onClick);
     return button;

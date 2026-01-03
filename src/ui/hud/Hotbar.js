@@ -13,15 +13,16 @@ export function createHotbar(slotCount = 9) {
     hotbar.id = 'hotbar';
     hotbar.style.cssText = `
         position: fixed;
-        bottom: 20px;
+        bottom: 30px;
         left: 50%;
         transform: translateX(-50%);
         display: flex;
-        gap: 4px;
-        background: rgba(0, 0, 0, 0.5);
-        padding: 8px;
-        border-radius: 4px;
+        gap: 6px;
+        background: rgba(0, 0, 0, 0.3);
+        padding: 6px;
+        border-radius: 8px;
         z-index: 100;
+        pointer-events: none;
     `;
 
     for (let i = 0; i < slotCount; i++) {
@@ -42,15 +43,17 @@ function createSlot(index) {
     slot.className = 'hotbar-slot';
     slot.dataset.index = String(index);
     slot.style.cssText = `
-        width: 48px;
-        height: 48px;
-        background: rgba(0, 0, 0, 0.5);
-        border: 2px solid #555;
-        border-radius: 4px;
+        width: 52px;
+        height: 52px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 2px solid rgba(40, 40, 40, 0.9);
+        border-radius: 6px;
         display: flex;
         align-items: center;
         justify-content: center;
         position: relative;
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.5);
+        transition: all 0.2s ease;
     `;
 
     // Slot number
@@ -78,7 +81,17 @@ export function setHotbarSelection(hotbar, selectedIndex) {
     slots.forEach((slot, i) => {
         /** @type {HTMLElement} */
         const slotEl = /** @type {HTMLElement} */ (slot);
-        slotEl.style.borderColor = i === selectedIndex ? '#fff' : '#555';
+        if (i === selectedIndex) {
+            slotEl.style.borderColor = '#fff';
+            slotEl.style.boxShadow = '0 0 12px rgba(255, 255, 255, 0.8), inset 0 0 0 2px rgba(0, 0, 0, 0.5)';
+            slotEl.style.transform = 'scale(1.15)';
+            slotEl.style.background = 'rgba(255, 255, 255, 0.2)';
+        } else {
+            slotEl.style.borderColor = 'rgba(40, 40, 40, 0.9)';
+            slotEl.style.boxShadow = 'inset 0 0 0 1px rgba(255, 255, 255, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.5)';
+            slotEl.style.transform = 'scale(1)';
+            slotEl.style.background = 'rgba(255, 255, 255, 0.1)';
+        }
     });
 }
 

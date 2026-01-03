@@ -13,7 +13,7 @@ export function createLoadingOverlay() {
     overlay.style.cssText = `
         position: fixed;
         inset: 0;
-        background: #1a1a2e;
+        background: #1a1a1a;
         display: none;
         flex-direction: column;
         align-items: center;
@@ -48,7 +48,8 @@ export function createLoadingOverlay() {
     progressBar.style.cssText = `
         width: 0%;
         height: 100%;
-        background: linear-gradient(90deg, #ff6b35, #f7c331);
+        background: #4caf50;
+        border-radius: 10px;
         transition: width 0.3s ease;
     `;
     progressContainer.appendChild(progressBar);
