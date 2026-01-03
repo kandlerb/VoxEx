@@ -13,7 +13,7 @@ let game = null;
  * Initialize and start the game
  */
 async function init() {
-    console.log('%c VoxEx ', 'background: #ff6b35; color: white; font-size: 24px; font-weight: bold; padding: 4px 8px;');
+    console.log('%c VoxEx ', 'background: #4caf50; color: white; font-size: 24px; font-weight: bold; padding: 4px 8px;');
     console.log('%c Browser-based Voxel Explorer ', 'color: #888; font-size: 12px;');
     console.log('');
 
@@ -56,11 +56,11 @@ async function init() {
  */
 function showError(container, error) {
     container.innerHTML = `
-        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #1a1a2e; color: #fff; font-family: Arial, sans-serif; padding: 20px; text-align: center;">
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #1a1a1a; color: #fff; font-family: 'Segoe UI', sans-serif; padding: 20px; text-align: center;">
             <h1 style="color: #f44336; margin-bottom: 16px;">VoxEx Failed to Load</h1>
             <p style="color: #888; margin-bottom: 24px;">An error occurred during initialization:</p>
-            <pre style="background: #2a2a3e; padding: 16px; border-radius: 8px; color: #ff6b6b; max-width: 600px; overflow: auto; text-align: left;">${error.message}\n\n${error.stack}</pre>
-            <button onclick="location.reload()" style="margin-top: 24px; padding: 12px 24px; background: #ff6b35; border: none; color: white; border-radius: 4px; cursor: pointer; font-size: 16px;">Reload</button>
+            <pre style="background: #222; padding: 16px; border-radius: 8px; color: #ff6b6b; max-width: 600px; overflow: auto; text-align: left;">${error.message}\n\n${error.stack}</pre>
+            <button onclick="location.reload()" style="margin-top: 24px; padding: 12px 24px; background: #4caf50; border: none; color: white; border-radius: 6px; cursor: pointer; font-size: 16px;">Reload</button>
         </div>
     `;
 }

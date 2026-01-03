@@ -35,7 +35,10 @@ export function createInventoryScreen(onBlockSelect, onClose) {
     const title = document.createElement('h2');
     title.textContent = 'Inventory';
     title.style.cssText = `
-        color: white;
+        color: #4caf50;
+        font-size: 24px;
+        font-weight: 600;
+        text-shadow: 2px 2px 0 #000;
         margin-bottom: 20px;
     `;
     screen.appendChild(title);
@@ -87,12 +90,14 @@ export function createInventoryScreen(onBlockSelect, onClose) {
 
         // Hover effect
         slot.addEventListener('mouseenter', () => {
-            slot.style.borderColor = '#fff';
-            slot.style.background = 'rgba(255, 255, 255, 0.2)';
+            slot.style.borderColor = '#4caf50';
+            slot.style.background = 'rgba(76, 175, 80, 0.2)';
+            slot.style.transform = 'scale(1.08)';
         });
         slot.addEventListener('mouseleave', () => {
             slot.style.borderColor = 'transparent';
             slot.style.background = 'rgba(255, 255, 255, 0.1)';
+            slot.style.transform = 'scale(1)';
         });
 
         // Click to select
