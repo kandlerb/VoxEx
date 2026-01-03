@@ -54,6 +54,14 @@ export class Entity {
     }
 
     /**
+     * Get position as an object
+     * @returns {{x: number, y: number, z: number}} Position
+     */
+    get position() {
+        return { x: this.x, y: this.y, z: this.z };
+    }
+
+    /**
      * Get entity's axis-aligned bounding box
      * @returns {import('../physics/AABB.js').AABB} AABB
      */
