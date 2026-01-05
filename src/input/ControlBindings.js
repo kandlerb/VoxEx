@@ -14,6 +14,9 @@
  * @property {string} crouch - Crouch/fly down key
  * @property {string} sprint - Sprint key
  * @property {string} toggleTorch - Toggle torch key
+ * @property {string} toggleThirdPerson - Toggle third-person camera key
+ * @property {string} cameraZoomIn - Zoom camera in (third-person)
+ * @property {string} cameraZoomOut - Zoom camera out (third-person)
  * @property {string} inventory - Open inventory key
  * @property {string} pause - Pause/menu key
  * @property {string} debug - Debug overlay key
@@ -47,6 +50,9 @@ export const DEFAULT_BINDINGS = {
 
     // Actions
     toggleTorch: 'KeyF',
+    toggleThirdPerson: 'KeyV',
+    cameraZoomIn: 'Equal',
+    cameraZoomOut: 'Minus',
     inventory: 'KeyE',
     pause: 'Escape',
     debug: 'Backquote',  // Tilde key (~)

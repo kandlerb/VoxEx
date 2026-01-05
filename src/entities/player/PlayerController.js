@@ -138,7 +138,11 @@ export class PlayerController extends Entity {
 
         // Update sprint state (can only sprint when moving forward and not crouching)
         const isMovingForward = input.forward && !input.back;
-        this.isSprinting = input.sprint && isMovingForward && !this.isCrouching && !this.isSwimming;
+        const wantsSprint = input.sprint && isMovingForward && !this.isSwimming && !this.isFlying;
+        if (wantsSprint && this.isCrouching) {
+            this.isCrouching = false;
+        }
+        this.isSprinting = wantsSprint && !this.isCrouching;
 
         // Apply speed to velocity
         const speed = this.getCurrentSpeed();
@@ -148,8 +152,10 @@ export class PlayerController extends Entity {
         // Handle vertical movement
         this.processVerticalInput(input, dt);
 
-        // Update crouch state
-        this.isCrouching = input.crouch && !this.isFlying && !this.isSwimming;
+        // Ensure crouch is disabled when flying or swimming
+        if (this.isFlying || this.isSwimming) {
+            this.isCrouching = false;
+        }
     }
 
     /**
@@ -286,7 +292,16 @@ export class PlayerController extends Entity {
         this.isSwimming = swimming;
         if (swimming) {
             this.isFlying = false;
+            this.isCrouching = false;
         }
+    }
+
+    /**
+     * Toggle crouch state (ground only)
+     */
+    toggleCrouch() {
+        if (this.isFlying || this.isSwimming) return;
+        this.isCrouching = !this.isCrouching;
     }
 
     /**
