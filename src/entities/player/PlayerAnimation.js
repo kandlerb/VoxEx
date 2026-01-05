@@ -4,6 +4,7 @@
  */
 
 import { POSE_PRESETS, POSE_CONSTRAINTS } from '../../config/PosePresets.js';
+import { FLIGHT_HEAD_LEAN } from '../../config/PlayerConfig.js';
 import { springDamper, applyPoseConstraints } from '../../math/animation.js';
 
 /**
@@ -26,6 +27,7 @@ export class PlayerAnimation {
         this.walkPhase = 0;
         this.armSwingPhase = 0;
         this.swimPhase = 0;
+        this.idleTimer = 0;
 
         /** @type {AnimationState} */
         this.currentState = 'idle';
@@ -39,9 +41,18 @@ export class PlayerAnimation {
         this.poseHalflife = 0.1;
 
         // Locomotion parameters
-        this.walkCycleSpeed = 8;
-        this.sprintCycleSpeed = 12;
-        this.swimCycleSpeed = 4;
+        this.walkCycleSpeed = 7;
+        this.sprintCycleSpeed = 7;
+        this.crouchCycleSpeed = 4;
+        this.swimCycleSpeed = 2.5;
+
+        // Stride rate smoothing
+        this.targetStrideRate = this.walkCycleSpeed;
+        this.currentStrideRate = this.walkCycleSpeed;
+
+        // Flight head lean spring
+        this.flightHeadLean = 0;
+        this.flightHeadLeanVelocity = 0;
     }
 
     /**
@@ -166,6 +177,7 @@ export class PlayerAnimation {
             this.previousState = this.currentState;
             this.currentState = newState;
             this.stateBlendTime = 0;
+            this.idleTimer = 0;
         }
 
         // Update blend time
@@ -182,7 +194,7 @@ export class PlayerAnimation {
         this.interpolatePose(targetPose, dt);
 
         // Apply locomotion animation on top
-        this.applyLocomotion(playerState);
+        this.applyLocomotion(playerState, dt);
 
         // Apply pose constraints to prevent interpenetration
         applyPoseConstraints(this.pose);
@@ -197,13 +209,20 @@ export class PlayerAnimation {
         const isMoving = playerState.isMoving();
 
         if (this.currentState === 'walk' && isMoving) {
-            this.walkPhase += dt * this.walkCycleSpeed;
-            this.armSwingPhase = this.walkPhase;
+            this.targetStrideRate = this.walkCycleSpeed;
         } else if (this.currentState === 'sprint' && isMoving) {
-            this.walkPhase += dt * this.sprintCycleSpeed;
-            this.armSwingPhase = this.walkPhase;
+            this.targetStrideRate = this.sprintCycleSpeed;
         } else if (this.currentState === 'crouch' && isMoving) {
-            this.walkPhase += dt * (this.walkCycleSpeed * 0.6);
+            this.targetStrideRate = this.crouchCycleSpeed;
+        } else if (this.currentState === 'swim' && isMoving) {
+            this.targetStrideRate = this.swimCycleSpeed;
+        }
+
+        const blend = 1 - Math.pow(0.1, dt);
+        this.currentStrideRate += (this.targetStrideRate - this.currentStrideRate) * blend;
+
+        if (isMoving && (this.currentState === 'walk' || this.currentState === 'sprint' || this.currentState === 'crouch')) {
+            this.walkPhase += dt * this.currentStrideRate;
             this.armSwingPhase = this.walkPhase;
         } else if (this.currentState === 'swim') {
             this.swimPhase += dt * this.swimCycleSpeed;
@@ -241,14 +260,14 @@ export class PlayerAnimation {
     /**
      * Apply locomotion cycle to pose (additive animation)
      * @param {Object} playerState
+     * @param {number} dt
      */
-    applyLocomotion(playerState) {
+    applyLocomotion(playerState, dt) {
         const isMoving = playerState.isMoving();
-        if (!isMoving) return;
+        const phase = this.walkPhase;
 
         if (this.currentState === 'walk' || this.currentState === 'sprint') {
             const amplitude = this.currentState === 'sprint' ? 0.8 : 0.5;
-            const phase = this.walkPhase;
 
             // Leg swing (sinusoidal)
             this.pose.leftLegX += Math.sin(phase) * amplitude * 0.7;
@@ -273,7 +292,6 @@ export class PlayerAnimation {
             this.pose.lowerSpineY = Math.sin(phase) * 0.05;
         } else if (this.currentState === 'crouch' && isMoving) {
             const amplitude = 0.2;
-            const phase = this.walkPhase;
 
             // Reduced leg movement for crouch-walking
             this.pose.leftLegX += Math.sin(phase) * amplitude;
@@ -282,7 +300,7 @@ export class PlayerAnimation {
             // Arm movement
             this.pose.leftArmX += Math.sin(phase + Math.PI) * amplitude * 0.3;
             this.pose.rightArmX += Math.sin(phase) * amplitude * 0.3;
-        } else if (this.currentState === 'swim') {
+        } else if (this.currentState === 'swim' && isMoving) {
             const phase = this.swimPhase;
 
             // Swimming arm stroke
@@ -292,6 +310,31 @@ export class PlayerAnimation {
             // Leg kick
             this.pose.leftLegX += Math.sin(phase * 2) * 0.3;
             this.pose.rightLegX += Math.sin(phase * 2 + Math.PI) * 0.3;
+        } else if (!isMoving) {
+            this.idleTimer += dt;
+
+            // Idle breathing and subtle sway
+            const breath = Math.sin(this.idleTimer * 0.4 * Math.PI);
+            this.pose.headY += breath * 0.015;
+            this.pose.bodyY += Math.abs(Math.sin(this.idleTimer * 0.3)) * 0.005;
+            this.pose.leftArmX += Math.sin(this.idleTimer * 0.5) * 0.04;
+            this.pose.rightArmX += Math.sin(this.idleTimer * 0.5 + 0.7) * 0.04;
+            this.pose.leftElbow += Math.abs(Math.sin(this.idleTimer * 0.4)) * 0.05;
+            this.pose.rightElbow += Math.abs(Math.sin(this.idleTimer * 0.4 + 0.3)) * 0.05;
+        }
+
+        if (this.currentState === 'fly') {
+            const target = playerState.isMoving() ? FLIGHT_HEAD_LEAN.target : 0;
+            const result = springDamper(
+                this.flightHeadLean,
+                this.flightHeadLeanVelocity,
+                target,
+                FLIGHT_HEAD_LEAN.halflife,
+                dt
+            );
+            this.flightHeadLean = result.value;
+            this.flightHeadLeanVelocity = result.velocity;
+            this.pose.headX += this.flightHeadLean;
         }
     }
 
