@@ -34,14 +34,22 @@ import { calculateChunkSunlight } from './world/lighting/SkyLight.js';
 import { PlayerController } from './entities/player/PlayerController.js';
 import { PlayerAnimation } from './entities/player/PlayerAnimation.js';
 import { EntityManager } from './entities/EntityManager.js';
+import { ZOMBIE_EFFECTS } from './config/ZombieConfig.js';
 
 // Render
 import { createTextureAtlas } from './render/textures/TextureAtlas.js';
 import { createTerrainMaterial } from './render/materials/TerrainMaterial.js';
-import { createWaterMaterial, updateWaterOpacity } from './render/materials/WaterMaterial.js';
+import {
+    createWaterMaterial,
+    createFastWaterMaterial,
+    createRefractionWaterMaterial,
+    updateWaterTime,
+    updateWaterOpacity
+} from './render/materials/WaterMaterial.js';
 import { buildChunkMesh, disposeChunkGeometry } from './render/meshing/ChunkMesher.js';
 import { DayNightCycle } from './render/sky/DayNightCycle.js';
 import { createTorchViewmodel } from './render/models/TorchModel.js';
+import { PostProcessingManager } from './render/effects/PostProcessing.js';
 
 // UI
 import { UIManager } from './ui/UIManager.js';
@@ -109,6 +117,25 @@ export class Game {
         this.textureAtlas = null;
         this.terrainMaterial = null;
         this.waterMaterial = null;
+        this.waterMaterialRefraction = null;
+
+        // Post-processing
+        this.postProcessing = null;
+
+        // Refraction render target
+        this.refractionRenderTarget = null;
+        this.refractionScale = 0.5;
+        this.refractionUpdateFrames = 2;
+        this.refractionMoveThreshold = 0.5;
+        this.refractionRotateThreshold = 0.1;
+        this.refractionFrameCounter = 0;
+        this.lastRefractionCamPos = new THREE.Vector3();
+        this.lastRefractionCamQuat = new THREE.Quaternion();
+
+        // Underwater state
+        this.isUnderwater = false;
+        this.underwaterDepth = 0;
+        this._lastUnderwaterCheckY = -Infinity;
 
         // Viewmodels
         this.torchViewmodel = null;
@@ -203,6 +230,7 @@ export class Game {
         this.initInput();
         this.initUI();
         this.initDayNight();
+        this.initPostProcessing();
 
         // Initialize persistence
         await this.worldStorage.init();
@@ -305,12 +333,9 @@ export class Game {
         this.terrainMaterial = createTerrainMaterial(this.textureAtlas, {
             useStandardMaterial: true
         });
-        this.waterMaterial = createWaterMaterial(this.textureAtlas, {
-            opacity: this.settings.waterOpacity ?? 0.7
-        });
-        if (this.waterMaterial.color) {
-            this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
-        }
+        const { material, refractionMaterial } = this.createWaterMaterialFromSettings();
+        this.waterMaterial = material;
+        this.waterMaterialRefraction = refractionMaterial;
     }
 
     /**
@@ -589,6 +614,18 @@ export class Game {
     }
 
     /**
+     * Initialize post-processing and refraction buffers
+     */
+    initPostProcessing() {
+        this.postProcessing = new PostProcessingManager(this.renderer, this.scene, this.camera, {
+            enabled: true,
+            settings: this.settings
+        });
+        this.postProcessing.resize(window.innerWidth, window.innerHeight);
+        this.ensureRefractionTarget();
+    }
+
+    /**
      * Initialize torch viewmodel
      */
     initViewmodels() {
@@ -604,13 +641,77 @@ export class Game {
     }
 
     /**
-     * Refresh world cards in the main menu
+     * Ensure refraction render target is created or disposed based on settings.
      */
-    async refreshWorldCards() {
-        if (!this.uiManager) return;
-        const worlds = this.worldStorage.listWorlds();
-        const totalBytes = await this.worldStorage.getTotalStorageBytes();
-        this.uiManager.updateWorldCards(worlds, totalBytes);
+    ensureRefractionTarget() {
+        const refractionEnabled = this.settings.waterRefractionEnabled && !this.settings.waterFastMode;
+
+        if (!refractionEnabled) {
+            if (this.refractionRenderTarget) {
+                this.refractionRenderTarget.dispose();
+                this.refractionRenderTarget = null;
+            }
+            return;
+        }
+
+        const size = this.renderer.getSize(new THREE.Vector2());
+        const pixelRatio = this.renderer.getPixelRatio();
+        const width = Math.max(1, Math.floor(size.x * pixelRatio * this.refractionScale));
+        const height = Math.max(1, Math.floor(size.y * pixelRatio * this.refractionScale));
+
+        if (this.refractionRenderTarget) {
+            this.refractionRenderTarget.setSize(width, height);
+            return;
+        }
+
+        this.refractionRenderTarget = new THREE.WebGLRenderTarget(width, height, {
+            minFilter: THREE.LinearFilter,
+            magFilter: THREE.LinearFilter,
+            format: THREE.RGBAFormat,
+        });
+    }
+
+    /**
+     * Create water material based on current settings.
+     * @returns {{material: THREE.Material, refractionMaterial: THREE.ShaderMaterial|null}}
+     */
+    createWaterMaterialFromSettings() {
+        const waterOpacity = this.settings.waterOpacity ?? 0.7;
+
+        if (this.settings.waterFastMode) {
+            return { material: createFastWaterMaterial(this.textureAtlas, waterOpacity), refractionMaterial: null };
+        }
+
+        if (this.settings.waterRefractionEnabled) {
+            const material = createRefractionWaterMaterial(this.textureAtlas, {
+                opacity: waterOpacity,
+                refractionStrength: this.settings.waterRefractionStrength ?? 0.02,
+                waterColor: new THREE.Color(this.settings.waterColor ?? 0x4488ff),
+                absorptionR: this.settings.waterAbsorptionR ?? 0.25,
+                absorptionG: this.settings.waterAbsorptionG ?? 0.06,
+                absorptionB: this.settings.waterAbsorptionB ?? 0.01,
+            });
+            return { material, refractionMaterial: material };
+        }
+
+        return { material: createWaterMaterial(this.textureAtlas, { opacity: waterOpacity }), refractionMaterial: null };
+    }
+
+    /**
+     * Apply a new water material to all water meshes.
+     * @param {THREE.Material} material
+     * @param {THREE.ShaderMaterial|null} refractionMaterial
+     */
+    applyWaterMaterial(material, refractionMaterial) {
+        if (this.waterMaterial) {
+            this.waterMaterial.dispose();
+        }
+        this.waterMaterial = material;
+        this.waterMaterialRefraction = refractionMaterial;
+
+        for (const mesh of this.waterMeshes.values()) {
+            mesh.material = this.waterMaterial;
+        }
     }
 
     /**
@@ -908,7 +1009,11 @@ export class Game {
 
         // Skip updates if paused
         if (this.state.isPaused || !this.state.isRunning) {
-            this.renderer.render(this.scene, this.camera);
+            if (this.postProcessing) {
+                this.postProcessing.render();
+            } else {
+                this.renderer.render(this.scene, this.camera);
+            }
             return;
         }
 
@@ -920,9 +1025,14 @@ export class Game {
         this.updateChunks();
         this.processChunkRebuilds();
         this.updateUI();
+        this.updatePostProcessing(elapsed);
 
         // Render
-        this.renderer.render(this.scene, this.camera);
+        if (this.postProcessing) {
+            this.postProcessing.render();
+        } else {
+            this.renderer.render(this.scene, this.camera);
+        }
     }
 
     /**
@@ -1306,6 +1416,159 @@ export class Game {
     }
 
     /**
+     * Update post-processing effects and refraction
+     * @param {number} elapsed
+     */
+    updatePostProcessing(elapsed) {
+        if (!this.postProcessing) return;
+
+        this.updateUnderwaterState();
+
+        const zombieProximity = this.getZombieProximity();
+        this.postProcessing.updateZombieEffects(zombieProximity);
+
+        this.postProcessing.updateUnderwater({
+            isUnderwater: this.isUnderwater,
+            depth: this.underwaterDepth,
+            time: performance.now(),
+            waterColor: this.settings.waterColor,
+            absorptionR: this.settings.waterAbsorptionR,
+            absorptionG: this.settings.waterAbsorptionG,
+            absorptionB: this.settings.waterAbsorptionB
+        });
+
+        this.postProcessing.updateVolumetric({
+            dayNightCycle: this.dayNightCycle,
+            camera: this.camera,
+            aspectRatio: this.camera.aspect
+        });
+
+        this.postProcessing.updateColorGrading(this.dayNightCycle?.time ?? 0);
+
+        updateWaterTime(this.waterMaterial, elapsed);
+        this.updateWaterRefraction();
+    }
+
+    /**
+     * Update underwater state for post-processing
+     */
+    updateUnderwaterState() {
+        const eyePos = this.camera.position;
+        const eyeX = Math.floor(eyePos.x);
+        const eyeY = eyePos.y;
+        const eyeZ = Math.floor(eyePos.z);
+        const eyeBlockY = Math.floor(eyeY);
+
+        const wasUnderwater = this.isUnderwater;
+        this.isUnderwater = this.getBlockAt(eyeX, eyeBlockY, eyeZ) === WATER;
+
+        if (this.isUnderwater) {
+            const yDelta = Math.abs(eyeY - this._lastUnderwaterCheckY);
+            if (yDelta > 0.25 || !wasUnderwater) {
+                this._lastUnderwaterCheckY = eyeY;
+                let surfaceY = eyeBlockY;
+                for (let y = eyeBlockY; y < eyeBlockY + 50; y++) {
+                    if (this.getBlockAt(eyeX, y, eyeZ) !== WATER) {
+                        surfaceY = y;
+                        break;
+                    }
+                }
+                this.underwaterDepth = Math.max(0, surfaceY - eyeY);
+            }
+        } else if (wasUnderwater) {
+            this.underwaterDepth = 0;
+            this._lastUnderwaterCheckY = -Infinity;
+        }
+    }
+
+    /**
+     * Calculate zombie proximity for scare effects
+     * @returns {number}
+     */
+    getZombieProximity() {
+        if (!this.entityManager || !this.playerController) return 0;
+
+        const { zombie, distance } = this.entityManager.getClosestZombie(
+            this.playerController.x,
+            this.playerController.y,
+            this.playerController.z
+        );
+
+        if (!zombie) return 0;
+
+        const range = ZOMBIE_EFFECTS.effectRange ?? 20;
+        const falloff = ZOMBIE_EFFECTS.effectFalloff ?? 10;
+
+        if (distance <= range) return 1;
+        if (distance <= range + falloff) {
+            return 1 - (distance - range) / falloff;
+        }
+
+        return 0;
+    }
+
+    /**
+     * Update refraction render target and uniforms
+     */
+    updateWaterRefraction() {
+        const refractionEnabled = this.settings.waterRefractionEnabled && !this.settings.waterFastMode;
+        if (!refractionEnabled || !this.refractionRenderTarget || !this.waterMaterialRefraction) return;
+
+        this.refractionFrameCounter++;
+        const camPos = this.camera.position;
+        const camQuat = this.camera.quaternion;
+        const posDelta = this.lastRefractionCamPos.distanceTo(camPos);
+        const quatDot = Math.abs(this.lastRefractionCamQuat.dot(camQuat));
+        const rotDelta = quatDot < 1 ? Math.acos(Math.min(1, quatDot)) * 2 : 0;
+        const needsUpdate = this.refractionFrameCounter >= this.refractionUpdateFrames ||
+            posDelta > this.refractionMoveThreshold ||
+            rotDelta > this.refractionRotateThreshold;
+
+        if (needsUpdate) {
+            this.refractionFrameCounter = 0;
+            this.lastRefractionCamPos.copy(camPos);
+            this.lastRefractionCamQuat.copy(camQuat);
+
+            const hiddenWaterMeshes = [];
+            for (const mesh of this.waterMeshes.values()) {
+                if (mesh.visible) {
+                    mesh.visible = false;
+                    hiddenWaterMeshes.push(mesh);
+                }
+            }
+
+            const torchVisible = this.torchViewmodel?.visible ?? false;
+            if (this.torchViewmodel) {
+                this.torchViewmodel.visible = false;
+            }
+
+            this.renderer.setRenderTarget(this.refractionRenderTarget);
+            this.renderer.clear();
+            this.renderer.render(this.scene, this.camera);
+            this.renderer.setRenderTarget(null);
+
+            for (const mesh of hiddenWaterMeshes) {
+                mesh.visible = true;
+            }
+            if (this.torchViewmodel) {
+                this.torchViewmodel.visible = torchVisible;
+            }
+        }
+
+        const mat = this.waterMaterialRefraction;
+        mat.uniforms.tRefraction.value = this.refractionRenderTarget.texture;
+        mat.uniforms.time.value = performance.now() * 0.001;
+        mat.uniforms.opacity.value = this.settings.waterOpacity ?? 0.7;
+        mat.uniforms.refractionStrength.value = this.settings.waterRefractionStrength ?? 0.02;
+
+        if (this.scene.fog) {
+            mat.uniforms.fogColor.value.copy(this.scene.fog.color);
+            mat.uniforms.fogNear.value = this.scene.fog.near;
+            mat.uniforms.fogFar.value = this.scene.fog.far;
+        }
+    }
+
+    /**
      * Update chunk loading/unloading
      */
     updateChunks() {
@@ -1529,6 +1792,8 @@ export class Game {
         this.camera.aspect = window.innerWidth / window.innerHeight;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.postProcessing?.resize(window.innerWidth, window.innerHeight);
+        this.ensureRefractionTarget();
         this.renderer.setPixelRatio(this.getPixelRatio());
     }
 
@@ -1797,6 +2062,36 @@ export class Game {
             default:
                 break;
         }
+        if (key === 'dayLength' && this.dayNightCycle) {
+            this.dayNightCycle.setDayLength(value);
+        }
+        if (key === 'waterFastMode' || key === 'waterRefractionEnabled') {
+            const { material, refractionMaterial } = this.createWaterMaterialFromSettings();
+            this.applyWaterMaterial(material, refractionMaterial);
+            this.ensureRefractionTarget();
+        }
+        if (key === 'waterOpacity') {
+            updateWaterOpacity(this.waterMaterial, value);
+        }
+        if (key === 'waterColor' && this.waterMaterialRefraction?.uniforms?.waterColor) {
+            this.waterMaterialRefraction.uniforms.waterColor.value.setHex(value);
+        }
+        if (key === 'waterAbsorptionR' && this.waterMaterialRefraction?.uniforms?.absorptionR) {
+            this.waterMaterialRefraction.uniforms.absorptionR.value = value;
+        }
+        if (key === 'waterAbsorptionG' && this.waterMaterialRefraction?.uniforms?.absorptionG) {
+            this.waterMaterialRefraction.uniforms.absorptionG.value = value;
+        }
+        if (key === 'waterAbsorptionB' && this.waterMaterialRefraction?.uniforms?.absorptionB) {
+            this.waterMaterialRefraction.uniforms.absorptionB.value = value;
+        }
+        if (key === 'waterRefractionStrength' && this.waterMaterialRefraction?.uniforms?.refractionStrength) {
+            this.waterMaterialRefraction.uniforms.refractionStrength.value = value;
+        }
+
+        if (this.postProcessing) {
+            this.postProcessing.applySettings(this.settings);
+        }
 
         saveSettings(this.settings);
     }
@@ -1922,6 +2217,8 @@ export class Game {
         this.terrainMaterial?.dispose();
         this.waterMaterial?.dispose();
         this.textureAtlas?.dispose();
+        this.postProcessing?.dispose();
+        this.refractionRenderTarget?.dispose();
 
         // Dispose renderer
         this.renderer?.dispose();

@@ -378,6 +378,10 @@ export function buildChunkMesh(chunk, chunkX, chunkZ, getNeighborBlock, getLight
         waterGeometry.setAttribute('normal', new THREE.Float32BufferAttribute(waterNorm.slice(0, wVIdx), 3));
         waterGeometry.setAttribute('uv', new THREE.Float32BufferAttribute(waterUvs.slice(0, wUvIdx), 2));
         waterGeometry.setAttribute('color', new THREE.Float32BufferAttribute(waterCols.slice(0, wCIdx), 3));
+        const waterThickness = new Float32Array(wVertCount).fill(1);
+        const shoreDist = new Float32Array(wVertCount).fill(1);
+        waterGeometry.setAttribute('waterThickness', new THREE.Float32BufferAttribute(waterThickness, 1));
+        waterGeometry.setAttribute('shoreDist', new THREE.Float32BufferAttribute(shoreDist, 1));
         waterGeometry.computeBoundingSphere();
     }
 
