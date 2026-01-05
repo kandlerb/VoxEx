@@ -49,15 +49,29 @@ export function createDebugOverlay() {
  * @param {DebugInfo} info
  */
 export function updateDebugOverlay(overlay, info) {
+    // Guard against null/undefined info
+    if (!info) return;
+
+    // Safely convert values to numbers with fallbacks
+    const fps = Number(info.fps ?? 0);
+    const x = Number(info.x ?? 0);
+    const y = Number(info.y ?? 0);
+    const z = Number(info.z ?? 0);
+    const chunkX = Number(info.chunkX ?? 0);
+    const chunkZ = Number(info.chunkZ ?? 0);
+    const loadedChunks = Number(info.loadedChunks ?? 0);
+    const totalFaces = Number(info.totalFaces ?? 0);
+    const drawCalls = Number(info.drawCalls ?? 0);
+
     overlay.innerHTML = `
-        <div>FPS: ${info.fps.toFixed(0)}</div>
-        <div>Pos: ${info.x.toFixed(1)}, ${info.y.toFixed(1)}, ${info.z.toFixed(1)}</div>
-        <div>Chunk: ${info.chunkX}, ${info.chunkZ}</div>
-        <div>Biome: ${info.biome}</div>
-        <div>Loaded Chunks: ${info.loadedChunks}</div>
-        <div>Faces: ${info.totalFaces.toLocaleString()}</div>
-        <div>Draw Calls: ${info.drawCalls}</div>
-        <div>Seed: ${info.seed}</div>
+        <div>FPS: ${fps.toFixed(0)}</div>
+        <div>Pos: ${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)}</div>
+        <div>Chunk: ${chunkX}, ${chunkZ}</div>
+        <div>Biome: ${info.biome ?? 'unknown'}</div>
+        <div>Loaded Chunks: ${loadedChunks}</div>
+        <div>Faces: ${totalFaces.toLocaleString()}</div>
+        <div>Draw Calls: ${drawCalls}</div>
+        <div>Seed: ${info.seed ?? ''}</div>
     `;
 }
 

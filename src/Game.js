@@ -1667,9 +1667,9 @@ export class Game {
 
         this.uiManager.updateDebug({
             fps: this.stats.fps,
-            x: pos.x.toFixed(1),
-            y: pos.y.toFixed(1),
-            z: pos.z.toFixed(1),
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
             chunkX: cx,
             chunkZ: cz,
             biome: biome?.name || 'unknown',
