@@ -12,7 +12,7 @@ import { AIR, WATER, TORCH, GRASS, BEDROCK } from './core/constants.js';
 // Config
 import { BLOCK_CONFIG } from './config/BlockConfig.js';
 import { CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_VOLUME, SEA_LEVEL, Y_OFFSET } from './config/WorldConfig.js';
-import { DEFAULTS } from './config/Settings.js';
+import { DEFAULTS, SETTINGS_PROFILES, loadSettings, saveSettings } from './config/Settings.js';
 import { DEFAULT_BINDINGS, getHotbarSlotFromKey } from './input/ControlBindings.js';
 
 // Optimization
@@ -36,7 +36,7 @@ import { EntityManager } from './entities/EntityManager.js';
 // Render
 import { createTextureAtlas } from './render/textures/TextureAtlas.js';
 import { createTerrainMaterial } from './render/materials/TerrainMaterial.js';
-import { createWaterMaterial } from './render/materials/WaterMaterial.js';
+import { createWaterMaterial, updateWaterOpacity } from './render/materials/WaterMaterial.js';
 import { buildChunkMesh, disposeChunkGeometry } from './render/meshing/ChunkMesher.js';
 import { DayNightCycle } from './render/sky/DayNightCycle.js';
 import { createTorchViewmodel } from './render/models/TorchModel.js';
@@ -121,7 +121,9 @@ export class Game {
         this.animationId = null;
 
         // Settings
-        this.settings = { ...DEFAULTS };
+        this.settings = loadSettings();
+        this.activeProfileName = this.loadActiveProfile();
+        this.customProfile = this.loadCustomProfile();
         this.bindings = { ...DEFAULT_BINDINGS };
 
         // Stats
@@ -174,6 +176,9 @@ export class Game {
         // Initialize viewmodels
         this.initViewmodels();
 
+        // Apply settings to systems after initialization
+        this.applySettingsToSystems();
+
         // Event listeners
         window.addEventListener('resize', this.onWindowResize);
 
@@ -189,8 +194,9 @@ export class Game {
             powerPreference: 'high-performance'
         });
         this.renderer.setSize(window.innerWidth, window.innerHeight);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        this.renderer.setClearColor(0x87CEEB);
+        this.renderer.setPixelRatio(this.getPixelRatio());
+        this.renderer.setClearColor(this.settings.daySkyBottom ?? 0x87CEEB);
+        this.renderer.shadowMap.enabled = Boolean(this.settings.shadows);
         this.container.appendChild(this.renderer.domElement);
     }
 
@@ -199,15 +205,22 @@ export class Game {
      */
     initScene() {
         this.scene = new THREE.Scene();
-        this.scene.fog = new THREE.Fog(0x87CEEB, 10, this.settings.renderDistance * CHUNK_SIZE);
+        if (this.settings.fog) {
+            this.scene.fog = new THREE.Fog(
+                this.settings.fogColor ?? 0x87CEEB,
+                10,
+                this.settings.renderDistance * CHUNK_SIZE
+            );
+        }
 
         // Ambient light
-        this.ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        this.ambientLight = new THREE.AmbientLight(0xffffff, this.settings.ambientIntensity ?? 0.4);
         this.scene.add(this.ambientLight);
 
         // Directional light (sun)
-        this.sunLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        this.sunLight = new THREE.DirectionalLight(this.settings.sunColor ?? 0xffffff, this.settings.sunIntensity ?? 0.8);
         this.sunLight.position.set(100, 200, 100);
+        this.sunLight.castShadow = Boolean(this.settings.shadows);
         this.scene.add(this.sunLight);
     }
 
@@ -219,7 +232,7 @@ export class Game {
             this.settings.normalFOV || 75,
             window.innerWidth / window.innerHeight,
             0.1,
-            1000
+            this.getCameraFar()
         );
         this.camera.position.set(0, 80, 0);
     }
@@ -257,7 +270,12 @@ export class Game {
         this.terrainMaterial = createTerrainMaterial(this.textureAtlas, {
             useStandardMaterial: true
         });
-        this.waterMaterial = createWaterMaterial(this.textureAtlas);
+        this.waterMaterial = createWaterMaterial(this.textureAtlas, {
+            opacity: this.settings.waterOpacity ?? 0.7
+        });
+        if (this.waterMaterial.color) {
+            this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+        }
     }
 
     /**
@@ -440,7 +458,11 @@ export class Game {
      * Initialize torch viewmodel
      */
     initViewmodels() {
-        this.torchViewmodel = createTorchViewmodel();
+        this.torchViewmodel = createTorchViewmodel({
+            lightIntensity: this.settings.torchIntensity ?? 1,
+            lightDistance: this.settings.torchRange ?? 10,
+            lightColor: this.settings.torchColor ?? 0xff6600
+        });
         this.torchViewmodel.visible = false;
         this.torchViewmodel.position.set(0.35, -0.35, -0.5);
         this.camera.add(this.torchViewmodel);
@@ -895,6 +917,7 @@ export class Game {
 
         // Apply to scene
         this.dayNightCycle.applyToScene(this.scene, this.ambientLight, this.sunLight, null);
+        this.applyLightingSettings();
     }
 
     /**
@@ -1111,6 +1134,223 @@ export class Game {
         this.camera.aspect = window.innerWidth / window.innerHeight;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(this.getPixelRatio());
+    }
+
+    /**
+     * Get renderer pixel ratio based on settings
+     * @returns {number}
+     */
+    getPixelRatio() {
+        const ratio = this.settings.pixelRatio ?? 1;
+        return Math.min(window.devicePixelRatio * ratio, 2);
+    }
+
+    /**
+     * Get camera far plane distance
+     * @returns {number}
+     */
+    getCameraFar() {
+        return Math.max(200, (this.settings.renderDistance + 2) * CHUNK_SIZE);
+    }
+
+    /**
+     * Load custom profile from storage
+     * @returns {Object}
+     */
+    loadCustomProfile() {
+        if (typeof localStorage === 'undefined') {
+            return { ...DEFAULTS };
+        }
+        try {
+            const stored = JSON.parse(localStorage.getItem('voxex_custom_profile') || 'null');
+            return stored || { ...DEFAULTS };
+        } catch (e) {
+            console.warn('[Game] Failed to load custom profile:', e);
+            return { ...DEFAULTS };
+        }
+    }
+
+    /**
+     * Load active profile name from storage
+     * @returns {string|null}
+     */
+    loadActiveProfile() {
+        if (typeof localStorage === 'undefined') {
+            return null;
+        }
+        return localStorage.getItem('voxex_active_profile');
+    }
+
+    /**
+     * Save current settings as custom profile
+     */
+    saveCustomProfile() {
+        this.customProfile = {};
+        const profileKeys = Object.keys(SETTINGS_PROFILES.balanced ?? {});
+        profileKeys.forEach((key) => {
+            if (key in this.settings) {
+                this.customProfile[key] = this.settings[key];
+            }
+        });
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('voxex_custom_profile', JSON.stringify(this.customProfile));
+        }
+        this.applySettingsProfile('custom');
+    }
+
+    /**
+     * Apply a settings profile
+     * @param {string} profileName
+     */
+    applySettingsProfile(profileName) {
+        const profile = profileName === 'custom' ? this.customProfile : SETTINGS_PROFILES[profileName];
+        if (!profile) return;
+
+        Object.entries(profile).forEach(([key, value]) => {
+            if (key in this.settings) {
+                this.settings[key] = value;
+            }
+        });
+
+        this.activeProfileName = profileName;
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('voxex_active_profile', profileName);
+        }
+
+        this.applySettingsToSystems();
+        saveSettings(this.settings);
+    }
+
+    /**
+     * Apply settings to all systems
+     */
+    applySettingsToSystems() {
+        this.applyRendererSettings();
+        this.applySceneSettings();
+        this.applyCameraSettings();
+        this.applyDayNightSettings();
+        this.applyLightingSettings();
+        this.applyMaterialSettings();
+        this.applyViewmodelSettings();
+    }
+
+    /**
+     * Apply renderer-related settings
+     */
+    applyRendererSettings() {
+        if (!this.renderer) return;
+        this.renderer.setPixelRatio(this.getPixelRatio());
+        this.renderer.shadowMap.enabled = Boolean(this.settings.shadows);
+    }
+
+    /**
+     * Apply scene-related settings
+     */
+    applySceneSettings() {
+        if (!this.scene) return;
+
+        if (this.settings.fog) {
+            if (!this.scene.fog) {
+                this.scene.fog = new THREE.Fog(
+                    this.settings.fogColor ?? 0x87CEEB,
+                    10,
+                    this.settings.renderDistance * CHUNK_SIZE
+                );
+            }
+            this.scene.fog.color.setHex(this.settings.fogColor ?? 0x87CEEB);
+            this.scene.fog.far = this.settings.renderDistance * CHUNK_SIZE;
+        } else {
+            this.scene.fog = null;
+        }
+    }
+
+    /**
+     * Apply camera-related settings
+     */
+    applyCameraSettings() {
+        if (!this.camera) return;
+        this.camera.fov = this.settings.normalFOV || 75;
+        this.camera.far = this.getCameraFar();
+        this.camera.updateProjectionMatrix();
+    }
+
+    /**
+     * Apply day/night settings
+     */
+    applyDayNightSettings() {
+        if (!this.dayNightCycle) return;
+        this.dayNightCycle.setDayLength(this.settings.dayLength || 1200);
+    }
+
+    /**
+     * Apply lighting-related settings
+     */
+    applyLightingSettings() {
+        if (!this.ambientLight || !this.sunLight) return;
+
+        const baseAmbient = this.dayNightCycle?.getAmbientIntensity() ?? 0.4;
+        const baseSun = this.dayNightCycle?.sunIntensity ?? 0.8;
+
+        this.ambientLight.intensity = baseAmbient * (this.settings.ambientIntensity ?? 1);
+        this.sunLight.intensity = baseSun * (this.settings.sunIntensity ?? 1);
+        this.sunLight.color.setHex(this.settings.sunColor ?? 0xffffff);
+    }
+
+    /**
+     * Apply material-related settings
+     */
+    applyMaterialSettings() {
+        if (this.waterMaterial) {
+            updateWaterOpacity(this.waterMaterial, this.settings.waterOpacity ?? 0.7);
+            if (this.waterMaterial.color) {
+                this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+            }
+        }
+    }
+
+    /**
+     * Apply viewmodel-related settings
+     */
+    applyViewmodelSettings() {
+        const torchLight = this.torchViewmodel?.userData?.light;
+        if (torchLight) {
+            torchLight.intensity = this.settings.torchIntensity ?? torchLight.intensity;
+            torchLight.distance = this.settings.torchRange ?? torchLight.distance;
+            torchLight.color.setHex(this.settings.torchColor ?? 0xff6600);
+        }
+    }
+
+    /**
+     * Rebuild materials for texture resolution changes
+     */
+    rebuildMaterials() {
+        const atlasResult = createTextureAtlas(this.settings.textureResolution || 16);
+        const oldAtlas = this.textureAtlas;
+        const oldTerrain = this.terrainMaterial;
+        const oldWater = this.waterMaterial;
+
+        this.textureAtlas = atlasResult.texture;
+        this.terrainMaterial = createTerrainMaterial(this.textureAtlas, {
+            useStandardMaterial: true
+        });
+        this.waterMaterial = createWaterMaterial(this.textureAtlas, {
+            opacity: this.settings.waterOpacity ?? 0.7
+        });
+        if (this.waterMaterial.color) {
+            this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+        }
+
+        this.solidMeshes.forEach(mesh => {
+            mesh.material = this.terrainMaterial;
+        });
+        this.waterMeshes.forEach(mesh => {
+            mesh.material = this.waterMaterial;
+        });
+
+        oldTerrain?.dispose();
+        oldWater?.dispose();
+        oldAtlas?.dispose();
     }
 
     /**
@@ -1121,12 +1361,49 @@ export class Game {
     updateSetting(key, value) {
         this.settings[key] = value;
 
-        if (key === 'normalFOV' || key === 'sprintFOV') {
-            // FOV will update in animate loop
+        switch (key) {
+            case 'normalFOV':
+                this.applyCameraSettings();
+                break;
+            case 'renderDistance':
+                this.applySceneSettings();
+                this.applyCameraSettings();
+                break;
+            case 'fog':
+            case 'fogColor':
+                this.applySceneSettings();
+                break;
+            case 'antialiasing':
+                console.warn('[Game] Antialiasing changes require a full reload to take effect.');
+                break;
+            case 'pixelRatio':
+                this.applyRendererSettings();
+                break;
+            case 'textureResolution':
+                this.rebuildMaterials();
+                break;
+            case 'waterOpacity':
+            case 'waterColor':
+                this.applyMaterialSettings();
+                break;
+            case 'sunColor':
+            case 'sunIntensity':
+            case 'ambientIntensity':
+                this.applyLightingSettings();
+                break;
+            case 'torchColor':
+            case 'torchIntensity':
+            case 'torchRange':
+                this.applyViewmodelSettings();
+                break;
+            case 'dayLength':
+                this.applyDayNightSettings();
+                break;
+            default:
+                break;
         }
-        if (key === 'renderDistance') {
-            this.scene.fog.far = value * CHUNK_SIZE;
-        }
+
+        saveSettings(this.settings);
     }
 
     /**
