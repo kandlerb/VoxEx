@@ -5,7 +5,8 @@
 
 import { noise2D, treePlacementValue } from '../../../math/noise.js';
 import { TREE_CONFIG, resolveTreeProfile } from '../../../config/TreeConfig.js';
-import { LOG, LEAVES, LONGWOOD_LOG, LONGWOOD_LEAVES, AIR } from '../../../core/constants.js';
+import { LOG_BLOCK_IDS, LEAF_BLOCK_IDS, isLogBlock, isLeafBlock } from '../../../config/BlockConfig.js';
+import { AIR } from '../../../core/constants.js';
 import { WORLD_DIMS, SEA_LEVEL, getChunkKey } from '../../../config/WorldConfig.js';
 import { forEachCanopyVoxel, forEachTrunkBranch } from './CanopyBuilder.js';
 
@@ -32,35 +33,7 @@ function seededRandom(seed, gx, gz, x, y, z) {
     return (h >>> 0) / 4294967296;
 }
 
-/**
- * Set of log block IDs for identification
- * @type {Set<number>}
- */
-export const LOG_BLOCK_IDS = new Set([LOG, LONGWOOD_LOG]);
-
-/**
- * Set of leaf block IDs for identification
- * @type {Set<number>}
- */
-export const LEAF_BLOCK_IDS = new Set([LEAVES, LONGWOOD_LEAVES]);
-
-/**
- * Check if a block ID is a log block
- * @param {number} blockId
- * @returns {boolean}
- */
-export function isLogBlock(blockId) {
-    return LOG_BLOCK_IDS.has(blockId);
-}
-
-/**
- * Check if a block ID is a leaf block
- * @param {number} blockId
- * @returns {boolean}
- */
-export function isLeafBlock(blockId) {
-    return LEAF_BLOCK_IDS.has(blockId);
-}
+export { LOG_BLOCK_IDS, LEAF_BLOCK_IDS, isLogBlock, isLeafBlock };
 
 /**
  * Check if ground block is valid for tree placement

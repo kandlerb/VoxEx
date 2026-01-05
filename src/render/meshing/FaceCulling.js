@@ -3,6 +3,7 @@
  * @module render/meshing/FaceCulling
  */
 
+import { isLeafBlock } from '../../config/BlockConfig.js';
 import { AIR, WATER, UNLOADED_BLOCK } from '../../core/constants.js';
 import { buildBlockLookups } from '../../optimization/BlockLookups.js';
 
@@ -71,7 +72,7 @@ export function shouldRenderFace(blockId, neighborId) {
 
     // Water only draws faces against air or leaves
     if (blockId === WATER) {
-        return neighborId === AIR || isLeafBlockInternal(neighborId);
+        return neighborId === AIR || isLeafBlock(neighborId);
     }
 
     // For transparent blocks, check neighbor transparency
@@ -104,16 +105,6 @@ export function isSolid(blockId) {
 export function isOpaque(blockId) {
     const { BLOCK_IS_SOLID, IS_TRANSPARENT } = getLookups();
     return BLOCK_IS_SOLID[blockId] === 1 && IS_TRANSPARENT[blockId] === 0;
-}
-
-/**
- * Internal leaf block check without import cycle
- * @param {number} blockId - Block ID to check
- * @returns {boolean} True if leaf block
- */
-function isLeafBlockInternal(blockId) {
-    // Leaf block IDs: 6 (LEAVES), 14 (LONGWOOD_LEAVES)
-    return blockId === 6 || blockId === 14;
 }
 
 /**
