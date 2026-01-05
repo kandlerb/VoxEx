@@ -1,8 +1,10 @@
 /**
  * VoxEx Settings Configuration
- * Game settings and profiles.
+ * Game settings, profiles, and SettingsManager class.
  * @module config/Settings
  */
+
+import { WORLD_DIMS } from './WorldConfig.js';
 
 // =====================================================
 // RUNTIME-ONLY CONSTANTS (not persisted to localStorage)
@@ -548,5 +550,299 @@ export function saveSettings(settings) {
         } catch (e) {
             console.warn('[Settings] Failed to save settings:', e);
         }
+    }
+}
+
+// =====================================================
+// SETTINGS - Live mutable settings object
+// =====================================================
+
+/**
+ * Live settings object - initialized with loaded settings.
+ * This is the global mutable settings state used throughout the game.
+ * @type {Object}
+ */
+export let SETTINGS = loadSettings();
+
+/**
+ * Reinitialize SETTINGS from localStorage.
+ * Call this to reload settings after external changes.
+ * @returns {void}
+ */
+export function reloadSettings() {
+    SETTINGS = loadSettings();
+}
+
+// =====================================================
+// CUSTOM PROFILE SUPPORT
+// =====================================================
+
+/**
+ * Custom profile - saved by user, stored in localStorage
+ * @type {Object}
+ */
+export let CUSTOM_PROFILE = (() => {
+    if (typeof localStorage !== 'undefined') {
+        try {
+            return JSON.parse(localStorage.getItem('voxex_custom_profile') || 'null') || { ...DEFAULTS };
+        } catch (e) {
+            return { ...DEFAULTS };
+        }
+    }
+    return { ...DEFAULTS };
+})();
+
+/**
+ * Save custom profile to localStorage
+ * @param {Object} profile - Profile settings to save
+ */
+export function saveCustomProfile(profile) {
+    CUSTOM_PROFILE = { ...profile };
+    if (typeof localStorage !== 'undefined') {
+        try {
+            localStorage.setItem('voxex_custom_profile', JSON.stringify(CUSTOM_PROFILE));
+        } catch (e) {
+            console.warn('[Settings] Failed to save custom profile:', e);
+        }
+    }
+}
+
+/**
+ * Current active profile name
+ * @type {string|null}
+ */
+export let activeProfileName = (() => {
+    if (typeof localStorage !== 'undefined') {
+        return localStorage.getItem('voxex_active_profile') || null;
+    }
+    return null;
+})();
+
+/**
+ * Set the active profile name
+ * @param {string|null} name - Profile name or null for custom
+ */
+export function setActiveProfileName(name) {
+    activeProfileName = name;
+    if (typeof localStorage !== 'undefined') {
+        if (name) {
+            localStorage.setItem('voxex_active_profile', name);
+        } else {
+            localStorage.removeItem('voxex_active_profile');
+        }
+    }
+}
+
+// =====================================================
+// SETTINGS MANAGER CLASS
+// =====================================================
+// OPTIMIZATION AUDIT (2025-12-15):
+// - NOT a hot path: Only called at init and on user settings changes
+// - The main animate loop uses the plain SETTINGS object directly
+// - All methods are O(1) or O(n) where n = number of settings keys (small)
+// - No allocations in loops, no GC pressure concerns
+// - Status: All methods marked "no-op" - already optimal for their use case
+
+/**
+ * SettingsManager - handles game settings with localStorage persistence.
+ * Supports listeners for reactive setting changes.
+ */
+export class SettingsManager {
+    /**
+     * Create a new SettingsManager.
+     * @param {Object} defaults - Default settings object.
+     * @param {Object} [options] - Optional configuration.
+     * @param {boolean} [options.debug=false] - Enable debug call counting.
+     */
+    constructor(defaults, options = {}) {
+        this.defaults = { ...defaults };
+        this.values = { ...defaults };
+        this.listeners = new Map();
+        this._debug = options.debug || false;
+        // DEBUG: Call counters for hot-path verification (only in debug mode)
+        this._callCounts = { get: 0, set: 0, save: 0, load: 0 };
+    }
+
+    /**
+     * Load settings from localStorage.
+     * @returns {void}
+     */
+    loadFromStorage() {
+        if (this._debug) this._callCounts.load++;
+        if (typeof localStorage === 'undefined') return;
+        try {
+            const saved = JSON.parse(localStorage.getItem('voxex_settings')) || {};
+            for (const key of Object.keys(this.defaults)) {
+                if (saved[key] !== undefined) {
+                    this.values[key] = saved[key];
+                }
+            }
+        } catch (e) {
+            console.warn('[SettingsManager] Failed to load settings from storage:', e);
+        }
+    }
+
+    /**
+     * Save settings to localStorage.
+     * @returns {void}
+     */
+    saveToStorage() {
+        if (this._debug) this._callCounts.save++;
+        if (typeof localStorage === 'undefined') return;
+        try {
+            localStorage.setItem('voxex_settings', JSON.stringify(this.values));
+        } catch (e) {
+            console.warn('[SettingsManager] Failed to save settings to storage:', e);
+        }
+    }
+
+    /**
+     * Get a setting value.
+     * @param {string} key - Setting key.
+     * @returns {unknown} Setting value or default.
+     */
+    get(key) {
+        if (this._debug) this._callCounts.get++;
+        return this.values[key] !== undefined ? this.values[key] : this.defaults[key];
+    }
+
+    /**
+     * Set a setting value and notify listeners.
+     * @param {string} key - Setting key.
+     * @param {unknown} value - New value.
+     * @returns {void}
+     */
+    set(key, value) {
+        if (this._debug) this._callCounts.set++;
+        const oldValue = this.values[key];
+        this.values[key] = value;
+        // Notify listeners
+        if (this.listeners.has(key)) {
+            for (const callback of this.listeners.get(key)) {
+                callback(value, oldValue, key);
+            }
+        }
+        this.saveToStorage();
+    }
+
+    /**
+     * Register a callback for setting changes.
+     * @param {string} key - Setting key to watch.
+     * @param {Function} callback - Callback(value, oldValue, key).
+     * @returns {void}
+     */
+    onChange(key, callback) {
+        if (!this.listeners.has(key)) {
+            this.listeners.set(key, []);
+        }
+        this.listeners.get(key).push(callback);
+    }
+
+    /**
+     * Unregister a callback for setting changes.
+     * @param {string} key - Setting key.
+     * @param {Function} callback - Callback to remove.
+     * @returns {boolean} True if callback was found and removed.
+     */
+    offChange(key, callback) {
+        if (!this.listeners.has(key)) return false;
+        const callbacks = this.listeners.get(key);
+        const index = callbacks.indexOf(callback);
+        if (index !== -1) {
+            callbacks.splice(index, 1);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Reset a setting or all settings to defaults.
+     * @param {string} [key] - Setting key to reset (omit for all).
+     * @returns {void}
+     */
+    reset(key) {
+        if (key) {
+            this.set(key, this.defaults[key]);
+        } else {
+            this.values = { ...this.defaults };
+            this.saveToStorage();
+        }
+    }
+
+    /**
+     * Apply settings to the render engine.
+     * @param {Object|null} renderEngine - Render engine instance with scene and renderer.
+     * @returns {void}
+     */
+    applyToRender(renderEngine) {
+        if (!renderEngine) return;
+        // Apply fog settings
+        if (renderEngine.scene?.fog) {
+            renderEngine.scene.fog.far = this.get('renderDistance') * WORLD_DIMS.chunkSize;
+        }
+        // Apply shadow settings
+        if (renderEngine.renderer) {
+            renderEngine.renderer.shadowMap.enabled = this.get('shadows');
+        }
+    }
+
+    /**
+     * Get debug call statistics.
+     * @returns {{get: number, set: number, save: number, load: number}} Copy of call counts.
+     */
+    getCallStats() {
+        return { ...this._callCounts };
+    }
+
+    /**
+     * Reset debug call counters.
+     * @returns {void}
+     */
+    resetCallStats() {
+        this._callCounts.get = 0;
+        this._callCounts.set = 0;
+        this._callCounts.save = 0;
+        this._callCounts.load = 0;
+    }
+
+    /**
+     * Get all current values as a plain object.
+     * @returns {Object} Copy of all current settings.
+     */
+    getAll() {
+        return { ...this.values };
+    }
+
+    /**
+     * Set multiple values at once.
+     * @param {Object} values - Object with key-value pairs to set.
+     * @param {boolean} [notify=true] - Whether to notify listeners.
+     * @returns {void}
+     */
+    setMany(values, notify = true) {
+        for (const [key, value] of Object.entries(values)) {
+            if (notify) {
+                this.set(key, value);
+            } else {
+                this.values[key] = value;
+            }
+        }
+        if (!notify) {
+            this.saveToStorage();
+        }
+    }
+
+    /**
+     * Apply a settings profile.
+     * @param {string} profileName - Name of the profile to apply.
+     * @returns {boolean} True if profile was found and applied.
+     */
+    applyProfile(profileName) {
+        const profile = SETTINGS_PROFILES[profileName];
+        if (profile) {
+            this.setMany(profile);
+            return true;
+        }
+        return false;
     }
 }
