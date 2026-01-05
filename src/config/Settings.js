@@ -283,6 +283,28 @@ export const SETTINGS_PROFILES = {
     },
 };
 
+const STORAGE_KEYS = {
+    settings: 'voxex_settings',
+    customProfile: 'voxex_custom_profile',
+    activeProfile: 'voxex_active_profile'
+};
+
+function safeReadStorage(key, fallback) {
+    if (typeof localStorage === 'undefined') {
+        return fallback;
+    }
+    try {
+        const raw = localStorage.getItem(key);
+        if (!raw) {
+            return fallback;
+        }
+        return JSON.parse(raw);
+    } catch (error) {
+        console.warn(`[Settings] Failed to read ${key}:`, error);
+        return fallback;
+    }
+}
+
 /**
  * Create a default settings object
  * @returns {Object} Copy of default settings
@@ -314,20 +336,63 @@ export function getProfileNames() {
 }
 
 /**
+ * Load custom profile from localStorage
+ * @returns {Object} Custom profile data
+ */
+export function loadCustomProfile() {
+    const stored = safeReadStorage(STORAGE_KEYS.customProfile, null);
+    return stored || { ...DEFAULTS };
+}
+
+/**
+ * Save custom profile to localStorage
+ * @param {Object} profile
+ */
+export function saveCustomProfile(profile) {
+    if (typeof localStorage === 'undefined') {
+        return;
+    }
+    try {
+        localStorage.setItem(STORAGE_KEYS.customProfile, JSON.stringify(profile));
+    } catch (error) {
+        console.warn('[Settings] Failed to save custom profile:', error);
+    }
+}
+
+/**
+ * Load active profile name from localStorage
+ * @returns {string|null}
+ */
+export function loadActiveProfile() {
+    if (typeof localStorage === 'undefined') {
+        return null;
+    }
+    return localStorage.getItem(STORAGE_KEYS.activeProfile);
+}
+
+/**
+ * Save active profile name to localStorage
+ * @param {string|null} profileName
+ */
+export function saveActiveProfile(profileName) {
+    if (typeof localStorage === 'undefined') {
+        return;
+    }
+    if (profileName === null || profileName === undefined) {
+        localStorage.removeItem(STORAGE_KEYS.activeProfile);
+        return;
+    }
+    localStorage.setItem(STORAGE_KEYS.activeProfile, String(profileName));
+}
+
+/**
  * Load settings from localStorage, merging with defaults.
  * Creates a runtime SETTINGS object matching the source voxEx.html behavior.
  * @returns {Object} Settings object with saved values and defaults
  */
 export function loadSettings() {
     // Load saved settings from localStorage (browser-only)
-    let savedSettings = {};
-    if (typeof localStorage !== 'undefined') {
-        try {
-            savedSettings = JSON.parse(localStorage.getItem('voxex_settings')) || {};
-        } catch (e) {
-            savedSettings = {};
-        }
-    }
+    const savedSettings = safeReadStorage(STORAGE_KEYS.settings, {}) || {};
     const savedLighting = savedSettings.lighting || {};
 
     // Build runtime SETTINGS object matching source voxEx.html
@@ -544,9 +609,65 @@ export function saveSettings(settings) {
             // Create a copy without runtime-only constants
             const toSave = { ...settings };
             Object.keys(RUNTIME_CONSTANTS).forEach(key => delete toSave[key]);
-            localStorage.setItem('voxex_settings', JSON.stringify(toSave));
+            localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(toSave));
         } catch (e) {
             console.warn('[Settings] Failed to save settings:', e);
         }
     }
+}
+
+/**
+ * Runtime settings object (mutable singleton)
+ * @type {Object}
+ */
+export const SETTINGS = loadSettings();
+
+/**
+ * Custom profile state
+ * @type {Object}
+ */
+export let CUSTOM_PROFILE = loadCustomProfile();
+
+/**
+ * Active profile name state
+ * @type {string|null}
+ */
+export let ACTIVE_PROFILE_NAME = loadActiveProfile();
+
+/**
+ * Get the current custom profile state
+ * @returns {Object}
+ */
+export function getCustomProfile() {
+    return CUSTOM_PROFILE;
+}
+
+/**
+ * Set and persist the custom profile state
+ * @param {Object} profile
+ * @returns {Object}
+ */
+export function setCustomProfile(profile) {
+    CUSTOM_PROFILE = { ...profile };
+    saveCustomProfile(CUSTOM_PROFILE);
+    return CUSTOM_PROFILE;
+}
+
+/**
+ * Get the active profile name state
+ * @returns {string|null}
+ */
+export function getActiveProfileName() {
+    return ACTIVE_PROFILE_NAME;
+}
+
+/**
+ * Set and persist the active profile name state
+ * @param {string|null} profileName
+ * @returns {string|null}
+ */
+export function setActiveProfileName(profileName) {
+    ACTIVE_PROFILE_NAME = profileName ?? null;
+    saveActiveProfile(ACTIVE_PROFILE_NAME);
+    return ACTIVE_PROFILE_NAME;
 }

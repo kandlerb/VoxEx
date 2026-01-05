@@ -12,7 +12,15 @@ import { AIR, WATER, TORCH, GRASS, BEDROCK } from './core/constants.js';
 // Config
 import { BLOCK_CONFIG } from './config/BlockConfig.js';
 import { CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_VOLUME, SEA_LEVEL, Y_OFFSET } from './config/WorldConfig.js';
-import { DEFAULTS, SETTINGS_PROFILES, loadSettings, saveSettings } from './config/Settings.js';
+import {
+    SETTINGS,
+    SETTINGS_PROFILES,
+    getActiveProfileName,
+    getCustomProfile,
+    saveSettings,
+    setActiveProfileName,
+    setCustomProfile
+} from './config/Settings.js';
 import { DEFAULT_BINDINGS, getHotbarSlotFromKey } from './input/ControlBindings.js';
 import { PLAYER_PHYSICS } from './config/PlayerConfig.js';
 
@@ -154,9 +162,9 @@ export class Game {
         this.animationId = null;
 
         // Settings
-        this.settings = loadSettings();
-        this.activeProfileName = this.loadActiveProfile();
-        this.customProfile = this.loadCustomProfile();
+        this.settings = SETTINGS;
+        this.activeProfileName = getActiveProfileName();
+        this.customProfile = getCustomProfile();
         this.bindings = { ...DEFAULT_BINDINGS };
 
         // Persistence
@@ -1815,47 +1823,17 @@ export class Game {
     }
 
     /**
-     * Load custom profile from storage
-     * @returns {Object}
-     */
-    loadCustomProfile() {
-        if (typeof localStorage === 'undefined') {
-            return { ...DEFAULTS };
-        }
-        try {
-            const stored = JSON.parse(localStorage.getItem('voxex_custom_profile') || 'null');
-            return stored || { ...DEFAULTS };
-        } catch (e) {
-            console.warn('[Game] Failed to load custom profile:', e);
-            return { ...DEFAULTS };
-        }
-    }
-
-    /**
-     * Load active profile name from storage
-     * @returns {string|null}
-     */
-    loadActiveProfile() {
-        if (typeof localStorage === 'undefined') {
-            return null;
-        }
-        return localStorage.getItem('voxex_active_profile');
-    }
-
-    /**
      * Save current settings as custom profile
      */
     saveCustomProfile() {
-        this.customProfile = {};
+        const nextProfile = {};
         const profileKeys = Object.keys(SETTINGS_PROFILES.balanced ?? {});
         profileKeys.forEach((key) => {
             if (key in this.settings) {
-                this.customProfile[key] = this.settings[key];
+                nextProfile[key] = this.settings[key];
             }
         });
-        if (typeof localStorage !== 'undefined') {
-            localStorage.setItem('voxex_custom_profile', JSON.stringify(this.customProfile));
-        }
+        this.customProfile = setCustomProfile(nextProfile);
         this.applySettingsProfile('custom');
     }
 
@@ -1873,10 +1851,7 @@ export class Game {
             }
         });
 
-        this.activeProfileName = profileName;
-        if (typeof localStorage !== 'undefined') {
-            localStorage.setItem('voxex_active_profile', profileName);
-        }
+        this.activeProfileName = setActiveProfileName(profileName);
 
         this.applySettingsToSystems();
         saveSettings(this.settings);
