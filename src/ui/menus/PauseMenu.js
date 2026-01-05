@@ -9,7 +9,7 @@ import { createMenuButton } from './MainMenu.js';
  * Create pause menu
  * @param {Object} callbacks
  * @param {Function} callbacks.onResume
- * @param {Function} callbacks.onSave
+ * @param {(name?: string) => void} callbacks.onSave
  * @param {Function} callbacks.onLoad
  * @param {Function} callbacks.onSettings
  * @param {Function} callbacks.onQuit
@@ -38,6 +38,54 @@ export function createPauseMenu(callbacks) {
         margin-bottom: 30px;
     `;
     menu.appendChild(title);
+
+    // Save row
+    const saveRow = document.createElement('div');
+    saveRow.style.cssText = `
+        display: flex;
+        gap: 10px;
+        width: 320px;
+        margin-bottom: 20px;
+    `;
+
+    const saveInput = document.createElement('input');
+    saveInput.type = 'text';
+    saveInput.id = 'pause-save-name';
+    saveInput.placeholder = 'Save name...';
+    saveInput.style.cssText = `
+        flex: 1;
+        padding: 10px 12px;
+        background: #222;
+        border: 1px solid #555;
+        border-radius: 6px;
+        color: #fff;
+        font-size: 14px;
+    `;
+
+    const saveButton = document.createElement('button');
+    saveButton.textContent = 'Save';
+    saveButton.style.cssText = `
+        padding: 10px 16px;
+        background: #4caf50;
+        border: 1px solid #4caf50;
+        border-radius: 6px;
+        color: #fff;
+        cursor: pointer;
+        transition: all 0.2s;
+    `;
+    saveButton.addEventListener('mouseenter', () => {
+        saveButton.style.background = '#5cbf60';
+        saveButton.style.borderColor = '#5cbf60';
+    });
+    saveButton.addEventListener('mouseleave', () => {
+        saveButton.style.background = '#4caf50';
+        saveButton.style.borderColor = '#4caf50';
+    });
+    saveButton.addEventListener('click', () => callbacks.onSave(saveInput.value));
+
+    saveRow.appendChild(saveInput);
+    saveRow.appendChild(saveButton);
+    menu.appendChild(saveRow);
 
     // Buttons
     const buttonContainer = document.createElement('div');
