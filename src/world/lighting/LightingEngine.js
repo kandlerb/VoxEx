@@ -16,7 +16,8 @@ import {
     hasLightingData
 } from './CrossChunkLight.js';
 import { SunlightTask, createLightTaskTracker, finalizeLightTracker } from './SunlightTask.js';
-import { posToIndex, indexToPos, getCombinedLight, getChunkKey, parseChunkKey } from './LightPropagation.js';
+import { posToIndex, indexToPos, getCombinedLight } from './LightPropagation.js';
+import { getChunkKey, parseChunkKey } from '../../config/WorldConfig.js';
 
 // =====================================================
 // LIGHTING ENGINE

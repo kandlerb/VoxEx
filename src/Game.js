@@ -11,7 +11,15 @@ import { AIR, WATER, TORCH, GRASS, BEDROCK } from './core/constants.js';
 
 // Config
 import { BLOCK_CONFIG } from './config/BlockConfig.js';
-import { CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_VOLUME, SEA_LEVEL, Y_OFFSET } from './config/WorldConfig.js';
+import {
+    CHUNK_SIZE,
+    CHUNK_HEIGHT,
+    CHUNK_VOLUME,
+    SEA_LEVEL,
+    Y_OFFSET,
+    getChunkKey,
+    parseChunkKey
+} from './config/WorldConfig.js';
 import { DEFAULTS, SETTINGS_PROFILES, loadSettings, saveSettings } from './config/Settings.js';
 import { DEFAULT_BINDINGS, getHotbarSlotFromKey } from './input/ControlBindings.js';
 import { PLAYER_PHYSICS } from './config/PlayerConfig.js';
@@ -26,7 +34,6 @@ import { InputManager } from './input/InputManager.js';
 import { pickVoxel, getPlacementPosition } from './physics/Raycast.js';
 
 // World
-import { getChunkKey, parseChunkKey } from './world/Chunk.js';
 import { ChunkGenerator } from './world/generation/ChunkGenerator.js';
 import { calculateChunkSunlight } from './world/lighting/SkyLight.js';
 

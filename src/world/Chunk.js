@@ -3,7 +3,15 @@
  * @module world/Chunk
  */
 
-import { CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_VOLUME, CHUNK_SIZE_SQUARED } from '../config/WorldConfig.js';
+import {
+    CHUNK_SIZE,
+    CHUNK_HEIGHT,
+    CHUNK_VOLUME,
+    CHUNK_SIZE_SQUARED,
+    getBlockIndex,
+    getChunkKey,
+    parseChunkKey
+} from '../config/WorldConfig.js';
 import { AIR } from '../core/constants.js';
 
 /**
@@ -68,17 +76,6 @@ export function createChunkWithMetadata(cx, cz) {
 }
 
 /**
- * Calculate block index in chunk array
- * @param {number} x - Local X (0-15)
- * @param {number} y - Local Y (0-319)
- * @param {number} z - Local Z (0-15)
- * @returns {number} Array index
- */
-export function getBlockIndex(x, y, z) {
-    return x + z * CHUNK_SIZE + y * CHUNK_SIZE_SQUARED;
-}
-
-/**
  * Get block at local position
  * @param {ChunkData} chunk
  * @param {number} x - Local X (0-15)
@@ -111,25 +108,7 @@ export function setBlock(chunk, x, y, z, blockId) {
     return true;
 }
 
-/**
- * Get chunk key string from chunk coordinates
- * @param {number} cx - Chunk X coordinate
- * @param {number} cz - Chunk Z coordinate
- * @returns {string} Chunk key in format "cx,cz"
- */
-export function getChunkKey(cx, cz) {
-    return `${cx},${cz}`;
-}
-
-/**
- * Parse chunk key string to coordinates
- * @param {string} key - Chunk key in format "cx,cz"
- * @returns {{cx: number, cz: number}} Chunk coordinates
- */
-export function parseChunkKey(key) {
-    const [cx, cz] = key.split(',').map(Number);
-    return { cx, cz };
-}
+export { getBlockIndex, getChunkKey, parseChunkKey };
 
 /**
  * Convert global coordinates to chunk coordinates

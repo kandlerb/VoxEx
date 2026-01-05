@@ -4,7 +4,7 @@
  * @module world/lighting/LightPropagation
  */
 
-import { CHUNK_SIZE, CHUNK_HEIGHT } from '../../config/WorldConfig.js';
+import { CHUNK_SIZE, CHUNK_HEIGHT, getChunkKey, parseChunkKey } from '../../config/WorldConfig.js';
 
 // =====================================================
 // INDEX CONVERSION UTILITIES
@@ -123,30 +123,6 @@ export function getAttenuatedLight(currentLight, attenuation, minimum = 1) {
     }
     const reduced = currentLight - attenuation;
     return reduced > minimum ? reduced : minimum;
-}
-
-// =====================================================
-// CHUNK KEY UTILITIES
-// =====================================================
-
-/**
- * Get chunk key string from chunk coordinates.
- * @param {number} cx - Chunk X coordinate
- * @param {number} cz - Chunk Z coordinate
- * @returns {string} Chunk key "cx,cz"
- */
-export function getChunkKey(cx, cz) {
-    return `${cx},${cz}`;
-}
-
-/**
- * Parse chunk key string into chunk coordinates.
- * @param {string} key - Chunk key "cx,cz"
- * @returns {{cx: number, cz: number}} Chunk coordinates
- */
-export function parseChunkKey(key) {
-    const [cx, cz] = key.split(',').map(Number);
-    return { cx, cz };
 }
 
 /**

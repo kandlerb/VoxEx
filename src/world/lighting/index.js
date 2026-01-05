@@ -33,7 +33,7 @@ export {
 // PROPAGATION UTILITIES
 // =====================================================
 // Note: getChunkKey, parseChunkKey, globalToChunk, globalToLocal, localToGlobal
-// are exported from ../Chunk.js (the canonical source) to avoid duplicate exports
+// are exported from ../config/WorldConfig.js (the canonical source) to avoid duplicate exports
 export {
     posToIndex,
     posToIndexDynamic,

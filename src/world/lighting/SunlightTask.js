@@ -10,7 +10,7 @@ import {
     HARD_CAP_MAX_CHUNKS,
     HARD_CAP_GROWTH_RATIO
 } from './LightConstants.js';
-import { getChunkKey, parseChunkKey } from './LightPropagation.js';
+import { getChunkKey, parseChunkKey } from '../../config/WorldConfig.js';
 
 // =====================================================
 // SUNLIGHT TASK CLASS
