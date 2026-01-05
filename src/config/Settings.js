@@ -4,6 +4,23 @@
  * @module config/Settings
  */
 
+// =====================================================
+// RUNTIME-ONLY CONSTANTS (not persisted to localStorage)
+// =====================================================
+
+/**
+ * Runtime-only settings constants (not saved/loaded)
+ * @type {Object}
+ */
+export const RUNTIME_CONSTANTS = {
+    minRenderDistance: 6,
+    maxRenderDistance: 16,
+    targetFPS: 60,
+    frameUpdateInterval: 5,
+    fog: true,
+    fogColor: 0xb3d9ff,
+};
+
 /**
  * Default settings values
  * @type {Object}
@@ -294,4 +311,242 @@ export function applyProfile(settings, profileName) {
  */
 export function getProfileNames() {
     return Object.keys(SETTINGS_PROFILES);
+}
+
+/**
+ * Load settings from localStorage, merging with defaults.
+ * Creates a runtime SETTINGS object matching the source voxEx.html behavior.
+ * @returns {Object} Settings object with saved values and defaults
+ */
+export function loadSettings() {
+    // Load saved settings from localStorage (browser-only)
+    let savedSettings = {};
+    if (typeof localStorage !== 'undefined') {
+        try {
+            savedSettings = JSON.parse(localStorage.getItem('voxex_settings')) || {};
+        } catch (e) {
+            savedSettings = {};
+        }
+    }
+    const savedLighting = savedSettings.lighting || {};
+
+    // Build runtime SETTINGS object matching source voxEx.html
+    return {
+        // Runtime-only constants (not persisted)
+        ...RUNTIME_CONSTANTS,
+
+        // Performance
+        renderDistance: savedSettings.renderDistance || DEFAULTS.renderDistance,
+        buildQueueLimit: savedSettings.buildQueueLimit || DEFAULTS.buildQueueLimit,
+        maxCachedChunks: savedSettings.maxCachedChunks || DEFAULTS.maxCachedChunks,
+        preGenRenderDistance: savedSettings.preGenRenderDistance || DEFAULTS.preGenRenderDistance,
+        dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : DEFAULTS.dynamicRenderDistance,
+        lowerBoundFPS: savedSettings.lowerBoundFPS || DEFAULTS.lowerBoundFPS,
+        upperBoundFPS: savedSettings.upperBoundFPS || DEFAULTS.upperBoundFPS,
+        enableFrustumCulling: savedSettings.enableFrustumCulling !== undefined ? savedSettings.enableFrustumCulling : DEFAULTS.enableFrustumCulling,
+
+        // Graphics - Basic
+        AO: savedSettings.AO !== undefined ? savedSettings.AO : DEFAULTS.AO,
+        shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : DEFAULTS.shadows,
+        textureResolution: savedSettings.textureResolution || DEFAULTS.textureResolution,
+
+        // Graphics - Lighting
+        sunColor: savedSettings.sunColor || DEFAULTS.sunColor,
+        sunIntensity: savedSettings.sunIntensity !== undefined ? savedSettings.sunIntensity : DEFAULTS.sunIntensity,
+        moonColor: savedSettings.moonColor || DEFAULTS.moonColor,
+        moonIntensity: savedSettings.moonIntensity !== undefined ? savedSettings.moonIntensity : DEFAULTS.moonIntensity,
+        ambientIntensity: savedSettings.ambientIntensity !== undefined ? savedSettings.ambientIntensity : DEFAULTS.ambientIntensity,
+        lighting: savedLighting,
+        torchColor: savedSettings.torchColor || DEFAULTS.torchColor,
+        torchIntensity: savedSettings.torchIntensity !== undefined ? savedSettings.torchIntensity : DEFAULTS.torchIntensity,
+        torchRange: savedSettings.torchRange || DEFAULTS.torchRange,
+
+        // Graphics - Sky & Fog
+        daySkyTop: savedSettings.daySkyTop || DEFAULTS.daySkyTop,
+        daySkyBottom: savedSettings.daySkyBottom || DEFAULTS.daySkyBottom,
+        nightSkyTop: savedSettings.nightSkyTop || DEFAULTS.nightSkyTop,
+        nightSkyBottom: savedSettings.nightSkyBottom || DEFAULTS.nightSkyBottom,
+
+        // Graphics - Water
+        waterFastMode: savedSettings.waterFastMode !== undefined ? savedSettings.waterFastMode : DEFAULTS.waterFastMode,
+        waterColor: savedSettings.waterColor || DEFAULTS.waterColor,
+        waterOpacity: savedSettings.waterOpacity !== undefined ? savedSettings.waterOpacity : DEFAULTS.waterOpacity,
+        waterFogDensity: savedSettings.waterFogDensity !== undefined ? savedSettings.waterFogDensity : DEFAULTS.waterFogDensity,
+        waterAbsorptionR: savedSettings.waterAbsorptionR !== undefined ? savedSettings.waterAbsorptionR : DEFAULTS.waterAbsorptionR,
+        waterAbsorptionG: savedSettings.waterAbsorptionG !== undefined ? savedSettings.waterAbsorptionG : DEFAULTS.waterAbsorptionG,
+        waterAbsorptionB: savedSettings.waterAbsorptionB !== undefined ? savedSettings.waterAbsorptionB : DEFAULTS.waterAbsorptionB,
+        waterRefractionEnabled: savedSettings.waterRefractionEnabled !== undefined ? savedSettings.waterRefractionEnabled : DEFAULTS.waterRefractionEnabled,
+        waterRefractionStrength: savedSettings.waterRefractionStrength !== undefined ? savedSettings.waterRefractionStrength : DEFAULTS.waterRefractionStrength,
+
+        // Gameplay - Movement
+        playerSpeed: savedSettings.playerSpeed || DEFAULTS.playerSpeed,
+        sprintMultiplier: savedSettings.sprintMultiplier || DEFAULTS.sprintMultiplier,
+        crouchMultiplier: savedSettings.crouchMultiplier || DEFAULTS.crouchMultiplier,
+        flySpeedMultiplier: savedSettings.flySpeedMultiplier || DEFAULTS.flySpeedMultiplier,
+        jumpForce: savedSettings.jumpForce || DEFAULTS.jumpForce,
+        gravity: savedSettings.gravity || DEFAULTS.gravity,
+        blockReach: savedSettings.blockReach || DEFAULTS.blockReach,
+
+        // Gameplay - Camera
+        normalFOV: savedSettings.normalFOV || DEFAULTS.normalFOV,
+        sprintFOV: savedSettings.sprintFOV || DEFAULTS.sprintFOV,
+
+        // World
+        dayLength: savedSettings.dayLength || 360, // Note: runtime default is 360, DEFAULTS is 1200
+
+        // Shader
+        shadowQuality: savedSettings.shadowQuality || DEFAULTS.shadowQuality,
+        shadowBias: savedSettings.shadowBias !== undefined ? savedSettings.shadowBias : DEFAULTS.shadowBias,
+        shadowRadius: savedSettings.shadowRadius !== undefined ? savedSettings.shadowRadius : DEFAULTS.shadowRadius,
+        antialiasing: savedSettings.antialiasing !== undefined ? savedSettings.antialiasing : DEFAULTS.antialiasing,
+        pixelRatio: savedSettings.pixelRatio !== undefined ? savedSettings.pixelRatio : DEFAULTS.pixelRatio,
+
+        // Zombie Scare Effects
+        zombieVignetteEnabled: savedSettings.zombieVignetteEnabled !== undefined ? savedSettings.zombieVignetteEnabled : DEFAULTS.zombieVignetteEnabled,
+        zombieDesaturationEnabled: savedSettings.zombieDesaturationEnabled !== undefined ? savedSettings.zombieDesaturationEnabled : DEFAULTS.zombieDesaturationEnabled,
+        zombieVignetteIntensity: savedSettings.zombieVignetteIntensity !== undefined ? savedSettings.zombieVignetteIntensity : DEFAULTS.zombieVignetteIntensity,
+
+        // Volumetric Lighting
+        volumetricLightingEnabled: savedSettings.volumetricLightingEnabled !== undefined ? savedSettings.volumetricLightingEnabled : DEFAULTS.volumetricLightingEnabled,
+        volumetricDensity: savedSettings.volumetricDensity !== undefined ? savedSettings.volumetricDensity : DEFAULTS.volumetricDensity,
+        volumetricDecay: savedSettings.volumetricDecay !== undefined ? savedSettings.volumetricDecay : DEFAULTS.volumetricDecay,
+        volumetricWeight: savedSettings.volumetricWeight !== undefined ? savedSettings.volumetricWeight : DEFAULTS.volumetricWeight,
+        volumetricSamples: savedSettings.volumetricSamples !== undefined ? savedSettings.volumetricSamples : DEFAULTS.volumetricSamples,
+        volumetricExposure: savedSettings.volumetricExposure !== undefined ? savedSettings.volumetricExposure : DEFAULTS.volumetricExposure,
+        volumetricFogDensity: savedSettings.volumetricFogDensity !== undefined ? savedSettings.volumetricFogDensity : DEFAULTS.volumetricFogDensity,
+
+        // Global Illumination
+        giEnabled: savedSettings.giEnabled !== undefined ? savedSettings.giEnabled : DEFAULTS.giEnabled,
+        giIntensity: savedSettings.giIntensity !== undefined ? savedSettings.giIntensity : DEFAULTS.giIntensity,
+        giBounceIntensity: savedSettings.giBounceIntensity !== undefined ? savedSettings.giBounceIntensity : DEFAULTS.giBounceIntensity,
+        giRange: savedSettings.giRange !== undefined ? savedSettings.giRange : DEFAULTS.giRange,
+        giColorBleed: savedSettings.giColorBleed !== undefined ? savedSettings.giColorBleed : DEFAULTS.giColorBleed,
+        giSamples: savedSettings.giSamples !== undefined ? savedSettings.giSamples : DEFAULTS.giSamples,
+
+        // Diffuse Lighting
+        diffuseEnabled: savedSettings.diffuseEnabled !== undefined ? savedSettings.diffuseEnabled : DEFAULTS.diffuseEnabled,
+        diffuseIntensity: savedSettings.diffuseIntensity !== undefined ? savedSettings.diffuseIntensity : DEFAULTS.diffuseIntensity,
+        diffuseWrap: savedSettings.diffuseWrap !== undefined ? savedSettings.diffuseWrap : DEFAULTS.diffuseWrap,
+        diffuseSoftness: savedSettings.diffuseSoftness !== undefined ? savedSettings.diffuseSoftness : DEFAULTS.diffuseSoftness,
+
+        // Specular Lighting
+        specularEnabled: savedSettings.specularEnabled !== undefined ? savedSettings.specularEnabled : DEFAULTS.specularEnabled,
+        specularIntensity: savedSettings.specularIntensity !== undefined ? savedSettings.specularIntensity : DEFAULTS.specularIntensity,
+        specularShininess: savedSettings.specularShininess !== undefined ? savedSettings.specularShininess : DEFAULTS.specularShininess,
+        specularFresnel: savedSettings.specularFresnel !== undefined ? savedSettings.specularFresnel : DEFAULTS.specularFresnel,
+        specularRoughness: savedSettings.specularRoughness !== undefined ? savedSettings.specularRoughness : DEFAULTS.specularRoughness,
+
+        // Atmospheric Effects
+        particlesEnabled: savedSettings.particlesEnabled !== undefined ? savedSettings.particlesEnabled : DEFAULTS.particlesEnabled,
+        starsEnabled: savedSettings.starsEnabled !== undefined ? savedSettings.starsEnabled : DEFAULTS.starsEnabled,
+        cloudsEnabled: savedSettings.cloudsEnabled !== undefined ? savedSettings.cloudsEnabled : DEFAULTS.cloudsEnabled,
+        waterRipplesEnabled: savedSettings.waterRipplesEnabled !== undefined ? savedSettings.waterRipplesEnabled : DEFAULTS.waterRipplesEnabled,
+        waterSplashParticlesEnabled: savedSettings.waterSplashParticlesEnabled !== undefined ? savedSettings.waterSplashParticlesEnabled : DEFAULTS.waterSplashParticlesEnabled,
+        waterWadingRipplesEnabled: savedSettings.waterWadingRipplesEnabled !== undefined ? savedSettings.waterWadingRipplesEnabled : DEFAULTS.waterWadingRipplesEnabled,
+        waterWakeEnabled: savedSettings.waterWakeEnabled !== undefined ? savedSettings.waterWakeEnabled : DEFAULTS.waterWakeEnabled,
+        waterBubblesEnabled: savedSettings.waterBubblesEnabled !== undefined ? savedSettings.waterBubblesEnabled : DEFAULTS.waterBubblesEnabled,
+
+        // Ripple Settings
+        waterRippleColor: savedSettings.waterRippleColor ?? DEFAULTS.waterRippleColor,
+        waterRippleInitialScale: savedSettings.waterRippleInitialScale ?? DEFAULTS.waterRippleInitialScale,
+        waterRippleVelocityScale: savedSettings.waterRippleVelocityScale ?? DEFAULTS.waterRippleVelocityScale,
+        waterRippleExpansionRate: savedSettings.waterRippleExpansionRate ?? DEFAULTS.waterRippleExpansionRate,
+        waterRippleLifespan: savedSettings.waterRippleLifespan ?? DEFAULTS.waterRippleLifespan,
+        waterRippleOpacity: savedSettings.waterRippleOpacity ?? DEFAULTS.waterRippleOpacity,
+        waterRippleSegments: savedSettings.waterRippleSegments ?? DEFAULTS.waterRippleSegments,
+
+        // Wading/Wake Settings
+        waterWadeMinSpeed: savedSettings.waterWadeMinSpeed ?? DEFAULTS.waterWadeMinSpeed,
+        waterWadeCooldownBase: savedSettings.waterWadeCooldownBase ?? DEFAULTS.waterWadeCooldownBase,
+        waterWadeScale: savedSettings.waterWadeScale ?? DEFAULTS.waterWadeScale,
+        waterWadeExpansionRate: savedSettings.waterWadeExpansionRate ?? DEFAULTS.waterWadeExpansionRate,
+        waterWadeLifespan: savedSettings.waterWadeLifespan ?? DEFAULTS.waterWadeLifespan,
+        waterWadeOpacity: savedSettings.waterWadeOpacity ?? DEFAULTS.waterWadeOpacity,
+        waterWadeAngle: savedSettings.waterWadeAngle ?? DEFAULTS.waterWadeAngle,
+
+        // Splash Particle Settings
+        waterSplashMinParticles: savedSettings.waterSplashMinParticles ?? DEFAULTS.waterSplashMinParticles,
+        waterSplashMaxParticles: savedSettings.waterSplashMaxParticles ?? DEFAULTS.waterSplashMaxParticles,
+        waterSplashVelocityScale: savedSettings.waterSplashVelocityScale ?? DEFAULTS.waterSplashVelocityScale,
+        waterSplashSize: savedSettings.waterSplashSize ?? DEFAULTS.waterSplashSize,
+        waterSplashGravity: savedSettings.waterSplashGravity ?? DEFAULTS.waterSplashGravity,
+        waterSplashColumnThreshold: savedSettings.waterSplashColumnThreshold ?? DEFAULTS.waterSplashColumnThreshold,
+
+        // Bubble Settings
+        waterBubbleRate: savedSettings.waterBubbleRate ?? DEFAULTS.waterBubbleRate,
+        waterBubbleSize: savedSettings.waterBubbleSize ?? DEFAULTS.waterBubbleSize,
+        waterBubbleRiseSpeed: savedSettings.waterBubbleRiseSpeed ?? DEFAULTS.waterBubbleRiseSpeed,
+        waterBreathBubbleInterval: savedSettings.waterBreathBubbleInterval ?? DEFAULTS.waterBreathBubbleInterval,
+
+        colorGradingEnabled: savedSettings.colorGradingEnabled !== undefined ? savedSettings.colorGradingEnabled : DEFAULTS.colorGradingEnabled,
+        biomeFogEnabled: savedSettings.biomeFogEnabled !== undefined ? savedSettings.biomeFogEnabled : DEFAULTS.biomeFogEnabled,
+
+        // Star Settings
+        starLayerCount: savedSettings.starLayerCount !== undefined ? savedSettings.starLayerCount : DEFAULTS.starLayerCount,
+        starLayer1Color: savedSettings.starLayer1Color !== undefined ? savedSettings.starLayer1Color : DEFAULTS.starLayer1Color,
+        starLayer1ColorVariation: savedSettings.starLayer1ColorVariation !== undefined ? savedSettings.starLayer1ColorVariation : DEFAULTS.starLayer1ColorVariation,
+        starLayer1Size: savedSettings.starLayer1Size !== undefined ? savedSettings.starLayer1Size : DEFAULTS.starLayer1Size,
+        starLayer1Twinkle: savedSettings.starLayer1Twinkle !== undefined ? savedSettings.starLayer1Twinkle : DEFAULTS.starLayer1Twinkle,
+        starLayer1Brightness: savedSettings.starLayer1Brightness !== undefined ? savedSettings.starLayer1Brightness : DEFAULTS.starLayer1Brightness,
+        starLayer1Count: savedSettings.starLayer1Count !== undefined ? savedSettings.starLayer1Count : DEFAULTS.starLayer1Count,
+        starLayer2Color: savedSettings.starLayer2Color !== undefined ? savedSettings.starLayer2Color : DEFAULTS.starLayer2Color,
+        starLayer2ColorVariation: savedSettings.starLayer2ColorVariation !== undefined ? savedSettings.starLayer2ColorVariation : DEFAULTS.starLayer2ColorVariation,
+        starLayer2Size: savedSettings.starLayer2Size !== undefined ? savedSettings.starLayer2Size : DEFAULTS.starLayer2Size,
+        starLayer2Twinkle: savedSettings.starLayer2Twinkle !== undefined ? savedSettings.starLayer2Twinkle : DEFAULTS.starLayer2Twinkle,
+        starLayer2Brightness: savedSettings.starLayer2Brightness !== undefined ? savedSettings.starLayer2Brightness : DEFAULTS.starLayer2Brightness,
+        starLayer2Count: savedSettings.starLayer2Count !== undefined ? savedSettings.starLayer2Count : DEFAULTS.starLayer2Count,
+        starLayer3Color: savedSettings.starLayer3Color !== undefined ? savedSettings.starLayer3Color : DEFAULTS.starLayer3Color,
+        starLayer3ColorVariation: savedSettings.starLayer3ColorVariation !== undefined ? savedSettings.starLayer3ColorVariation : DEFAULTS.starLayer3ColorVariation,
+        starLayer3Size: savedSettings.starLayer3Size !== undefined ? savedSettings.starLayer3Size : DEFAULTS.starLayer3Size,
+        starLayer3Twinkle: savedSettings.starLayer3Twinkle !== undefined ? savedSettings.starLayer3Twinkle : DEFAULTS.starLayer3Twinkle,
+        starLayer3Brightness: savedSettings.starLayer3Brightness !== undefined ? savedSettings.starLayer3Brightness : DEFAULTS.starLayer3Brightness,
+        starLayer3Count: savedSettings.starLayer3Count !== undefined ? savedSettings.starLayer3Count : DEFAULTS.starLayer3Count,
+
+        // Cloud Settings
+        cloudHeight: savedSettings.cloudHeight !== undefined ? savedSettings.cloudHeight : DEFAULTS.cloudHeight,
+        cloudHeightRange: savedSettings.cloudHeightRange !== undefined ? savedSettings.cloudHeightRange : DEFAULTS.cloudHeightRange,
+        cloudSpeed: savedSettings.cloudSpeed !== undefined ? savedSettings.cloudSpeed : DEFAULTS.cloudSpeed,
+        cloudDensity: savedSettings.cloudDensity !== undefined ? savedSettings.cloudDensity : DEFAULTS.cloudDensity,
+        cloudParticleSize: savedSettings.cloudParticleSize !== undefined ? savedSettings.cloudParticleSize : DEFAULTS.cloudParticleSize,
+        cloudClumping: savedSettings.cloudClumping !== undefined ? savedSettings.cloudClumping : DEFAULTS.cloudClumping,
+
+        // Torch Particle Settings
+        torchParticlesEnabled: savedSettings.torchParticlesEnabled ?? DEFAULTS.torchParticlesEnabled,
+        torchSmokeColor: savedSettings.torchSmokeColor ?? savedSettings.torchParticleColor ?? DEFAULTS.torchSmokeColor,
+        torchSmokeSize: savedSettings.torchSmokeSize ?? savedSettings.torchParticleSize ?? DEFAULTS.torchSmokeSize,
+        torchSmokeSpawnRate: savedSettings.torchSmokeSpawnRate ?? savedSettings.torchParticleFrequency ?? DEFAULTS.torchSmokeSpawnRate,
+        torchSmokeDecay: savedSettings.torchSmokeDecay ?? DEFAULTS.torchSmokeDecay,
+        torchFlameColor: savedSettings.torchFlameColor ?? DEFAULTS.torchFlameColor,
+        torchFlameSize: savedSettings.torchFlameSize ?? DEFAULTS.torchFlameSize,
+        torchFlameSpawnRate: savedSettings.torchFlameSpawnRate ?? DEFAULTS.torchFlameSpawnRate,
+        torchFlameDecay: savedSettings.torchFlameDecay ?? DEFAULTS.torchFlameDecay,
+
+        // Block break settings
+        blockBreakEnabled: savedSettings.blockBreakEnabled ?? DEFAULTS.blockBreakEnabled,
+        blockBreakSize: savedSettings.blockBreakSize ?? DEFAULTS.blockBreakSize,
+        blockBreakCount: savedSettings.blockBreakCount ?? DEFAULTS.blockBreakCount,
+        blockBreakDecay: savedSettings.blockBreakDecay ?? DEFAULTS.blockBreakDecay,
+
+        // Footstep settings
+        footstepEnabled: savedSettings.footstepEnabled ?? DEFAULTS.footstepEnabled,
+        footstepSize: savedSettings.footstepSize ?? DEFAULTS.footstepSize,
+        footstepDecay: savedSettings.footstepDecay ?? DEFAULTS.footstepDecay,
+    };
+}
+
+/**
+ * Save settings to localStorage
+ * @param {Object} settings - Settings object to save
+ */
+export function saveSettings(settings) {
+    if (typeof localStorage !== 'undefined') {
+        try {
+            // Create a copy without runtime-only constants
+            const toSave = { ...settings };
+            Object.keys(RUNTIME_CONSTANTS).forEach(key => delete toSave[key]);
+            localStorage.setItem('voxex_settings', JSON.stringify(toSave));
+        } catch (e) {
+            console.warn('[Settings] Failed to save settings:', e);
+        }
+    }
 }
