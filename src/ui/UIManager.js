@@ -34,6 +34,13 @@ import { createChunkIndicator, updateChunkIndicator } from './overlays/ChunkIndi
  * @property {Function} [onBlockSelect]
  * @property {Function} [onSettingChange]
  * @property {Function} [onStateChange]
+ * @property {Function} [onDeleteWorld]
+ * @property {Function} [onRenameWorld]
+ * @property {Function} [onDuplicateWorld]
+ * @property {Function} [onClearWorldCache]
+ * @property {Function} [onExportWorld]
+ * @property {Function} [onImportWorld]
+ * @property {Function} [onWorldStorageInfo]
  * @property {Object} [settings]
  */
 
@@ -67,7 +74,14 @@ export class UIManager {
             mainMenu: createMainMenu({
                 onNewWorld: callbacks.onNewWorld ?? (() => {}),
                 onLoadWorld: callbacks.onLoadWorld ?? (() => {}),
-                onSettings: () => this.setState('settings')
+                onSettings: () => this.setState('settings'),
+                onDeleteWorld: callbacks.onDeleteWorld ?? (() => {}),
+                onRenameWorld: callbacks.onRenameWorld ?? (() => {}),
+                onDuplicateWorld: callbacks.onDuplicateWorld ?? (() => {}),
+                onClearWorldCache: callbacks.onClearWorldCache ?? (() => {}),
+                onExportWorld: callbacks.onExportWorld ?? (() => {}),
+                onImportWorld: callbacks.onImportWorld ?? (() => {}),
+                onWorldStorageInfo: callbacks.onWorldStorageInfo ?? (() => {})
             }),
             pauseMenu: createPauseMenu({
                 onResume: () => this.setState('playing'),
@@ -90,7 +104,8 @@ export class UIManager {
 
             // Overlays
             loadingOverlay: createLoadingOverlay(),
-            chunkIndicator: createChunkIndicator()
+            chunkIndicator: createChunkIndicator(),
+            toastContainer: createToastContainer()
         };
 
         // Append all elements to container
@@ -238,6 +253,37 @@ export class UIManager {
     }
 
     /**
+     * Update world cards list in main menu
+     * @param {Array} worlds
+     * @param {number} totalBytes
+     */
+    updateWorldCards(worlds, totalBytes) {
+        this.elements.mainMenu.updateWorldCards?.(worlds, totalBytes);
+    }
+
+    /**
+     * Show toast notification
+     * @param {string} message
+     * @param {'success'|'info'|'warning'|'error'} [type]
+     * @param {number} [duration]
+     */
+    showToast(message, type = 'success', duration = 3000) {
+        const container = this.elements.toastContainer;
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        container.appendChild(toast);
+        requestAnimationFrame(() => {
+            toast.classList.add('show');
+        });
+        setTimeout(() => {
+            toast.classList.remove('show');
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
+    }
+
+    /**
      * Check if game should be paused (any menu open)
      * @returns {boolean}
      */
@@ -288,3 +334,13 @@ export class UIManager {
 }
 
 export default UIManager;
+
+/**
+ * Create toast container element
+ * @returns {HTMLElement}
+ */
+function createToastContainer() {
+    const container = document.createElement('div');
+    container.id = 'toast-container';
+    return container;
+}

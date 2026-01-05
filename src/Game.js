@@ -12,8 +12,9 @@ import { AIR, WATER, TORCH, GRASS, BEDROCK } from './core/constants.js';
 // Config
 import { BLOCK_CONFIG } from './config/BlockConfig.js';
 import { CHUNK_SIZE, CHUNK_HEIGHT, CHUNK_VOLUME, SEA_LEVEL, Y_OFFSET } from './config/WorldConfig.js';
-import { DEFAULTS } from './config/Settings.js';
+import { DEFAULTS, SETTINGS_PROFILES, loadSettings, saveSettings } from './config/Settings.js';
 import { DEFAULT_BINDINGS, getHotbarSlotFromKey } from './input/ControlBindings.js';
+import { PLAYER_PHYSICS } from './config/PlayerConfig.js';
 
 // Optimization
 import { BlockLookups } from './optimization/BlockLookups.js';
@@ -31,18 +32,22 @@ import { calculateChunkSunlight } from './world/lighting/SkyLight.js';
 
 // Entities
 import { PlayerController } from './entities/player/PlayerController.js';
+import { PlayerAnimation } from './entities/player/PlayerAnimation.js';
 import { EntityManager } from './entities/EntityManager.js';
 
 // Render
 import { createTextureAtlas } from './render/textures/TextureAtlas.js';
 import { createTerrainMaterial } from './render/materials/TerrainMaterial.js';
-import { createWaterMaterial } from './render/materials/WaterMaterial.js';
+import { createWaterMaterial, updateWaterOpacity } from './render/materials/WaterMaterial.js';
 import { buildChunkMesh, disposeChunkGeometry } from './render/meshing/ChunkMesher.js';
 import { DayNightCycle } from './render/sky/DayNightCycle.js';
 import { createTorchViewmodel } from './render/models/TorchModel.js';
 
 // UI
 import { UIManager } from './ui/UIManager.js';
+
+// Persistence
+import { WorldStorage } from './persistence/WorldStorage.js';
 
 /**
  * @typedef {Object} GameState
@@ -83,6 +88,7 @@ export class Game {
         this.inputManager = null;
         this.uiManager = null;
         this.playerController = null;
+        this.playerAnimation = null;
         this.entityManager = null;
         this.dayNightCycle = null;
         this.chunkGenerator = null;
@@ -121,8 +127,14 @@ export class Game {
         this.animationId = null;
 
         // Settings
-        this.settings = { ...DEFAULTS };
+        this.settings = loadSettings();
+        this.activeProfileName = this.loadActiveProfile();
+        this.customProfile = this.loadCustomProfile();
         this.bindings = { ...DEFAULT_BINDINGS };
+
+        // Persistence
+        this.worldStorage = new WorldStorage();
+        this.activeWorldName = null;
 
         // Stats
         this.stats = {
@@ -131,6 +143,27 @@ export class Game {
             lastFpsUpdate: 0,
             totalFaces: 0
         };
+
+        // Third-person camera state
+        this.isThirdPerson = false;
+        this.thirdPersonOrbitYaw = 0;
+        this.thirdPersonOrbitPitch = 0;
+        this.thirdPersonDistance = 4.0;
+        this.thirdPersonDistanceMin = 2.0;
+        this.thirdPersonDistanceMax = 8.0;
+        this.thirdPersonHeight = 2.5;
+        this.thirdPersonLookHeight = 1.2;
+        this.thirdPersonCamBuffer = 0.3;
+        this.thirdPersonPitchMin = -Math.PI / 3;
+        this.thirdPersonPitchMax = Math.PI / 3;
+        this.thirdPersonSmoothFactor = 0.15;
+
+        // Third-person camera scratch vectors
+        this._thirdPersonCamDesired = new THREE.Vector3();
+        this._thirdPersonPlayerPos = new THREE.Vector3();
+        this._thirdPersonRayDir = new THREE.Vector3();
+        this._thirdPersonSmoothPos = new THREE.Vector3();
+        this._thirdPersonSmoothInitialized = false;
 
         // Scratch objects
         this._lookDir = new THREE.Vector3();
@@ -171,8 +204,15 @@ export class Game {
         this.initUI();
         this.initDayNight();
 
+        // Initialize persistence
+        await this.worldStorage.init();
+        await this.refreshWorldCards();
+
         // Initialize viewmodels
         this.initViewmodels();
+
+        // Apply settings to systems after initialization
+        this.applySettingsToSystems();
 
         // Event listeners
         window.addEventListener('resize', this.onWindowResize);
@@ -189,8 +229,9 @@ export class Game {
             powerPreference: 'high-performance'
         });
         this.renderer.setSize(window.innerWidth, window.innerHeight);
-        this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-        this.renderer.setClearColor(0x87CEEB);
+        this.renderer.setPixelRatio(this.getPixelRatio());
+        this.renderer.setClearColor(this.settings.daySkyBottom ?? 0x87CEEB);
+        this.renderer.shadowMap.enabled = Boolean(this.settings.shadows);
         this.container.appendChild(this.renderer.domElement);
     }
 
@@ -199,15 +240,22 @@ export class Game {
      */
     initScene() {
         this.scene = new THREE.Scene();
-        this.scene.fog = new THREE.Fog(0x87CEEB, 10, this.settings.renderDistance * CHUNK_SIZE);
+        if (this.settings.fog) {
+            this.scene.fog = new THREE.Fog(
+                this.settings.fogColor ?? 0x87CEEB,
+                10,
+                this.settings.renderDistance * CHUNK_SIZE
+            );
+        }
 
         // Ambient light
-        this.ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        this.ambientLight = new THREE.AmbientLight(0xffffff, this.settings.ambientIntensity ?? 0.4);
         this.scene.add(this.ambientLight);
 
         // Directional light (sun)
-        this.sunLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        this.sunLight = new THREE.DirectionalLight(this.settings.sunColor ?? 0xffffff, this.settings.sunIntensity ?? 0.8);
         this.sunLight.position.set(100, 200, 100);
+        this.sunLight.castShadow = Boolean(this.settings.shadows);
         this.scene.add(this.sunLight);
     }
 
@@ -219,7 +267,7 @@ export class Game {
             this.settings.normalFOV || 75,
             window.innerWidth / window.innerHeight,
             0.1,
-            1000
+            this.getCameraFar()
         );
         this.camera.position.set(0, 80, 0);
     }
@@ -257,7 +305,12 @@ export class Game {
         this.terrainMaterial = createTerrainMaterial(this.textureAtlas, {
             useStandardMaterial: true
         });
-        this.waterMaterial = createWaterMaterial(this.textureAtlas);
+        this.waterMaterial = createWaterMaterial(this.textureAtlas, {
+            opacity: this.settings.waterOpacity ?? 0.7
+        });
+        if (this.waterMaterial.color) {
+            this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+        }
     }
 
     /**
@@ -297,6 +350,9 @@ export class Game {
         if (e.code === this.bindings.toggleTorch) {
             this.toggleTorch();
         }
+        if (e.code === this.bindings.toggleThirdPerson) {
+            this.toggleThirdPerson();
+        }
         if (e.code === this.bindings.debug) {
             this.uiManager?.toggleDebug();
         }
@@ -321,6 +377,21 @@ export class Game {
         if (e.code === this.bindings.quickLoad) {
             this.loadWorld();
             e.preventDefault();
+        }
+
+        if (e.code === this.bindings.crouch) {
+            if (this.playerController && !this.playerController.isFlying && !this.playerController.isSwimming) {
+                this.playerController.toggleCrouch();
+            }
+        }
+
+        if (this.isThirdPerson) {
+            if (e.code === this.bindings.cameraZoomOut || e.code === 'NumpadSubtract') {
+                this.adjustThirdPersonDistance(0.5);
+            }
+            if (e.code === this.bindings.cameraZoomIn || e.code === 'NumpadAdd') {
+                this.adjustThirdPersonDistance(-0.5);
+            }
         }
     }
 
@@ -405,14 +476,95 @@ export class Game {
      */
     initUI() {
         this.uiManager = new UIManager(this.container, {
-            onNewWorld: (seed) => this.startNewWorld(seed),
+            onNewWorld: ({ name, seed }) => this.startNewWorld(seed, name),
             onLoadWorld: (saveName) => this.loadWorld(saveName),
-            onSave: () => this.saveWorld(),
+            onSave: (name) => this.saveWorld(name),
             onLoad: () => this.uiManager.setState('mainMenu'),
             onSettingChange: (key, value) => this.updateSetting(key, value),
             onBlockSelect: (blockId) => {
                 this.selectedBlock = blockId;
             },
+            onDeleteWorld: async (name) => {
+                if (!name) return;
+                if (!confirm(`Delete world "${name}"? This cannot be undone.`)) return;
+                await this.worldStorage.deleteWorld(name);
+                if (this.activeWorldName === name) this.activeWorldName = null;
+                await this.refreshWorldCards();
+                this.uiManager.showToast(`Deleted "${name}"`, 'success');
+            },
+            onRenameWorld: async (oldName, newName) => {
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    this.uiManager.showToast('Please enter a valid name', 'warning');
+                    return false;
+                }
+                if (this.worldStorage.getIndex().includes(trimmed)) {
+                    this.uiManager.showToast('A world with that name already exists', 'error');
+                    return false;
+                }
+                const success = this.worldStorage.renameWorld(oldName, trimmed);
+                if (success) {
+                    if (this.activeWorldName === oldName) this.activeWorldName = trimmed;
+                    await this.refreshWorldCards();
+                    this.uiManager.showToast(`Renamed to "${trimmed}"`, 'success');
+                } else {
+                    this.uiManager.showToast('World not found', 'error');
+                }
+                return success;
+            },
+            onDuplicateWorld: async (sourceName, newName) => {
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    this.uiManager.showToast('Please enter a valid name', 'warning');
+                    return false;
+                }
+                if (this.worldStorage.getIndex().includes(trimmed)) {
+                    this.uiManager.showToast('A world with that name already exists', 'error');
+                    return false;
+                }
+                const success = this.worldStorage.duplicateWorld(sourceName, trimmed);
+                if (success) {
+                    await this.refreshWorldCards();
+                    this.uiManager.showToast(`Created "${trimmed}"`, 'success');
+                } else {
+                    this.uiManager.showToast('Source world not found', 'error');
+                }
+                return success;
+            },
+            onClearWorldCache: async (name) => {
+                const metadata = this.worldStorage.loadMetadata(name);
+                if (!metadata?.seed) {
+                    this.uiManager.showToast('No chunks to clear', 'info');
+                    return;
+                }
+                if (!confirm(`Clear all cached chunks for "${name}"?\n\nThe world can be regenerated from its seed, but any manually placed/removed blocks will be lost.`)) {
+                    return;
+                }
+                const deletedCount = await this.worldStorage.clearChunksForSeed(metadata.seed.toString());
+                this.uiManager.showToast(`Cleared ${deletedCount} chunks`, 'success');
+            },
+            onExportWorld: async (name) => {
+                const blob = await this.worldStorage.exportWorld(name);
+                if (!blob) {
+                    this.uiManager.showToast('World not found', 'error');
+                } else {
+                    this.uiManager.showToast(`Exported "${name}"`, 'success');
+                }
+                return blob;
+            },
+            onImportWorld: async (file) => {
+                try {
+                    const result = await this.worldStorage.importWorld(file);
+                    if (result) {
+                        await this.refreshWorldCards();
+                        this.uiManager.showToast(`Imported "${result.name}" (${result.chunkCount} chunks)`, 'success');
+                    }
+                } catch (error) {
+                    console.error('[Game] Import failed:', error);
+                    this.uiManager.showToast(`Failed to import world: ${error.message}`, 'error');
+                }
+            },
+            onWorldStorageInfo: (name) => this.worldStorage.getWorldStorageInfo(name),
             onStateChange: (state) => {
                 this.state.isPaused = state !== 'playing';
             },
@@ -440,7 +592,11 @@ export class Game {
      * Initialize torch viewmodel
      */
     initViewmodels() {
-        this.torchViewmodel = createTorchViewmodel();
+        this.torchViewmodel = createTorchViewmodel({
+            lightIntensity: this.settings.torchIntensity ?? 1,
+            lightDistance: this.settings.torchRange ?? 10,
+            lightColor: this.settings.torchColor ?? 0xff6600
+        });
         this.torchViewmodel.visible = false;
         this.torchViewmodel.position.set(0.35, -0.35, -0.5);
         this.camera.add(this.torchViewmodel);
@@ -448,13 +604,35 @@ export class Game {
     }
 
     /**
+     * Refresh world cards in the main menu
+     */
+    async refreshWorldCards() {
+        if (!this.uiManager) return;
+        const worlds = this.worldStorage.listWorlds();
+        const totalBytes = await this.worldStorage.getTotalStorageBytes();
+        this.uiManager.updateWorldCards(worlds, totalBytes);
+    }
+
+    /**
      * Start a new world with given seed
      * @param {string} seed
+     * @param {string} [worldName]
      */
-    async startNewWorld(seed) {
-        console.log(`%c[Game] Starting new world with seed: ${seed}`, 'color: #2196F3');
+    async startNewWorld(seed, worldName = 'New World') {
+        const resolvedSeed = seed || Math.random().toString(36).substring(7);
+        console.log(`%c[Game] Starting new world with seed: ${resolvedSeed}`, 'color: #2196F3');
+        this.activeWorldName = worldName;
+        await this.initializeWorld(resolvedSeed);
+    }
 
-        this.state.seed = seed || Math.random().toString(36).substring(7);
+    /**
+     * Initialize world state for new or loaded worlds
+     * @param {string} seed
+     * @param {Object} [playerState]
+     * @param {{x: number, y: number, z: number}} [cameraRot]
+     */
+    async initializeWorld(seed, playerState = null, cameraRot = null) {
+        this.state.seed = seed;
         this.state.isRunning = true;
         this.state.isPaused = false;
 
@@ -472,10 +650,23 @@ export class Game {
         // Initialize player at spawn
         const spawnY = this.chunkGenerator.getHeightAt(0, 0) + 2 + Y_OFFSET;
         this.playerController = new PlayerController(0, spawnY, 0);
+        this.playerAnimation = new PlayerAnimation();
         this.camera.position.set(0, spawnY, 0);
+
+        if (playerState) {
+            this.playerController.setState(playerState);
+        }
 
         // Initialize entity manager
         this.entityManager = new EntityManager();
+
+        // Update camera orientation before positioning
+        if (cameraRot) {
+            this.camera.rotation.set(cameraRot.x, cameraRot.y, cameraRot.z);
+        }
+
+        const eyePos = this.playerController.getEyePosition();
+        this.camera.position.set(eyePos.x, eyePos.y, eyePos.z);
 
         // Generate initial chunks
         await this.generateInitialChunks();
@@ -522,10 +713,8 @@ export class Game {
 
         for (let dx = -renderDist; dx <= renderDist; dx++) {
             for (let dz = -renderDist; dz <= renderDist; dz++) {
-                const key = getChunkKey(dx, dz);
-
-                if (!this.chunks.has(key)) {
-                    this.generateChunk(dx, dz);
+                if (!this.chunks.has(getChunkKey(dx, dz))) {
+                    await this.loadChunkAsync(dx, dz);
                     generated++;
 
                     const progress = (generated / totalChunks) * 100;
@@ -541,11 +730,11 @@ export class Game {
     }
 
     /**
-     * Generate a single chunk
+     * Queue a chunk load
      * @param {number} cx - Chunk X coordinate
      * @param {number} cz - Chunk Z coordinate
      */
-    generateChunk(cx, cz) {
+    queueChunkLoad(cx, cz) {
         const key = getChunkKey(cx, cz);
 
         if (this.chunks.has(key) || this.chunksLoading.has(key)) {
@@ -553,25 +742,65 @@ export class Game {
         }
 
         this.chunksLoading.add(key);
+        this.loadChunkAsync(cx, cz).catch((error) => {
+            console.error('[Game] Failed to load chunk:', error);
+        });
+    }
 
-        // Generate chunk data
-        const chunkData = this.chunkGenerator.generateChunk(cx, cz);
+    /**
+     * Load a single chunk from cache or generate it.
+     * @param {number} cx - Chunk X coordinate
+     * @param {number} cz - Chunk Z coordinate
+     */
+    async loadChunkAsync(cx, cz) {
+        const key = getChunkKey(cx, cz);
 
-        // Calculate lighting
-        calculateChunkSunlight(
-            chunkData,
-            CHUNK_SIZE,
-            CHUNK_HEIGHT,
-            BlockLookups.IS_TRANSPARENT,
-            BlockLookups.SUNLIGHT_ATTENUATION
-        );
+        if (this.chunks.has(key)) {
+            this.chunksLoading.delete(key);
+            return;
+        }
 
-        this.chunks.set(key, chunkData);
+        const wasLoading = this.chunksLoading.has(key);
+        if (!wasLoading) {
+            this.chunksLoading.add(key);
+        }
+        let chunkData = null;
+        try {
+            if (this.worldStorage.isReady()) {
+                chunkData = await this.worldStorage.loadChunk(key, this.state.seed);
+            }
 
-        // Build mesh
-        this.buildChunkMeshes(cx, cz, chunkData);
+            if (!chunkData) {
+                chunkData = this.chunkGenerator.generateChunk(cx, cz);
+                calculateChunkSunlight(
+                    chunkData,
+                    CHUNK_SIZE,
+                    CHUNK_HEIGHT,
+                    BlockLookups.IS_TRANSPARENT,
+                    BlockLookups.SUNLIGHT_ATTENUATION
+                );
+            } else {
+                chunkData.cx = cx;
+                chunkData.cz = cz;
+                chunkData.startX = cx * CHUNK_SIZE;
+                chunkData.startZ = cz * CHUNK_SIZE;
+                chunkData.generated = true;
+                chunkData.lit = true;
+                chunkData.meshed = false;
+                chunkData.modified = false;
+            }
 
-        this.chunksLoading.delete(key);
+            this.chunks.set(key, chunkData);
+
+            // Build mesh
+            this.buildChunkMeshes(cx, cz, chunkData);
+
+            if (!chunkData.modified && this.worldStorage.isReady()) {
+                this.worldStorage.saveChunk(key, chunkData, this.state.seed).catch(() => {});
+            }
+        } finally {
+            this.chunksLoading.delete(key);
+        }
     }
 
     /**
@@ -722,7 +951,8 @@ export class Game {
         this._playerInput.left = this.inputManager.isKeyDown(this.bindings.left);
         this._playerInput.right = this.inputManager.isKeyDown(this.bindings.right);
         this._playerInput.jump = this.inputManager.isKeyDown(this.bindings.jump);
-        this._playerInput.crouch = this.inputManager.isKeyDown(this.bindings.crouch);
+        const crouchKeyDown = this.inputManager.isKeyDown(this.bindings.crouch);
+        this._playerInput.crouch = this.playerController?.isFlying ? crouchKeyDown : false;
         this._playerInput.sprint = this.inputManager.isKeyDown(this.bindings.sprint);
     }
 
@@ -733,9 +963,15 @@ export class Game {
     updatePlayer(delta) {
         if (!this.playerController) return;
 
-        // Sync yaw from camera
-        const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
-        this.playerController.yaw = euler.y;
+        // Sync yaw/pitch from camera or third-person orbit
+        if (this.isThirdPerson) {
+            this.playerController.yaw = this.thirdPersonOrbitYaw;
+            this.playerController.pitch = this.thirdPersonOrbitPitch;
+        } else {
+            const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+            this.playerController.yaw = euler.y;
+            this.playerController.pitch = euler.x;
+        }
 
         // Process input
         this.playerController.processInput(this._playerInput, delta);
@@ -749,9 +985,21 @@ export class Game {
         // Move with collision
         this.movePlayerWithCollision(delta);
 
+        // Update animation state
+        if (this.playerAnimation) {
+            this.playerAnimation.update(this.playerController, delta);
+            const headPitch = this.isThirdPerson ? this.thirdPersonOrbitPitch : this.playerController.pitch;
+            this.playerAnimation.setHeadLook(headPitch, 0);
+        }
+
         // Sync camera
-        const eyePos = this.playerController.getEyePosition();
-        this.camera.position.set(eyePos.x, eyePos.y, eyePos.z);
+        if (this.isThirdPerson) {
+            this.updateThirdPersonOrbit(delta);
+            this.updateThirdPersonCamera(delta);
+        } else {
+            const eyePos = this.playerController.getEyePosition();
+            this.camera.position.set(eyePos.x, eyePos.y, eyePos.z);
+        }
 
         // Update FOV for sprint
         const targetFov = this.playerController.isSprinting
@@ -759,6 +1007,165 @@ export class Game {
             : (this.settings.normalFOV || 75);
         this.camera.fov += (targetFov - this.camera.fov) * 0.1;
         this.camera.updateProjectionMatrix();
+    }
+
+    /**
+     * Toggle third-person camera mode
+     */
+    toggleThirdPerson() {
+        if (!this.camera) return;
+
+        this.isThirdPerson = !this.isThirdPerson;
+        if (this.isThirdPerson) {
+            const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+            this.thirdPersonOrbitYaw = euler.y;
+            this.thirdPersonOrbitPitch = 0.2;
+            this.thirdPersonDistance = 4.0;
+            this._thirdPersonSmoothInitialized = false;
+            this.inputManager?.consumeMouseDelta();
+        } else {
+            this.camera.rotation.order = 'YXZ';
+            this.camera.rotation.set(0, this.thirdPersonOrbitYaw, 0);
+        }
+
+        this.syncTorchVisibility();
+    }
+
+    /**
+     * Adjust third-person camera distance
+     * @param {number} delta
+     */
+    adjustThirdPersonDistance(delta) {
+        this.thirdPersonDistance = Math.min(
+            this.thirdPersonDistanceMax,
+            Math.max(this.thirdPersonDistanceMin, this.thirdPersonDistance + delta)
+        );
+        this._thirdPersonSmoothInitialized = false;
+    }
+
+    /**
+     * Update third-person orbit angles from mouse input
+     * @param {number} dt
+     */
+    updateThirdPersonOrbit(dt) {
+        if (!this.controls?.isLocked || !this.inputManager) return;
+
+        const mouseDelta = this.inputManager.consumeMouseDelta();
+        const sensitivity = 0.002;
+        this.thirdPersonOrbitYaw -= mouseDelta.x * sensitivity;
+        this.thirdPersonOrbitPitch += mouseDelta.y * sensitivity;
+        this.thirdPersonOrbitPitch = Math.max(
+            this.thirdPersonPitchMin,
+            Math.min(this.thirdPersonPitchMax, this.thirdPersonOrbitPitch)
+        );
+    }
+
+    /**
+     * Update third-person camera position and rotation
+     * @param {number} dt
+     */
+    updateThirdPersonCamera(dt) {
+        if (!this.playerController) return;
+
+        const playerPos = this.playerController.position;
+        const orbitYaw = this.thirdPersonOrbitYaw;
+        const orbitPitch = this.thirdPersonOrbitPitch;
+        const desiredDist = this.thirdPersonDistance;
+        const heightOffset = this.thirdPersonHeight - PLAYER_PHYSICS.eyeHeightStand;
+        const horizontalDist = desiredDist * Math.cos(orbitPitch);
+        const verticalOffset = desiredDist * Math.sin(orbitPitch) + heightOffset;
+
+        let desiredCamX = Math.sin(orbitYaw) * horizontalDist;
+        const desiredCamY = verticalOffset;
+        let desiredCamZ = Math.cos(orbitYaw) * horizontalDist;
+
+        const behindFactor = Math.max(0, Math.cos(orbitYaw));
+        const shoulderOffset = 0.5 * behindFactor;
+        const rightX = -Math.cos(orbitYaw);
+        const rightZ = Math.sin(orbitYaw);
+        desiredCamX += rightX * shoulderOffset;
+        desiredCamZ += rightZ * shoulderOffset;
+
+        const actualDist = this.getThirdPersonCameraDistance(
+            playerPos,
+            desiredCamX,
+            desiredCamY,
+            desiredCamZ,
+            desiredDist
+        );
+        const distRatio = actualDist / desiredDist;
+        const camX = desiredCamX * distRatio;
+        const camY = desiredCamY * distRatio;
+        const camZ = desiredCamZ * distRatio;
+
+        if (!this._thirdPersonSmoothInitialized) {
+            this._thirdPersonSmoothPos.set(camX, camY, camZ);
+            this._thirdPersonSmoothInitialized = true;
+        } else {
+            this._thirdPersonSmoothPos.x += (camX - this._thirdPersonSmoothPos.x) * this.thirdPersonSmoothFactor;
+            this._thirdPersonSmoothPos.y += (camY - this._thirdPersonSmoothPos.y) * this.thirdPersonSmoothFactor;
+            this._thirdPersonSmoothPos.z += (camZ - this._thirdPersonSmoothPos.z) * this.thirdPersonSmoothFactor;
+        }
+
+        this.camera.position.set(
+            playerPos.x + this._thirdPersonSmoothPos.x,
+            playerPos.y + this._thirdPersonSmoothPos.y,
+            playerPos.z + this._thirdPersonSmoothPos.z
+        );
+
+        const lookY = playerPos.y + this.thirdPersonLookHeight;
+        const dx = playerPos.x - this.camera.position.x;
+        const dz = playerPos.z - this.camera.position.z;
+        const dy = lookY - this.camera.position.y;
+        const distToPlayer = Math.sqrt(dx * dx + dz * dz);
+        const lookYaw = Math.atan2(dx, dz);
+        const lookPitch = Math.atan2(dy, distToPlayer);
+
+        this.camera.rotation.order = 'YXZ';
+        this.camera.rotation.set(lookPitch, lookYaw, 0);
+    }
+
+    /**
+     * Determine camera distance to avoid terrain clipping
+     * @param {{x: number, y: number, z: number}} playerPos
+     * @param {number} camX
+     * @param {number} camY
+     * @param {number} camZ
+     * @param {number} originalDist
+     * @returns {number}
+     */
+    getThirdPersonCameraDistance(playerPos, camX, camY, camZ, originalDist) {
+        this._thirdPersonCamDesired.set(
+            playerPos.x + camX,
+            playerPos.y + camY,
+            playerPos.z + camZ
+        );
+
+        this._thirdPersonPlayerPos.set(
+            playerPos.x,
+            playerPos.y + this.thirdPersonLookHeight,
+            playerPos.z
+        );
+
+        this._thirdPersonRayDir
+            .subVectors(this._thirdPersonCamDesired, this._thirdPersonPlayerPos)
+            .normalize();
+
+        const stepSize = 0.25;
+        const maxSteps = Math.ceil(originalDist / stepSize);
+
+        for (let i = 1; i <= maxSteps; i++) {
+            const t = i * stepSize;
+            const checkX = Math.floor(this._thirdPersonPlayerPos.x + this._thirdPersonRayDir.x * t);
+            const checkY = Math.floor(this._thirdPersonPlayerPos.y + this._thirdPersonRayDir.y * t);
+            const checkZ = Math.floor(this._thirdPersonPlayerPos.z + this._thirdPersonRayDir.z * t);
+
+            if (this.isSolidBlock(checkX, checkY, checkZ)) {
+                return Math.max(0.5, t - this.thirdPersonCamBuffer);
+            }
+        }
+
+        return originalDist;
     }
 
     /**
@@ -895,6 +1302,7 @@ export class Game {
 
         // Apply to scene
         this.dayNightCycle.applyToScene(this.scene, this.ambientLight, this.sunLight, null);
+        this.applyLightingSettings();
     }
 
     /**
@@ -919,7 +1327,7 @@ export class Game {
                 const key = getChunkKey(cx, cz);
 
                 if (!this.chunks.has(key) && !this.chunksLoading.has(key)) {
-                    this.generateChunk(cx, cz);
+                    this.queueChunkLoad(cx, cz);
                     loaded++;
                 }
             }
@@ -953,6 +1361,10 @@ export class Game {
                 this.waterMeshes.delete(key);
             }
 
+            const chunk = this.chunks.get(key);
+            if (chunk?.modified && this.worldStorage.isReady()) {
+                this.worldStorage.saveChunk(key, chunk, this.state.seed).catch(() => {});
+            }
             this.chunks.delete(key);
         }
 
@@ -1099,9 +1511,15 @@ export class Game {
      */
     toggleTorch() {
         this.torchVisible = !this.torchVisible;
-        if (this.torchViewmodel) {
-            this.torchViewmodel.visible = this.torchVisible;
-        }
+        this.syncTorchVisibility();
+    }
+
+    /**
+     * Sync torch viewmodel visibility with camera mode
+     */
+    syncTorchVisibility() {
+        if (!this.torchViewmodel) return;
+        this.torchViewmodel.visible = this.torchVisible && !this.isThirdPerson;
     }
 
     /**
@@ -1111,6 +1529,223 @@ export class Game {
         this.camera.aspect = window.innerWidth / window.innerHeight;
         this.camera.updateProjectionMatrix();
         this.renderer.setSize(window.innerWidth, window.innerHeight);
+        this.renderer.setPixelRatio(this.getPixelRatio());
+    }
+
+    /**
+     * Get renderer pixel ratio based on settings
+     * @returns {number}
+     */
+    getPixelRatio() {
+        const ratio = this.settings.pixelRatio ?? 1;
+        return Math.min(window.devicePixelRatio * ratio, 2);
+    }
+
+    /**
+     * Get camera far plane distance
+     * @returns {number}
+     */
+    getCameraFar() {
+        return Math.max(200, (this.settings.renderDistance + 2) * CHUNK_SIZE);
+    }
+
+    /**
+     * Load custom profile from storage
+     * @returns {Object}
+     */
+    loadCustomProfile() {
+        if (typeof localStorage === 'undefined') {
+            return { ...DEFAULTS };
+        }
+        try {
+            const stored = JSON.parse(localStorage.getItem('voxex_custom_profile') || 'null');
+            return stored || { ...DEFAULTS };
+        } catch (e) {
+            console.warn('[Game] Failed to load custom profile:', e);
+            return { ...DEFAULTS };
+        }
+    }
+
+    /**
+     * Load active profile name from storage
+     * @returns {string|null}
+     */
+    loadActiveProfile() {
+        if (typeof localStorage === 'undefined') {
+            return null;
+        }
+        return localStorage.getItem('voxex_active_profile');
+    }
+
+    /**
+     * Save current settings as custom profile
+     */
+    saveCustomProfile() {
+        this.customProfile = {};
+        const profileKeys = Object.keys(SETTINGS_PROFILES.balanced ?? {});
+        profileKeys.forEach((key) => {
+            if (key in this.settings) {
+                this.customProfile[key] = this.settings[key];
+            }
+        });
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('voxex_custom_profile', JSON.stringify(this.customProfile));
+        }
+        this.applySettingsProfile('custom');
+    }
+
+    /**
+     * Apply a settings profile
+     * @param {string} profileName
+     */
+    applySettingsProfile(profileName) {
+        const profile = profileName === 'custom' ? this.customProfile : SETTINGS_PROFILES[profileName];
+        if (!profile) return;
+
+        Object.entries(profile).forEach(([key, value]) => {
+            if (key in this.settings) {
+                this.settings[key] = value;
+            }
+        });
+
+        this.activeProfileName = profileName;
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem('voxex_active_profile', profileName);
+        }
+
+        this.applySettingsToSystems();
+        saveSettings(this.settings);
+    }
+
+    /**
+     * Apply settings to all systems
+     */
+    applySettingsToSystems() {
+        this.applyRendererSettings();
+        this.applySceneSettings();
+        this.applyCameraSettings();
+        this.applyDayNightSettings();
+        this.applyLightingSettings();
+        this.applyMaterialSettings();
+        this.applyViewmodelSettings();
+    }
+
+    /**
+     * Apply renderer-related settings
+     */
+    applyRendererSettings() {
+        if (!this.renderer) return;
+        this.renderer.setPixelRatio(this.getPixelRatio());
+        this.renderer.shadowMap.enabled = Boolean(this.settings.shadows);
+    }
+
+    /**
+     * Apply scene-related settings
+     */
+    applySceneSettings() {
+        if (!this.scene) return;
+
+        if (this.settings.fog) {
+            if (!this.scene.fog) {
+                this.scene.fog = new THREE.Fog(
+                    this.settings.fogColor ?? 0x87CEEB,
+                    10,
+                    this.settings.renderDistance * CHUNK_SIZE
+                );
+            }
+            this.scene.fog.color.setHex(this.settings.fogColor ?? 0x87CEEB);
+            this.scene.fog.far = this.settings.renderDistance * CHUNK_SIZE;
+        } else {
+            this.scene.fog = null;
+        }
+    }
+
+    /**
+     * Apply camera-related settings
+     */
+    applyCameraSettings() {
+        if (!this.camera) return;
+        this.camera.fov = this.settings.normalFOV || 75;
+        this.camera.far = this.getCameraFar();
+        this.camera.updateProjectionMatrix();
+    }
+
+    /**
+     * Apply day/night settings
+     */
+    applyDayNightSettings() {
+        if (!this.dayNightCycle) return;
+        this.dayNightCycle.setDayLength(this.settings.dayLength || 1200);
+    }
+
+    /**
+     * Apply lighting-related settings
+     */
+    applyLightingSettings() {
+        if (!this.ambientLight || !this.sunLight) return;
+
+        const baseAmbient = this.dayNightCycle?.getAmbientIntensity() ?? 0.4;
+        const baseSun = this.dayNightCycle?.sunIntensity ?? 0.8;
+
+        this.ambientLight.intensity = baseAmbient * (this.settings.ambientIntensity ?? 1);
+        this.sunLight.intensity = baseSun * (this.settings.sunIntensity ?? 1);
+        this.sunLight.color.setHex(this.settings.sunColor ?? 0xffffff);
+    }
+
+    /**
+     * Apply material-related settings
+     */
+    applyMaterialSettings() {
+        if (this.waterMaterial) {
+            updateWaterOpacity(this.waterMaterial, this.settings.waterOpacity ?? 0.7);
+            if (this.waterMaterial.color) {
+                this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+            }
+        }
+    }
+
+    /**
+     * Apply viewmodel-related settings
+     */
+    applyViewmodelSettings() {
+        const torchLight = this.torchViewmodel?.userData?.light;
+        if (torchLight) {
+            torchLight.intensity = this.settings.torchIntensity ?? torchLight.intensity;
+            torchLight.distance = this.settings.torchRange ?? torchLight.distance;
+            torchLight.color.setHex(this.settings.torchColor ?? 0xff6600);
+        }
+    }
+
+    /**
+     * Rebuild materials for texture resolution changes
+     */
+    rebuildMaterials() {
+        const atlasResult = createTextureAtlas(this.settings.textureResolution || 16);
+        const oldAtlas = this.textureAtlas;
+        const oldTerrain = this.terrainMaterial;
+        const oldWater = this.waterMaterial;
+
+        this.textureAtlas = atlasResult.texture;
+        this.terrainMaterial = createTerrainMaterial(this.textureAtlas, {
+            useStandardMaterial: true
+        });
+        this.waterMaterial = createWaterMaterial(this.textureAtlas, {
+            opacity: this.settings.waterOpacity ?? 0.7
+        });
+        if (this.waterMaterial.color) {
+            this.waterMaterial.color.setHex(this.settings.waterColor ?? 0xffffff);
+        }
+
+        this.solidMeshes.forEach(mesh => {
+            mesh.material = this.terrainMaterial;
+        });
+        this.waterMeshes.forEach(mesh => {
+            mesh.material = this.waterMaterial;
+        });
+
+        oldTerrain?.dispose();
+        oldWater?.dispose();
+        oldAtlas?.dispose();
     }
 
     /**
@@ -1121,12 +1756,49 @@ export class Game {
     updateSetting(key, value) {
         this.settings[key] = value;
 
-        if (key === 'normalFOV' || key === 'sprintFOV') {
-            // FOV will update in animate loop
+        switch (key) {
+            case 'normalFOV':
+                this.applyCameraSettings();
+                break;
+            case 'renderDistance':
+                this.applySceneSettings();
+                this.applyCameraSettings();
+                break;
+            case 'fog':
+            case 'fogColor':
+                this.applySceneSettings();
+                break;
+            case 'antialiasing':
+                console.warn('[Game] Antialiasing changes require a full reload to take effect.');
+                break;
+            case 'pixelRatio':
+                this.applyRendererSettings();
+                break;
+            case 'textureResolution':
+                this.rebuildMaterials();
+                break;
+            case 'waterOpacity':
+            case 'waterColor':
+                this.applyMaterialSettings();
+                break;
+            case 'sunColor':
+            case 'sunIntensity':
+            case 'ambientIntensity':
+                this.applyLightingSettings();
+                break;
+            case 'torchColor':
+            case 'torchIntensity':
+            case 'torchRange':
+                this.applyViewmodelSettings();
+                break;
+            case 'dayLength':
+                this.applyDayNightSettings();
+                break;
+            default:
+                break;
         }
-        if (key === 'renderDistance') {
-            this.scene.fog.far = value * CHUNK_SIZE;
-        }
+
+        saveSettings(this.settings);
     }
 
     /**
@@ -1144,20 +1816,89 @@ export class Game {
     }
 
     /**
-     * Save world (placeholder)
+     * Save world
+     * @param {string} [saveName]
      */
-    saveWorld() {
-        console.log('%c[Game] Quick save', 'color: #FF9800');
-        // TODO: Implement world saving
+    async saveWorld(saveName) {
+        const name = (saveName || this.activeWorldName || 'AutoSave').trim();
+        if (!name) return;
+
+        const seedToSave = this.state.seed?.toString() || Math.random().toString(36).substring(7);
+        const playerState = this.playerController?.getState?.() || null;
+        const cameraRot = {
+            x: this.camera.rotation.x,
+            y: this.camera.rotation.y,
+            z: this.camera.rotation.z
+        };
+
+        const metadata = {
+            seed: seedToSave,
+            player: {
+                state: playerState,
+                cameraRot
+            },
+            timestamp: Date.now(),
+            version: 2,
+            thumbnail: this.captureWorldThumbnail()
+        };
+
+        try {
+            this.worldStorage.saveMetadata(name, metadata);
+            await this.worldStorage.batchSaveChunks(this.chunks, seedToSave);
+            this.activeWorldName = name;
+            await this.refreshWorldCards();
+            this.uiManager?.showToast(`World "${name}" saved!`, 'success');
+        } catch (error) {
+            console.error('[Game] Failed to save world:', error);
+            this.uiManager?.showToast(`Save failed: ${error.message}`, 'error');
+        }
     }
 
     /**
-     * Load world (placeholder)
+     * Load world
      * @param {string} [saveName]
      */
-    loadWorld(saveName) {
-        console.log(`%c[Game] Load world: ${saveName || 'quicksave'}`, 'color: #FF9800');
-        // TODO: Implement world loading
+    async loadWorld(saveName) {
+        const name = saveName || this.activeWorldName;
+        if (!name) {
+            this.uiManager?.showToast('Select a world to load.', 'warning');
+            return;
+        }
+
+        const metadata = this.worldStorage.loadMetadata(name);
+        if (!metadata) {
+            this.uiManager?.showToast('Save file not found!', 'error');
+            return;
+        }
+
+        const seed = metadata.seed?.toString() || name;
+        const playerState = metadata.player?.state || null;
+        const cameraRot = metadata.player?.cameraRot || null;
+        this.activeWorldName = name;
+
+        await this.initializeWorld(seed, playerState, cameraRot);
+    }
+
+    /**
+     * Capture a thumbnail for the current world.
+     * @returns {string|null}
+     */
+    captureWorldThumbnail() {
+        if (!this.renderer?.domElement) return null;
+        try {
+            const thumbWidth = 120;
+            const thumbHeight = 80;
+            const thumbCanvas = document.createElement('canvas');
+            thumbCanvas.width = thumbWidth;
+            thumbCanvas.height = thumbHeight;
+            const ctx = thumbCanvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.drawImage(this.renderer.domElement, 0, 0, thumbWidth, thumbHeight);
+            return thumbCanvas.toDataURL('image/jpeg', 0.7);
+        } catch (error) {
+            console.warn('[Game] Failed to capture thumbnail:', error);
+            return null;
+        }
     }
 
     /**
