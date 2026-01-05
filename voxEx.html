@@ -1,3 +1,1002 @@
+            // RENDER SYSTEMS: STARS (Multi-Layer)
+            let starFieldSystem = null;
+            class StarFieldSystem {
+                constructor(scene) {
+                    this.scene = scene;
+                    this.layers = [];
+                }
+                rebuild() {
+                    this.dispose();
+                    if (!SETTINGS.starsEnabled) return null;
+
+                    const numLayers = SETTINGS.starLayerCount;
+                    const layerConfigs = [
+                        { // Layer 1 - furthest
+                            count: SETTINGS.starLayer1Count,
+                            radius: 450,
+                            size: SETTINGS.starLayer1Size,
+                            brightness: SETTINGS.starLayer1Brightness,
+                            twinkle: SETTINGS.starLayer1Twinkle,
+                            colorVar: SETTINGS.starLayer1ColorVariation,
+                            baseColor: new THREE.Color(SETTINGS.starLayer1Color)
+                        },
+                        { // Layer 2 - middle
+                            count: SETTINGS.starLayer2Count,
+                            radius: 400,
+                            size: SETTINGS.starLayer2Size,
+                            brightness: SETTINGS.starLayer2Brightness,
+                            twinkle: SETTINGS.starLayer2Twinkle,
+                            colorVar: SETTINGS.starLayer2ColorVariation,
+                            baseColor: new THREE.Color(SETTINGS.starLayer2Color)
+                        },
+                        { // Layer 3 - closest
+                            count: SETTINGS.starLayer3Count,
+                            radius: 350,
+                            size: SETTINGS.starLayer3Size,
+                            brightness: SETTINGS.starLayer3Brightness,
+                            twinkle: SETTINGS.starLayer3Twinkle,
+                            colorVar: SETTINGS.starLayer3ColorVariation,
+                            baseColor: new THREE.Color(SETTINGS.starLayer3Color)
+                        }
+                    ];
+
+                    for (let layerIdx = 0; layerIdx < numLayers; layerIdx++) {
+                        const config = layerConfigs[layerIdx];
+                        const geometry = new THREE.BufferGeometry();
+                        const positions = new Float32Array(config.count * 3);
+                        const colors = new Float32Array(config.count * 3);
+                        const sizes = new Float32Array(config.count);
+                        const twinklePhases = new Float32Array(config.count);
+
+                        for (let i = 0; i < config.count; i++) {
+                            // Distribute uniformly on full sphere (stars visible above AND below horizon)
+                            const theta = Math.random() * Math.PI * 2;  // 0 to 2π (full rotation)
+                            const phi = Math.acos(1 - 2 * Math.random());  // 0 to π (full sphere, uniform distribution)
+
+                            positions[i * 3] = config.radius * Math.sin(phi) * Math.cos(theta);
+                            positions[i * 3 + 1] = config.radius * Math.cos(phi);
+                            positions[i * 3 + 2] = config.radius * Math.sin(phi) * Math.sin(theta);
+
+                            // Color with variation
+                            const variation = (Math.random() - 0.5) * 2 * config.colorVar;
+                            colors[i * 3] = Math.min(1, Math.max(0, config.baseColor.r + variation));
+                            colors[i * 3 + 1] = Math.min(1, Math.max(0, config.baseColor.g + variation));
+                            colors[i * 3 + 2] = Math.min(1, Math.max(0, config.baseColor.b + variation * 0.5));
+
+                            sizes[i] = config.size * (0.8 + Math.random() * 0.4);
+                            twinklePhases[i] = Math.random() * Math.PI * 2;
+                        }
+
+                        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+                        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+                        geometry.setAttribute('twinklePhase', new THREE.BufferAttribute(twinklePhases, 1));
+
+                        const material = new THREE.ShaderMaterial({
+                            uniforms: {
+                                time: { value: 0 },
+                                visibility: { value: 0 },
+                                twinkleSpeed: { value: config.twinkle },
+                                brightness: { value: config.brightness }
+                            },
+                            vertexShader: `
+                                attribute float size;
+                                attribute vec3 color;
+                                attribute float twinklePhase;
+                                uniform float time;
+                                uniform float visibility;
+                                uniform float twinkleSpeed;
+                                uniform float brightness;
+                                varying vec3 vColor;
+                                varying float vAlpha;
+                                void main() {
+                                    vColor = color * brightness * 1.5; // Boost star brightness
+                                    float twinkle = 0.7 + 0.3 * sin(time * twinkleSpeed + twinklePhase);
+                                    vAlpha = visibility * twinkle * 1.2; // Boost star alpha
+                                    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                                    gl_PointSize = size * (400.0 / -mvPosition.z);
+                                    gl_Position = projectionMatrix * mvPosition;
+                                }
+                            `,
+                            fragmentShader: `
+                                varying vec3 vColor;
+                                varying float vAlpha;
+                                void main() {
+                                    // CUBE shape using Chebyshev distance
+                                    vec2 center = gl_PointCoord - vec2(0.5);
+                                    float dist = max(abs(center.x), abs(center.y));
+                                    if (dist > 0.5) discard;
+                                    float alpha = vAlpha * (1.0 - smoothstep(0.35, 0.5, dist));
+                                    gl_FragColor = vec4(vColor, alpha);
+                                }
+                            `,
+                            transparent: true,
+                            depthWrite: false,  // Don't write to depth buffer
+                            depthTest: true,    // DO test depth - terrain will properly occlude stars
+                            blending: THREE.AdditiveBlending
+                        });
+
+                        const stars = new THREE.Points(geometry, material);
+                        stars.renderOrder = -100 + layerIdx;  // Render FIRST (background), before everything else
+                        this.scene.add(stars);
+
+                        this.layers.push({ mesh: stars, material, geometry, layerIndex: layerIdx });
+                    return this.layers.length > 0 ? this.layers[0] : null;
+                }
+
+                update(time, dayNightTime, cameraPosition) {
+                    if (!SETTINGS.starsEnabled || this.layers.length === 0) return;
+
+                    let visibility = 0;
+                    if (dayNightTime > 0.7 || dayNightTime < 0.2) {
+                        if (dayNightTime > 0.7) {
+                            visibility = (dayNightTime - 0.7) / 0.15;
+                        } else if (dayNightTime < 0.2) {
+                            visibility = 1.0 - (dayNightTime / 0.2);
+                        }
+                        visibility = Math.min(1, Math.max(0, visibility));
+                    }
+
+                    this.layers.forEach(layer => {
+                        if (layer.material && layer.material.uniforms) {
+                            layer.material.uniforms.time.value = time * 0.001;
+                            layer.material.uniforms.visibility.value = visibility;
+                        }
+                        // Make stars follow the camera so they're always at the same relative distance
+                        if (layer.mesh && cameraPosition) {
+                            layer.mesh.position.copy(cameraPosition);
+                        }
+                    });
+
+                    // Debug: Log star position updates (remove after testing)
+                    if (cameraPosition && this.layers.length > 0 && Math.random() < 0.005) {
+                        console.log(`[Stars] Following camera at (${cameraPosition.x.toFixed(1)}, ${cameraPosition.y.toFixed(1)}, ${cameraPosition.z.toFixed(1)}), layers: ${this.layers.length}`);
+                    }
+                }
+
+                dispose() {
+                    this.layers.forEach(layer => {
+                        if (layer.mesh) this.scene.remove(layer.mesh);
+                        if (layer.geometry) layer.geometry.dispose();
+                        if (layer.material) layer.material.dispose();
+                    });
+                    this.layers = [];
+                }
+            }
+
+            function createStarField(theScene) {
+                if (!starFieldSystem || starFieldSystem.scene !== theScene) {
+                    starFieldSystem = new StarFieldSystem(theScene);
+                }
+                starField = starFieldSystem.rebuild();
+                return starField;
+            }
+
+            function updateStars(time, dayNightTime, cameraPosition) {
+                if (!starFieldSystem) return;
+                if (!SETTINGS.starsEnabled && starFieldSystem.layers.length > 0) {
+                    starFieldSystem.dispose();
+                    return;
+                }
+                starFieldSystem.update(time, dayNightTime, cameraPosition);
+            }
+
+            // ============================================
+            // RENDER SYSTEMS: CLOUDS (Volumetric Particles)
+            // ============================================
+            let cloudPlane = null;
+            let cloudSystem = null;
+            const CLOUD_BASE_COUNT = 1500; // Base particle count, multiplied by density setting
+
+            class CloudSystem {
+                constructor(scene) {
+                    this.scene = scene;
+                    this.cloudParticles = null;
+                }
+
+                rebuild() {
+                    this.dispose();
+                    if (!SETTINGS.cloudsEnabled) return null;
+
+                    const count = Math.floor(CLOUD_BASE_COUNT * SETTINGS.cloudDensity);
+                    const clumping = SETTINGS.cloudClumping;
+                    const heightRange = SETTINGS.cloudHeightRange;
+                    const baseY = SETTINGS.cloudHeight;
+                    const particleSize = SETTINGS.cloudParticleSize;
+
+                    const positions = new Float32Array(count * 3);
+                    const sizes = new Float32Array(count);
+                    const alphas = new Float32Array(count);
+                    const driftPhases = new Float32Array(count);
+
+                    // Generate cloud clumps - more clusters = less clumping
+                    const numClumps = Math.floor(20 + (1 - clumping) * 80);
+                    const clumpCenters = [];
+                    const spreadRadius = 400;
+
+                    for (let c = 0; c < numClumps; c++) {
+                        clumpCenters.push({
+                            x: (Math.random() - 0.5) * spreadRadius * 2,
+                            z: (Math.random() - 0.5) * spreadRadius * 2,
+                            y: baseY + (Math.random() - 0.5) * heightRange,
+                            radius: 30 + Math.random() * 80 * clumping, // Base size for box dimensions
+                            // Add aspect ratios for non-uniform rectangular prisms
+                            aspectX: 0.8 + Math.random() * 0.4, // 0.8-1.2x width variation
+                            aspectZ: 0.7 + Math.random() * 0.6  // 0.7-1.3x depth variation
+                        });
+                    }
+
+                    for (let i = 0; i < count; i++) {
+                        let x, z, y;
+                        if (Math.random() < clumping && clumpCenters.length > 0) {
+                            // Position near a clump center - use BOX distribution for rectangular prisms
+                            const clump = clumpCenters[Math.floor(Math.random() * clumpCenters.length)];
+                            // Random offset within a rectangular box, not a circle
+                            const boxWidth = clump.radius * clump.aspectX;
+                            const boxDepth = clump.radius * clump.aspectZ;
+                            const boxHeight = heightRange * 0.4;
+                            x = clump.x + (Math.random() - 0.5) * boxWidth;
+                            z = clump.z + (Math.random() - 0.5) * boxDepth;
+                            y = clump.y + (Math.random() - 0.5) * boxHeight;
+                            alphas[i] = 0.4 + Math.random() * 0.4;
+                        } else {
+                            // Random scattered position (also box-based)
+                            x = (Math.random() - 0.5) * spreadRadius * 2;
+                            z = (Math.random() - 0.5) * spreadRadius * 2;
+                            y = baseY + (Math.random() - 0.5) * heightRange * 0.5;
+                            alphas[i] = 0.2 + Math.random() * 0.3;
+                        }
+
+                        positions[i * 3] = x;
+                        positions[i * 3 + 1] = y;
+                        positions[i * 3 + 2] = z;
+
+                        sizes[i] = particleSize * (0.5 + Math.random() * 1.0);
+                        driftPhases[i] = Math.random() * Math.PI * 2;
+                    geometry.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
+                    geometry.setAttribute('driftPhase', new THREE.BufferAttribute(driftPhases, 1));
+                            cloudSpeed: { value: SETTINGS.cloudSpeed },
+                            playerPos: { value: new THREE.Vector3(0, 0, 0) },
+                            dayNightFactor: { value: 1.0 }, // 1.0 = full day, 0.0 = full night
+                            nightColor: { value: new THREE.Color(0x050812) } // Very dark blue-gray for night
+                            attribute float alpha;
+                            attribute float driftPhase;
+                            uniform float cloudSpeed;
+                            uniform vec3 playerPos;
+                            uniform float dayNightFactor;
+                            uniform vec3 nightColor;
+                            varying vec3 vColor;
+
+                                // Drift animation
+                                vec3 pos = position;
+                                pos.x += sin(time * cloudSpeed + driftPhase) * 5.0;
+                                pos.z += time * cloudSpeed * 10.0;
+
+                                // Wrap around player
+                                pos.x = mod(pos.x - playerPos.x + 400.0, 800.0) - 400.0 + playerPos.x;
+                                pos.z = mod(pos.z - playerPos.z + 400.0, 800.0) - 400.0 + playerPos.z;
+
+                                // Lerp cloud color between white (day) and nearly black (night)
+                                vec3 dayColor = vec3(0.95, 0.95, 1.0);
+                                vec3 darkNightColor = vec3(0.02, 0.03, 0.05); // Nearly black for night
+                                // Use squared factor for faster color transition to dark
+                                float colorFactor = dayNightFactor * dayNightFactor;
+                                vColor = mix(darkNightColor, dayColor, colorFactor);
+                                // At night (dayNightFactor near 0), clouds should be nearly invisible
+                                // Apply exponential falloff to make night clouds disappear faster
+                                float alphaFactor = dayNightFactor * dayNightFactor; // Square for faster falloff
+                                vAlpha = alpha * alphaFactor * 0.9; // Nearly 0% at night, 90% at full day
+
+                                vec4 mvPosition = modelViewMatrix * vec4(pos, 1.0);
+                                gl_PointSize = size * (300.0 / -mvPosition.z);
+                            varying vec3 vColor;
+
+
+                                float edgeSoftness = 1.0 - smoothstep(0.3, 0.5, dist);
+
+                                // Slight internal shading for depth
+                                float shading = 0.9 + 0.1 * (1.0 - dist * 2.0);
+                                vec3 shadedColor = vColor * shading;
+
+                                gl_FragColor = vec4(shadedColor, vAlpha * edgeSoftness);
+                        depthWrite: false,  // Transparent objects shouldn't write depth - allows stars to show through
+                        depthTest: true,    // Enable depth testing
+                        blending: THREE.NormalBlending
+                    const clouds = new THREE.Points(geometry, material);
+                    clouds.renderOrder = -50;  // Render after stars (-100) but before terrain (0)
+                    this.scene.add(clouds);
+                    this.cloudParticles = { mesh: clouds, material, geometry };
+                    return this.cloudParticles;
+                update(time, playerPos, dayNightTime) {
+                    if (!SETTINGS.cloudsEnabled || !this.cloudParticles || !this.cloudParticles.material) return;
+                    this.cloudParticles.material.uniforms.time.value = time * 0.001;
+                    // Calculate day/night factor for cloud coloring based on sun position
+                    // Uses the same sun angle calculation as updateDayNight for consistency
+                    let dayNightFactor;
+                    if (dayNightTime === undefined) {
+                        dayNightFactor = 1.0; // Default to day if not provided
+                    } else {
+                        // Calculate sun height using same formula as updateDayNight
+                        const smoothAngle = dayNightTime < 0.667
+                            ? (dayNightTime / 0.667) * Math.PI
+                            : Math.PI + ((dayNightTime - 0.667) / 0.333) * Math.PI;
+                        const sunHeight = Math.sin(smoothAngle); // -1 (midnight) to +1 (noon)
+
+                        // Map sun height to brightness factor
+                        // sunHeight > 0 = daytime (factor 0.5 to 1.0)
+                        // sunHeight < 0 = nighttime (factor 0 to 0.5)
+                        // Use a curve that makes night darker faster
+                        if (sunHeight > 0) {
+                            // Day: sunHeight 0->1 maps to factor 0.5->1.0
+                            dayNightFactor = 0.5 + sunHeight * 0.5;
+                        } else {
+                            // Night: sunHeight 0->-1 maps to factor 0.5->0
+                            // Square it to make night darker faster
+                            const nightDepth = -sunHeight; // 0 to 1
+                            dayNightFactor = 0.5 * (1 - nightDepth * nightDepth);
+                        }
+                    this.cloudParticles.material.uniforms.dayNightFactor.value = dayNightFactor;
+                    // Debug: Log dayNightFactor at night (remove after testing)
+                    if (dayNightTime > 0.7 || dayNightTime < 0.2) {
+                        if (Math.random() < 0.01) { // Only log occasionally
+                            console.log(`[Clouds] dayNightTime=${dayNightTime.toFixed(3)}, dayNightFactor=${dayNightFactor.toFixed(3)}`);
+                        }
+
+                    if (playerPos) {
+                        this.cloudParticles.material.uniforms.playerPos.value.copy(playerPos);
+                }
+
+                dispose() {
+                    if (this.cloudParticles) {
+                        if (this.cloudParticles.mesh) this.scene.remove(this.cloudParticles.mesh);
+                        if (this.cloudParticles.geometry) this.cloudParticles.geometry.dispose();
+                        if (this.cloudParticles.material) this.cloudParticles.material.dispose();
+                    }
+                    this.cloudParticles = null;
+                }
+            }
+
+            function createCloudPlane(theScene) {
+                if (!cloudSystem || cloudSystem.scene !== theScene) {
+                    cloudSystem = new CloudSystem(theScene);
+                }
+                cloudPlane = cloudSystem.rebuild();
+                return cloudPlane;
+            }
+            function updateClouds(time, sunY, playerPos, dayNightTime) {
+                if (!cloudSystem) return;
+                if (!SETTINGS.cloudsEnabled && cloudSystem.cloudParticles) {
+                    cloudSystem.dispose();
+                    return;
+                cloudSystem.update(time, playerPos, dayNightTime);
+            // WORLD SYSTEMS: WATER RIPPLES & VELOCITY EFFECTS
+            let waterEffectsSystem = null;
+            class WaterEffectsSystem {
+                constructor(scene, particleSystemRef) {
+                    this.scene = scene;
+                    this.particleSystem = particleSystemRef;
+                    this.ripples = [];
+                    this.maxRipples = 20; // Increased for multiple concurrent ripples
+                    this.lastWadeRippleTime = 0;
+                    this.lastWakeParticleTime = 0;
+                    this.lastBubbleTime = 0;
+                    this.breathBubbleTimer = 0;
+                setParticleSystem(particleSystemRef) {
+                    this.particleSystem = particleSystemRef;
+                }
+                resetBreathBubbles() {
+                    this.breathBubbleTimer = 0;
+                }
+                /**
+                 * Creates a voxel-style diamond/octagonal ring geometry for water ripples.
+                 * Uses shared vertices for a continuous ring with no seams.
+                 * @param {number} innerRadius - Inner radius of the ring.
+                 * @param {number} outerRadius - Outer radius of the ring.
+                 * @param {number} segments - Number of segments (4 for diamond, 8 for octagon).
+                 * @returns {THREE.BufferGeometry} The voxel-style ring geometry.
+                 */
+                createSquareRippleGeometry(innerRadius, outerRadius, segments = 4) {
+                    const geometry = new THREE.BufferGeometry();
+                    const vertices = [];
+                    const indices = [];
+                    const uvs = [];
+
+                    // Rotate 45° for diamond orientation when segments=4
+                    const angleOffset = segments === 4 ? Math.PI / 4 : 0;
+
+                    // Create vertices: inner ring first, then outer ring (shared corners)
+                    for (let i = 0; i < segments; i++) {
+                        const angle = (i / segments) * Math.PI * 2 + angleOffset;
+
+                        // Inner vertex
+                        vertices.push(
+                            Math.cos(angle) * innerRadius,
+                            0,
+                            Math.sin(angle) * innerRadius
+                        );
+                        uvs.push(0.5 + Math.cos(angle) * 0.25, 0.5 + Math.sin(angle) * 0.25);
+                    }
+                    for (let i = 0; i < segments; i++) {
+                        const angle = (i / segments) * Math.PI * 2 + angleOffset;
+                        // Outer vertex
+                        vertices.push(
+                            Math.cos(angle) * outerRadius,
+                            0,
+                            Math.sin(angle) * outerRadius
+                        );
+                        uvs.push(0.5 + Math.cos(angle) * 0.5, 0.5 + Math.sin(angle) * 0.5);
+                    // Create triangles connecting inner and outer rings
+                    for (let i = 0; i < segments; i++) {
+                        const nextI = (i + 1) % segments;
+                        const inner1 = i;
+                        const inner2 = nextI;
+                        const outer1 = i + segments;
+                        const outer2 = nextI + segments;
+                        // Two triangles per segment
+                        indices.push(inner1, outer1, inner2);
+                        indices.push(inner2, outer1, outer2);
+                    }
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+                    geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+                    geometry.setIndex(indices);
+                    geometry.computeVertexNormals();
+                    return geometry;
+                }
+                /**
+                 * Creates a V-shaped chevron wake geometry for wading effects.
+                 * The chevron points in the +Z direction (will be rotated to face movement).
+                 * @param {number} width - Width of the chevron arms.
+                 * @param {number} length - Length from tip to back.
+                 * @param {number} thickness - Thickness of the arms.
+                 * @param {number} angleDegrees - Angle between arms in degrees.
+                 * @returns {THREE.BufferGeometry} The chevron geometry.
+                 */
+                createChevronWakeGeometry(width = 0.5, length = 0.4, thickness = 0.08, angleDegrees = 70) {
+                    const geometry = new THREE.BufferGeometry();
+                    const vertices = [];
+                    const indices = [];
+
+                    const halfAngle = (angleDegrees / 2) * (Math.PI / 180);
+
+                    // Chevron tip at origin, arms extend backward in -Z direction
+                    // Left arm outer edge
+                    const leftOuterX = -Math.sin(halfAngle) * length;
+                    const leftOuterZ = -Math.cos(halfAngle) * length;
+                    // Left arm inner edge (closer to center)
+                    const leftInnerX = -Math.sin(halfAngle) * (length - thickness);
+                    const leftInnerZ = -Math.cos(halfAngle) * (length - thickness);
+
+                    // Right arm outer edge
+                    const rightOuterX = Math.sin(halfAngle) * length;
+                    const rightOuterZ = -Math.cos(halfAngle) * length;
+                    // Right arm inner edge
+                    const rightInnerX = Math.sin(halfAngle) * (length - thickness);
+                    const rightInnerZ = -Math.cos(halfAngle) * (length - thickness);
+
+                    // Vertices (in XZ plane, Y=0)
+                    // 0: tip front
+                    vertices.push(0, 0, thickness * 0.3);
+                    // 1: tip back
+                    vertices.push(0, 0, -thickness * 0.3);
+                    // 2: left arm outer
+                    vertices.push(leftOuterX - thickness * 0.2, 0, leftOuterZ);
+                    // 3: left arm inner
+                    vertices.push(leftInnerX, 0, leftInnerZ);
+                    // 4: right arm outer
+                    vertices.push(rightOuterX + thickness * 0.2, 0, rightOuterZ);
+                    // 5: right arm inner
+                    vertices.push(rightInnerX, 0, rightInnerZ);
+
+                    // Left arm triangles
+                    indices.push(0, 2, 3);
+                    indices.push(0, 3, 1);
+
+                    // Right arm triangles
+                    indices.push(0, 5, 4);
+                    indices.push(0, 1, 5);
+
+                    geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+                    geometry.setIndex(indices);
+                    geometry.computeVertexNormals();
+
+                    return geometry;
+                }
+                /**
+                 * Spawns a velocity-scaled water ripple at the given position.
+                 * Uses diamond geometry for voxel aesthetic, scales based on impact velocity.
+                 * @param {number} x - X position.
+                 * @param {number} y - Y position (water surface).
+                 * @param {number} z - Z position.
+                 * @param {number} [impactVelocity=2] - Vertical velocity at impact (negative = falling).
+                 */
+                spawnWaterRipple(x, y, z, impactVelocity = 2) {
+                    if (!SETTINGS.waterRipplesEnabled) return;
+
+                    const absVelocity = Math.abs(impactVelocity);
+                    const clampedVelocity = Math.min(absVelocity, 15);
+
+                    // Calculate velocity-based parameters using SETTINGS
+                    const initialScale = SETTINGS.waterRippleInitialScale + clampedVelocity * SETTINGS.waterRippleVelocityScale;
+                    const expansionRate = SETTINGS.waterRippleExpansionRate + clampedVelocity * 0.25;
+                    const initialOpacity = Math.min(SETTINGS.waterRippleOpacity + 0.1, SETTINGS.waterRippleOpacity + clampedVelocity * 0.015);
+                    const lifespan = SETTINGS.waterRippleLifespan + clampedVelocity * 0.08;
+
+                    // For high-velocity impacts, spawn multiple concentric ripples
+                    const rippleCount = absVelocity > 8 ? Math.min(3, Math.ceil(absVelocity / 6)) : 1;
+
+                    for (let r = 0; r < rippleCount; r++) {
+                        // Stagger spawns with small delay effect via scale offset
+                        const delay = r * 0.15;
+
+                        setTimeout(() => {
+                            if (this.ripples.length >= this.maxRipples) {
+                                const oldest = this.ripples.shift();
+                                if (oldest && oldest.mesh) {
+                                    this.scene.remove(oldest.mesh);
+                                    oldest.geometry.dispose();
+                                    oldest.material.dispose();
+                                }
+                            }
+
+                            // Use configurable segments for voxel aesthetic (4=diamond, 6=hex, 8=octagon)
+                            const geometry = this.createSquareRippleGeometry(0.08, 0.15, SETTINGS.waterRippleSegments);
+                            const material = new THREE.MeshBasicMaterial({
+                                color: SETTINGS.waterRippleColor,
+                                transparent: true,
+                                opacity: initialOpacity * (1 - r * 0.2),
+                                side: THREE.DoubleSide,
+                                depthWrite: false
+                            });
+                            const ripple = new THREE.Mesh(geometry, material);
+                            // Geometry is already in XZ plane (horizontal), no rotation needed
+                            ripple.position.set(x, y + 0.02, z);
+
+                            // Apply initial scale based on velocity and ring index
+                            // Scale in XZ plane (horizontal), Y stays at 1
+                            const ringScale = initialScale * (1 + r * 0.3);
+                            ripple.scale.set(ringScale, 1, ringScale);
+
+                            this.scene.add(ripple);
+
+                            this.ripples.push({
+                                mesh: ripple,
+                                geometry,
+                                material,
+                                life: lifespan,
+                                maxLife: lifespan,
+                                scale: ringScale,
+                                expansionRate: expansionRate * (1 - r * 0.15),
+                                initialOpacity: initialOpacity * (1 - r * 0.2)
+                            });
+                        }, delay * 1000);
+                    }
+                }
+                /**
+                 * Spawns a V-shaped wake when walking through shallow water.
+                 * @param {number} x - X position.
+                 * @param {number} y - Y position (water surface).
+                 * @param {number} z - Z position.
+                 * @param {number} hSpeed - Horizontal movement speed.
+                 * @param {number} moveDirX - Normalized movement direction X.
+                 * @param {number} moveDirZ - Normalized movement direction Z.
+                 */
+                spawnWadingRipple(x, y, z, hSpeed, moveDirX, moveDirZ) {
+                    if (!SETTINGS.waterRipplesEnabled || !SETTINGS.waterWadingRipplesEnabled) return;
+                    if (this.ripples.length >= this.maxRipples) {
+                        const oldest = this.ripples.shift();
+                        if (oldest && oldest.mesh) {
+                            this.scene.remove(oldest.mesh);
+                            oldest.geometry.dispose();
+                            oldest.material.dispose();
+                    }
+                    // Use chevron geometry for V-shaped wake
+                    const geometry = this.createChevronWakeGeometry(
+                        SETTINGS.waterWadeScale,
+                        SETTINGS.waterWadeScale * 0.8,
+                        0.08,
+                        SETTINGS.waterWadeAngle
+                    );
+                    const material = new THREE.MeshBasicMaterial({
+                        color: SETTINGS.waterRippleColor,
+                        transparent: true,
+                        opacity: SETTINGS.waterWadeOpacity,
+                        side: THREE.DoubleSide,
+                        depthWrite: false
+                    });
+                    const ripple = new THREE.Mesh(geometry, material);
+                    ripple.position.set(x, y + 0.02, z);
+
+                    // Rotate chevron to point in movement direction
+                    // Chevron geometry has tip at +Z, atan2 gives angle from +Z to movement
+                    const angle = Math.atan2(moveDirX, moveDirZ);
+                    ripple.rotation.y = angle;
+
+                    const wadeScale = SETTINGS.waterWadeScale + Math.min(hSpeed * 0.1, 0.4);
+                    ripple.scale.set(wadeScale, 1, wadeScale);
+
+                    this.scene.add(ripple);
+
+                    this.ripples.push({
+                        mesh: ripple,
+                        geometry,
+                        material,
+                        life: SETTINGS.waterWadeLifespan,
+                        maxLife: SETTINGS.waterWadeLifespan,
+                        scale: wadeScale,
+                        expansionRate: SETTINGS.waterWadeExpansionRate + hSpeed * 0.2,
+                        initialOpacity: SETTINGS.waterWadeOpacity,
+                        isWake: true
+                    });
+                }
+                /**
+                 * Updates wading ripples when player walks through shallow water.
+                 * @param {number} dt - Delta time.
+                 * @param {THREE.Vector3} playerPos - Player position.
+                 * @param {THREE.Vector3} playerVelocity - Player velocity.
+                 */
+                updateWadingRipples(dt, playerPos, playerVelocity) {
+                    if (!SETTINGS.waterWadingRipplesEnabled) return;
+                    if (!playerPos || !playerVelocity || !controls) return;
+                    const feetX = Math.floor(playerPos.x);
+                    const feetZ = Math.floor(playerPos.z);
+                    const feetY = Math.floor(playerPos.y - 1.7);
+                    const feetInWater = getBlock(feetX, feetY, feetZ) === WATER;
+                    const headInWater = isUnderwater;
+                    // Wading: feet in water but head above water
+                    if (!feetInWater || headInWater) return;
+                    // Find water surface Y (first non-water block above feet)
+                    let surfaceY = feetY + 1;
+                    for (let y = feetY; y < feetY + 10; y++) {
+                        if (getBlock(feetX, y, feetZ) !== WATER) {
+                            surfaceY = y;
+                            break;
+                        }
+                    // Convert camera-space velocity to world-space velocity
+                    // (same formula physics uses at lines 24085-24091)
+                    controls.getDirection(_physFwd);
+                    _physFwd.y = 0;
+                    _physFwd.normalize();
+                    _physRight.crossVectors(_physFwd, _physUp);
+                    const worldVelX = _physFwd.x * -playerVelocity.z + _physRight.x * playerVelocity.x;
+                    const worldVelZ = _physFwd.z * -playerVelocity.z + _physRight.z * playerVelocity.x;
+                    const hSpeed = Math.sqrt(worldVelX * worldVelX + worldVelZ * worldVelZ);
+                    if (hSpeed < SETTINGS.waterWadeMinSpeed) return;
+                    const now = performance.now();
+                    // Scale cooldown by speed: faster = more frequent wakes
+                    const cooldown = Math.max(150, SETTINGS.waterWadeCooldownBase - hSpeed * 50);
+                    if (now - this.lastWadeRippleTime < cooldown) return;
+                    this.lastWadeRippleTime = now;
+                    // Normalize world-space movement direction
+                    const moveDirX = worldVelX / hSpeed;
+                    const moveDirZ = worldVelZ / hSpeed;
+                    // Spawn wake behind player at water surface
+                    const behindX = playerPos.x - moveDirX * 0.3;
+                    const behindZ = playerPos.z - moveDirZ * 0.3;
+                    this.spawnWadingRipple(behindX, surfaceY, behindZ, hSpeed, moveDirX, moveDirZ);
+                /**
+                 * Updates all water ripples: expansion, fading, and cleanup.
+                 * @param {number} dt - Delta time.
+                 */
+                updateWaterRipples(dt) {
+                    if (!SETTINGS.waterRipplesEnabled) {
+                        this.dispose();
+                        return;
+                    }
+                    for (let i = this.ripples.length - 1; i >= 0; i--) {
+                        const ripple = this.ripples[i];
+                        ripple.life -= dt;
+                        if (ripple.life <= 0) {
+                            this.scene.remove(ripple.mesh);
+                            ripple.geometry.dispose();
+                            ripple.material.dispose();
+                            this.ripples.splice(i, 1);
+                            continue;
+                        }
+                        // Expand using velocity-based expansion rate
+                        const expRate = ripple.expansionRate ?? 2;
+                        ripple.scale += dt * expRate;
+                        // Scale in XZ plane (horizontal), Y stays at 1
+                        ripple.mesh.scale.set(ripple.scale, 1, ripple.scale);
+                        // Fade based on initial opacity
+                        const baseOpacity = ripple.initialOpacity ?? 0.5;
+                        ripple.material.opacity = baseOpacity * (ripple.life / ripple.maxLife);
+                    }
+                }
+                /**
+                 * Spawns velocity-scaled splash particles when entering water.
+                 * Particle count and spread scale with impact velocity.
+                 * @param {number} x - X position.
+                 * @param {number} y - Y position (water surface).
+                 * @param {number} z - Z position.
+                 * @param {number} impactVelocity - Vertical velocity at impact.
+                 */
+                spawnWaterEntrySplash(x, y, z, impactVelocity) {
+                    if (!this.particleSystem || !SETTINGS.particlesEnabled || !SETTINGS.waterSplashParticlesEnabled) return;
+                    const impactSpeed = Math.abs(impactVelocity);
+                    // Dynamic particle count: 1-8 based on impact speed
+                    const particleCount = Math.ceil(Math.min(impactSpeed, 20) / 2.5);
+                    const sizeBase = SETTINGS.footstepSize ?? 0.15;
+                    for (let i = 0; i < particleCount; i++) {
+                        // Scale velocities by impact speed
+                        const spreadAngle = Math.random() * Math.PI * 2;
+                        const spreadRadius = 0.3 + impactSpeed * 0.05;
+                        const upVelocity = (1 + impactSpeed * 0.3) * (0.5 + Math.random());
+                        const outVelocity = (0.5 + impactSpeed * 0.15) * (0.3 + Math.random() * 0.7);
+
+                        this.particleSystem.spawn(
+                            x + (Math.random() - 0.5) * spreadRadius,
+                            y + 0.1,
+                            z + (Math.random() - 0.5) * spreadRadius,
+                            {
+                                vx: Math.cos(spreadAngle) * outVelocity,
+                                vy: upVelocity,
+                                vz: Math.sin(spreadAngle) * outVelocity,
+                                r: 0.7, g: 0.88, b: 1.0, a: 0.7,
+                                size: sizeBase * (0.5 + impactSpeed * 0.05 + Math.random() * 0.3),
+                                life: 0.6 + impactSpeed * 0.03,
+                                gravity: 10,
+                                type: 'splash'
+                            }
+                        );
+                    }
+                    // Secondary droplets after short delay for larger impacts
+                    if (impactSpeed > 5) {
+                        setTimeout(() => {
+                            if (!this.particleSystem || !SETTINGS.particlesEnabled || !SETTINGS.waterSplashParticlesEnabled) return;
+                            const dropletCount = Math.ceil(impactSpeed / 5);
+                            for (let i = 0; i < dropletCount; i++) {
+                                const angle = Math.random() * Math.PI * 2;
+                                this.particleSystem.spawn(
+                                    x + (Math.random() - 0.5) * 0.5,
+                                    y + 0.3 + Math.random() * 0.3,
+                                    z + (Math.random() - 0.5) * 0.5,
+                                    {
+                                        vx: Math.cos(angle) * (0.3 + Math.random() * 0.5),
+                                        vy: 0.5 + Math.random() * 1.5,
+                                        vz: Math.sin(angle) * (0.3 + Math.random() * 0.5),
+                                        r: 0.75, g: 0.9, b: 1.0, a: 0.5,
+                                        size: sizeBase * 0.4,
+                                        life: 0.4,
+                                        gravity: 12,
+                                        type: 'droplet'
+                                    }
+                                );
+                        }, 120);
+                    }
+                }
+                /**
+                 * Spawns a dramatic splash column for high-velocity water impacts.
+                 * Creates vertical spray, crown ring, and mist effects.
+                 * @param {number} x - X position.
+                 * @param {number} y - Y position (water surface).
+                 * @param {number} z - Z position.
+                 * @param {number} impactVelocity - Vertical velocity at impact.
+                 */
+                spawnSplashColumn(x, y, z, impactVelocity) {
+                    if (!this.particleSystem || !SETTINGS.particlesEnabled || !SETTINGS.waterSplashParticlesEnabled) return;
+
+                    const impactSpeed = Math.abs(impactVelocity);
+                    const sizeBase = SETTINGS.footstepSize ?? 0.15;
+                    // Vertical column particles (8-15)
+                    const columnCount = Math.min(15, 8 + Math.floor(impactSpeed / 3));
+                    const columnHeight = 1 + impactSpeed * 0.15;
+
+                    for (let i = 0; i < columnCount; i++) {
+                        const delay = i * 25; // Staggered spawns for rising effect
+                        setTimeout(() => {
+                            if (!this.particleSystem || !SETTINGS.particlesEnabled || !SETTINGS.waterSplashParticlesEnabled) return;
+                            this.particleSystem.spawn(
+                                x + (Math.random() - 0.5) * 0.3,
+                                y + 0.1 + (i / columnCount) * 0.5,
+                                z + (Math.random() - 0.5) * 0.3,
+                                {
+                                    vx: (Math.random() - 0.5) * 0.8,
+                                    vy: columnHeight * (1 - i / columnCount * 0.3) + Math.random() * 2,
+                                    vz: (Math.random() - 0.5) * 0.8,
+                                    r: 0.8, g: 0.92, b: 1.0, a: 0.8,
+                                    size: sizeBase * (0.8 + Math.random() * 0.4),
+                                    life: 0.8 + Math.random() * 0.4,
+                                    gravity: 12,
+                                    type: 'column'
+                                }
+                            );
+                        }, delay);
+                    }
+                    // Crown ring particles (6-8 outward)
+                    const crownCount = 6 + Math.floor(impactSpeed / 8);
+                    for (let i = 0; i < crownCount; i++) {
+                        const angle = (i / crownCount) * Math.PI * 2;
+                        const outSpeed = 1.5 + impactSpeed * 0.1;
+                        setTimeout(() => {
+                            if (!this.particleSystem || !SETTINGS.particlesEnabled || !SETTINGS.waterSplashParticlesEnabled) return;
+                            this.particleSystem.spawn(
+                                x + Math.cos(angle) * 0.2,
+                                y + 0.15,
+                                z + Math.sin(angle) * 0.2,
+                                {
+                                    vx: Math.cos(angle) * outSpeed,
+                                    vy: 1 + Math.random() * 0.5,
+                                    vz: Math.sin(angle) * outSpeed,
+                                    r: 0.75, g: 0.9, b: 1.0, a: 0.6,
+                                    size: sizeBase * 0.6,
+                                    life: 0.5,
+                                    gravity: 8,
+                                    type: 'crown'
+                                }
+                            );
+                        }, 50);
+                    }
+                    // Mist particles (low opacity, minimal gravity)
+                    for (let i = 0; i < 5; i++) {
+                        this.particleSystem.spawn(
+                            x + (Math.random() - 0.5) * 0.6,
+                            y + 0.2 + Math.random() * 0.3,
+                            z + (Math.random() - 0.5) * 0.6,
+                            {
+                                vx: (Math.random() - 0.5) * 0.5,
+                                vy: 0.3 + Math.random() * 0.5,
+                                vz: (Math.random() - 0.5) * 0.5,
+                                r: 0.9, g: 0.95, b: 1.0, a: 0.25,
+                                size: sizeBase * 1.2,
+                                life: 0.6,
+                                gravity: 0.5,
+                                type: 'mist'
+                            }
+                        );
+                /**
+                 * Updates swimming wake effect (foam trail behind player).
+                 * @param {number} dt - Delta time.
+                 * @param {THREE.Vector3} playerPos - Player position.
+                 * @param {THREE.Vector3} playerVelocity - Player velocity.
+                 */
+                updateSwimWake(dt, playerPos, playerVelocity) {
+                    if (!SETTINGS.waterWakeEnabled || !SETTINGS.particlesEnabled || !this.particleSystem) return;
+                    if (!playerPos || !playerVelocity || !isUnderwater || !controls) return;
+                    // Convert camera-space velocity to world-space velocity
+                    controls.getDirection(_physFwd);
+                    _physFwd.y = 0;
+                    _physFwd.normalize();
+                    _physRight.crossVectors(_physFwd, _physUp);
+                    const worldVelX = _physFwd.x * -playerVelocity.z + _physRight.x * playerVelocity.x;
+                    const worldVelZ = _physFwd.z * -playerVelocity.z + _physRight.z * playerVelocity.x;
+                    const hSpeed = Math.sqrt(worldVelX * worldVelX + worldVelZ * worldVelZ);
+                    if (hSpeed < 0.5) return;
+                    const now = performance.now();
+                    const cooldown = Math.max(50, 200 - hSpeed * 30);
+                    if (now - this.lastWakeParticleTime < cooldown) return;
+                    this.lastWakeParticleTime = now;
+                    const sizeBase = SETTINGS.footstepSize ?? 0.15;
+
+                    // Normalize world-space movement direction
+                    const moveDirX = worldVelX / hSpeed;
+                    const moveDirZ = worldVelZ / hSpeed;
+
+                    // Spawn foam/bubbles behind player (opposite movement direction)
+                    const behindX = playerPos.x - moveDirX * 0.5;
+                    const behindZ = playerPos.z - moveDirZ * 0.5;
+
+                    // V-wake pattern: 2 particles offset perpendicular to movement
+                    const perpX = -moveDirZ;
+                    const perpZ = moveDirX;
+
+                    for (let side = -1; side <= 1; side += 2) {
+                        this.particleSystem.spawn(
+                            behindX + perpX * side * 0.25,
+                            playerPos.y - 0.3 + Math.random() * 0.2,
+                            behindZ + perpZ * side * 0.25,
+                            {
+                                vx: (Math.random() - 0.5) * 0.3,
+                                vy: -0.5 + Math.random() * 0.3, // Slight downward then float up
+                                vz: (Math.random() - 0.5) * 0.3,
+                                r: 0.85, g: 0.95, b: 1.0, a: 0.4,
+                                size: sizeBase * (0.4 + Math.random() * 0.3),
+                                life: 0.5 + Math.random() * 0.3,
+                                gravity: -0.5, // Float upward slightly
+                                type: 'wake'
+                            }
+                        );
+                /**
+                 * Updates underwater bubble stream from player.
+                 * @param {number} dt - Delta time.
+                 * @param {THREE.Vector3} playerPos - Player position.
+                 * @param {THREE.Vector3} playerVelocity - Player velocity.
+                 */
+                updateUnderwaterBubbles(dt, playerPos, playerVelocity) {
+                    if (!SETTINGS.waterBubblesEnabled || !SETTINGS.particlesEnabled || !this.particleSystem) return;
+                    if (!playerPos || !isUnderwater) return;
+                    const now = performance.now();
+                    const hSpeed = playerVelocity ? Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z) : 0;
+                    // Base bubble rate: faster when moving
+                    const bubbleCooldown = hSpeed > 1 ? 100 : 300;
+                    if (now - this.lastBubbleTime >= bubbleCooldown) {
+                        this.lastBubbleTime = now;
+                        const sizeBase = SETTINGS.footstepSize ?? 0.15;
+                        // Spawn bubble slightly behind/below player
+                        this.particleSystem.spawn(
+                            playerPos.x + (Math.random() - 0.5) * 0.3,
+                            playerPos.y - 0.5 + (Math.random() - 0.5) * 0.3,
+                            playerPos.z + (Math.random() - 0.5) * 0.3,
+                            {
+                                vx: (Math.random() - 0.5) * 0.3,
+                                vy: 0, // Gravity handles upward float
+                                vz: (Math.random() - 0.5) * 0.3,
+                                r: 0.8, g: 0.92, b: 1.0, a: 0.5,
+                                size: sizeBase * (0.3 + Math.random() * 0.3),
+                                life: 1.5 + Math.random() * 1.0,
+                                gravity: -3 - Math.random() * 2, // Float upward
+                                type: 'bubble'
+                            }
+                        );
+                    }
+                    // Breath bubbles: periodic burst every 3-5 seconds
+                    this.breathBubbleTimer += dt;
+                    if (this.breathBubbleTimer >= 3 + Math.random() * 2) {
+                        this.breathBubbleTimer = 0;
+                        const sizeBase = SETTINGS.footstepSize ?? 0.15;
+                        const burstCount = 3 + Math.floor(Math.random() * 3);
+                        for (let i = 0; i < burstCount; i++) {
+                            this.particleSystem.spawn(
+                                playerPos.x + (Math.random() - 0.5) * 0.15,
+                                playerPos.y - 0.2,
+                                playerPos.z + (Math.random() - 0.5) * 0.15,
+                                {
+                                    vx: (Math.random() - 0.5) * 0.2,
+                                    vy: 0.5 + Math.random() * 0.5,
+                                    vz: (Math.random() - 0.5) * 0.2,
+                                    r: 0.85, g: 0.95, b: 1.0, a: 0.6,
+                                    size: sizeBase * (0.5 + Math.random() * 0.3),
+                                    life: 2.0,
+                                    gravity: -4,
+                                    type: 'breath_bubble'
+                                }
+                            );
+                        }
+                }
+                /**
+                 * Main update function for all water velocity effects.
+                 * Called from the main update loop.
+                 * @param {number} dt - Delta time.
+                 * @param {THREE.Vector3} playerPos - Player position.
+                 * @param {THREE.Vector3} playerVelocity - Player velocity.
+                 */
+                updateVelocityEffects(dt, playerPos, playerVelocity) {
+                    this.updateWadingRipples(dt, playerPos, playerVelocity);
+                    this.updateSwimWake(dt, playerPos, playerVelocity);
+                    this.updateUnderwaterBubbles(dt, playerPos, playerVelocity);
+                }
+                dispose() {
+                    for (let i = this.ripples.length - 1; i >= 0; i--) {
+                        const ripple = this.ripples[i];
+                        this.scene.remove(ripple.mesh);
+                        ripple.geometry.dispose();
+                        ripple.material.dispose();
+                    }
+                    this.ripples = [];
+            function ensureWaterEffectsSystem() {
+                if (!waterEffectsSystem && scene) {
+                    waterEffectsSystem = new WaterEffectsSystem(scene, particleSystem);
+                }
+                if (waterEffectsSystem) {
+                    waterEffectsSystem.setParticleSystem(particleSystem);
+                }
+                return waterEffectsSystem;
+            }
+            function spawnWaterRipple(x, y, z, impactVelocity = 2) {
+                ensureWaterEffectsSystem()?.spawnWaterRipple(x, y, z, impactVelocity);
+            }
+            function updateWaterRipples(dt) {
+                waterEffectsSystem?.updateWaterRipples(dt);
+            }
+            function spawnWaterEntrySplash(x, y, z, impactVelocity) {
+                waterEffectsSystem?.spawnWaterEntrySplash(x, y, z, impactVelocity);
+            }
+            function spawnSplashColumn(x, y, z, impactVelocity) {
+                waterEffectsSystem?.spawnSplashColumn(x, y, z, impactVelocity);
+            }
+            function updateWaterVelocityEffects(dt, playerPos, playerVelocity) {
+                waterEffectsSystem?.updateVelocityEffects(dt, playerPos, playerVelocity);
+                waterEffectsSystem = new WaterEffectsSystem(scene, particleSystem);
+                    waterEffectsSystem?.resetBreathBubbles();
                 if (audioManager) {
                     audioManager.playFootstep();
                 }
