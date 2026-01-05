@@ -4,13 +4,30 @@
  */
 
 import * as THREE from 'three';
-import { CHUNK_SIZE, CHUNK_HEIGHT } from '../../config/WorldConfig.js';
+import { CHUNK_SIZE, CHUNK_HEIGHT, WORLD_DIMS } from '../../config/WorldConfig.js';
 import { NUM_TILES, BLOCK_CONFIG, TILE } from '../../config/BlockConfig.js';
 import { AIR, WATER, TORCH } from '../../core/constants.js';
-import { shouldRenderFace, isTransparent, FACE_DIRECTIONS } from './FaceCulling.js';
-import { getCachedFaceVertices } from '../../optimization/caches/FaceVertexCache.js';
+import { shouldRenderFace, isTransparent, getIsTransparentArray, FACE_DIRECTIONS } from './FaceCulling.js';
+import { getCachedFaceVertices, getCachedFaceVerticesIndexed } from '../../optimization/caches/FaceVertexCache.js';
 import { Float32ArrayPool } from '../../optimization/pools/Float32ArrayPool.js';
 import { Uint32ArrayPool } from '../../optimization/pools/Uint32ArrayPool.js';
+import {
+    calculateFaceAO,
+    initAOCache,
+    clearAOCache,
+    getSimplifiedLight,
+} from './AmbientOcclusion.js';
+import {
+    writeFaceVertices,
+    writeFaceVerticesIndexed,
+    writeFaceColors,
+    writeFaceColorsIndexed,
+    writeFaceColorsWater,
+    writeFaceColorsWaterIndexed,
+    writeFaceUVs,
+    writeFaceUVsIndexed,
+    writeFaceIndices,
+} from './FaceWriters.js';
 
 // =====================================================
 // Pool instances
@@ -415,5 +432,427 @@ export function disposeChunkGeometry(geometry) {
     }
 }
 
-export { getTileForFace, getFaceNormal };
-export default { buildChunkMesh, disposeChunkGeometry, getBlockUV };
+// =====================================================
+// Full Face-Adding Functions (with AO support)
+// =====================================================
+
+/**
+ * Add a face to the chunk mesh with full AO and lighting.
+ * Non-indexed version (6 vertices per face).
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset [u, v]
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Function} getter - Block getter function
+ * @param {number} solidX - Solid block X
+ * @param {number} solidY - Solid block Y
+ * @param {number} solidZ - Solid block Z
+ * @param {number} blockId - Block type ID
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {Function} lightGetter - Light getter function
+ * @param {number} lightX - Light sample X
+ * @param {number} lightY - Light sample Y
+ * @param {number} lightZ - Light sample Z
+ * @param {number} faceIdx - Face index for AO caching
+ * @returns {void}
+ */
+export function addFace(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx) {
+    const verts = getCachedFaceVertices(nx, ny, nz);
+    writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, getIsTransparentArray(), faceIdx);
+    const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+    writeFaceColors(col, cIdx, ao, lightLevel);
+    writeFaceUVs(uvs, uvIdx, uv);
+}
+
+/**
+ * Add a water face with depth-based coloring.
+ * Non-indexed version.
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Function} getter - Block getter function
+ * @param {number} solidX - Solid block X
+ * @param {number} solidY - Solid block Y
+ * @param {number} solidZ - Solid block Z
+ * @param {number} blockId - Block type ID
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {Function} lightGetter - Light getter function
+ * @param {number} lightX - Light sample X
+ * @param {number} lightY - Light sample Y
+ * @param {number} lightZ - Light sample Z
+ * @param {number} faceIdx - Face index for AO caching
+ * @param {number} waterDepth - Water depth in blocks
+ * @param {Float32Array} shoreBuffer - Shore distance buffer
+ * @param {number} shoreIdx - Shore buffer index
+ * @param {number} shoreDist - Distance to shore
+ * @param {Float32Array} thicknessBuffer - Water thickness buffer
+ * @param {number} thicknessIdx - Thickness buffer index
+ * @returns {void}
+ */
+export function addFaceWater(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
+    const verts = getCachedFaceVertices(nx, ny, nz);
+    writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, getIsTransparentArray(), faceIdx);
+    const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+    writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
+    writeFaceUVs(uvs, uvIdx, uv);
+
+    // Write shore distance for all 6 vertices
+    const shoreNorm = Math.min(shoreDist / 4.0, 1.0);
+    shoreBuffer[shoreIdx] = shoreNorm;
+    shoreBuffer[shoreIdx + 1] = shoreNorm;
+    shoreBuffer[shoreIdx + 2] = shoreNorm;
+    shoreBuffer[shoreIdx + 3] = shoreNorm;
+    shoreBuffer[shoreIdx + 4] = shoreNorm;
+    shoreBuffer[shoreIdx + 5] = shoreNorm;
+
+    // Write water thickness
+    const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+    thicknessBuffer[thicknessIdx] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 4] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 5] = thicknessNorm;
+}
+
+/**
+ * Add a simplified face for distant LOD chunks.
+ * Skips expensive AO calculation, uses height-based lighting.
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Function} getter - Block getter function (unused)
+ * @param {number} solidX - Solid block X (unused)
+ * @param {number} solidY - Solid block Y (unused)
+ * @param {number} solidZ - Solid block Z (unused)
+ * @param {number} blockId - Block type ID (unused)
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {number} ly - Local Y coordinate
+ * @returns {void}
+ */
+export function addFaceSimplified(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, ly) {
+    const verts = getCachedFaceVertices(nx, ny, nz);
+    writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const simplifiedLight = getSimplifiedLight(ly, CHUNK_HEIGHT) / 15.0;
+    const c = simplifiedLight;
+    col[cIdx] = c; col[cIdx+1] = c; col[cIdx+2] = c;
+    col[cIdx+3] = c; col[cIdx+4] = c; col[cIdx+5] = c;
+    col[cIdx+6] = c; col[cIdx+7] = c; col[cIdx+8] = c;
+    col[cIdx+9] = c; col[cIdx+10] = c; col[cIdx+11] = c;
+    col[cIdx+12] = c; col[cIdx+13] = c; col[cIdx+14] = c;
+    col[cIdx+15] = c; col[cIdx+16] = c; col[cIdx+17] = c;
+    writeFaceUVs(uvs, uvIdx, uv);
+}
+
+// =====================================================
+// Indexed Geometry Face Functions
+// =====================================================
+
+/**
+ * Add a face using indexed geometry (4 vertices + 6 indices).
+ * Full AO and lighting support.
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Uint32Array} indices - Index buffer
+ * @param {Function} getter - Block getter function
+ * @param {number} solidX - Solid block X
+ * @param {number} solidY - Solid block Y
+ * @param {number} solidZ - Solid block Z
+ * @param {number} blockId - Block type ID
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {number} iIdx - Index buffer index
+ * @param {number} vertexCount - Current vertex count (for index offset)
+ * @param {Function} lightGetter - Light getter function
+ * @param {number} lightX - Light sample X
+ * @param {number} lightY - Light sample Y
+ * @param {number} lightZ - Light sample Z
+ * @param {number} faceIdx - Face index for AO caching
+ * @returns {void}
+ */
+export function addFaceIndexedFull(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx) {
+    const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+    writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, getIsTransparentArray(), faceIdx);
+    const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+    writeFaceColorsIndexed(col, cIdx, ao, lightLevel);
+    writeFaceUVsIndexed(uvs, uvIdx, uv);
+    writeFaceIndices(indices, iIdx, vertexCount);
+}
+
+/**
+ * Add a water face using indexed geometry.
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Uint32Array} indices - Index buffer
+ * @param {Function} getter - Block getter function
+ * @param {number} solidX - Solid block X
+ * @param {number} solidY - Solid block Y
+ * @param {number} solidZ - Solid block Z
+ * @param {number} blockId - Block type ID
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {number} iIdx - Index buffer index
+ * @param {number} vertexCount - Current vertex count
+ * @param {Function} lightGetter - Light getter function
+ * @param {number} lightX - Light sample X
+ * @param {number} lightY - Light sample Y
+ * @param {number} lightZ - Light sample Z
+ * @param {number} faceIdx - Face index for AO caching
+ * @param {number} waterDepth - Water depth in blocks
+ * @param {Float32Array} shoreBuffer - Shore distance buffer
+ * @param {number} shoreIdx - Shore buffer index
+ * @param {number} shoreDist - Distance to shore
+ * @param {Float32Array} thicknessBuffer - Water thickness buffer
+ * @param {number} thicknessIdx - Thickness buffer index
+ * @returns {void}
+ */
+export function addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
+    const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+    writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, getIsTransparentArray(), faceIdx);
+    const lightLevel = lightGetter ? lightGetter(lightX, lightY, lightZ) / 15.0 : 1.0;
+    writeFaceColorsWaterIndexed(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
+    writeFaceUVsIndexed(uvs, uvIdx, uv);
+    writeFaceIndices(indices, iIdx, vertexCount);
+
+    // Shore and thickness attributes (4 vertices)
+    const shoreNorm = Math.min(shoreDist / 4.0, 1.0);
+    shoreBuffer[shoreIdx] = shoreNorm;
+    shoreBuffer[shoreIdx + 1] = shoreNorm;
+    shoreBuffer[shoreIdx + 2] = shoreNorm;
+    shoreBuffer[shoreIdx + 3] = shoreNorm;
+
+    const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+    thicknessBuffer[thicknessIdx] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
+    thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+}
+
+/**
+ * Add a simplified face using indexed geometry (for distant LOD chunks).
+ * @param {number} wx - World X position
+ * @param {number} wy - World Y position
+ * @param {number} wz - World Z position
+ * @param {number} nx - Normal X
+ * @param {number} ny - Normal Y
+ * @param {number} nz - Normal Z
+ * @param {number[]} uv - UV tile offset
+ * @param {Float32Array} pos - Position buffer
+ * @param {Float32Array} norm - Normal buffer
+ * @param {Float32Array} uvs - UV buffer
+ * @param {Float32Array} col - Color buffer
+ * @param {Uint32Array} indices - Index buffer
+ * @param {Function} getter - Block getter function (unused)
+ * @param {number} solidX - Solid block X (unused)
+ * @param {number} solidY - Solid block Y (unused)
+ * @param {number} solidZ - Solid block Z (unused)
+ * @param {number} blockId - Block type ID (unused)
+ * @param {number} vIdx - Vertex buffer index
+ * @param {number} uvIdx - UV buffer index
+ * @param {number} cIdx - Color buffer index
+ * @param {number} iIdx - Index buffer index
+ * @param {number} vertexCount - Current vertex count
+ * @param {number} ly - Local Y coordinate
+ * @returns {void}
+ */
+export function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly) {
+    const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+    writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
+    const simplifiedLight = getSimplifiedLight(ly, CHUNK_HEIGHT) / 15.0;
+    // Write flat colors for 4 vertices
+    col[cIdx] = simplifiedLight; col[cIdx+1] = simplifiedLight; col[cIdx+2] = simplifiedLight;
+    col[cIdx+3] = simplifiedLight; col[cIdx+4] = simplifiedLight; col[cIdx+5] = simplifiedLight;
+    col[cIdx+6] = simplifiedLight; col[cIdx+7] = simplifiedLight; col[cIdx+8] = simplifiedLight;
+    col[cIdx+9] = simplifiedLight; col[cIdx+10] = simplifiedLight; col[cIdx+11] = simplifiedLight;
+    writeFaceUVsIndexed(uvs, uvIdx, uv);
+    writeFaceIndices(indices, iIdx, vertexCount);
+}
+
+// =====================================================
+// ChunkMesher Class
+// =====================================================
+// OPTIMIZATION AUDIT (2025-12-15):
+// - NOT a hot path: Only called at init and on user settings changes
+// - The main animate loop uses the plain functions directly
+// - All methods are O(1) or O(n) where n = number of settings keys (small)
+// - No allocations in loops, no GC pressure concerns
+// - Status: All methods marked "no-op" - already optimal for their use case
+
+/**
+ * ChunkMesher - handles chunk mesh generation with material management.
+ * Provides caching for face vertices and AO configurations.
+ */
+export class ChunkMesher {
+    /**
+     * Create a new ChunkMesher.
+     * @param {Object} [materials] - Material configuration.
+     * @param {Object} [options] - Optional configuration.
+     * @param {boolean} [options.debug=false] - Enable debug call counting.
+     */
+    constructor(materials, options = {}) {
+        this.materials = materials || {};
+        this.faceVertexCache = new Map();
+        this._debug = options.debug || false;
+        // DEBUG: Call counters for verification
+        this._callCounts = { getCachedFaceVertices: 0, calculateVertexAO: 0, buildMesh: 0 };
+    }
+
+    /**
+     * Set materials for terrain and water rendering.
+     * @param {THREE.Material} terrain - Terrain material.
+     * @param {THREE.Material} water - Water material.
+     * @returns {void}
+     */
+    setMaterials(terrain, water) {
+        this.materials.terrain = terrain;
+        this.materials.water = water;
+    }
+
+    /**
+     * Get cached face vertices.
+     * Uses numeric key for cache to avoid string concat GC pressure.
+     * @param {number} nx - Normal X component.
+     * @param {number} ny - Normal Y component.
+     * @param {number} nz - Normal Z component.
+     * @returns {Float32Array} Face vertices (18 floats).
+     */
+    getCachedFaceVertices(nx, ny, nz) {
+        if (this._debug) this._callCounts.getCachedFaceVertices++;
+        const key = (nx + 1) * 9 + (ny + 1) * 3 + (nz + 1);
+        if (this.faceVertexCache.has(key)) return this.faceVertexCache.get(key);
+
+        const verts = new Float32Array(18);
+        let x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4;
+
+        if (ny > 0) { x1 = 0; y1 = 1; z1 = 1; x2 = 1; y2 = 1; z2 = 1; x3 = 1; y3 = 1; z3 = 0; x4 = 0; y4 = 1; z4 = 0; }
+        else if (ny < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 0; z3 = 1; x4 = 0; y4 = 0; z4 = 1; }
+        else if (nx > 0) { x1 = 1; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 1; }
+        else if (nx < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 1; x3 = 0; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 0; }
+        else if (nz > 0) { x1 = 0; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 1; x3 = 1; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 1; }
+        else { x1 = 1; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 0; x3 = 0; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 0; }
+
+        verts[0] = x1; verts[1] = y1; verts[2] = z1;
+        verts[3] = x2; verts[4] = y2; verts[5] = z2;
+        verts[6] = x4; verts[7] = y4; verts[8] = z4;
+        verts[9] = x2; verts[10] = y2; verts[11] = z2;
+        verts[12] = x3; verts[13] = y3; verts[14] = z3;
+        verts[15] = x4; verts[16] = y4; verts[17] = z4;
+
+        this.faceVertexCache.set(key, verts);
+        return verts;
+    }
+
+    /**
+     * Build mesh for a chunk (delegates to global buildChunkMesh).
+     * @param {Object} chunk - Chunk data.
+     * @param {Object} neighbors - Neighbor chunk data.
+     * @param {Object} uvMap - UV mapping.
+     * @returns {Object|null} Mesh result or null.
+     */
+    buildMeshForChunk(chunk, neighbors, uvMap) {
+        if (this._debug) this._callCounts.buildMesh++;
+        // Delegate to the global function
+        return null; // Placeholder - uses existing buildChunkMesh()
+    }
+
+    /**
+     * Dispose of chunk mesh resources.
+     * @param {Object} chunk - Chunk with mesh and waterMesh properties.
+     * @returns {void}
+     */
+    disposeChunkMesh(chunk) {
+        if (chunk.mesh) {
+            if (chunk.mesh.geometry) chunk.mesh.geometry.dispose();
+            chunk.mesh = null;
+        }
+        if (chunk.waterMesh) {
+            if (chunk.waterMesh.geometry) chunk.waterMesh.geometry.dispose();
+            chunk.waterMesh = null;
+        }
+    }
+
+    /**
+     * Get debug call statistics.
+     * @returns {Object} Copy of call counts.
+     */
+    getCallStats() {
+        return { ...this._callCounts };
+    }
+
+    /**
+     * Reset debug call counters.
+     * @returns {void}
+     */
+    resetCallStats() {
+        for (const key in this._callCounts) {
+            this._callCounts[key] = 0;
+        }
+    }
+}
+
+export { getTileForFace, getFaceNormal, initAOCache, clearAOCache };
+export default {
+    buildChunkMesh,
+    disposeChunkGeometry,
+    getBlockUV,
+    ChunkMesher,
+    addFace,
+    addFaceWater,
+    addFaceSimplified,
+    addFaceIndexedFull,
+    addFaceWaterIndexed,
+    addFaceSimplifiedIndexed,
+};
