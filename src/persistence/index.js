@@ -5,3 +5,4 @@
  */
 
 export { ChunkCompressor, default as ChunkCompressorDefault } from './ChunkCompressor.js';
+export { WorldStorage, default as WorldStorageDefault } from './WorldStorage.js';
