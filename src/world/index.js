@@ -5,6 +5,16 @@
  */
 
 // =====================================================
+// VOXELWORLD CLASS (Phase 6)
+// =====================================================
+// Main world management class for chunk-based voxel terrain
+export {
+    VoxelWorld,
+    setVoxelWorldDebug,
+    default as VoxelWorldDefault
+} from './VoxelWorld.js';
+
+// =====================================================
 // CHUNK DATA STRUCTURE (Phase 5)
 // =====================================================
 export * from './Chunk.js';
@@ -25,5 +35,4 @@ export * from './generation/index.js';
 // FUTURE SUBMODULES
 // =====================================================
 // These will be added in future phases:
-// - chunks/ (chunk management, streaming)
 // - entities/ (mobs, players)
