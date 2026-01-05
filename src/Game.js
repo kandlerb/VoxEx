@@ -44,6 +44,9 @@ import { createTorchViewmodel } from './render/models/TorchModel.js';
 // UI
 import { UIManager } from './ui/UIManager.js';
 
+// Persistence
+import { WorldStorage } from './persistence/WorldStorage.js';
+
 /**
  * @typedef {Object} GameState
  * @property {string} seed
@@ -126,6 +129,10 @@ export class Game {
         this.customProfile = this.loadCustomProfile();
         this.bindings = { ...DEFAULT_BINDINGS };
 
+        // Persistence
+        this.worldStorage = new WorldStorage();
+        this.activeWorldName = null;
+
         // Stats
         this.stats = {
             fps: 0,
@@ -172,6 +179,10 @@ export class Game {
         this.initInput();
         this.initUI();
         this.initDayNight();
+
+        // Initialize persistence
+        await this.worldStorage.init();
+        await this.refreshWorldCards();
 
         // Initialize viewmodels
         this.initViewmodels();
@@ -423,14 +434,95 @@ export class Game {
      */
     initUI() {
         this.uiManager = new UIManager(this.container, {
-            onNewWorld: (seed) => this.startNewWorld(seed),
+            onNewWorld: ({ name, seed }) => this.startNewWorld(seed, name),
             onLoadWorld: (saveName) => this.loadWorld(saveName),
-            onSave: () => this.saveWorld(),
+            onSave: (name) => this.saveWorld(name),
             onLoad: () => this.uiManager.setState('mainMenu'),
             onSettingChange: (key, value) => this.updateSetting(key, value),
             onBlockSelect: (blockId) => {
                 this.selectedBlock = blockId;
             },
+            onDeleteWorld: async (name) => {
+                if (!name) return;
+                if (!confirm(`Delete world "${name}"? This cannot be undone.`)) return;
+                await this.worldStorage.deleteWorld(name);
+                if (this.activeWorldName === name) this.activeWorldName = null;
+                await this.refreshWorldCards();
+                this.uiManager.showToast(`Deleted "${name}"`, 'success');
+            },
+            onRenameWorld: async (oldName, newName) => {
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    this.uiManager.showToast('Please enter a valid name', 'warning');
+                    return false;
+                }
+                if (this.worldStorage.getIndex().includes(trimmed)) {
+                    this.uiManager.showToast('A world with that name already exists', 'error');
+                    return false;
+                }
+                const success = this.worldStorage.renameWorld(oldName, trimmed);
+                if (success) {
+                    if (this.activeWorldName === oldName) this.activeWorldName = trimmed;
+                    await this.refreshWorldCards();
+                    this.uiManager.showToast(`Renamed to "${trimmed}"`, 'success');
+                } else {
+                    this.uiManager.showToast('World not found', 'error');
+                }
+                return success;
+            },
+            onDuplicateWorld: async (sourceName, newName) => {
+                const trimmed = newName.trim();
+                if (!trimmed) {
+                    this.uiManager.showToast('Please enter a valid name', 'warning');
+                    return false;
+                }
+                if (this.worldStorage.getIndex().includes(trimmed)) {
+                    this.uiManager.showToast('A world with that name already exists', 'error');
+                    return false;
+                }
+                const success = this.worldStorage.duplicateWorld(sourceName, trimmed);
+                if (success) {
+                    await this.refreshWorldCards();
+                    this.uiManager.showToast(`Created "${trimmed}"`, 'success');
+                } else {
+                    this.uiManager.showToast('Source world not found', 'error');
+                }
+                return success;
+            },
+            onClearWorldCache: async (name) => {
+                const metadata = this.worldStorage.loadMetadata(name);
+                if (!metadata?.seed) {
+                    this.uiManager.showToast('No chunks to clear', 'info');
+                    return;
+                }
+                if (!confirm(`Clear all cached chunks for "${name}"?\n\nThe world can be regenerated from its seed, but any manually placed/removed blocks will be lost.`)) {
+                    return;
+                }
+                const deletedCount = await this.worldStorage.clearChunksForSeed(metadata.seed.toString());
+                this.uiManager.showToast(`Cleared ${deletedCount} chunks`, 'success');
+            },
+            onExportWorld: async (name) => {
+                const blob = await this.worldStorage.exportWorld(name);
+                if (!blob) {
+                    this.uiManager.showToast('World not found', 'error');
+                } else {
+                    this.uiManager.showToast(`Exported "${name}"`, 'success');
+                }
+                return blob;
+            },
+            onImportWorld: async (file) => {
+                try {
+                    const result = await this.worldStorage.importWorld(file);
+                    if (result) {
+                        await this.refreshWorldCards();
+                        this.uiManager.showToast(`Imported "${result.name}" (${result.chunkCount} chunks)`, 'success');
+                    }
+                } catch (error) {
+                    console.error('[Game] Import failed:', error);
+                    this.uiManager.showToast(`Failed to import world: ${error.message}`, 'error');
+                }
+            },
+            onWorldStorageInfo: (name) => this.worldStorage.getWorldStorageInfo(name),
             onStateChange: (state) => {
                 this.state.isPaused = state !== 'playing';
             },
@@ -470,13 +562,35 @@ export class Game {
     }
 
     /**
+     * Refresh world cards in the main menu
+     */
+    async refreshWorldCards() {
+        if (!this.uiManager) return;
+        const worlds = this.worldStorage.listWorlds();
+        const totalBytes = await this.worldStorage.getTotalStorageBytes();
+        this.uiManager.updateWorldCards(worlds, totalBytes);
+    }
+
+    /**
      * Start a new world with given seed
      * @param {string} seed
+     * @param {string} [worldName]
      */
-    async startNewWorld(seed) {
-        console.log(`%c[Game] Starting new world with seed: ${seed}`, 'color: #2196F3');
+    async startNewWorld(seed, worldName = 'New World') {
+        const resolvedSeed = seed || Math.random().toString(36).substring(7);
+        console.log(`%c[Game] Starting new world with seed: ${resolvedSeed}`, 'color: #2196F3');
+        this.activeWorldName = worldName;
+        await this.initializeWorld(resolvedSeed);
+    }
 
-        this.state.seed = seed || Math.random().toString(36).substring(7);
+    /**
+     * Initialize world state for new or loaded worlds
+     * @param {string} seed
+     * @param {Object} [playerState]
+     * @param {{x: number, y: number, z: number}} [cameraRot]
+     */
+    async initializeWorld(seed, playerState = null, cameraRot = null) {
+        this.state.seed = seed;
         this.state.isRunning = true;
         this.state.isPaused = false;
 
@@ -494,10 +608,21 @@ export class Game {
         // Initialize player at spawn
         const spawnY = this.chunkGenerator.getHeightAt(0, 0) + 2 + Y_OFFSET;
         this.playerController = new PlayerController(0, spawnY, 0);
-        this.camera.position.set(0, spawnY, 0);
+
+        if (playerState) {
+            this.playerController.setState(playerState);
+        }
 
         // Initialize entity manager
         this.entityManager = new EntityManager();
+
+        // Update camera orientation before positioning
+        if (cameraRot) {
+            this.camera.rotation.set(cameraRot.x, cameraRot.y, cameraRot.z);
+        }
+
+        const eyePos = this.playerController.getEyePosition();
+        this.camera.position.set(eyePos.x, eyePos.y, eyePos.z);
 
         // Generate initial chunks
         await this.generateInitialChunks();
@@ -544,10 +669,8 @@ export class Game {
 
         for (let dx = -renderDist; dx <= renderDist; dx++) {
             for (let dz = -renderDist; dz <= renderDist; dz++) {
-                const key = getChunkKey(dx, dz);
-
-                if (!this.chunks.has(key)) {
-                    this.generateChunk(dx, dz);
+                if (!this.chunks.has(getChunkKey(dx, dz))) {
+                    await this.loadChunkAsync(dx, dz);
                     generated++;
 
                     const progress = (generated / totalChunks) * 100;
@@ -563,11 +686,11 @@ export class Game {
     }
 
     /**
-     * Generate a single chunk
+     * Queue a chunk load
      * @param {number} cx - Chunk X coordinate
      * @param {number} cz - Chunk Z coordinate
      */
-    generateChunk(cx, cz) {
+    queueChunkLoad(cx, cz) {
         const key = getChunkKey(cx, cz);
 
         if (this.chunks.has(key) || this.chunksLoading.has(key)) {
@@ -575,25 +698,65 @@ export class Game {
         }
 
         this.chunksLoading.add(key);
+        this.loadChunkAsync(cx, cz).catch((error) => {
+            console.error('[Game] Failed to load chunk:', error);
+        });
+    }
 
-        // Generate chunk data
-        const chunkData = this.chunkGenerator.generateChunk(cx, cz);
+    /**
+     * Load a single chunk from cache or generate it.
+     * @param {number} cx - Chunk X coordinate
+     * @param {number} cz - Chunk Z coordinate
+     */
+    async loadChunkAsync(cx, cz) {
+        const key = getChunkKey(cx, cz);
 
-        // Calculate lighting
-        calculateChunkSunlight(
-            chunkData,
-            CHUNK_SIZE,
-            CHUNK_HEIGHT,
-            BlockLookups.IS_TRANSPARENT,
-            BlockLookups.SUNLIGHT_ATTENUATION
-        );
+        if (this.chunks.has(key)) {
+            this.chunksLoading.delete(key);
+            return;
+        }
 
-        this.chunks.set(key, chunkData);
+        const wasLoading = this.chunksLoading.has(key);
+        if (!wasLoading) {
+            this.chunksLoading.add(key);
+        }
+        let chunkData = null;
+        try {
+            if (this.worldStorage.isReady()) {
+                chunkData = await this.worldStorage.loadChunk(key, this.state.seed);
+            }
 
-        // Build mesh
-        this.buildChunkMeshes(cx, cz, chunkData);
+            if (!chunkData) {
+                chunkData = this.chunkGenerator.generateChunk(cx, cz);
+                calculateChunkSunlight(
+                    chunkData,
+                    CHUNK_SIZE,
+                    CHUNK_HEIGHT,
+                    BlockLookups.IS_TRANSPARENT,
+                    BlockLookups.SUNLIGHT_ATTENUATION
+                );
+            } else {
+                chunkData.cx = cx;
+                chunkData.cz = cz;
+                chunkData.startX = cx * CHUNK_SIZE;
+                chunkData.startZ = cz * CHUNK_SIZE;
+                chunkData.generated = true;
+                chunkData.lit = true;
+                chunkData.meshed = false;
+                chunkData.modified = false;
+            }
 
-        this.chunksLoading.delete(key);
+            this.chunks.set(key, chunkData);
+
+            // Build mesh
+            this.buildChunkMeshes(cx, cz, chunkData);
+
+            if (!chunkData.modified && this.worldStorage.isReady()) {
+                this.worldStorage.saveChunk(key, chunkData, this.state.seed).catch(() => {});
+            }
+        } finally {
+            this.chunksLoading.delete(key);
+        }
     }
 
     /**
@@ -942,7 +1105,7 @@ export class Game {
                 const key = getChunkKey(cx, cz);
 
                 if (!this.chunks.has(key) && !this.chunksLoading.has(key)) {
-                    this.generateChunk(cx, cz);
+                    this.queueChunkLoad(cx, cz);
                     loaded++;
                 }
             }
@@ -976,6 +1139,10 @@ export class Game {
                 this.waterMeshes.delete(key);
             }
 
+            const chunk = this.chunks.get(key);
+            if (chunk?.modified && this.worldStorage.isReady()) {
+                this.worldStorage.saveChunk(key, chunk, this.state.seed).catch(() => {});
+            }
             this.chunks.delete(key);
         }
 
@@ -1421,20 +1588,89 @@ export class Game {
     }
 
     /**
-     * Save world (placeholder)
+     * Save world
+     * @param {string} [saveName]
      */
-    saveWorld() {
-        console.log('%c[Game] Quick save', 'color: #FF9800');
-        // TODO: Implement world saving
+    async saveWorld(saveName) {
+        const name = (saveName || this.activeWorldName || 'AutoSave').trim();
+        if (!name) return;
+
+        const seedToSave = this.state.seed?.toString() || Math.random().toString(36).substring(7);
+        const playerState = this.playerController?.getState?.() || null;
+        const cameraRot = {
+            x: this.camera.rotation.x,
+            y: this.camera.rotation.y,
+            z: this.camera.rotation.z
+        };
+
+        const metadata = {
+            seed: seedToSave,
+            player: {
+                state: playerState,
+                cameraRot
+            },
+            timestamp: Date.now(),
+            version: 2,
+            thumbnail: this.captureWorldThumbnail()
+        };
+
+        try {
+            this.worldStorage.saveMetadata(name, metadata);
+            await this.worldStorage.batchSaveChunks(this.chunks, seedToSave);
+            this.activeWorldName = name;
+            await this.refreshWorldCards();
+            this.uiManager?.showToast(`World "${name}" saved!`, 'success');
+        } catch (error) {
+            console.error('[Game] Failed to save world:', error);
+            this.uiManager?.showToast(`Save failed: ${error.message}`, 'error');
+        }
     }
 
     /**
-     * Load world (placeholder)
+     * Load world
      * @param {string} [saveName]
      */
-    loadWorld(saveName) {
-        console.log(`%c[Game] Load world: ${saveName || 'quicksave'}`, 'color: #FF9800');
-        // TODO: Implement world loading
+    async loadWorld(saveName) {
+        const name = saveName || this.activeWorldName;
+        if (!name) {
+            this.uiManager?.showToast('Select a world to load.', 'warning');
+            return;
+        }
+
+        const metadata = this.worldStorage.loadMetadata(name);
+        if (!metadata) {
+            this.uiManager?.showToast('Save file not found!', 'error');
+            return;
+        }
+
+        const seed = metadata.seed?.toString() || name;
+        const playerState = metadata.player?.state || null;
+        const cameraRot = metadata.player?.cameraRot || null;
+        this.activeWorldName = name;
+
+        await this.initializeWorld(seed, playerState, cameraRot);
+    }
+
+    /**
+     * Capture a thumbnail for the current world.
+     * @returns {string|null}
+     */
+    captureWorldThumbnail() {
+        if (!this.renderer?.domElement) return null;
+        try {
+            const thumbWidth = 120;
+            const thumbHeight = 80;
+            const thumbCanvas = document.createElement('canvas');
+            thumbCanvas.width = thumbWidth;
+            thumbCanvas.height = thumbHeight;
+            const ctx = thumbCanvas.getContext('2d');
+            if (!ctx) return null;
+            ctx.drawImage(this.renderer.domElement, 0, 0, thumbWidth, thumbHeight);
+            return thumbCanvas.toDataURL('image/jpeg', 0.7);
+        } catch (error) {
+            console.warn('[Game] Failed to capture thumbnail:', error);
+            return null;
+        }
     }
 
     /**
