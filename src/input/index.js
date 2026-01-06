@@ -5,3 +5,4 @@
 
 export { InputManager, default as InputManagerDefault } from './InputManager.js';
 export * from './ControlBindings.js';
+export * from './InputConstants.js';

@@ -250,3 +250,15 @@ POSE_PRESETS.knockdown_collapse = KNOCKDOWN_KEYFRAMES[1].pose;
 POSE_PRESETS.knockdown_ground = KNOCKDOWN_KEYFRAMES[2].pose;
 POSE_PRESETS.knockdown_pushup = KNOCKDOWN_KEYFRAMES[4].pose;
 POSE_PRESETS.knockdown_kneel = KNOCKDOWN_KEYFRAMES[5].pose;
+
+// =====================================================
+// POSE FIELD DEFINITIONS
+// =====================================================
+
+/**
+ * Fields that represent position offsets (not rotations).
+ * Used by smoothPose to identify which fields need linear interpolation
+ * vs spring-based angular interpolation.
+ * @type {string[]}
+ */
+export const POSE_POSITION_FIELDS = ['bodyY', 'headY', 'headZ'];
