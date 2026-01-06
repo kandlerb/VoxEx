@@ -31,6 +31,7 @@ import { createChunkIndicator, updateChunkIndicator } from './overlays/ChunkIndi
  * @property {Function} [onLoadWorld]
  * @property {Function} [onSave]
  * @property {Function} [onLoad]
+ * @property {Function} [onResume] - Called when Resume button is clicked (should lock controls)
  * @property {Function} [onBlockSelect]
  * @property {Function} [onSettingChange]
  * @property {Function} [onStateChange]
@@ -84,7 +85,15 @@ export class UIManager {
                 onWorldStorageInfo: callbacks.onWorldStorageInfo ?? (() => {})
             }),
             pauseMenu: createPauseMenu({
-                onResume: () => this.setState('playing'),
+                onResume: () => {
+                    // Call external onResume callback to lock controls
+                    // This will trigger the 'lock' event which sets state to 'playing'
+                    if (callbacks.onResume) {
+                        callbacks.onResume();
+                    } else {
+                        this.setState('playing');
+                    }
+                },
                 onSave: callbacks.onSave ?? (() => {}),
                 onLoad: callbacks.onLoad ?? (() => {}),
                 onSettings: () => this.setState('settings'),

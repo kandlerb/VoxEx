@@ -314,8 +314,12 @@ export class Game {
         });
 
         this.controls.addEventListener('unlock', () => {
+            // Only show pause if game is running (not during init or inventory)
             if (this.state.isRunning && this.uiManager) {
-                this.uiManager.setState('paused');
+                const currentState = this.uiManager.getState();
+                if (currentState !== 'inventory') {
+                    this.uiManager.setState('paused');
+                }
             }
             this.state.isPaused = true;
         });
@@ -505,6 +509,12 @@ export class Game {
             onLoadWorld: (saveName) => this.loadWorld(saveName),
             onSave: (name) => this.saveWorld(name),
             onLoad: () => this.uiManager.setState('mainMenu'),
+            onResume: () => {
+                // Lock controls - this triggers 'lock' event which sets state to 'playing'
+                if (this.controls && !this.controls.isLocked) {
+                    this.controls.lock();
+                }
+            },
             onSettingChange: (key, value) => this.updateSetting(key, value),
             onBlockSelect: (blockId) => {
                 this.selectedBlock = blockId;
@@ -772,15 +782,72 @@ export class Game {
         // Generate initial chunks
         await this.generateInitialChunks();
 
-        // Start game
-        this.uiManager.setState('playing');
-        this.controls.lock();
+        // Show start screen instead of immediately starting
+        this.showStartScreen();
 
-        // Start game loop
+        // Start game loop (but paused until user clicks)
         if (!this.animationId) {
             this.clock.start();
             this.animate();
         }
+    }
+
+    /**
+     * Show the "Ready to Explore" start screen after world generation
+     */
+    showStartScreen() {
+        // Hide the loading overlay first
+        this.uiManager.setLoadingProgress(100, 'Ready!');
+
+        // Create start screen overlay
+        const startScreen = document.createElement('div');
+        startScreen.id = 'start-screen-overlay';
+        startScreen.style.cssText = `
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.85);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 1200;
+            cursor: pointer;
+        `;
+
+        // Content container
+        const content = document.createElement('div');
+        content.style.cssText = 'text-align: center;';
+        content.innerHTML = `
+            <h1 style="color: #4CAF50; font-size: 48px; margin-bottom: 20px; text-shadow: 2px 2px 4px rgba(0,0,0,0.5);">Ready to Explore!</h1>
+            <p style="font-size: 20px; color: #fff; margin-bottom: 10px;">Seed: ${this.state.seed}</p>
+            <p style="font-size: 16px; color: rgba(255,255,255,0.7);">Click anywhere to start</p>
+        `;
+        startScreen.appendChild(content);
+
+        // Append to container
+        this.container.appendChild(startScreen);
+
+        // Game is ready but paused until user clicks
+        this.state.isPaused = true;
+
+        // Click handler to start game
+        const startGame = (e) => {
+            // Prevent event from propagating
+            e.stopPropagation();
+
+            // Remove start screen
+            startScreen.remove();
+
+            // Lock controls - this will trigger the 'lock' event which sets state to 'playing'
+            this.controls.lock();
+
+            // Clean up listener
+            document.removeEventListener('click', startGame);
+        };
+
+        // Add click listener to both the overlay and document
+        startScreen.addEventListener('click', startGame);
+        document.addEventListener('click', startGame);
     }
 
     /**
