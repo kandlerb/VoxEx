@@ -11,3 +11,21 @@ export {
     disposeTorchMaterials,
     default as TorchModelDefault
 } from './TorchModel.js';
+
+export {
+    generatePlayerSkinTexture,
+    generatePlayerHeadMaterials,
+    generatePlayerUpperArmMaterials,
+    generatePlayerForearmMaterials,
+    generatePlayerMaterials,
+    buildArticulatedMesh,
+    buildPlayerMesh,
+    createThirdPersonTorch,
+    createHeldBlockMesh
+} from './PlayerModel.js';
+
+export {
+    buildPlayerViewmodelArms,
+    ViewmodelArmsAnimator,
+    animateViewmodelArms
+} from './ViewmodelArms.js';
