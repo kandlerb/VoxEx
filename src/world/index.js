@@ -15,6 +15,41 @@ export {
 } from './VoxelWorld.js';
 
 // =====================================================
+// CHUNK QUEUE MANAGEMENT (Phase 6)
+// =====================================================
+// Queue management, scheduling, frame budget
+export {
+    ChunkQueue,
+    CHUNK_QUEUE_CONFIG,
+    processWithBudget,
+    default as ChunkQueueDefault
+} from './ChunkQueue.js';
+
+// =====================================================
+// CHUNK CACHING (Phase 6)
+// =====================================================
+// Height map caching, biome weight caching, IndexedDB batch ops
+export {
+    ChunkCache,
+    HeightMapCache,
+    BiomeWeightCache,
+    CACHE_CONFIG,
+    batchLoadChunksFromCache,
+    batchSaveChunksToCache,
+    default as ChunkCacheDefault
+} from './ChunkCache.js';
+
+// =====================================================
+// CHUNK MESH POOLING (Phase 6)
+// =====================================================
+// Mesh pooling for terrain and water
+export {
+    ChunkMeshPool,
+    MESH_POOL_CONFIG,
+    default as ChunkMeshPoolDefault
+} from './ChunkMeshPool.js';
+
+// =====================================================
 // CHUNK DATA STRUCTURE (Phase 5)
 // =====================================================
 export * from './Chunk.js';
