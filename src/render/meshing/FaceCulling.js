@@ -88,6 +88,30 @@ export function isTransparent(blockId) {
 }
 
 /**
+ * Get the IS_TRANSPARENT lookup array directly.
+ * Used by AO calculation which needs direct array access for performance.
+ * @returns {Uint8Array} Transparency lookup array
+ */
+export function getIsTransparentArray() {
+    return getLookups().IS_TRANSPARENT;
+}
+
+/**
+ * IS_TRANSPARENT lookup array (lazy-initialized).
+ * Direct export for modules that need array access.
+ * @type {Uint8Array}
+ */
+export const IS_TRANSPARENT = new Proxy({}, {
+    get(target, prop) {
+        const arr = getLookups().IS_TRANSPARENT;
+        if (prop === 'length') return arr.length;
+        const idx = parseInt(prop, 10);
+        if (!isNaN(idx)) return arr[idx];
+        return arr[prop];
+    }
+});
+
+/**
  * Check if block is solid
  * @param {number} blockId - Block ID to check
  * @returns {boolean} True if solid

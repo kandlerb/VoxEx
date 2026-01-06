@@ -138,3 +138,42 @@ export const CHUNK_SIZE_SQUARED = CHUNK_SIZE * CHUNK_SIZE;
 
 /** Total blocks per chunk (volume) */
 export const CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+
+// =====================================================
+// CHUNK PROCESSING CONSTANTS
+// =====================================================
+
+/** Time budget for chunk building per frame (ms) */
+export const CHUNK_BUILD_BUDGET_MS = 8;
+
+/** Number of chunks to process per batch */
+export const CHUNK_BATCH_SIZE = 4;
+
+/** Minimum time between rebuilds of same chunk (ms) */
+export const CHUNK_REBUILD_COOLDOWN_MS = 1000;
+
+/** Size of chunk key string cache */
+export const CHUNK_KEY_CACHE_SIZE = 128;
+
+/** Pre-generation radius (chunks ahead to generate) */
+export const PRE_GEN_RADIUS = 2;
+
+// =====================================================
+// BIOME GRID CONSTANTS
+// =====================================================
+
+/** Size of biome cell in blocks for caching */
+export const BIOME_CELL_SIZE = 64;
+
+/** Precision for biome weight storage (integers * 100) */
+export const BIOME_WEIGHT_PRECISION = 100;
+
+// =====================================================
+// TERRAIN HEIGHT CONSTANTS
+// =====================================================
+
+/** Alpine line height (stunted trees above this) */
+export const ALPINE_LINE = 85;
+
+/** Tree line base height (varies by slope aspect) */
+export const TREE_LINE_BASE = 80;

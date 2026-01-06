@@ -11,3 +11,5 @@ export * from './Settings.js';
 export * from './ZombieConfig.js';
 export * from './PlayerConfig.js';
 export * from './PosePresets.js';
+export * from './CameraConfig.js';
+export * from './EffectsConfig.js';

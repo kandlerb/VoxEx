@@ -130,3 +130,94 @@ export function clampBlockLight(level) {
     if (level > MAX_BLOCK_LIGHT_LEVEL) return MAX_BLOCK_LIGHT_LEVEL;
     return level;
 }
+
+// =====================================================
+// AMBIENT OCCLUSION CONSTANTS
+// =====================================================
+
+/**
+ * Pre-computed AO power curve lookup table.
+ * Math.pow((3 - occlusionCount) / 3, 0.6) for occlusion counts 0-3.
+ * Avoids expensive Math.pow calls in tight rendering loop.
+ * @type {number[]}
+ */
+export const AO_LOOKUP = [
+    1.0,   // 0 occlusions: Full brightness
+    0.85,  // 1 occlusion: Slight darkening
+    0.7,   // 2 occlusions: Moderate darkening
+    0.5,   // 3 occlusions: Deep corners
+];
+
+/**
+ * AO neighbor offset configurations for each face direction.
+ * Each face has 4 vertices, each vertex checks 2 sides + 1 corner.
+ * Format: [dx1, dy1, dz1, dx2, dy2, dz2, dxc, dyc, dzc]
+ * @type {Object<string, number[][]>}
+ */
+export const AO_FACE_CONFIGS = {
+    top: [
+        [-1, 1, 0, 0, 1, 1, -1, 1, 1],   // ao1
+        [1, 1, 0, 0, 1, 1, 1, 1, 1],     // ao2
+        [1, 1, 0, 0, 1, -1, 1, 1, -1],   // ao3
+        [-1, 1, 0, 0, 1, -1, -1, 1, -1]  // ao4
+    ],
+    bottom: [
+        [-1, -1, 0, 0, -1, -1, -1, -1, -1],
+        [1, -1, 0, 0, -1, -1, 1, -1, -1],
+        [1, -1, 0, 0, -1, 1, 1, -1, 1],
+        [-1, -1, 0, 0, -1, 1, -1, -1, 1]
+    ],
+    right: [
+        [1, -1, 0, 1, 0, 1, 1, -1, 1],
+        [1, -1, 0, 1, 0, -1, 1, -1, -1],
+        [1, 1, 0, 1, 0, -1, 1, 1, -1],
+        [1, 1, 0, 1, 0, 1, 1, 1, 1]
+    ],
+    left: [
+        [-1, -1, 0, -1, 0, -1, -1, -1, -1],
+        [-1, -1, 0, -1, 0, 1, -1, -1, 1],
+        [-1, 1, 0, -1, 0, 1, -1, 1, 1],
+        [-1, 1, 0, -1, 0, -1, -1, 1, -1]
+    ],
+    back: [
+        [-1, 0, 1, 0, -1, 1, -1, -1, 1],
+        [1, 0, 1, 0, -1, 1, 1, -1, 1],
+        [1, 0, 1, 0, 1, 1, 1, 1, 1],
+        [-1, 0, 1, 0, 1, 1, -1, 1, 1]
+    ],
+    front: [
+        [1, 0, -1, 0, -1, -1, 1, -1, -1],
+        [-1, 0, -1, 0, -1, -1, -1, -1, -1],
+        [-1, 0, -1, 0, 1, -1, -1, 1, -1],
+        [1, 0, -1, 0, 1, -1, 1, 1, -1]
+    ]
+};
+
+/** AO cache size for full chunk with 6 face directions */
+export const AO_CACHE_SIZE = 16 * 320 * 16 * 6;
+
+/**
+ * Get AO vertex offset configuration for a face based on its normal.
+ * @param {number} nx - Face normal X component
+ * @param {number} ny - Face normal Y component
+ * @param {number} nz - Face normal Z component
+ * @returns {number[][]} Array of 4 vertex offset configurations
+ */
+export function getAOConfig(nx, ny, nz) {
+    if (ny > 0) return AO_FACE_CONFIGS.top;
+    if (ny < 0) return AO_FACE_CONFIGS.bottom;
+    if (nx > 0) return AO_FACE_CONFIGS.right;
+    if (nx < 0) return AO_FACE_CONFIGS.left;
+    if (nz > 0) return AO_FACE_CONFIGS.back;
+    return AO_FACE_CONFIGS.front;
+}
+
+// =====================================================
+// DEFERRED LIGHTING CONSTANTS
+// =====================================================
+
+/** Chunks beyond this distance use simplified lighting */
+export const DEFERRED_LIGHT_DISTANCE = 16;
+
+/** Allow lighting to finish before forcing rebuilds (ms) */
+export const LIGHT_PENDING_GRACE_MS = 500;
