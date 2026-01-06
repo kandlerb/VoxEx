@@ -173,7 +173,10 @@ export function createRefractionWaterMaterial(atlasTexture, options = {}) {
         `,
         transparent: true,
         depthWrite: false,
+        depthTest: true,
         side: THREE.DoubleSide,
+        vertexColors: true,
+        fog: false,
     });
 }
 
