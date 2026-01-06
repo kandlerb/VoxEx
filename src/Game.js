@@ -2111,6 +2111,16 @@ export class Game {
     }
 
     /**
+     * Refresh world cards in the main menu UI.
+     * @returns {Promise<void>}
+     */
+    async refreshWorldCards() {
+        const worlds = this.worldStorage.listWorlds();
+        const totalBytes = worlds.reduce((sum, w) => sum + (w.metaBytes || 0), 0);
+        this.uiManager?.updateWorldCards(worlds, totalBytes);
+    }
+
+    /**
      * Save world
      * @param {string} [saveName]
      */
