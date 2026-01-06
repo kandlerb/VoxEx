@@ -29,3 +29,21 @@ export {
     ViewmodelArmsAnimator,
     animateViewmodelArms
 } from './ViewmodelArms.js';
+
+export {
+    ZOMBIE_SKIN_COLORS,
+    ZOMBIE_EYE_TYPES,
+    ZOMBIE_MOUTH_TYPES,
+    ZOMBIE_CLOTHING_THEMES,
+    pickZombieSkinIndex,
+    pickZombieClothingPalette,
+    generateZombieTexture,
+    generateZombieHeadMaterials,
+    generateZombieBodyMaterial,
+    generateZombieArmMaterials,
+    generateZombieLegMaterials,
+    generateZombieMaterials,
+    buildZombieMesh,
+    animateZombieLimbs,
+    resetZombieMesh
+} from './ZombieModel.js';
