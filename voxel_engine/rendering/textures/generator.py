@@ -1,12 +1,14 @@
 """
-Procedural texture atlas generator.
-Generates all block textures at runtime using PIL/Pillow.
+Data-driven procedural texture atlas generator.
+Reads texture generation parameters from block.json files and generates the atlas.
 """
 
-from PIL import Image, ImageDraw
+from PIL import Image
 import math
-from typing import Callable, Dict, Optional
-from .palettes import *
+import random
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Union
+import json
 
 
 class SeededRNG:
@@ -20,341 +22,344 @@ class SeededRNG:
         self.seed = (self.seed * 1103515245 + 12345) & 0x7fffffff
         return self.seed / 0x7fffffff
 
+    def randint(self, min_val: int, max_val: int) -> int:
+        """Returns an integer in [min_val, max_val]."""
+        return min_val + int(self.next() * (max_val - min_val + 1))
+
+    def choice(self, items: list):
+        """Returns a random item from the list."""
+        if not items:
+            return None
+        return items[self.randint(0, len(items) - 1)]
+
 
 class TextureGenerator:
     """
-    Generates a texture atlas for all blocks.
+    Generates a texture atlas from block.json texture configs.
 
-    Atlas layout: horizontal strip, one tile per block texture.
-    Each tile is pixels_per_tile x pixels_per_tile.
+    Supports these generation types:
+    - noise_fill: Random pixels with optional clustering
+    - layered: Horizontal zones with different generation
+    - log_bark: Vertical grooves (bark texture)
+    - log_rings: Concentric rings (log top)
+    - sparse: Partial coverage with holes (leaves)
+    - gradient: Top/bottom color variation with features
+    - planks: Wood grain with horizontal gaps
+    - shape: Specific geometric shapes (torch)
+    - reference: Use another texture
     """
 
-    def __init__(self, pixels_per_tile: int = 16, num_tiles: int = 17):
-        self.pixels_per_tile = pixels_per_tile
-        self.num_tiles = num_tiles
-        self.tile_size = pixels_per_tile  # 1:1 for PIL (no upscaling needed)
+    def __init__(self, pixels_per_tile: int = 16):
+        self.ppt = pixels_per_tile
+        self.tiles: Dict[str, Image.Image] = {}
+        self.tile_order: List[str] = []
+        self.block_configs: Dict[str, dict] = {}
+        self.tile_map: Dict[str, int] = {}
 
-        # Create atlas image
-        self.atlas = Image.new(
-            'RGBA',
-            (num_tiles * self.tile_size, self.tile_size),
-            (0, 0, 0, 255)
-        )
-        self.draw = ImageDraw.Draw(self.atlas)
-
-        # Track which tiles allow transparency
-        self.allow_transparency: set[int] = set()
-
-    def hex_to_rgb(self, hex_color: str) -> tuple[int, int, int]:
+    def hex_to_rgb(self, hex_color: str) -> tuple:
         """Convert hex color string to RGB tuple."""
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-    def fill_pixel(self, tile_index: int, x: int, y: int, color: str, alpha: int = 255):
-        """Fill a single pixel at logical coordinates within a tile."""
-        if x < 0 or x >= self.pixels_per_tile or y < 0 or y >= self.pixels_per_tile:
-            return
+    def get_color(self, palette: dict, key: str, rng: Optional[SeededRNG] = None) -> str:
+        """Get a color from palette, handling arrays."""
+        value = palette.get(key, "#FF00FF")  # Magenta for missing
+        if isinstance(value, list):
+            if rng:
+                return rng.choice(value)
+            return random.choice(value)
+        return value
 
-        px = tile_index * self.tile_size + x
-        py = y
+    def load_blocks(self, content_path: Path):
+        """Load all block.json files from content/blocks/."""
+        blocks_path = content_path / "blocks"
+        if not blocks_path.exists():
+            raise FileNotFoundError(f"Blocks directory not found: {blocks_path}")
+
+        for block_dir in sorted(blocks_path.iterdir()):
+            if not block_dir.is_dir():
+                continue
+
+            block_json = block_dir / "block.json"
+            if block_json.exists():
+                with open(block_json) as f:
+                    config = json.load(f)
+                    block_key = block_dir.name
+                    self.block_configs[block_key] = config
+
+    def generate_atlas(self, content_path: Path) -> Image.Image:
+        """Generate complete texture atlas from block configs."""
+        self.load_blocks(content_path)
+
+        # Determine tile order and generate each texture
+        tile_index = 0
+
+        # Process blocks in ID order for consistent atlas layout
+        sorted_blocks = sorted(
+            self.block_configs.items(),
+            key=lambda x: x[1].get("id", 999)
+        )
+
+        for block_key, config in sorted_blocks:
+            textures = config.get("textures")
+            if not textures:
+                continue
+
+            # Handle "all" vs per-face textures
+            if "all" in textures:
+                tex_config = textures["all"]
+                if tex_config.get("type") == "reference":
+                    # Handle reference later
+                    continue
+                tile_key = f"{block_key}:all"
+                self._generate_tile(tile_key, tex_config, tile_index)
+                self.tile_map[tile_key] = tile_index
+                tile_index += 1
+            else:
+                for face in ["top", "side", "bottom"]:
+                    if face not in textures:
+                        continue
+
+                    tex_config = textures[face]
+
+                    # Handle references
+                    if tex_config.get("type") == "reference":
+                        ref = tex_config.get("ref")
+                        if ref in ["top", "side", "bottom"]:
+                            # Reference another face of same block
+                            ref_key = f"{block_key}:{ref}"
+                        else:
+                            # Reference another block
+                            ref_key = f"{ref}:all"
+                        self.tile_map[f"{block_key}:{face}"] = self.tile_map.get(ref_key, 0)
+                        continue
+
+                    tile_key = f"{block_key}:{face}"
+                    self._generate_tile(tile_key, tex_config, tile_index)
+                    self.tile_map[tile_key] = tile_index
+                    tile_index += 1
+
+        # Create atlas image
+        num_tiles = len(self.tiles)
+        if num_tiles == 0:
+            return Image.new('RGBA', (16, 16), (255, 0, 255, 255))
+
+        atlas = Image.new('RGBA', (num_tiles * self.ppt, self.ppt), (0, 0, 0, 255))
+
+        for i, tile_key in enumerate(self.tile_order):
+            tile = self.tiles[tile_key]
+            atlas.paste(tile, (i * self.ppt, 0))
+
+        return atlas
+
+    def _generate_tile(self, tile_key: str, config: dict, tile_index: int):
+        """Generate a single tile based on config."""
+        tex_type = config.get("type", "noise_fill")
+        palette = config.get("palette", {})
+        params = config.get("params", {})
+        allow_transparency = config.get("allow_transparency", False)
+        seed_offset = config.get("seed_offset", tile_index)
+
+        # Create tile image
+        if allow_transparency:
+            tile = Image.new('RGBA', (self.ppt, self.ppt), (0, 0, 0, 0))
+        else:
+            tile = Image.new('RGBA', (self.ppt, self.ppt), (0, 0, 0, 255))
+
+        # Select generator based on type
+        generators = {
+            "noise_fill": self._gen_noise_fill,
+            "layered": self._gen_layered,
+            "log_bark": self._gen_log_bark,
+            "log_rings": self._gen_log_rings,
+            "sparse": self._gen_sparse,
+            "gradient": self._gen_gradient,
+            "planks": self._gen_planks,
+            "shape": self._gen_shape,
+        }
+
+        gen_func = generators.get(tex_type)
+        if gen_func:
+            gen_func(tile, palette, params, seed_offset)
+
+        self.tiles[tile_key] = tile
+        self.tile_order.append(tile_key)
+
+    def _fill_pixel(self, tile: Image.Image, x: int, y: int, color: str, alpha: int = 255):
+        """Fill a pixel with bounds checking."""
+        if 0 <= x < self.ppt and 0 <= y < self.ppt:
+            rgb = self.hex_to_rgb(color)
+            tile.putpixel((x, y), (*rgb, alpha))
+
+    def _fill_tile(self, tile: Image.Image, color: str):
+        """Fill entire tile with solid color."""
         rgb = self.hex_to_rgb(color)
-        self.atlas.putpixel((px, py), (*rgb, alpha))
+        for y in range(self.ppt):
+            for x in range(self.ppt):
+                tile.putpixel((x, y), (*rgb, 255))
 
-    def fill_tile(self, tile_index: int, color: str):
-        """Fill entire tile with a solid color."""
-        rgb = self.hex_to_rgb(color)
-        x0 = tile_index * self.tile_size
-        for y in range(self.tile_size):
-            for x in range(self.tile_size):
-                self.atlas.putpixel((x0 + x, y), (*rgb, 255))
+    # =========================================================================
+    # GENERATION ALGORITHMS
+    # =========================================================================
 
-    def clear_tile(self, tile_index: int):
-        """Clear tile to transparent."""
-        x0 = tile_index * self.tile_size
-        for y in range(self.tile_size):
-            for x in range(self.tile_size):
-                self.atlas.putpixel((x0 + x, y), (0, 0, 0, 0))
-
-    def generate_atlas(self) -> Image.Image:
-        """Generate all textures and return the atlas."""
-        import random
-
-        ppt = self.pixels_per_tile
-
-        # Tile indices (must match TILE constants)
-        GRASS_TOP = 0
-        GRASS_SIDE = 1
-        DIRT = 2
-        STONE = 3
-        PLANK = 4
-        LOG_SIDE = 5
-        LEAF = 6
-        BEDROCK = 7
-        LOG_TOP = 8
-        SAND = 9
-        WATER = 10
-        TORCH = 11
-        SNOW = 12
-        GRAVEL = 13
-        LONGWOOD_LOG_SIDE = 14
-        LONGWOOD_LOG_TOP = 15
-        LONGWOOD_LEAF = 16
-
-        # Mark transparent tiles
-        self.allow_transparency = {LEAF, LONGWOOD_LEAF}
-
-        # === TILE 0: Grass Top ===
-        self._generate_grass_top(GRASS_TOP)
-
-        # === TILE 1: Grass Side ===
-        self._generate_grass_side(GRASS_SIDE)
-
-        # === TILE 2: Dirt ===
-        self._generate_dirt(DIRT)
-
-        # === TILE 3: Stone ===
-        self._generate_stone(STONE)
-
-        # === TILE 4: Wood Planks ===
-        self._generate_planks(PLANK)
-
-        # === TILE 5: Log Side (Oak) ===
-        self._generate_log_side(LOG_SIDE, OAK_PALETTE, SeededRNG(12345 + LOG_SIDE))
-
-        # === TILE 6: Leaves ===
-        self._generate_leaves(LEAF)
-
-        # === TILE 7: Bedrock ===
-        self._generate_bedrock(BEDROCK)
-
-        # === TILE 8: Log Top (Oak) ===
-        self._generate_log_top(LOG_TOP, OAK_PALETTE, SeededRNG(12345 + LOG_TOP))
-
-        # === TILE 9: Sand ===
-        self._generate_sand(SAND)
-
-        # === TILE 10: Water ===
-        self._generate_water(WATER)
-
-        # === TILE 11: Torch ===
-        self._generate_torch(TORCH)
-
-        # === TILE 12: Snow ===
-        self._generate_snow(SNOW)
-
-        # === TILE 13: Gravel ===
-        self._generate_gravel(GRAVEL)
-
-        # === TILE 14: Longwood Log Side ===
-        self._generate_log_side(LONGWOOD_LOG_SIDE, LONGWOOD_PALETTE, SeededRNG(12345 + LONGWOOD_LOG_SIDE))
-
-        # === TILE 15: Longwood Log Top ===
-        self._generate_log_top(LONGWOOD_LOG_TOP, LONGWOOD_PALETTE, SeededRNG(12345 + LONGWOOD_LOG_TOP))
-
-        # === TILE 16: Longwood Leaves ===
-        self._generate_longwood_leaves(LONGWOOD_LEAF)
-
-        return self.atlas
-
-    def _generate_grass_top(self, tile: int):
-        """Generate grass top texture."""
-        import random
-        ppt = self.pixels_per_tile
-
-        for y in range(ppt):
-            for x in range(ppt):
-                base = GRASS_PALETTE["base1"] if random.random() > 0.4 else GRASS_PALETTE["base2"]
-                self.fill_pixel(tile, x, y, base)
-
-        noise_count = (ppt * ppt) // 4
-        for _ in range(noise_count):
-            x = random.randint(0, ppt - 2)
-            y = random.randint(0, ppt - 2)
-            col = GRASS_PALETTE["dark"] if random.random() > 0.5 else GRASS_PALETTE["light"]
-            self.fill_pixel(tile, x, y, col)
-            if random.random() > 0.5:
-                if random.random() > 0.5:
-                    self.fill_pixel(tile, x, y + 1, col)
-                else:
-                    self.fill_pixel(tile, x + 1, y, col)
-
-    def _generate_grass_side(self, tile: int):
-        """Generate grass side texture with dirt and dripping grass."""
-        import random
-        ppt = self.pixels_per_tile
-        grass_height = ppt // 4
+    def _gen_noise_fill(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate noise-based fill texture (stone, dirt, bedrock, snow, gravel)."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
 
         # Base fill
-        for y in range(ppt):
-            for x in range(ppt):
-                if y < grass_height:
-                    col = GRASS_PALETTE["base1"] if random.random() > 0.3 else GRASS_PALETTE["base2"]
-                else:
-                    col = DIRT_PALETTE["shadow"]
-                self.fill_pixel(tile, x, y, col)
-
-        # Dirt clumps
-        clump_count = int((ppt * ppt) * 0.4)
-        for _ in range(clump_count):
-            x = random.randint(0, ppt - 2)
-            y = grass_height + random.randint(0, ppt - grass_height - 2)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["base"])
-            if random.random() > 0.4:
-                self.fill_pixel(tile, x + 1, y, DIRT_PALETTE["base"])
-            if random.random() > 0.4 and y + 1 < ppt:
-                self.fill_pixel(tile, x, y + 1, DIRT_PALETTE["base"])
-
-        # Highlights and grit
-        for _ in range((ppt * ppt) // 10):
-            x = random.randint(0, ppt - 1)
-            y = grass_height + random.randint(0, ppt - grass_height - 1)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["highlight"])
-
-        for _ in range((ppt * ppt) // 8):
-            x = random.randint(0, ppt - 1)
-            y = grass_height + random.randint(0, ppt - grass_height - 1)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["grit"])
-
-        # Grass drips
-        seed_count = max(2, ppt // 4)
-        max_drip = max(3, ppt // 6)
-        for _ in range(seed_count):
-            x = random.randint(0, ppt - 1)
-            drip_color = GRASS_PALETTE["base1"] if random.random() < 0.5 else GRASS_PALETTE["base2"]
-
-            # Tuft at boundary
-            tuft_half = max(1, ppt // 32)
-            for tx in range(-tuft_half, tuft_half + 1):
-                hx = (x + tx) % ppt
-                self.fill_pixel(tile, hx, grass_height, drip_color)
-
-            # Drip downward
-            drip_length = 1 + random.randint(0, max_drip - 1)
-            cur_x = x
-            for d in range(drip_length):
-                dy = grass_height + d
-                if dy >= ppt:
-                    break
-                self.fill_pixel(tile, cur_x, dy, drip_color)
-                if random.random() < 0.6:
-                    side = -1 if random.random() < 0.5 else 1
-                    nx = (cur_x + side) % ppt
-                    self.fill_pixel(tile, nx, dy, drip_color)
-                if random.random() < 0.3:
-                    cur_x = (cur_x + (-1 if random.random() < 0.5 else 1)) % ppt
-                if d > 1 and random.random() < 0.25:
-                    break
-
-    def _generate_dirt(self, tile: int):
-        """Generate dirt texture."""
-        import random
-        ppt = self.pixels_per_tile
-
-        # Base shadow
-        self.fill_tile(tile, DIRT_PALETTE["shadow"])
-
-        # Clumps
-        for _ in range((ppt * ppt) // 2):
-            x = random.randint(0, ppt - 2)
-            y = random.randint(0, ppt - 2)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["base"])
-            if random.random() > 0.3:
-                self.fill_pixel(tile, x + 1, y, DIRT_PALETTE["base"])
-            if random.random() > 0.3:
-                self.fill_pixel(tile, x, y + 1, DIRT_PALETTE["base"])
-
-        # Highlights
-        for _ in range((ppt * ppt) // 8):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["highlight"])
-
-        # Grit
-        for _ in range((ppt * ppt) // 6):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, DIRT_PALETTE["grit"])
-
-    def _generate_stone(self, tile: int):
-        """Generate stone texture."""
-        import random
-        ppt = self.pixels_per_tile
+        base_color = params.get("base_color")
+        base_colors = params.get("base_colors")
+        base_thresholds = params.get("base_thresholds", [])
+        random_from_array = params.get("random_from_array", False)
 
         for y in range(ppt):
             for x in range(ppt):
-                r = random.random()
-                if r > 0.6:
-                    col = STONE_PALETTE["dark"]
-                elif r > 0.9:
-                    col = STONE_PALETTE["darker"]
+                if base_color:
+                    col = self.get_color(palette, base_color, rng)
+                elif base_colors:
+                    if random_from_array and isinstance(palette.get(base_colors), list):
+                        col = rng.choice(palette[base_colors])
+                    elif isinstance(base_colors, list):
+                        r = rng.next()
+                        col = palette.get(base_colors[0], "#808080")
+                        for i, thresh in enumerate(base_thresholds):
+                            if r > thresh and i + 1 < len(base_colors):
+                                col = palette.get(base_colors[i + 1], col)
+                    else:
+                        col = self.get_color(palette, base_colors, rng)
                 else:
-                    col = STONE_PALETTE["base"]
-                self.fill_pixel(tile, x, y, col)
+                    col = "#808080"
+                self._fill_pixel(tile, x, y, col)
 
-        # Flecks
-        for _ in range((ppt * ppt) // 8):
-            x = random.randint(0, ppt - 2)
-            y = random.randint(0, ppt - 2)
-            r = random.random()
-            if r > 0.85:
-                col = STONE_PALETTE["fleck_blue"]
-            elif r > 0.5:
-                col = STONE_PALETTE["fleck_darker"]
-            else:
-                col = STONE_PALETTE["fleck_dark"]
-            self.fill_pixel(tile, x, y, col)
-            if random.random() > 0.5:
-                self.fill_pixel(tile, x + 1, y, col)
-            elif random.random() > 0.5:
-                self.fill_pixel(tile, x, y + 1, col)
+        # Apply layers
+        layers = params.get("layers", [])
+        for layer in layers:
+            layer_colors = layer.get("colors") or layer.get("color")
+            density = layer.get("density", 0.1)
+            cluster_chance = layer.get("cluster_chance", 0)
+            cluster_size = layer.get("cluster_size", 1)
+            rand_array = layer.get("random_from_array", False)
 
-    def _generate_log_side(self, tile: int, palette: dict, rng: SeededRNG):
+            count = int(ppt * ppt * density)
+            for _ in range(count):
+                x = rng.randint(0, ppt - 2)
+                y = rng.randint(0, ppt - 2)
+
+                if rand_array and isinstance(palette.get(layer_colors), list):
+                    col = rng.choice(palette[layer_colors])
+                else:
+                    col = self.get_color(palette, layer_colors, rng)
+
+                self._fill_pixel(tile, x, y, col)
+
+                # Clustering
+                if cluster_chance > 0 and rng.next() < cluster_chance:
+                    for _ in range(cluster_size - 1):
+                        dx = 1 if rng.next() > 0.5 else 0
+                        dy = 0 if dx else 1
+                        self._fill_pixel(tile, x + dx, y + dy, col)
+
+        # Special layers (rocks, static, pebbles, etc.)
+        for special_key in ["rocks", "static", "pebbles", "darks", "flecks"]:
+            special = params.get(special_key)
+            if not special:
+                continue
+
+            density = special.get("density", 0.1)
+            colors = special.get("colors") or special.get("color")
+            thresholds = special.get("thresholds", [])
+            cluster_chance = special.get("cluster_chance", 0)
+
+            count = int(ppt * ppt * density)
+            for _ in range(count):
+                x = rng.randint(0, ppt - 2)
+                y = rng.randint(0, ppt - 2)
+
+                if isinstance(colors, list):
+                    r = rng.next()
+                    col = palette.get(colors[0], colors[0])
+                    for i, thresh in enumerate(thresholds):
+                        if r > thresh and i + 1 < len(colors):
+                            col = palette.get(colors[i + 1], colors[i + 1])
+                else:
+                    col = self.get_color(palette, colors, rng)
+
+                self._fill_pixel(tile, x, y, col)
+
+                if cluster_chance > 0 and rng.next() < cluster_chance:
+                    dx = 1 if rng.next() > 0.5 else -1
+                    dy = 1 if rng.next() > 0.5 else -1
+                    self._fill_pixel(tile, (x + dx) % ppt, (y + dy) % ppt, col)
+
+    def _gen_log_bark(self, tile: Image.Image, palette: dict, params: dict, seed: int):
         """Generate log bark texture with vertical grooves."""
-        ppt = self.pixels_per_tile
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
 
-        self.fill_tile(tile, palette["bark_base"])
+        # Fill base
+        self._fill_tile(tile, palette.get("bark_base", "#5D4037"))
 
         # Base noise
         for y in range(ppt):
             for x in range(ppt):
                 if rng.next() > 0.5:
-                    self.fill_pixel(tile, x, y, palette["bark_dark"])
+                    self._fill_pixel(tile, x, y, palette.get("bark_dark", "#4E342E"))
 
         # Vertical grooves
-        num_grooves = ppt // 3
-        for _ in range(num_grooves):
-            x = int(rng.next() * ppt)
-            for y in range(ppt):
+        groove_count = int(ppt * params.get("groove_count_ratio", 0.333))
+        wiggle_left = params.get("groove_wiggle_left", 0.2)
+        wiggle_right = params.get("groove_wiggle_right", 0.2)
+        skip_chance = params.get("groove_skip_chance", 0.1)
+
+        for _ in range(groove_count):
+            x = rng.randint(0, ppt - 1)
+            y = 0
+            while y < ppt:
                 left = (x - 1 + ppt) % ppt
                 right = (x + 1) % ppt
-                self.fill_pixel(tile, left, y, palette["bark_groove_edge"])
-                self.fill_pixel(tile, right, y, palette["bark_groove_edge"])
-                self.fill_pixel(tile, x, y, palette["bark_groove"])
 
+                self._fill_pixel(tile, left, y, palette.get("bark_groove_edge", "#3E2723"))
+                self._fill_pixel(tile, right, y, palette.get("bark_groove_edge", "#3E2723"))
+                self._fill_pixel(tile, x, y, palette.get("bark_groove", "#281814"))
+
+                # Wiggle
                 wiggle = rng.next()
-                if wiggle < 0.2:
-                    x -= 1
-                elif wiggle > 0.8:
-                    x += 1
-                x = x % ppt
-                if rng.next() > 0.9:
+                if wiggle < wiggle_left:
+                    x = (x - 1 + ppt) % ppt
+                elif wiggle > (1 - wiggle_right):
+                    x = (x + 1) % ppt
+
+                # Skip ahead occasionally
+                if rng.next() > (1 - skip_chance):
                     y += 1
+                y += 1
 
         # Highlights
-        for y in range(ppt):
-            for x in range(ppt):
-                if rng.next() > 0.75:
-                    hl = palette["bark_highlight"] if rng.next() > 0.5 else palette["bark_highlight2"]
-                    self.fill_pixel(tile, x, y, hl)
+        highlight_density = params.get("highlight_density", 0.5)
+        highlight_chance = params.get("highlight_chance", 0.25)
+        count = int(ppt * ppt * highlight_density)
 
-    def _generate_log_top(self, tile: int, palette: dict, rng: SeededRNG):
-        """Generate log top texture with rings."""
-        ppt = self.pixels_per_tile
+        for _ in range(count):
+            x = rng.randint(0, ppt - 1)
+            y = rng.randint(0, ppt - 1)
+            if rng.next() < highlight_chance:
+                hl = palette.get("bark_highlight" if rng.next() > 0.5 else "bark_highlight2", "#795548")
+                self._fill_pixel(tile, x, y, hl)
+
+    def _gen_log_rings(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate log top texture with concentric rings."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
         center = (ppt - 1) / 2
-        ring_spacing = palette["ring_spacing"]
-        ring_threshold = palette["ring_threshold"]
 
-        self.fill_tile(tile, palette["wood_base"])
+        ring_spacing = params.get("ring_spacing", 4)
+        ring_threshold = params.get("ring_threshold", 0.65)
+        center_radius = params.get("center_radius", 1.5)
+        noise_chance = params.get("noise_chance", 0.15)
+        bark_edge = params.get("bark_edge_width", 1)
+
+        self._fill_tile(tile, palette.get("wood_base", "#C19A6B"))
 
         for y in range(ppt):
             for x in range(ppt):
@@ -362,304 +367,406 @@ class TextureGenerator:
                 dy = y - center
                 dist = math.sqrt(dx * dx + dy * dy)
 
-                if dist >= center - 1:
+                if dist >= center - bark_edge:
                     # Bark edge
-                    col = palette["wood_bark"]
+                    col = palette.get("bark", "#5D4037")
                     if rng.next() > 0.5:
-                        col = palette["wood_bark_dark"]
+                        col = palette.get("bark_dark", "#3E2723")
                 else:
-                    col = palette["wood_base"]
+                    col = palette.get("wood_base", "#C19A6B")
+
                     # Rings
                     ring_index = dist / ring_spacing
                     if (ring_index % 1) > ring_threshold:
-                        col = palette["wood_ring"]
+                        col = palette.get("wood_ring", "#8B5A2B")
+
                     # Center knot
-                    if dist < 1.5:
-                        col = palette["wood_center"]
+                    if dist < center_radius:
+                        col = palette.get("wood_center", "#A6764A")
+
                     # Noise
-                    if rng.next() > 0.85:
-                        col = palette["wood_noise"] if col == palette["wood_base"] else palette["wood_base"]
+                    if rng.next() > (1 - noise_chance):
+                        base = palette.get("wood_base", "#C19A6B")
+                        noise = palette.get("wood_noise", "#A17E55")
+                        col = noise if col == base else base
 
-                self.fill_pixel(tile, x, y, col)
+                self._fill_pixel(tile, x, y, col)
 
-    def _generate_leaves(self, tile: int):
-        """Generate leaf texture with transparency holes."""
-        import random
-        ppt = self.pixels_per_tile
+    def _gen_sparse(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate sparse texture with holes (leaves)."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
 
-        self.clear_tile(tile)
+        coverage = params.get("coverage", 1.0)
+        colors = params.get("colors", [])
+        thresholds = params.get("thresholds", [])
+        cluster_chance = params.get("cluster_chance", 0)
+        holes_config = params.get("holes", {})
 
-        density = int(ppt * ppt * 1.2)
-        for _ in range(density):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            r = random.random()
-            if r > 0.7:
-                col = LEAVES_PALETTE["light"]
-            elif r < 0.4:
-                col = LEAVES_PALETTE["dark"]
-            else:
-                col = LEAVES_PALETTE["mid"]
-            self.fill_pixel(tile, x, y, col)
-            if random.random() > 0.5:
-                self.fill_pixel(tile, min(x + 1, ppt - 1), y, col)
+        # Fill with leaves
+        if coverage < 1.0:
+            # Sparse mode - coverage determines pixel placement
+            for y in range(ppt):
+                for x in range(ppt):
+                    r = rng.next()
+                    if r > coverage:
+                        continue  # Leave transparent
 
-        # Create holes
-        gap_count = int(math.sqrt(ppt) * 1.5)
-        max_radius = max(2, ppt // 10)
-        for _ in range(gap_count):
-            cx = random.randint(0, ppt - 1)
-            cy = random.randint(0, ppt - 1)
-            size = 1 + random.random() * (max_radius - 1)
-            for dy in range(int(-size), int(size) + 1):
-                for dx in range(int(-size), int(size) + 1):
-                    px, py = cx + dx, cy + dy
-                    if 0 <= px < ppt and 0 <= py < ppt:
-                        if dx * dx + dy * dy <= size * size:
-                            if random.random() > 0.2:
-                                self.fill_pixel(tile, px, py, "#000000", alpha=0)
+                    r2 = rng.next()
+                    col = palette.get(colors[0], "#2E7D32") if colors else "#2E7D32"
+                    for i, thresh in enumerate(thresholds):
+                        if r2 > thresh and i + 1 < len(colors):
+                            col = palette.get(colors[i + 1], col)
 
-    def _generate_longwood_leaves(self, tile: int):
-        """Generate dark longwood leaves with sparse coverage."""
-        ppt = self.pixels_per_tile
-        rng = SeededRNG(12345 + tile)
-
-        self.clear_tile(tile)
-
-        for y in range(ppt):
-            for x in range(ppt):
-                if rng.next() < 0.35:
-                    continue  # 35% holes
+                    self._fill_pixel(tile, x, y, col)
+        else:
+            # Dense mode with holes
+            density = int(ppt * ppt * coverage)
+            for _ in range(density):
+                x = rng.randint(0, ppt - 1)
+                y = rng.randint(0, ppt - 1)
 
                 r = rng.next()
-                if r < 0.35:
-                    col = LONGWOOD_LEAVES_PALETTE["dark"]
-                elif r < 0.65:
-                    col = LONGWOOD_LEAVES_PALETTE["mid"]
-                elif r < 0.85:
-                    col = LONGWOOD_LEAVES_PALETTE["light"]
+                col = palette.get(colors[0], "#2E7D32") if colors else "#2E7D32"
+                for i, thresh in enumerate(thresholds):
+                    if r > thresh and i + 1 < len(colors):
+                        col = palette.get(colors[i + 1], col)
+
+                self._fill_pixel(tile, x, y, col)
+
+                # Cluster
+                if cluster_chance > 0:
+                    r = rng.next()
+                    if r < cluster_chance:
+                        self._fill_pixel(tile, min(x + 1, ppt - 1), y, col)
+
+            # Create holes
+            if holes_config:
+                hole_count = int(math.sqrt(ppt) * holes_config.get("count_factor", 1.5))
+                max_radius = max(2, int(ppt * holes_config.get("max_radius_ratio", 0.1)))
+                keep_chance = holes_config.get("keep_chance", 0.2)
+
+                for _ in range(hole_count):
+                    cx = rng.randint(0, ppt - 1)
+                    cy = rng.randint(0, ppt - 1)
+                    r_size = rng.next()
+                    size = 1 + r_size * (max_radius - 1)
+
+                    for dy in range(int(-size), int(size) + 1):
+                        for dx in range(int(-size), int(size) + 1):
+                            px, py = cx + dx, cy + dy
+                            if 0 <= px < ppt and 0 <= py < ppt:
+                                if dx * dx + dy * dy <= size * size:
+                                    r = rng.next()
+                                    if r > keep_chance:
+                                        tile.putpixel((px, py), (0, 0, 0, 0))
+
+    def _gen_gradient(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate gradient texture with features (sand, water)."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
+
+        grad_colors = params.get("gradient_colors", ["top", "bottom"])
+        grad_split = params.get("gradient_split", 0.5)
+
+        # Base gradient
+        for y in range(ppt):
+            for x in range(ppt):
+                if y < ppt * grad_split:
+                    col = palette.get(grad_colors[0], "#808080")
                 else:
-                    col = LONGWOOD_LEAVES_PALETTE["very_dark"]
+                    col = palette.get(grad_colors[1], "#606060")
+                self._fill_pixel(tile, x, y, col)
 
-                self.fill_pixel(tile, x, y, col)
+        # Grains (sand)
+        grains = params.get("grains")
+        if grains:
+            density = grains.get("density", 0.333)
+            colors = grains.get("colors", [])
+            thresholds = grains.get("thresholds", [])
 
-    def _generate_bedrock(self, tile: int):
-        """Generate bedrock texture."""
-        import random
-        ppt = self.pixels_per_tile
+            count = int(ppt * ppt * density)
+            for _ in range(count):
+                x = rng.randint(0, ppt - 1)
+                y = rng.randint(0, ppt - 1)
 
-        for y in range(ppt):
-            for x in range(ppt):
-                r = random.random()
-                if r > 0.8:
-                    col = BEDROCK_PALETTE["light"]
-                elif r > 0.6:
-                    col = BEDROCK_PALETTE["mid"]
-                else:
-                    col = BEDROCK_PALETTE["base"]
-                self.fill_pixel(tile, x, y, col)
+                r = rng.next()
+                col = palette.get(colors[0], "#808080") if colors else "#808080"
+                for i, thresh in enumerate(thresholds):
+                    if r > thresh and i + 1 < len(colors):
+                        col = palette.get(colors[i + 1], col)
 
-        rock_count = (ppt * ppt) // 5
-        for _ in range(rock_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            col = BEDROCK_PALETTE["highlight"] if random.random() > 0.5 else BEDROCK_PALETTE["dark"]
-            self.fill_pixel(tile, x, y, col)
-            if random.random() > 0.5:
-                dx = 1 if random.random() > 0.5 else -1
-                dy = 1 if random.random() > 0.5 else -1
-                self.fill_pixel(tile, (x + dx) % ppt, (y + dy) % ppt, col)
+                self._fill_pixel(tile, x, y, col)
 
-        static_count = (ppt * ppt) // 16
-        for _ in range(static_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, BEDROCK_PALETTE["static"])
+        # Waves (sand)
+        waves = params.get("waves")
+        if waves:
+            count_ratio = waves.get("count_ratio", 0.125)
+            wave_color = palette.get(waves.get("color", "wave"), "#D1C296")
+            coverage = waves.get("coverage", 0.3)
 
-    def _generate_sand(self, tile: int):
-        """Generate sand texture."""
-        import random
-        ppt = self.pixels_per_tile
+            wave_count = max(2, int(ppt * count_ratio))
+            for _ in range(wave_count):
+                wave_y = 2 + rng.randint(0, ppt - 5)
+                for x in range(ppt):
+                    if rng.next() < coverage:
+                        self._fill_pixel(tile, x, wave_y, wave_color)
 
-        for y in range(ppt):
-            for x in range(ppt):
-                base = SAND_PALETTE["base_light"] if y < ppt // 2 else SAND_PALETTE["base_dark"]
-                self.fill_pixel(tile, x, y, base)
+        # Ripples (water)
+        ripples = params.get("ripples")
+        if ripples:
+            count_ratio = ripples.get("count_ratio", 0.5)
+            min_len = ripples.get("min_length_ratio", 0.2)
+            max_len = ripples.get("max_length_ratio", 0.5)
+            light = palette.get(ripples.get("light_color", "ripple_light"), "#4FC3F7")
+            dark = palette.get(ripples.get("dark_color", "ripple_dark"), "#1565C0")
 
-        grain_count = (ppt * ppt) // 3
-        for _ in range(grain_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            r = random.random()
-            if r > 0.8:
-                col = SAND_PALETTE["grain_light"]
-            elif r > 0.6:
-                col = SAND_PALETTE["grain_dark"]
-            else:
-                col = SAND_PALETTE["grain1"]
-            self.fill_pixel(tile, x, y, col)
+            count = int(ppt * count_ratio)
+            for _ in range(count):
+                y = rng.randint(0, ppt - 1)
+                length = int(ppt * min_len + rng.next() * ppt * (max_len - min_len))
+                start_x = rng.randint(0, ppt - 1)
 
-        wave_count = max(2, ppt // 8)
-        for _ in range(wave_count):
-            wave_y = 2 + random.randint(0, ppt - 5)
-            for x in range(ppt):
-                if random.random() > 0.7:
-                    self.fill_pixel(tile, x, wave_y, SAND_PALETTE["wave"])
+                for k in range(length):
+                    x = (start_x + k) % ppt
+                    self._fill_pixel(tile, x, y, light)
+                    if y + 1 < ppt:
+                        self._fill_pixel(tile, x, y + 1, dark)
 
-    def _generate_water(self, tile: int):
-        """Generate water texture."""
-        import random
-        ppt = self.pixels_per_tile
+        # Sparkles (water)
+        sparkles = params.get("sparkles")
+        if sparkles:
+            count_ratio = sparkles.get("count_ratio", 0.25)
+            color = palette.get(sparkles.get("color", "sparkle"), "#FFFFFF")
 
-        for y in range(ppt):
-            for x in range(ppt):
-                col = WATER_PALETTE["base_light"] if y < ppt // 2 else WATER_PALETTE["base_dark"]
-                self.fill_pixel(tile, x, y, col)
+            count = int(ppt * count_ratio)
+            for _ in range(count):
+                x = rng.randint(0, ppt - 1)
+                y = rng.randint(0, ppt - 1)
+                self._fill_pixel(tile, x, y, color)
 
-        ripple_count = ppt // 2
-        for _ in range(ripple_count):
-            y = random.randint(0, ppt - 1)
-            length = int(ppt * 0.2 + random.random() * ppt * 0.3)
-            start_x = random.randint(0, ppt - 1)
-            for k in range(length):
-                x = (start_x + k) % ppt
-                self.fill_pixel(tile, x, y, WATER_PALETTE["ripple_light"])
-                if y + 1 < ppt:
-                    self.fill_pixel(tile, x, y + 1, WATER_PALETTE["ripple_dark"])
+    def _gen_planks(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate wood planks texture with gaps."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
 
-        sparkle_count = ppt // 4
-        for _ in range(sparkle_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, WATER_PALETTE["sparkle"])
+        self._fill_tile(tile, palette.get("base", "#C19A6B"))
 
-    def _generate_torch(self, tile: int):
-        """Generate torch texture."""
-        ppt = self.pixels_per_tile
+        # Wood grain noise
+        noise_density = params.get("noise_density", 4.0)
+        noise_colors = params.get("noise_colors", ["noise1", "noise2"])
+        noise_threshold = params.get("noise_threshold", 0.7)
 
-        self.fill_tile(tile, TORCH_PALETTE["background"])
+        count = int(ppt * ppt * noise_density)
+        for _ in range(count):
+            x = rng.randint(0, ppt - 1)
+            y = rng.randint(0, ppt - 1)
+            col = palette.get(noise_colors[0] if rng.next() > noise_threshold else noise_colors[1], "#a17e55")
+            self._fill_pixel(tile, x, y, col)
 
-        center_x = ppt // 2
-        torch_width = max(2, ppt // 8)
-        handle_height = int(ppt * 0.6)
-        flame_height = int(ppt * 0.35)
+        # Horizontal plank gaps
+        planks_per_tile = params.get("planks_per_tile", 4)
+        gap_size_ratio = params.get("gap_size_ratio", 0.03125)
+        gap_colors = params.get("gap_colors", ["gap", "gap_dark", "gap_darker"])
+        gap_thresholds = params.get("gap_thresholds", [0.7, 0.9])
 
-        # Handle
-        for y in range(ppt - handle_height, ppt):
-            for x in range(center_x - torch_width // 2, center_x + torch_width // 2 + 1):
-                if 0 <= x < ppt:
-                    self.fill_pixel(tile, x, y, TORCH_PALETTE["handle"])
-
-        # Flame
-        flame_start_y = ppt - handle_height - flame_height
-        for y in range(flame_start_y, ppt - handle_height):
-            for x in range(center_x - torch_width // 2, center_x + torch_width // 2 + 1):
-                if 0 <= x < ppt:
-                    progress = (y - flame_start_y) / flame_height
-                    col = TORCH_PALETTE["flame_top"] if progress < 0.5 else TORCH_PALETTE["flame_bottom"]
-                    self.fill_pixel(tile, x, y, col)
-
-    def _generate_snow(self, tile: int):
-        """Generate snow texture."""
-        import random
-        ppt = self.pixels_per_tile
-
-        for y in range(ppt):
-            for x in range(ppt):
-                col = random.choice(SNOW_PALETTE["base"])
-                self.fill_pixel(tile, x, y, col)
-
-        shadow_count = (ppt * ppt) // 4
-        for _ in range(shadow_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            col = random.choice(SNOW_PALETTE["shadow"])
-            self.fill_pixel(tile, x, y, col)
-
-        sparkle_count = (ppt * ppt) // 6
-        for _ in range(sparkle_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, SNOW_PALETTE["sparkle"])
-
-    def _generate_gravel(self, tile: int):
-        """Generate gravel texture."""
-        import random
-        ppt = self.pixels_per_tile
-
-        for y in range(ppt):
-            for x in range(ppt):
-                col = random.choice(GRAVEL_PALETTE["base"])
-                self.fill_pixel(tile, x, y, col)
-
-        pebble_count = (ppt * ppt) // 3
-        for _ in range(pebble_count):
-            x = random.randint(0, ppt - 2)
-            y = random.randint(0, ppt - 2)
-            col = random.choice(GRAVEL_PALETTE["accent"])
-            self.fill_pixel(tile, x, y, col)
-            if random.random() > 0.5:
-                if random.random() > 0.5:
-                    self.fill_pixel(tile, x + 1, y, col)
-                else:
-                    self.fill_pixel(tile, x, y + 1, col)
-
-        dark_count = (ppt * ppt) // 8
-        for _ in range(dark_count):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            self.fill_pixel(tile, x, y, GRAVEL_PALETTE["dark"])
-
-    def _generate_planks(self, tile: int):
-        """Generate wood planks texture."""
-        import random
-        ppt = self.pixels_per_tile
-
-        self.fill_tile(tile, PLANKS_PALETTE["base"])
-
-        # Noise
-        noise_density = ppt * ppt * 4
-        for _ in range(noise_density):
-            x = random.randint(0, ppt - 1)
-            y = random.randint(0, ppt - 1)
-            col = PLANKS_PALETTE["noise1"] if random.random() > 0.7 else PLANKS_PALETTE["noise2"]
-            self.fill_pixel(tile, x, y, col)
-
-        # Horizontal gaps between planks
-        planks_per_tile = 4
         plank_height = ppt // planks_per_tile
-        gap_size = max(1, ppt // 32)
+        gap_size = max(1, int(ppt * gap_size_ratio))
 
         for row in range(plank_height - gap_size, ppt, plank_height):
             for g in range(gap_size):
                 if row + g >= ppt:
                     break
                 for x in range(ppt):
-                    r = random.random()
-                    if r > 0.9:
-                        col = PLANKS_PALETTE["gap_darker"]
-                    elif r > 0.7:
-                        col = PLANKS_PALETTE["gap_dark"]
-                    else:
-                        col = PLANKS_PALETTE["gap"]
-                    self.fill_pixel(tile, x, row + g, col)
+                    r = rng.next()
+                    col = palette.get(gap_colors[0], "#8B5A2B")
+                    for i, thresh in enumerate(gap_thresholds):
+                        if r > thresh and i + 1 < len(gap_colors):
+                            col = palette.get(gap_colors[i + 1], col)
+                    self._fill_pixel(tile, x, row + g, col)
+
+    def _gen_shape(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate shape-based texture (torch)."""
+        ppt = self.ppt
+        shape = params.get("shape", "torch")
+
+        if shape == "torch":
+            # Background
+            self._fill_tile(tile, palette.get("background", "#808080"))
+
+            center_x = ppt // 2
+            handle_width = max(2, int(ppt * params.get("handle_width_ratio", 0.125)))
+            handle_height = int(ppt * params.get("handle_height_ratio", 0.6))
+            flame_height = int(ppt * params.get("flame_height_ratio", 0.35))
+
+            # Handle
+            for y in range(ppt - handle_height, ppt):
+                for x in range(center_x - handle_width // 2, center_x + handle_width // 2 + 1):
+                    if 0 <= x < ppt:
+                        self._fill_pixel(tile, x, y, palette.get("handle", "#8b4513"))
+
+            # Flame
+            flame_start = ppt - handle_height - flame_height
+            for y in range(flame_start, ppt - handle_height):
+                for x in range(center_x - handle_width // 2, center_x + handle_width // 2 + 1):
+                    if 0 <= x < ppt:
+                        progress = (y - flame_start) / flame_height
+                        col = palette.get("flame_top" if progress < 0.5 else "flame_bottom", "#ff9800")
+                        self._fill_pixel(tile, x, y, col)
+
+    def _gen_layered(self, tile: Image.Image, palette: dict, params: dict, seed: int):
+        """Generate layered texture (grass side)."""
+        rng = SeededRNG(12345 + seed)
+        ppt = self.ppt
+
+        layers = params.get("layers", [])
+        current_y = 0
+
+        for layer in layers:
+            height_ratio = layer.get("height_ratio", 0.5)
+            layer_height = int(ppt * height_ratio)
+            layer_type = layer.get("type", "solid")
+
+            end_y = current_y + layer_height
+
+            if layer_type == "noise_fill":
+                colors_key = layer.get("colors")
+                weights = layer.get("weights", [0.5, 0.5])
+                colors = palette.get(colors_key, [])
+                if isinstance(colors, str):
+                    colors = [colors]
+
+                for y in range(current_y, min(end_y, ppt)):
+                    for x in range(ppt):
+                        r = rng.next()
+                        col = colors[0] if isinstance(colors, list) and colors else "#808080"
+                        cumulative = 0
+                        for i, w in enumerate(weights):
+                            cumulative += w
+                            if r < cumulative and i < len(colors):
+                                col = colors[i]
+                                break
+                        self._fill_pixel(tile, x, y, col)
+
+            elif layer_type == "dirt_fill":
+                base = palette.get(layer.get("base_color"), "#3e2723")
+                clump = palette.get(layer.get("clump_color"), "#5d4037")
+                highlight = palette.get(layer.get("highlight_color"), "#8d6e63")
+                grit = palette.get(layer.get("grit_color"), "#795548")
+
+                # Base fill
+                for y in range(current_y, min(end_y, ppt)):
+                    for x in range(ppt):
+                        self._fill_pixel(tile, x, y, base)
+
+                # Clumps
+                clump_density = layer.get("clump_density", 0.4)
+                layer_area = layer_height * ppt
+                for _ in range(int(layer_area * clump_density)):
+                    x = rng.randint(0, ppt - 2)
+                    y = current_y + rng.randint(0, max(0, layer_height - 2))
+                    if y < ppt:
+                        self._fill_pixel(tile, x, y, clump)
+                        if rng.next() > 0.4:
+                            self._fill_pixel(tile, x + 1, y, clump)
+                        if rng.next() > 0.4 and y + 1 < ppt:
+                            self._fill_pixel(tile, x, y + 1, clump)
+
+                # Highlights
+                for _ in range(int(layer_area * layer.get("highlight_density", 0.1))):
+                    x = rng.randint(0, ppt - 1)
+                    y = current_y + rng.randint(0, max(0, layer_height - 1))
+                    if y < ppt:
+                        self._fill_pixel(tile, x, y, highlight)
+
+                # Grit
+                for _ in range(int(layer_area * layer.get("grit_density", 0.08))):
+                    x = rng.randint(0, ppt - 1)
+                    y = current_y + rng.randint(0, max(0, layer_height - 1))
+                    if y < ppt:
+                        self._fill_pixel(tile, x, y, grit)
+
+            current_y = end_y
+
+        # Drip effect (grass hanging over dirt)
+        drip = params.get("drip")
+        if drip and drip.get("enabled", False):
+            colors_key = drip.get("colors")
+            colors = palette.get(colors_key, ["#378a32", "#2c6b2f"])
+            if isinstance(colors, str):
+                colors = [colors]
+
+            seed_count = max(2, int((ppt / 16) * drip.get("seed_count_per_16px", 4)))
+            max_drip_len = max(3, int(ppt * drip.get("max_length_ratio", 0.167)))
+            tuft_half = max(1, int(ppt * drip.get("tuft_width_ratio", 0.03125)))
+
+            # Find grass/dirt boundary (first layer height)
+            grass_height = int(ppt * layers[0].get("height_ratio", 0.25)) if layers else ppt // 4
+
+            for _ in range(seed_count):
+                x = rng.randint(0, ppt - 1)
+                drip_color = rng.choice(colors) if colors else "#378a32"
+
+                # Tuft at boundary
+                for tx in range(-tuft_half, tuft_half + 1):
+                    hx = (x + tx) % ppt
+                    self._fill_pixel(tile, hx, grass_height, drip_color)
+                    if grass_height + 1 < ppt and rng.next() < 0.5:
+                        self._fill_pixel(tile, hx, grass_height + 1, drip_color)
+
+                # Drip downward
+                drip_length = 1 + rng.randint(0, max_drip_len - 1)
+                cur_x = x
+                for d in range(drip_length):
+                    dy = grass_height + d
+                    if dy >= ppt:
+                        break
+                    self._fill_pixel(tile, cur_x, dy, drip_color)
+
+                    if rng.next() < 0.6:
+                        side = -1 if rng.next() < 0.5 else 1
+                        nx = (cur_x + side) % ppt
+                        self._fill_pixel(tile, nx, dy, drip_color)
+
+                    if rng.next() < 0.3:
+                        cur_x = (cur_x + (-1 if rng.next() < 0.5 else 1)) % ppt
+
+                    if d > 1 and rng.next() < 0.25:
+                        break
 
     def save(self, path: str):
-        """Save atlas to file."""
-        self.atlas.save(path)
+        """Save the generated atlas."""
+        if self.tiles:
+            atlas = self.generate_atlas_image()
+            atlas.save(path)
 
-    def get_bytes(self) -> bytes:
-        """Get atlas as PNG bytes for OpenGL upload."""
-        import io
-        buffer = io.BytesIO()
-        self.atlas.save(buffer, format='PNG')
-        return buffer.getvalue()
+    def generate_atlas_image(self) -> Image.Image:
+        """Create atlas from generated tiles."""
+        if not self.tiles:
+            return Image.new('RGBA', (16, 16), (255, 0, 255, 255))
+
+        num_tiles = len(self.tiles)
+        atlas = Image.new('RGBA', (num_tiles * self.ppt, self.ppt), (0, 0, 0, 255))
+
+        for i, tile_key in enumerate(self.tile_order):
+            tile = self.tiles[tile_key]
+            atlas.paste(tile, (i * self.ppt, 0))
+
+        return atlas
 
 
 if __name__ == "__main__":
     # Test texture generation
-    print("Generating texture atlas...")
-    gen = TextureGenerator(16, 17)
-    gen.generate_atlas()
-    gen.save("test_atlas.png")
-    print("Saved to test_atlas.png")
+    from pathlib import Path
+    content_path = Path(__file__).parent.parent.parent / "content"
+    print(f"Loading blocks from: {content_path}")
+
+    gen = TextureGenerator(pixels_per_tile=16)
+    atlas = gen.generate_atlas(content_path)
+
+    output_path = Path(__file__).parent / "test_atlas.png"
+    atlas.save(output_path)
+
+    print(f"Generated atlas with {len(gen.tiles)} tiles")
+    print(f"Tile order: {gen.tile_order}")
+    print(f"Saved to: {output_path}")
