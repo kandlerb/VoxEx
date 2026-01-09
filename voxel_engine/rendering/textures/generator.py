@@ -88,19 +88,19 @@ class TextureGenerator:
                     self.block_configs[block_key] = config
 
     def generate_atlas(self, content_path: Path) -> Image.Image:
-        """Generate complete texture atlas from block configs."""
+        """Generate complete texture atlas from block configs.
+
+        Uses tile_index from block.json to determine exact tile positions,
+        matching VoxEx's tiles.json order.
+        """
         self.load_blocks(content_path)
 
-        # Determine tile order and generate each texture
-        tile_index = 0
+        # Collect all texture configs with their tile_index values
+        # Format: [(tile_index, tile_key, tex_config, block_key, face)]
+        tile_entries: List[tuple] = []
+        references: List[tuple] = []  # Store references to resolve after main tiles
 
-        # Process blocks in ID order for consistent atlas layout
-        sorted_blocks = sorted(
-            self.block_configs.items(),
-            key=lambda x: x[1].get("id", 999)
-        )
-
-        for block_key, config in sorted_blocks:
+        for block_key, config in self.block_configs.items():
             textures = config.get("textures")
             if not textures:
                 continue
@@ -108,47 +108,59 @@ class TextureGenerator:
             # Handle "all" vs per-face textures
             if "all" in textures:
                 tex_config = textures["all"]
-                if tex_config.get("type") == "reference":
-                    # Handle reference later
-                    continue
                 tile_key = f"{block_key}:all"
-                self._generate_tile(tile_key, tex_config, tile_index)
-                self.tile_map[tile_key] = tile_index
-                tile_index += 1
+
+                if tex_config.get("type") == "reference":
+                    references.append((tile_key, tex_config, block_key))
+                else:
+                    tile_idx = tex_config.get("tile_index")
+                    if tile_idx is not None:
+                        tile_entries.append((tile_idx, tile_key, tex_config))
             else:
                 for face in ["top", "side", "bottom"]:
                     if face not in textures:
                         continue
 
                     tex_config = textures[face]
-
-                    # Handle references
-                    if tex_config.get("type") == "reference":
-                        ref = tex_config.get("ref")
-                        if ref in ["top", "side", "bottom"]:
-                            # Reference another face of same block
-                            ref_key = f"{block_key}:{ref}"
-                        else:
-                            # Reference another block
-                            ref_key = f"{ref}:all"
-                        self.tile_map[f"{block_key}:{face}"] = self.tile_map.get(ref_key, 0)
-                        continue
-
                     tile_key = f"{block_key}:{face}"
-                    self._generate_tile(tile_key, tex_config, tile_index)
-                    self.tile_map[tile_key] = tile_index
-                    tile_index += 1
 
-        # Create atlas image
-        num_tiles = len(self.tiles)
-        if num_tiles == 0:
+                    if tex_config.get("type") == "reference":
+                        references.append((tile_key, tex_config, block_key))
+                    else:
+                        tile_idx = tex_config.get("tile_index")
+                        if tile_idx is not None:
+                            tile_entries.append((tile_idx, tile_key, tex_config))
+
+        # Sort by tile_index to generate in correct order
+        tile_entries.sort(key=lambda x: x[0])
+
+        # Generate tiles in tile_index order
+        for tile_idx, tile_key, tex_config in tile_entries:
+            self._generate_tile(tile_key, tex_config, tile_idx)
+            self.tile_map[tile_key] = tile_idx
+
+        # Resolve references after all main tiles are generated
+        for tile_key, tex_config, block_key in references:
+            ref = tex_config.get("ref")
+            if ref in ["top", "side", "bottom"]:
+                ref_key = f"{block_key}:{ref}"
+            else:
+                ref_key = f"{ref}:all"
+            self.tile_map[tile_key] = self.tile_map.get(ref_key, 0)
+
+        # Create atlas image based on max tile_index + 1
+        if not tile_entries:
             return Image.new('RGBA', (16, 16), (255, 0, 255, 255))
+
+        max_tile_index = max(entry[0] for entry in tile_entries)
+        num_tiles = max_tile_index + 1
 
         atlas = Image.new('RGBA', (num_tiles * self.ppt, self.ppt), (0, 0, 0, 255))
 
-        for i, tile_key in enumerate(self.tile_order):
+        # Place tiles at their correct positions by tile_index
+        for tile_idx, tile_key, _ in tile_entries:
             tile = self.tiles[tile_key]
-            atlas.paste(tile, (i * self.ppt, 0))
+            atlas.paste(tile, (tile_idx * self.ppt, 0))
 
         return atlas
 
@@ -288,9 +300,11 @@ class TextureGenerator:
                 self._fill_pixel(tile, x, y, col)
 
                 if cluster_chance > 0 and rng.next() < cluster_chance:
-                    dx = 1 if rng.next() > 0.5 else -1
-                    dy = 1 if rng.next() > 0.5 else -1
-                    self._fill_pixel(tile, (x + dx) % ppt, (y + dy) % ppt, col)
+                    # Right OR down only (not diagonal) to match VoxEx
+                    if rng.next() > 0.5:
+                        self._fill_pixel(tile, x + 1, y, col)  # RIGHT
+                    else:
+                        self._fill_pixel(tile, x, y + 1, col)  # DOWN
 
     def _gen_log_bark(self, tile: Image.Image, palette: dict, params: dict, seed: int):
         """Generate log bark texture with vertical grooves."""
