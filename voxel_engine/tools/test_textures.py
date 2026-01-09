@@ -271,6 +271,70 @@ def test_tile_map():
     print()
 
 
+def test_tile_order_matches_voxex():
+    """Test that tile indices match VoxEx's tiles.json exactly."""
+    print("Testing tile order matches VoxEx tiles.json...")
+
+    import json
+    config_path = Path(__file__).parent.parent / "config" / "tiles.json"
+
+    with open(config_path) as f:
+        tiles_json = json.load(f)
+
+    # Expected mapping from tiles.json tile names to generator tile keys
+    tile_name_to_key = {
+        "GRASS_TOP": "grass:top",
+        "GRASS_SIDE": "grass:side",
+        "DIRT": "dirt:all",
+        "STONE": "stone:all",
+        "PLANK": "wood:all",
+        "LOG_SIDE": "log:side",
+        "LEAF": "leaves:all",
+        "BEDROCK": "bedrock:all",
+        "LOG_TOP": "log:top",
+        "SAND": "sand:all",
+        "WATER": "water:all",
+        "TORCH": "torch:all",
+        "SNOW": "snow:all",
+        "GRAVEL": "gravel:all",
+        "LONGWOOD_LOG_SIDE": "longwood_log:side",
+        "LONGWOOD_LOG_TOP": "longwood_log:top",
+        "LONGWOOD_LEAF": "longwood_leaves:all",
+    }
+
+    content_path = get_content_path()
+    generator = TextureGenerator()
+    atlas = generator.generate_atlas(content_path)
+
+    # Verify atlas has exactly 17 tiles
+    expected_num_tiles = 17
+    assert atlas.width == expected_num_tiles * generator.ppt, \
+        f"Atlas should have {expected_num_tiles} tiles, got {atlas.width // generator.ppt}"
+    print(f"  Atlas has exactly {expected_num_tiles} tiles: PASS")
+
+    # Verify each tile index matches tiles.json
+    all_match = True
+    for tile_name, expected_index in tiles_json.items():
+        tile_key = tile_name_to_key.get(tile_name)
+        if tile_key is None:
+            print(f"    WARNING: Unknown tile name in tiles.json: {tile_name}")
+            continue
+
+        actual_index = generator.tile_map.get(tile_key)
+        if actual_index is None:
+            print(f"    FAIL: {tile_name} ({tile_key}) not found in tile_map")
+            all_match = False
+        elif actual_index != expected_index:
+            print(f"    FAIL: {tile_name} expected index {expected_index}, got {actual_index}")
+            all_match = False
+        else:
+            print(f"    {tile_name}: index {actual_index} PASS")
+
+    assert all_match, "Tile indices do not match tiles.json!"
+    print("  All tile indices match VoxEx tiles.json: PASS")
+    print()
+
+
 def main():
     """Run all tests."""
     print("=" * 60)
@@ -286,6 +350,7 @@ def main():
         test_determinism()
         test_transparency()
         test_tile_map()
+        test_tile_order_matches_voxex()
 
         print("=" * 60)
         print("ALL TESTS PASSED!")
