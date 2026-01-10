@@ -1,13 +1,13 @@
 """UI rendering FrameSystem."""
 from typing import Optional
 
-from engine.systems.base import FrameSystem
-from engine.state import GameState
-from engine.window import Window
-from engine.ui.ui_renderer import UIRenderer
-from engine.ui.hud import Crosshair, Hotbar, DebugOverlay
-from engine.ui.pause_menu import PauseMenu, MenuAction
-from engine.loops import Clock
+from .base import FrameSystem
+from ..state import GameState
+from ..window import Window
+from ..ui.ui_renderer import UIRenderer
+from ..ui.hud import Crosshair, Hotbar, DebugOverlay
+from ..ui.pause_menu import PauseMenu, MenuAction
+from ..loops import Clock
 
 
 class UISystem(FrameSystem):
