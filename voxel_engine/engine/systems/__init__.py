@@ -13,10 +13,11 @@ Frame systems run every frame (variable rate):
 - ChunkUploadSystem: GPU mesh uploads (priority 90)
 - RenderSystem: Clears screen, basic rendering (priority 100)
 - WorldRenderSystem: Full voxel world rendering (priority 100)
+- UISystem: UI/HUD rendering (priority 110)
 
 Usage:
     from voxel_engine.engine.systems import InputSystem, PhysicsSystem
-    from voxel_engine.engine.systems import InteractionSystem
+    from voxel_engine.engine.systems import InteractionSystem, UISystem
     from voxel_engine.engine.systems import RenderSystem, WorldRenderSystem
     from voxel_engine.engine.systems import ChunkStreamingSystem, ChunkUploadSystem
     from voxel_engine.engine.window import Window
@@ -28,6 +29,7 @@ Usage:
     game_loop.add_tick_system(ChunkStreamingSystem(streamer))
     game_loop.add_frame_system(ChunkUploadSystem(streamer))
     game_loop.add_frame_system(WorldRenderSystem(window))
+    game_loop.add_frame_system(UISystem(window, clock))
 """
 
 from .base import System, TickSystem, FrameSystem
@@ -38,6 +40,7 @@ from .render_system import RenderSystem
 from .world_render_system import WorldRenderSystem
 from .chunk_system import ChunkStreamingSystem
 from .chunk_upload_system import ChunkUploadSystem
+from .ui_system import UISystem
 
 __all__ = [
     "System",
@@ -50,4 +53,5 @@ __all__ = [
     "WorldRenderSystem",
     "ChunkStreamingSystem",
     "ChunkUploadSystem",
+    "UISystem",
 ]
