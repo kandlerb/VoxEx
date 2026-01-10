@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Full world demo with rendering and block interaction.
+Full world demo with rendering, block interaction, and audio.
 
 Creates a window with procedurally generated terrain, camera controls,
-real-time voxel rendering, and block interaction (mining/placing).
+real-time voxel rendering, block interaction (mining/placing), and
+procedural audio (footsteps, block sounds, ambient).
 
 Controls:
     WASD        - Move
@@ -20,11 +21,16 @@ Controls:
     ~           - Toggle debug overlay
     ESC         - Pause menu (Resume/Settings/Quit)
 
+Audio:
+    - Footsteps based on surface material (grass, stone, wood, sand, water)
+    - Block break/place sounds
+    - Ambient wind/cave sounds
+
 Usage:
     python voxel_engine/tools/demo_world.py
 
 Requirements:
-    pip install glfw moderngl numpy
+    pip install glfw moderngl numpy sounddevice
 """
 
 import sys
@@ -54,7 +60,7 @@ def main():
     from voxel_engine.engine.loops import GameLoop, Clock
     from voxel_engine.engine.systems import (
         InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem,
-        SaveSystem
+        SaveSystem, AudioSystem
     )
     from voxel_engine.engine.ui import MenuAction
     from voxel_engine.engine.meshing import ChunkBuilder
@@ -62,6 +68,7 @@ def main():
     from voxel_engine.engine.interaction import BlockSelector
     from voxel_engine.engine.rendering import BlockOutlineRenderer
     from voxel_engine.engine.persistence import SaveManager
+    from voxel_engine.engine.audio import AudioManager
     from voxel_engine.systems.world.generation_system import TerrainGenerator
 
     print("=" * 60)
@@ -81,6 +88,8 @@ def main():
     print("  F9          - Quick load")
     print("  ~           - Toggle debug overlay")
     print("  ESC         - Pause menu")
+    print()
+    print("Audio: Footsteps, block sounds, ambient wind")
     print()
     print("Initializing...")
 
@@ -190,17 +199,24 @@ def main():
         save_manager = SaveManager()
         save_system = SaveSystem(save_manager, autosave_enabled=True, autosave_interval=300.0)
 
+        # Create audio manager and system
+        print("  Initializing audio system...")
+        audio_manager = AudioManager(seed=SEED)
+        audio_system = AudioSystem(audio_manager)
+
         loop.add_tick_system(input_system)        # Priority 0
         loop.add_tick_system(physics_system)      # Priority 10
+        loop.add_tick_system(audio_system)        # Priority 15
         loop.add_tick_system(interaction_system)  # Priority 20
         loop.add_tick_system(save_system)         # Priority 100 (autosave)
         loop.add_frame_system(render_system)      # Priority 100
         loop.add_frame_system(ui_system)          # Priority 110
 
-        # Initialize render system and UI system
+        # Initialize render system, UI system, and audio system
         print("  Initializing systems...")
         render_system.initialize(state)
         ui_system.initialize(state)
+        audio_system.initialize(state)
 
         # Build chunk meshes
         print("  Building chunk meshes...")
@@ -216,14 +232,22 @@ def main():
         mesh_time = time.perf_counter() - t0
         print(f"  Meshes built in {mesh_time:.2f}s")
 
-        # Set up chunk dirty callback for block interaction
+        # Set up chunk dirty callback for block interaction with audio
         dirty_chunks = set()
 
-        def on_chunk_dirty(cx, cz):
+        def on_chunk_dirty(cx, cz, block_id=None, position=None, is_break=False):
             """Mark a chunk as needing re-mesh due to block changes."""
             dirty_chunks.add((cx, cz))
             # Also mark as modified for save system
             save_manager.chunk_tracker.mark_modified(cx, cz)
+
+            # Play block sound if block info provided
+            if block_id is not None and position is not None:
+                pos_array = np.array(position, dtype=np.float32)
+                if is_break:
+                    audio_manager.play_block_break(block_id, pos_array)
+                else:
+                    audio_manager.play_block_place(block_id, pos_array)
 
         interaction_system.set_chunk_dirty_callback(on_chunk_dirty)
 
@@ -395,6 +419,7 @@ def main():
             save_manager.quick_save(state)
 
         outline_renderer.release()
+        audio_system.shutdown()
         save_system.shutdown()
         ui_system.shutdown()
         render_system.shutdown()

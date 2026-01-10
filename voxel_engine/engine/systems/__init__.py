@@ -6,6 +6,7 @@ Systems process GameState at fixed (tick) or variable (frame) rates.
 Tick systems run at 20 TPS (fixed timestep):
 - InputSystem: Samples input, updates PlayerState (priority 0)
 - PhysicsSystem: Movement and collision (priority 10)
+- AudioSystem: Footsteps and ambient sounds (priority 15)
 - InteractionSystem: Block mining and placement (priority 20)
 - ChunkStreamingSystem: Chunk generation and meshing (priority 50)
 
@@ -20,11 +21,15 @@ Usage:
     from voxel_engine.engine.systems import InteractionSystem, UISystem
     from voxel_engine.engine.systems import RenderSystem, WorldRenderSystem
     from voxel_engine.engine.systems import ChunkStreamingSystem, ChunkUploadSystem
+    from voxel_engine.engine.systems import AudioSystem
     from voxel_engine.engine.window import Window
+    from voxel_engine.engine.audio import AudioManager
 
     window = Window()
+    audio_manager = AudioManager()
     game_loop.add_tick_system(InputSystem(window))
     game_loop.add_tick_system(PhysicsSystem())
+    game_loop.add_tick_system(AudioSystem(audio_manager))
     game_loop.add_tick_system(InteractionSystem(selector))
     game_loop.add_tick_system(ChunkStreamingSystem(streamer))
     game_loop.add_frame_system(ChunkUploadSystem(streamer))
@@ -35,6 +40,7 @@ Usage:
 from .base import System, TickSystem, FrameSystem
 from .input_system import InputSystem
 from .physics_system import PhysicsSystem
+from .audio_system import AudioSystem
 from .interaction_system import InteractionSystem
 from .render_system import RenderSystem
 from .world_render_system import WorldRenderSystem
@@ -49,6 +55,7 @@ __all__ = [
     "FrameSystem",
     "InputSystem",
     "PhysicsSystem",
+    "AudioSystem",
     "InteractionSystem",
     "RenderSystem",
     "WorldRenderSystem",
