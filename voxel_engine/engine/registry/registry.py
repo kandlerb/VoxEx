@@ -384,6 +384,88 @@ class Registry:
         cls._check_initialized()
         return cls._tiles.get(name, -1)
 
+    @classmethod
+    def get_block_tile_index(cls, block_id: int, face_index: int) -> int:
+        """
+        Get texture atlas tile index for a block face.
+
+        Face indices: 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z.
+        Maps to texture keys: sides (0,1,4,5), top (2), bottom (3).
+
+        Handles per-face textures, 'all' textures, and references.
+
+        Args:
+            block_id: Block ID to look up.
+            face_index: Which face (0-5).
+
+        Returns:
+            int: Tile index in texture atlas, or 0 if not found.
+        """
+        cls._check_initialized()
+
+        block = cls._blocks.get(block_id)
+        if block is None:
+            return 0  # Default to first tile
+
+        textures = block.get("textures")
+        if textures is None:
+            return 0
+
+        # Determine which texture key to use based on face
+        if face_index == 2:  # +Y (top)
+            tex_key = "top"
+        elif face_index == 3:  # -Y (bottom)
+            tex_key = "bottom"
+        else:  # Sides (0, 1, 4, 5)
+            tex_key = "side"
+
+        # Try face-specific texture first
+        tex_data = textures.get(tex_key)
+
+        # Fall back to 'all' texture
+        if tex_data is None:
+            tex_data = textures.get("all")
+
+        if tex_data is None:
+            return 0
+
+        # Handle references
+        if tex_data.get("type") == "reference":
+            ref_key = tex_data.get("ref")
+            if ref_key:
+                # First, check if reference is to another texture within same block
+                ref_tex = textures.get(ref_key)
+                if ref_tex is not None:
+                    tex_data = ref_tex
+                else:
+                    # Reference might be to another block (e.g., "dirt")
+                    ref_block = cls._block_by_name.get(ref_key.lower())
+                    if ref_block is not None:
+                        ref_textures = ref_block.get("textures", {})
+                        # Get 'all' texture from referenced block
+                        tex_data = ref_textures.get("all")
+                        if tex_data is None:
+                            # Try to get same face key from referenced block
+                            tex_data = ref_textures.get(tex_key)
+                if tex_data is None:
+                    return 0
+
+        return tex_data.get("tile_index", 0)
+
+    @classmethod
+    def is_liquid(cls, block_id: int) -> bool:
+        """
+        Check if a block is a liquid (water, lava).
+
+        Args:
+            block_id: Block ID to check.
+
+        Returns:
+            bool: True if block is a liquid.
+        """
+        cls._check_initialized()
+        return block_id in cls._fluid_blocks
+
     # =========================================================================
     # WORLD CONFIG ACCESS
     # =========================================================================
