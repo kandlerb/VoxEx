@@ -1,0 +1,32 @@
+"""UI/HUD constants."""
+import numpy as np
+
+# Crosshair
+CROSSHAIR_SIZE: int = 20  # pixels
+CROSSHAIR_THICKNESS: int = 2
+CROSSHAIR_COLOR: tuple = (255, 255, 255, 200)
+
+# Hotbar
+HOTBAR_SLOTS: int = 9
+HOTBAR_SLOT_SIZE: int = 48  # pixels
+HOTBAR_SLOT_PADDING: int = 4
+HOTBAR_MARGIN_BOTTOM: int = 20
+HOTBAR_BG_COLOR: tuple = (30, 30, 30, 180)
+HOTBAR_SELECTED_COLOR: tuple = (255, 255, 255, 100)
+HOTBAR_BORDER_COLOR: tuple = (60, 60, 60, 255)
+
+# Debug overlay
+DEBUG_FONT_SIZE: int = 14
+DEBUG_LINE_HEIGHT: int = 18
+DEBUG_PADDING: int = 10
+DEBUG_BG_COLOR: tuple = (0, 0, 0, 150)
+DEBUG_TEXT_COLOR: tuple = (255, 255, 255, 255)
+
+# Pause menu
+MENU_BG_COLOR: tuple = (0, 0, 0, 180)
+MENU_BUTTON_WIDTH: int = 200
+MENU_BUTTON_HEIGHT: int = 40
+MENU_BUTTON_SPACING: int = 10
+MENU_BUTTON_COLOR: tuple = (60, 60, 60, 255)
+MENU_BUTTON_HOVER_COLOR: tuple = (80, 80, 80, 255)
+MENU_TEXT_COLOR: tuple = (255, 255, 255, 255)

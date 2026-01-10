@@ -16,7 +16,7 @@ Controls:
     Left Click  - Break block
     Right Click - Place block
     ~           - Toggle debug overlay
-    ESC         - Quit
+    ESC         - Pause menu (Resume/Settings/Quit)
 
 Usage:
     python voxel_engine/tools/demo_world.py
@@ -47,12 +47,13 @@ def main():
         print("Install with: pip install glfw moderngl numpy")
         return 1
 
-    from voxel_engine.engine.window import Window
+    from voxel_engine.engine.window import Window, Keys
     from voxel_engine.engine.state import GameState, GameMode
-    from voxel_engine.engine.loops import GameLoop
+    from voxel_engine.engine.loops import GameLoop, Clock
     from voxel_engine.engine.systems import (
-        InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem
+        InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem
     )
+    from voxel_engine.engine.ui import MenuAction
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
     from voxel_engine.engine.interaction import BlockSelector
@@ -73,7 +74,7 @@ def main():
     print("  Left Click  - Break block")
     print("  Right Click - Place block")
     print("  ~           - Toggle debug overlay")
-    print("  ESC         - Quit")
+    print("  ESC         - Pause menu")
     print()
     print("Initializing...")
 
@@ -163,11 +164,13 @@ def main():
 
         # Create game loop and systems
         print("  Setting up game loop...")
+        clock = Clock(target_fps=60.0)
         loop = GameLoop(state, tick_rate=20.0, target_fps=60.0)
 
         input_system = InputSystem(window, sensitivity=0.002)
         physics_system = PhysicsSystem()
         render_system = WorldRenderSystem(window, render_distance=RENDER_DISTANCE)
+        ui_system = UISystem(window, clock)
 
         # Create block interaction system
         block_selector = BlockSelector(state.world)
@@ -180,10 +183,15 @@ def main():
         loop.add_tick_system(physics_system)      # Priority 10
         loop.add_tick_system(interaction_system)  # Priority 20
         loop.add_frame_system(render_system)      # Priority 100
+        loop.add_frame_system(ui_system)          # Priority 110
 
-        # Initialize render system and build meshes
-        print("  Building chunk meshes...")
+        # Initialize render system and UI system
+        print("  Initializing systems...")
         render_system.initialize(state)
+        ui_system.initialize(state)
+
+        # Build chunk meshes
+        print("  Building chunk meshes...")
 
         chunk_builder = ChunkBuilder(state.world)
         t0 = time.perf_counter()
@@ -208,10 +216,59 @@ def main():
         # Stats tracking
         last_print = 0.0
         print_interval = 1.0
+        debug_key_pressed = False
+        pause_key_pressed = False
 
         def on_tick(game_state, dt):
-            nonlocal last_print, dirty_chunks
+            nonlocal last_print, dirty_chunks, debug_key_pressed, pause_key_pressed
             current_time = time.perf_counter()
+
+            # Update clock for FPS tracking
+            clock.tick()
+
+            # Handle debug toggle (~ key / grave accent)
+            if window.get_key(Keys.GRAVE_ACCENT):
+                if not debug_key_pressed:
+                    ui_system.toggle_debug()
+                    debug_key_pressed = True
+            else:
+                debug_key_pressed = False
+
+            # Handle pause toggle (ESC key)
+            if window.get_key(Keys.ESCAPE):
+                if not pause_key_pressed:
+                    if ui_system.paused:
+                        # If paused, resume game
+                        ui_system.toggle_pause()
+                    else:
+                        # Show pause menu
+                        ui_system.toggle_pause()
+                    pause_key_pressed = True
+            else:
+                pause_key_pressed = False
+
+            # Handle pause menu clicks
+            if ui_system.paused:
+                # Check for mouse click in pause menu
+                from voxel_engine.engine.window import MouseButtons
+                if window.get_mouse_button(MouseButtons.LEFT):
+                    mx, my = window.get_mouse_position()
+                    action = ui_system.handle_click(mx, my)
+                    if action == MenuAction.RESUME:
+                        ui_system.toggle_pause()
+                    elif action == MenuAction.QUIT:
+                        game_state.should_quit = True
+
+            # Update UI stats
+            render_stats = render_system.get_stats()
+            ui_system.set_stats(
+                render_stats.get('draw_calls', 0),
+                render_stats.get('visible_chunks', 0)
+            )
+
+            # Skip game logic updates if paused
+            if ui_system.paused:
+                return
 
             # Rebuild dirty chunks from block interactions
             if dirty_chunks:
@@ -289,6 +346,7 @@ def main():
 
         print("\n\nShutting down...")
         outline_renderer.release()
+        ui_system.shutdown()
         render_system.shutdown()
         window.close()
 
