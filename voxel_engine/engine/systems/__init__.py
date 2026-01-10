@@ -6,19 +6,24 @@ Systems process GameState at fixed (tick) or variable (frame) rates.
 Tick systems run at 20 TPS (fixed timestep):
 - InputSystem: Samples input, updates PlayerState (priority 0)
 - PhysicsSystem: Movement and collision (priority 10)
+- ChunkStreamingSystem: Chunk generation and meshing (priority 50)
 
 Frame systems run every frame (variable rate):
+- ChunkUploadSystem: GPU mesh uploads (priority 90)
 - RenderSystem: Clears screen, basic rendering (priority 100)
 - WorldRenderSystem: Full voxel world rendering (priority 100)
 
 Usage:
     from voxel_engine.engine.systems import InputSystem, PhysicsSystem
     from voxel_engine.engine.systems import RenderSystem, WorldRenderSystem
+    from voxel_engine.engine.systems import ChunkStreamingSystem, ChunkUploadSystem
     from voxel_engine.engine.window import Window
 
     window = Window()
     game_loop.add_tick_system(InputSystem(window))
     game_loop.add_tick_system(PhysicsSystem())
+    game_loop.add_tick_system(ChunkStreamingSystem(streamer))
+    game_loop.add_frame_system(ChunkUploadSystem(streamer))
     game_loop.add_frame_system(WorldRenderSystem(window))
 """
 
@@ -27,6 +32,8 @@ from .input_system import InputSystem
 from .physics_system import PhysicsSystem
 from .render_system import RenderSystem
 from .world_render_system import WorldRenderSystem
+from .chunk_system import ChunkStreamingSystem
+from .chunk_upload_system import ChunkUploadSystem
 
 __all__ = [
     "System",
@@ -36,4 +43,6 @@ __all__ = [
     "PhysicsSystem",
     "RenderSystem",
     "WorldRenderSystem",
+    "ChunkStreamingSystem",
+    "ChunkUploadSystem",
 ]
