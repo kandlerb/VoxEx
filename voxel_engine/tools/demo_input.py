@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Interactive demo showing input system working with game loop.
+Interactive demo showing input and physics systems working with game loop.
 
-Creates a window and displays real-time input state in the console.
-Move the mouse to look around, use WASD to show movement input.
+Creates a window and displays real-time player state in the console.
+Move the mouse to look around, use WASD to move, Space to jump.
 Press ESC to quit.
 
 Usage:
@@ -24,7 +24,7 @@ sys.path.insert(0, str(project_root))
 
 
 def main():
-    """Run the input demo."""
+    """Run the input and physics demo."""
     # Check dependencies
     try:
         import glfw
@@ -37,23 +37,26 @@ def main():
     from voxel_engine.engine.window import Window
     from voxel_engine.engine.state import GameState, GameMode
     from voxel_engine.engine.loops import GameLoop
-    from voxel_engine.engine.systems import InputSystem, RenderSystem
+    from voxel_engine.engine.systems import InputSystem, PhysicsSystem, RenderSystem
 
     print("=" * 60)
-    print("VoxEx Input Demo")
+    print("VoxEx Input + Physics Demo")
     print("=" * 60)
     print()
     print("Controls:")
-    print("  WASD      - Movement (shown in console)")
+    print("  WASD      - Movement")
     print("  Mouse     - Look around")
     print("  Space     - Jump (double-tap for flight toggle)")
     print("  Shift     - Sprint")
     print("  C         - Crouch")
     print("  F         - Toggle torch")
-    print("  E         - Toggle inventory (shown)")
+    print("  E         - Toggle inventory")
     print("  1-9       - Select hotbar slot")
     print("  ~         - Toggle debug overlay")
     print("  ESC       - Quit")
+    print()
+    print("Note: Without loaded chunks, you'll fall through the void.")
+    print("      Toggle flight (double-tap Space) to explore freely.")
     print()
     print("Starting window...")
     print()
@@ -63,7 +66,7 @@ def main():
         window = Window(
             width=1280,
             height=720,
-            title="VoxEx - Input Demo"
+            title="VoxEx - Input + Physics Demo"
         )
 
         # Capture cursor for FPS-style controls
@@ -72,21 +75,26 @@ def main():
         # Create game state in creative mode (allows flight)
         state = GameState.create(seed=12345, mode=GameMode.CREATIVE)
 
+        # Position player above origin (will fall without terrain)
+        state.player.position[:] = [0.0, 70.0, 0.0]
+
         # Create game loop
         loop = GameLoop(state, tick_rate=20.0, target_fps=60.0)
 
-        # Add systems
+        # Add systems in priority order
         input_system = InputSystem(window, sensitivity=0.002)
+        physics_system = PhysicsSystem()
         render_system = RenderSystem(window)
 
-        loop.add_tick_system(input_system)
-        loop.add_frame_system(render_system)
+        loop.add_tick_system(input_system)   # Priority 0
+        loop.add_tick_system(physics_system)  # Priority 10
+        loop.add_frame_system(render_system)  # Priority 100
 
         # Track last print time (don't spam console)
         last_print = 0.0
         print_interval = 0.1  # Print every 100ms
 
-        # Custom tick callback to show input state
+        # Custom tick callback to show state
         def on_tick(game_state, dt):
             nonlocal last_print
 
@@ -110,37 +118,32 @@ def main():
             if not movement:
                 movement = "-"
 
-            # Build action indicator
-            actions = ""
-            if p.jump_pressed:
-                actions += "Jump "
-            if p.sprint_pressed:
-                actions += "Sprint "
-            if p.crouch_pressed:
-                actions += "Crouch "
-            if not actions:
-                actions = "-"
-
             # Build status
             status = ""
             if p.is_flying:
-                status += "FLYING "
-            if p.torch_active:
-                status += "TORCH "
-            if game_state.debug_overlay:
-                status += "DEBUG "
+                status += "FLY "
+            if p.on_ground:
+                status += "GND "
+            if p.in_water:
+                status += "H2O "
+            if p.is_sprinting:
+                status += "SPR "
+            if p.is_crouching:
+                status += "CRO "
             if not status:
                 status = "-"
 
-            # Format output
-            yaw_deg = np.degrees(p.yaw) % 360
-            pitch_deg = np.degrees(p.pitch)
+            # Format position
+            pos_str = f"({p.position[0]:7.2f}, {p.position[1]:7.2f}, {p.position[2]:7.2f})"
 
+            # Format velocity
+            vel_str = f"({p.velocity[0]:6.2f}, {p.velocity[1]:6.2f}, {p.velocity[2]:6.2f})"
+
+            # Format output
             print(
-                f"\rMove: {movement:4s} | "
-                f"Actions: {actions:20s} | "
-                f"Look: ({yaw_deg:6.1f}, {pitch_deg:5.1f}) | "
-                f"Slot: {p.selected_slot} | "
+                f"\rPos: {pos_str} | "
+                f"Vel: {vel_str} | "
+                f"Move: {movement:4s} | "
                 f"Status: {status:15s} | "
                 f"FPS: {game_state.fps:5.1f}",
                 end="",
