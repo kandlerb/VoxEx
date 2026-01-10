@@ -113,6 +113,10 @@ class InputSystem(TickSystem):
         player.crouch_pressed = input_state.crouch
         player.sprint_pressed = input_state.sprint
 
+        # Block interaction input (mouse buttons)
+        player.input_primary_action = input_state.primary_action
+        player.input_secondary_action = input_state.secondary_action
+
         # Mouse look - apply sensitivity and update yaw/pitch
         if input_state.mouse_dx != 0.0 or input_state.mouse_dy != 0.0:
             player.yaw -= input_state.mouse_dx * self._sensitivity

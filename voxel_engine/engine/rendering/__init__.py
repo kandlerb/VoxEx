@@ -7,11 +7,13 @@ Provides GPU rendering components for voxel worlds:
 - TextureAtlas: Procedural texture generation and GPU upload
 - ChunkRenderer: VAO management for chunk meshes
 - SkyRenderer: Sky background with day/night cycle
+- BlockOutlineRenderer: Wireframe outline for selected blocks
 - Shaders: GLSL shader sources for terrain and sky
 
 Usage:
     from voxel_engine.engine.rendering import Camera, Frustum, TextureAtlas
     from voxel_engine.engine.rendering import ChunkRenderer, SkyRenderer
+    from voxel_engine.engine.rendering import BlockOutlineRenderer
     from voxel_engine.engine.rendering import VOXEL_VERTEX_SHADER
 """
 
@@ -26,6 +28,7 @@ from .frustum import Frustum
 from .texture import TextureAtlas, generate_texture_atlas, create_texture
 from .chunk_renderer import ChunkRenderer, ChunkVAO
 from .sky_renderer import SkyRenderer
+from .block_outline import BlockOutlineRenderer
 from .shaders import (
     VOXEL_VERTEX_SHADER,
     VOXEL_FRAGMENT_SHADER,
@@ -53,6 +56,8 @@ __all__ = [
     'ChunkVAO',
     # Sky rendering
     'SkyRenderer',
+    # Block outline
+    'BlockOutlineRenderer',
     # Shaders
     'VOXEL_VERTEX_SHADER',
     'VOXEL_FRAGMENT_SHADER',

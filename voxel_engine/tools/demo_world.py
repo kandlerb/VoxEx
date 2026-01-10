@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Full world demo with rendering.
+Full world demo with rendering and block interaction.
 
 Creates a window with procedurally generated terrain, camera controls,
-and real-time voxel rendering using the WorldRenderSystem.
+real-time voxel rendering, and block interaction (mining/placing).
 
 Controls:
     WASD        - Move
@@ -12,6 +12,9 @@ Controls:
     Shift       - Sprint
     C           - Crouch
     F           - Toggle torch
+    1-9         - Select hotbar slot
+    Left Click  - Break block
+    Right Click - Place block
     ~           - Toggle debug overlay
     ESC         - Quit
 
@@ -47,9 +50,13 @@ def main():
     from voxel_engine.engine.window import Window
     from voxel_engine.engine.state import GameState, GameMode
     from voxel_engine.engine.loops import GameLoop
-    from voxel_engine.engine.systems import InputSystem, PhysicsSystem, WorldRenderSystem
+    from voxel_engine.engine.systems import (
+        InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem
+    )
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
+    from voxel_engine.engine.interaction import BlockSelector
+    from voxel_engine.engine.rendering import BlockOutlineRenderer
     from voxel_engine.systems.world.generation_system import TerrainGenerator
 
     print("=" * 60)
@@ -57,13 +64,16 @@ def main():
     print("=" * 60)
     print()
     print("Controls:")
-    print("  WASD      - Movement")
-    print("  Mouse     - Look around")
-    print("  Space     - Jump (double-tap for flight toggle)")
-    print("  Shift     - Sprint")
-    print("  C         - Crouch / Fly down")
-    print("  ~         - Toggle debug overlay")
-    print("  ESC       - Quit")
+    print("  WASD        - Movement")
+    print("  Mouse       - Look around")
+    print("  Space       - Jump (double-tap for flight toggle)")
+    print("  Shift       - Sprint")
+    print("  C           - Crouch / Fly down")
+    print("  1-9         - Select hotbar slot")
+    print("  Left Click  - Break block")
+    print("  Right Click - Place block")
+    print("  ~           - Toggle debug overlay")
+    print("  ESC         - Quit")
     print()
     print("Initializing...")
 
@@ -159,9 +169,17 @@ def main():
         physics_system = PhysicsSystem()
         render_system = WorldRenderSystem(window, render_distance=RENDER_DISTANCE)
 
-        loop.add_tick_system(input_system)    # Priority 0
-        loop.add_tick_system(physics_system)  # Priority 10
-        loop.add_frame_system(render_system)  # Priority 100
+        # Create block interaction system
+        block_selector = BlockSelector(state.world)
+        interaction_system = InteractionSystem(block_selector)
+
+        # Create block outline renderer
+        outline_renderer = BlockOutlineRenderer(window.ctx)
+
+        loop.add_tick_system(input_system)        # Priority 0
+        loop.add_tick_system(physics_system)      # Priority 10
+        loop.add_tick_system(interaction_system)  # Priority 20
+        loop.add_frame_system(render_system)      # Priority 100
 
         # Initialize render system and build meshes
         print("  Building chunk meshes...")
@@ -178,13 +196,31 @@ def main():
         mesh_time = time.perf_counter() - t0
         print(f"  Meshes built in {mesh_time:.2f}s")
 
+        # Set up chunk dirty callback for block interaction
+        dirty_chunks = set()
+
+        def on_chunk_dirty(cx, cz):
+            """Mark a chunk as needing re-mesh due to block changes."""
+            dirty_chunks.add((cx, cz))
+
+        interaction_system.set_chunk_dirty_callback(on_chunk_dirty)
+
         # Stats tracking
         last_print = 0.0
         print_interval = 1.0
 
         def on_tick(game_state, dt):
-            nonlocal last_print
+            nonlocal last_print, dirty_chunks
             current_time = time.perf_counter()
+
+            # Rebuild dirty chunks from block interactions
+            if dirty_chunks:
+                for cx, cz in dirty_chunks:
+                    # Check if chunk exists
+                    if state.world.get_chunk(cx, cz) is not None:
+                        mesh = chunk_builder.build(cx, cz)
+                        render_system.upload_chunk_mesh(mesh)
+                dirty_chunks.clear()
 
             if current_time - last_print < print_interval:
                 return
@@ -206,17 +242,41 @@ def main():
             # Get render stats
             stats = render_system.get_stats()
 
+            # Show targeted block
+            target_str = "---"
+            if block_selector.has_target:
+                pos = block_selector.get_target_block_pos()
+                if pos:
+                    target_str = f"{pos[0]},{pos[1]},{pos[2]}"
+
             print(
                 f"\rPos: ({p.position[0]:7.1f}, {p.position[1]:7.1f}, {p.position[2]:7.1f}) | "
-                f"Status: {status:10s} | "
+                f"Target: {target_str:12s} | "
+                f"Slot: {p.selected_slot+1} | "
                 f"FPS: {game_state.fps:5.1f} | "
-                f"Visible: {stats.get('visible_chunks', 0):3d} chunks | "
-                f"Draw: {stats.get('draw_calls', 0):3d}",
+                f"Chunks: {stats.get('visible_chunks', 0):3d}",
                 end="",
                 flush=True
             )
 
         loop.on_tick(on_tick)
+
+        # Custom frame hook to render block outline after world
+        def on_frame(game_state, dt, alpha):
+            # Update outline position
+            if block_selector.has_target:
+                outline_renderer.set_target(block_selector.get_target_block_pos())
+            else:
+                outline_renderer.set_target(None)
+
+            # Render outline after world rendering (render_system handles this)
+            if outline_renderer.visible:
+                # Get camera matrices from render system
+                if hasattr(render_system, '_camera') and render_system._camera is not None:
+                    cam = render_system._camera
+                    outline_renderer.render(cam.view, cam.projection)
+
+        loop.on_frame(on_frame)
 
         print()
         print("=" * 60)
@@ -228,6 +288,7 @@ def main():
         loop.run()
 
         print("\n\nShutting down...")
+        outline_renderer.release()
         render_system.shutdown()
         window.close()
 

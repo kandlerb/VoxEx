@@ -62,6 +62,10 @@ class PlayerState:
     selected_slot: int = 0
     torch_active: bool = False
 
+    # Block interaction input (set by InputSystem, read by InteractionSystem)
+    input_primary_action: bool = False   # Left click - mine/break block
+    input_secondary_action: bool = False  # Right click - place block
+
     def store_previous_position(self) -> None:
         """Copy current position to prev_position for interpolation."""
         np.copyto(self.prev_position, self.position)
