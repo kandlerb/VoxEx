@@ -8,22 +8,25 @@ Tick systems run at 20 TPS (fixed timestep):
 - PhysicsSystem: Movement and collision (priority 10)
 
 Frame systems run every frame (variable rate):
-- RenderSystem: Clears screen, renders world (priority 100)
+- RenderSystem: Clears screen, basic rendering (priority 100)
+- WorldRenderSystem: Full voxel world rendering (priority 100)
 
 Usage:
-    from voxel_engine.engine.systems import InputSystem, PhysicsSystem, RenderSystem
+    from voxel_engine.engine.systems import InputSystem, PhysicsSystem
+    from voxel_engine.engine.systems import RenderSystem, WorldRenderSystem
     from voxel_engine.engine.window import Window
 
     window = Window()
     game_loop.add_tick_system(InputSystem(window))
     game_loop.add_tick_system(PhysicsSystem())
-    game_loop.add_frame_system(RenderSystem(window))
+    game_loop.add_frame_system(WorldRenderSystem(window))
 """
 
 from .base import System, TickSystem, FrameSystem
 from .input_system import InputSystem
 from .physics_system import PhysicsSystem
 from .render_system import RenderSystem
+from .world_render_system import WorldRenderSystem
 
 __all__ = [
     "System",
@@ -32,4 +35,5 @@ __all__ = [
     "InputSystem",
     "PhysicsSystem",
     "RenderSystem",
+    "WorldRenderSystem",
 ]
