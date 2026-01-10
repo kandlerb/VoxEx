@@ -148,3 +148,27 @@ class GameState:
     def quit(self) -> None:
         """Signal game should quit."""
         self.should_quit = True
+
+    # =========================================================================
+    # PERSISTENCE HELPERS
+    # =========================================================================
+
+    @property
+    def seed(self) -> int:
+        """
+        Get the world seed.
+
+        Returns:
+            int: World generation seed.
+        """
+        return self.world.seed
+
+    @seed.setter
+    def seed(self, value: int) -> None:
+        """
+        Set the world seed.
+
+        Args:
+            value: New world seed.
+        """
+        self.world.seed = value

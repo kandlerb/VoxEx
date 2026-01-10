@@ -15,6 +15,8 @@ Controls:
     1-9         - Select hotbar slot
     Left Click  - Break block
     Right Click - Place block
+    F5          - Quick save
+    F9          - Quick load
     ~           - Toggle debug overlay
     ESC         - Pause menu (Resume/Settings/Quit)
 
@@ -51,13 +53,15 @@ def main():
     from voxel_engine.engine.state import GameState, GameMode
     from voxel_engine.engine.loops import GameLoop, Clock
     from voxel_engine.engine.systems import (
-        InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem
+        InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem,
+        SaveSystem
     )
     from voxel_engine.engine.ui import MenuAction
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
     from voxel_engine.engine.interaction import BlockSelector
     from voxel_engine.engine.rendering import BlockOutlineRenderer
+    from voxel_engine.engine.persistence import SaveManager
     from voxel_engine.systems.world.generation_system import TerrainGenerator
 
     print("=" * 60)
@@ -73,6 +77,8 @@ def main():
     print("  1-9         - Select hotbar slot")
     print("  Left Click  - Break block")
     print("  Right Click - Place block")
+    print("  F5          - Quick save")
+    print("  F9          - Quick load")
     print("  ~           - Toggle debug overlay")
     print("  ESC         - Pause menu")
     print()
@@ -179,9 +185,15 @@ def main():
         # Create block outline renderer
         outline_renderer = BlockOutlineRenderer(window.ctx)
 
+        # Create save manager and system
+        print("  Initializing save system...")
+        save_manager = SaveManager()
+        save_system = SaveSystem(save_manager, autosave_enabled=True, autosave_interval=300.0)
+
         loop.add_tick_system(input_system)        # Priority 0
         loop.add_tick_system(physics_system)      # Priority 10
         loop.add_tick_system(interaction_system)  # Priority 20
+        loop.add_tick_system(save_system)         # Priority 100 (autosave)
         loop.add_frame_system(render_system)      # Priority 100
         loop.add_frame_system(ui_system)          # Priority 110
 
@@ -210,6 +222,8 @@ def main():
         def on_chunk_dirty(cx, cz):
             """Mark a chunk as needing re-mesh due to block changes."""
             dirty_chunks.add((cx, cz))
+            # Also mark as modified for save system
+            save_manager.chunk_tracker.mark_modified(cx, cz)
 
         interaction_system.set_chunk_dirty_callback(on_chunk_dirty)
 
@@ -218,13 +232,42 @@ def main():
         print_interval = 1.0
         debug_key_pressed = False
         pause_key_pressed = False
+        f5_pressed = False
+        f9_pressed = False
 
         def on_tick(game_state, dt):
             nonlocal last_print, dirty_chunks, debug_key_pressed, pause_key_pressed
+            nonlocal f5_pressed, f9_pressed
             current_time = time.perf_counter()
 
             # Update clock for FPS tracking
             clock.tick()
+
+            # Handle quick save (F5)
+            if window.get_key(Keys.F5):
+                if not f5_pressed:
+                    if save_manager.quick_save(game_state):
+                        print("\n[Save] Quick saved!")
+                        save_system.reset_autosave_timer()
+                    f5_pressed = True
+            else:
+                f5_pressed = False
+
+            # Handle quick load (F9)
+            if window.get_key(Keys.F9):
+                if not f9_pressed:
+                    if save_manager.has_quick_save():
+                        if save_manager.quick_load(game_state):
+                            print("\n[Save] Quick loaded!")
+                            # Rebuild all chunk meshes after load
+                            for cx, cz, chunk in game_state.world.iter_chunks():
+                                mesh = chunk_builder.build(cx, cz)
+                                render_system.upload_chunk_mesh(mesh)
+                    else:
+                        print("\n[Save] No quick save found!")
+                    f9_pressed = True
+            else:
+                f9_pressed = False
 
             # Handle debug toggle (~ key / grave accent)
             if window.get_key(Keys.GRAVE_ACCENT):
@@ -345,7 +388,14 @@ def main():
         loop.run()
 
         print("\n\nShutting down...")
+
+        # Auto-save on exit if there are modified chunks
+        if save_manager.chunk_tracker.modified_count > 0:
+            print("  Saving world...")
+            save_manager.quick_save(state)
+
         outline_renderer.release()
+        save_system.shutdown()
         ui_system.shutdown()
         render_system.shutdown()
         window.close()

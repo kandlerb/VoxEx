@@ -41,6 +41,7 @@ from .world_render_system import WorldRenderSystem
 from .chunk_system import ChunkStreamingSystem
 from .chunk_upload_system import ChunkUploadSystem
 from .ui_system import UISystem
+from .save_system import SaveSystem
 
 __all__ = [
     "System",
@@ -54,4 +55,5 @@ __all__ = [
     "ChunkStreamingSystem",
     "ChunkUploadSystem",
     "UISystem",
+    "SaveSystem",
 ]

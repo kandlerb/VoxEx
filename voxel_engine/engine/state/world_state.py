@@ -322,3 +322,22 @@ class WorldState:
     def mark_chunk_dirty(self, cx: int, cz: int) -> None:
         """Mark a chunk as needing mesh rebuild."""
         self.dirty_chunks.add(chunk_key(cx, cz))
+
+    # =========================================================================
+    # CLEAR / RESET
+    # =========================================================================
+
+    def clear(self) -> None:
+        """Clear all chunk data (for loading saves)."""
+        self.chunks.clear()
+        self.dirty_chunks.clear()
+        self.modified_chunks.clear()
+
+    def get_loaded_chunk_keys(self) -> list:
+        """
+        Get list of all loaded chunk coordinate pairs.
+
+        Returns:
+            list: List of (cx, cz) tuples.
+        """
+        return [key_to_coords(key) for key in self.chunks.keys()]
