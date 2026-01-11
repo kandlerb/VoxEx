@@ -205,7 +205,6 @@ class WorldRenderSystem(FrameSystem):
         self._program['u_model'].write(model.tobytes())
         self._program['u_view'].write(view.tobytes())
         self._program['u_projection'].write(projection.tobytes())
-        self._program['u_time'].value = state.tick_count * 0.05
 
         # Lighting uniforms
         sun_dir = self._sky_renderer.get_sun_direction(time_of_day)
