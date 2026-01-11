@@ -92,7 +92,7 @@ class StartMenu:
         self._screen_height = 0
         self._panel_x = 0.0
         self._panel_y = 0.0
-        self._panel_width = float(self.PANEL_WIDTH)
+        self._panel_width = float(self.MIN_PANEL_WIDTH)
         self._panel_height = 0.0
 
     @property
