@@ -79,8 +79,8 @@ class StartMenu:
         '_panel_x', '_panel_y', '_panel_width', '_panel_height'
     )
 
-    # Panel dimensions (matching voxEx.html)
-    PANEL_WIDTH = 380
+    # Panel dimensions
+    MIN_PANEL_WIDTH = 320
     PANEL_PADDING = 30
 
     def __init__(self):
@@ -130,36 +130,24 @@ class StartMenu:
         self._screen_width = screen_width
         self._screen_height = screen_height
 
-        # Calculate panel dimensions
-        self._panel_width = float(self.PANEL_WIDTH)
-        # Height: title + subtitle + divider + button + gap + seed area + settings button + padding
-        self._panel_height = 320.0  # Approximate height to fit content
-
-        # Center panel on screen
+        # Panel dimensions will be calculated dynamically in render()
+        # based on text measurements. Set initial estimates here.
+        self._panel_width = float(self.MIN_PANEL_WIDTH)
+        self._panel_height = 320.0
         self._panel_x = (screen_width - self._panel_width) / 2
         self._panel_y = (screen_height - self._panel_height) / 2
 
-        # Button dimensions
-        btn_width = self._panel_width - 2 * self.PANEL_PADDING
-        btn_height = 45.0
-        btn_x = self._panel_x + self.PANEL_PADDING
-
-        # Create buttons positioned within panel
-        # "Create New World" at top, below title area
-        create_y = self._panel_y + 100  # After title and subtitle
-
+        # Create buttons (positions will be updated in render)
         self._buttons = [
             StartMenuButton(
                 "Create New World",
-                btn_x, create_y,
-                btn_width, btn_height,
+                0, 0, 100, 45.0,
                 MenuAction.CREATE_WORLD,
                 START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER
             ),
             StartMenuButton(
                 "Settings",
-                btn_x, self._panel_y + self._panel_height - self.PANEL_PADDING - btn_height,
-                btn_width, btn_height,
+                0, 0, 100, 45.0,
                 MenuAction.SETTINGS,
                 START_MENU_SETTINGS_COLOR, START_MENU_SETTINGS_HOVER
             ),
@@ -202,18 +190,48 @@ class StartMenu:
         if not self._visible:
             return
 
-        px = self._panel_x
-        py = self._panel_y
-        pw = self._panel_width
-        ph = self._panel_height
         pad = float(self.PANEL_PADDING)
+
+        # Measure text to calculate dynamic panel width
+        title = "VoxEx"
+        title_width, title_height = ui.measure_text(title, scale=1.5)
+
+        subtitle = "The Python Voxel Explorer"
+        sub_width, sub_height = ui.measure_text(subtitle, scale=1.0)
+
+        # Panel width based on longest text element + padding
+        content_width = max(title_width, sub_width, self.MIN_PANEL_WIDTH - 2 * pad)
+        pw = content_width + 2 * pad
+        ph = self._panel_height
+
+        # Center panel on screen
+        px = (ui.width - pw) / 2
+        py = (ui.height - ph) / 2
+
+        # Update stored values for click detection
+        self._panel_x = px
+        self._panel_y = py
+        self._panel_width = pw
+
+        # Calculate button dimensions and positions
+        btn_width = pw - 2 * pad
+        btn_height = 45.0
+        btn_x = px + pad
+        create_y = py + 100  # After title and subtitle
+        settings_y = py + ph - pad - btn_height
+
+        # Update button positions
+        self._buttons[0].x = btn_x
+        self._buttons[0].y = create_y
+        self._buttons[0].width = btn_width
+        self._buttons[1].x = btn_x
+        self._buttons[1].y = settings_y
+        self._buttons[1].width = btn_width
 
         # Draw panel background
         ui.draw_rect(px, py, pw, ph, PANEL_BG_COLOR)
 
-        # Title "VoxEx" (h3 in HTML - smaller)
-        title = "VoxEx"
-        title_width, title_height = ui.measure_text(title, scale=1.5)
+        # Title "VoxEx"
         ui.draw_text(
             title,
             px + (pw - title_width) / 2,
@@ -222,9 +240,7 @@ class StartMenu:
             scale=1.5
         )
 
-        # Subtitle "The Python Voxel Explorer" (h1 in HTML - larger)
-        subtitle = "The Python Voxel Explorer"
-        sub_width, sub_height = ui.measure_text(subtitle, scale=1.0)
+        # Subtitle
         ui.draw_text(
             subtitle,
             px + (pw - sub_width) / 2,
@@ -265,7 +281,6 @@ class StartMenu:
 
         # Hint text
         hint = "Press R to randomize"
-        hint_width, _ = ui.measure_text(hint, scale=0.7)
         ui.draw_text(
             hint,
             px + pad,
@@ -284,7 +299,7 @@ class StartMenu:
 
         # Footer hint at bottom of screen
         footer = "Press SPACE or click Create to start"
-        footer_width, footer_height = ui.measure_text(footer, scale=0.8)
+        footer_width, _ = ui.measure_text(footer, scale=0.8)
         ui.draw_text(
             footer,
             (ui.width - footer_width) / 2,
