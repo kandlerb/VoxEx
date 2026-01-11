@@ -1,21 +1,29 @@
 """Start menu UI for VoxEx.
 
 Displays the main menu before game starts with title, seed input, and buttons.
-Inspired by the voxEx.html start menu design.
+Styled to match voxEx.html start menu design.
 """
-from typing import List, Optional, Callable
+from typing import List
 import random
 
 from .ui_renderer import UIRenderer
 from .pause_menu import Button, MenuAction
 from .constants import (
-    START_MENU_BG_COLOR, START_MENU_TITLE_COLOR, START_MENU_SUBTITLE_COLOR,
     START_MENU_BUTTON_WIDTH, START_MENU_BUTTON_HEIGHT, START_MENU_BUTTON_SPACING,
     START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER,
     START_MENU_SETTINGS_COLOR, START_MENU_SETTINGS_HOVER,
-    START_MENU_INPUT_BG_COLOR, START_MENU_INPUT_BORDER_COLOR,
     MENU_TEXT_COLOR
 )
+
+
+# Panel colors (matching voxEx.html #seed-menu styling)
+PANEL_BG_COLOR = (0, 0, 0, 216)  # rgba(0,0,0,0.85)
+PANEL_BORDER_COLOR = (68, 68, 68, 255)  # #444
+INPUT_BG_COLOR = (30, 30, 30, 255)  # #1e1e1e
+INPUT_BORDER_COLOR = (68, 68, 68, 255)  # #444
+TITLE_COLOR = (255, 255, 255, 255)
+SUBTITLE_COLOR = (170, 170, 170, 255)  # #aaa
+HINT_COLOR = (136, 136, 136, 255)  # #888
 
 
 class StartMenuButton(Button):
@@ -62,12 +70,18 @@ class StartMenu:
     """
     Start menu shown before game begins.
 
-    Displays title, subtitle, seed input, and action buttons.
+    Displays a centered panel with title, seed display, and action buttons.
+    Styled to match the HTML version's #seed-menu.
     """
 
     __slots__ = (
-        '_visible', '_buttons', '_seed', '_screen_width', '_screen_height'
+        '_visible', '_buttons', '_seed', '_screen_width', '_screen_height',
+        '_panel_x', '_panel_y', '_panel_width', '_panel_height'
     )
+
+    # Panel dimensions (matching voxEx.html)
+    PANEL_WIDTH = 380
+    PANEL_PADDING = 30
 
     def __init__(self):
         """Create start menu."""
@@ -76,6 +90,10 @@ class StartMenu:
         self._seed: int = random.randint(1, 999999)
         self._screen_width = 0
         self._screen_height = 0
+        self._panel_x = 0.0
+        self._panel_y = 0.0
+        self._panel_width = float(self.PANEL_WIDTH)
+        self._panel_height = 0.0
 
     @property
     def visible(self) -> bool:
@@ -112,25 +130,36 @@ class StartMenu:
         self._screen_width = screen_width
         self._screen_height = screen_height
 
-        # Create buttons centered on screen
-        button_x = (screen_width - START_MENU_BUTTON_WIDTH) / 2
-        center_y = screen_height / 2
+        # Calculate panel dimensions
+        self._panel_width = float(self.PANEL_WIDTH)
+        # Height: title + subtitle + divider + button + gap + seed area + settings button + padding
+        self._panel_height = 320.0  # Approximate height to fit content
 
-        # Position buttons below title area
-        button_start_y = center_y + 40
+        # Center panel on screen
+        self._panel_x = (screen_width - self._panel_width) / 2
+        self._panel_y = (screen_height - self._panel_height) / 2
+
+        # Button dimensions
+        btn_width = self._panel_width - 2 * self.PANEL_PADDING
+        btn_height = 45.0
+        btn_x = self._panel_x + self.PANEL_PADDING
+
+        # Create buttons positioned within panel
+        # "Create New World" at top, below title area
+        create_y = self._panel_y + 100  # After title and subtitle
 
         self._buttons = [
             StartMenuButton(
-                "CREATE NEW WORLD",
-                button_x, button_start_y,
-                START_MENU_BUTTON_WIDTH, START_MENU_BUTTON_HEIGHT,
+                "Create New World",
+                btn_x, create_y,
+                btn_width, btn_height,
                 MenuAction.CREATE_WORLD,
                 START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER
             ),
             StartMenuButton(
-                "SETTINGS",
-                button_x, button_start_y + START_MENU_BUTTON_HEIGHT + START_MENU_BUTTON_SPACING,
-                START_MENU_BUTTON_WIDTH, START_MENU_BUTTON_HEIGHT,
+                "Settings",
+                btn_x, self._panel_y + self._panel_height - self.PANEL_PADDING - btn_height,
+                btn_width, btn_height,
                 MenuAction.SETTINGS,
                 START_MENU_SETTINGS_COLOR, START_MENU_SETTINGS_HOVER
             ),
@@ -173,76 +202,93 @@ class StartMenu:
         if not self._visible:
             return
 
-        # Fill background
-        ui.draw_rect(0, 0, ui.width, ui.height, START_MENU_BG_COLOR)
+        px = self._panel_x
+        py = self._panel_y
+        pw = self._panel_width
+        ph = self._panel_height
+        pad = float(self.PANEL_PADDING)
 
-        center_x = ui.width / 2
-        center_y = ui.height / 2
+        # Draw panel background
+        ui.draw_rect(px, py, pw, ph, PANEL_BG_COLOR)
 
-        # Title "VoxEx"
+        # Title "VoxEx" (h3 in HTML - smaller)
         title = "VoxEx"
-        title_width, title_height = ui.measure_text(title, scale=2.5)
+        title_width, title_height = ui.measure_text(title, scale=1.5)
         ui.draw_text(
             title,
-            center_x - title_width / 2,
-            center_y - 120,
-            START_MENU_TITLE_COLOR,
-            scale=2.5
+            px + (pw - title_width) / 2,
+            py + pad,
+            TITLE_COLOR,
+            scale=1.5
         )
 
-        # Subtitle
+        # Subtitle "The Python Voxel Explorer" (h1 in HTML - larger)
         subtitle = "The Python Voxel Explorer"
         sub_width, sub_height = ui.measure_text(subtitle, scale=1.0)
         ui.draw_text(
             subtitle,
-            center_x - sub_width / 2,
-            center_y - 70,
-            START_MENU_SUBTITLE_COLOR,
+            px + (pw - sub_width) / 2,
+            py + pad + title_height + 5,
+            SUBTITLE_COLOR,
             scale=1.0
         )
 
-        # Seed display
-        seed_label = f"Seed: {self._seed}"
-        seed_width, seed_height = ui.measure_text(seed_label, scale=1.0)
+        # Divider line after first button
+        divider_y = self._buttons[0].y + self._buttons[0].height + 15
+        ui.draw_rect(px + pad, divider_y, pw - 2 * pad, 1, PANEL_BORDER_COLOR)
 
-        # Draw seed input background
-        input_width = START_MENU_BUTTON_WIDTH
-        input_height = 35
-        input_x = center_x - input_width / 2
-        input_y = center_y - 10
+        # Seed display section
+        seed_y = divider_y + 20
+        seed_label = "Seed"
+        label_width, label_height = ui.measure_text(seed_label, scale=0.9)
+        ui.draw_text(seed_label, px + pad, seed_y, SUBTITLE_COLOR, scale=0.9)
 
-        # Border
-        ui.draw_rect(
-            input_x - 2, input_y - 2,
-            input_width + 4, input_height + 4,
-            START_MENU_INPUT_BORDER_COLOR
-        )
-        # Background
-        ui.draw_rect(
-            input_x, input_y,
-            input_width, input_height,
-            START_MENU_INPUT_BG_COLOR
-        )
-        # Seed text
+        # Seed input box
+        input_y = seed_y + label_height + 8
+        input_height = 35.0
+        input_width = pw - 2 * pad
+
+        # Input border and background
+        ui.draw_rect(px + pad - 1, input_y - 1, input_width + 2, input_height + 2, INPUT_BORDER_COLOR)
+        ui.draw_rect(px + pad, input_y, input_width, input_height, INPUT_BG_COLOR)
+
+        # Seed value
+        seed_text = str(self._seed)
+        seed_tw, seed_th = ui.measure_text(seed_text, scale=1.0)
         ui.draw_text(
-            seed_label,
-            input_x + 10,
-            input_y + (input_height - seed_height) / 2,
-            MENU_TEXT_COLOR,
+            seed_text,
+            px + pad + 10,
+            input_y + (input_height - seed_th) / 2,
+            TITLE_COLOR,
             scale=1.0
         )
 
-        # Buttons
+        # Hint text
+        hint = "Press R to randomize"
+        hint_width, _ = ui.measure_text(hint, scale=0.7)
+        ui.draw_text(
+            hint,
+            px + pad,
+            input_y + input_height + 8,
+            HINT_COLOR,
+            scale=0.7
+        )
+
+        # Second divider before settings
+        divider2_y = self._buttons[1].y - 15
+        ui.draw_rect(px + pad, divider2_y, pw - 2 * pad, 1, PANEL_BORDER_COLOR)
+
+        # Render buttons
         for button in self._buttons:
             button.render(ui)
 
-        # Footer hint
-        hint = "Press SPACE or click Create to start"
-        hint_width, hint_height = ui.measure_text(hint, scale=0.8)
+        # Footer hint at bottom of screen
+        footer = "Press SPACE or click Create to start"
+        footer_width, footer_height = ui.measure_text(footer, scale=0.8)
         ui.draw_text(
-            hint,
-            center_x - hint_width / 2,
-            ui.height - 50,
-            START_MENU_SUBTITLE_COLOR,
+            footer,
+            (ui.width - footer_width) / 2,
+            ui.height - 40,
+            HINT_COLOR,
             scale=0.8
         )

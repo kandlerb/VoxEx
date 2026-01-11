@@ -25,13 +25,16 @@ def test_orthographic_corners():
     from engine.ui.orthographic import orthographic_matrix
     mat = orthographic_matrix(800, 600)
 
+    # Matrix is stored for GLSL column-major, use transpose for NumPy testing
+    mat_np = mat.T
+
     # Top-left (0, 0) should map to (-1, 1)
-    tl = mat @ np.array([0, 0, 0, 1], dtype=np.float32)
+    tl = mat_np @ np.array([0, 0, 0, 1], dtype=np.float32)
     assert abs(tl[0] - (-1)) < 0.01, f"Expected -1, got {tl[0]}"
     assert abs(tl[1] - 1) < 0.01, f"Expected 1, got {tl[1]}"
 
     # Bottom-right (800, 600) should map to (1, -1)
-    br = mat @ np.array([800, 600, 0, 1], dtype=np.float32)
+    br = mat_np @ np.array([800, 600, 0, 1], dtype=np.float32)
     assert abs(br[0] - 1) < 0.01, f"Expected 1, got {br[0]}"
     assert abs(br[1] - (-1)) < 0.01, f"Expected -1, got {br[1]}"
 
@@ -41,8 +44,11 @@ def test_orthographic_center():
     from engine.ui.orthographic import orthographic_matrix
     mat = orthographic_matrix(800, 600)
 
+    # Matrix is stored for GLSL column-major, use transpose for NumPy testing
+    mat_np = mat.T
+
     # Center (400, 300) should map to (0, 0)
-    center = mat @ np.array([400, 300, 0, 1], dtype=np.float32)
+    center = mat_np @ np.array([400, 300, 0, 1], dtype=np.float32)
     assert abs(center[0]) < 0.01, f"Expected 0, got {center[0]}"
     assert abs(center[1]) < 0.01, f"Expected 0, got {center[1]}"
 
