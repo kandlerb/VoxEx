@@ -45,7 +45,7 @@ from .bitmap_font import BitmapFont, FONT_DATA
 from .ui_renderer import UIRenderer
 from .hud import Crosshair, Hotbar, DebugOverlay
 from .pause_menu import PauseMenu, Button, MenuAction
-from .start_menu import StartMenu, StartMenuButton
+from .start_menu import StartMenu, StartMenuButton, SettingsPanel
 
 __all__ = [
     # Projection
@@ -59,7 +59,7 @@ __all__ = [
     # Pause menu
     'PauseMenu', 'Button', 'MenuAction',
     # Start menu
-    'StartMenu', 'StartMenuButton',
+    'StartMenu', 'StartMenuButton', 'SettingsPanel',
     # Constants
     'CROSSHAIR_SIZE', 'CROSSHAIR_THICKNESS', 'CROSSHAIR_COLOR',
     'HOTBAR_SLOTS', 'HOTBAR_SLOT_SIZE', 'HOTBAR_SLOT_PADDING',

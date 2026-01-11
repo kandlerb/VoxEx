@@ -62,7 +62,7 @@ def main():
         InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem,
         SaveSystem, AudioSystem
     )
-    from voxel_engine.engine.ui import MenuAction, UIRenderer, StartMenu
+    from voxel_engine.engine.ui import MenuAction, UIRenderer, StartMenu, SettingsPanel
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
     from voxel_engine.engine.interaction import BlockSelector
@@ -114,6 +114,10 @@ def main():
         start_menu = StartMenu()
         start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
 
+        # Create settings panel (hidden initially)
+        settings_panel = SettingsPanel()
+        settings_panel.render_distance = RENDER_DISTANCE
+
         print("  Showing start menu...")
         print()
 
@@ -124,62 +128,115 @@ def main():
         SEED = start_menu.seed
         click_held = False
         space_held = False
+        esc_held = False
+        showing_settings = False
 
         while not window.should_close and not game_started:
             window.poll_events()
 
-            # Get mouse position and update hover states
+            # Get mouse position
             mx, my = window.get_mouse_position()
-            start_menu.update_mouse(mx, my)
 
-            # Handle mouse click (with debounce)
-            if window.get_mouse_button(MouseButtons.LEFT):
-                if not click_held:
-                    action = start_menu.click(mx, my)
-                    if action == MenuAction.CREATE_WORLD:
+            if showing_settings:
+                # Settings panel is active
+                settings_panel.update_mouse(mx, my)
+
+                # Handle mouse button
+                mouse_down = window.get_mouse_button(MouseButtons.LEFT)
+                if mouse_down:
+                    if not click_held:
+                        # Check for button click first
+                        action = settings_panel.click(mx, my)
+                        if action == MenuAction.BACK:
+                            # Return to main menu
+                            settings_panel.hide()
+                            start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            showing_settings = False
+                        else:
+                            # Try to start slider drag
+                            settings_panel.start_drag(mx, my)
+                        click_held = True
+                else:
+                    settings_panel.stop_drag()
+                    click_held = False
+
+                # Handle ESC to go back
+                if window.get_key(Keys.ESCAPE):
+                    if not esc_held:
+                        settings_panel.hide()
+                        start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                        showing_settings = False
+                        esc_held = True
+                else:
+                    esc_held = False
+
+                # Render settings panel
+                window.ctx.clear(0.08, 0.08, 0.12, 1.0)
+                ui_renderer.begin()
+                settings_panel.render(ui_renderer)
+                ui_renderer.end()
+                window.swap_buffers()
+
+            else:
+                # Main menu is active
+                start_menu.update_mouse(mx, my)
+
+                # Handle mouse click (with debounce)
+                if window.get_mouse_button(MouseButtons.LEFT):
+                    if not click_held:
+                        action = start_menu.click(mx, my)
+                        if action == MenuAction.CREATE_WORLD:
+                            SEED = start_menu.seed
+                            RENDER_DISTANCE = settings_panel.render_distance
+                            game_started = True
+                        elif action == MenuAction.SETTINGS:
+                            # Show settings panel
+                            start_menu.hide()
+                            settings_panel.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            showing_settings = True
+                        click_held = True
+                else:
+                    click_held = False
+
+                # Handle space key to start game
+                if window.get_key(Keys.SPACE):
+                    if not space_held:
                         SEED = start_menu.seed
+                        RENDER_DISTANCE = settings_panel.render_distance
                         game_started = True
-                    elif action == MenuAction.SETTINGS:
-                        # Settings not implemented yet - just randomize seed
-                        start_menu.randomize_seed()
-                    click_held = True
-            else:
-                click_held = False
+                        space_held = True
+                else:
+                    space_held = False
 
-            # Handle space key to start game
-            if window.get_key(Keys.SPACE):
-                if not space_held:
-                    SEED = start_menu.seed
-                    game_started = True
-                    space_held = True
-            else:
-                space_held = False
+                # Handle R key to randomize seed
+                if window.get_key(Keys.R):
+                    start_menu.randomize_seed()
 
-            # Handle R key to randomize seed
-            if window.get_key(Keys.R):
-                start_menu.randomize_seed()
+                # Handle ESC to quit from menu
+                if window.get_key(Keys.ESCAPE):
+                    if not esc_held:
+                        print("Exiting from start menu.")
+                        ui_renderer.release()
+                        window.close()
+                        return 0
+                else:
+                    esc_held = False
 
-            # Handle ESC to quit from menu
-            if window.get_key(Keys.ESCAPE):
-                print("Exiting from start menu.")
-                ui_renderer.release()
-                window.close()
-                return 0
-
-            # Render start menu
-            window.ctx.clear(0.08, 0.08, 0.12, 1.0)
-            ui_renderer.begin()
-            start_menu.render(ui_renderer)
-            ui_renderer.end()
-            window.swap_buffers()
+                # Render start menu
+                window.ctx.clear(0.08, 0.08, 0.12, 1.0)
+                ui_renderer.begin()
+                start_menu.render(ui_renderer)
+                ui_renderer.end()
+                window.swap_buffers()
 
         if window.should_close:
             ui_renderer.release()
             window.close()
             return 0
 
-        # Hide start menu and release its renderer
+        # Hide menus and release renderer
         start_menu.hide()
+        settings_panel.hide()
         ui_renderer.release()
 
         # =====================================================================
