@@ -104,18 +104,19 @@ def _interleave_vertex_data(
     if vertex_count == 0:
         return np.array([], dtype=np.float32)
 
-    vertex_data = np.zeros(vertex_count * 11, dtype=np.float32)
+    # Reshape arrays for vectorized interleaving
+    pos_reshaped = positions.reshape(vertex_count, 3)
+    norm_reshaped = normals.reshape(vertex_count, 3)
+    uv_reshaped = uvs.reshape(vertex_count, 2)
+    color_reshaped = colors.reshape(vertex_count, 3)
 
-    for i in range(vertex_count):
-        base = i * 11
-        # Position (3 floats)
-        vertex_data[base:base + 3] = positions[i * 3:(i + 1) * 3]
-        # Normal (3 floats)
-        vertex_data[base + 3:base + 6] = normals[i * 3:(i + 1) * 3]
-        # UV (2 floats)
-        vertex_data[base + 6:base + 8] = uvs[i * 2:(i + 1) * 2]
-        # Color (3 floats)
-        vertex_data[base + 8:base + 11] = colors[i * 3:(i + 1) * 3]
+    # Stack horizontally and flatten
+    vertex_data = np.hstack([
+        pos_reshaped,
+        norm_reshaped,
+        uv_reshaped,
+        color_reshaped
+    ]).astype(np.float32).ravel()
 
     return vertex_data
 

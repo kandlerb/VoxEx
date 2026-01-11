@@ -101,6 +101,10 @@ class WorldRenderSystem(FrameSystem):
         Args:
             state: Game state for initialization.
         """
+        # Guard against double initialization
+        if self._initialized:
+            return
+
         if self._window is None:
             return
 

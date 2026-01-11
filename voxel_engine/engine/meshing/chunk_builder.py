@@ -14,7 +14,7 @@ from voxel_engine.engine.meshing.constants import (
     FACE_VERTICES, FACE_NORMALS, FACE_UVS, QUAD_INDICES,
     TILE_UV_WIDTH
 )
-from voxel_engine.engine.meshing.face_culling import iter_visible_faces
+from voxel_engine.engine.meshing.face_culling import iter_visible_faces_fast
 from voxel_engine.engine.meshing.ambient_occlusion import get_face_ao
 from voxel_engine.engine.meshing.chunk_mesh import ChunkMesh
 from voxel_engine.engine.state import WorldState
@@ -83,7 +83,7 @@ class ChunkBuilder:
         is_transparent = Registry.is_transparent
 
         # Iterate visible faces
-        for lx, ly, lz, face_index, block_id in iter_visible_faces(
+        for lx, ly, lz, face_index, block_id in iter_visible_faces_fast(
             self._world, cx, cz
         ):
             # Determine target arrays based on block transparency
