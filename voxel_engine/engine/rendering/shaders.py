@@ -25,7 +25,6 @@ in vec3 in_color;  // AO baked into vertex color
 uniform mat4 u_model;
 uniform mat4 u_view;
 uniform mat4 u_projection;
-uniform float u_time;
 
 // Outputs to fragment shader
 out vec3 v_position;

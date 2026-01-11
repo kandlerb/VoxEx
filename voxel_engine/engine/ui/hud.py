@@ -2,16 +2,16 @@
 import numpy as np
 from typing import List, Optional, Dict
 
-from engine.ui.ui_renderer import UIRenderer
-from engine.ui.constants import (
+from .ui_renderer import UIRenderer
+from .constants import (
     CROSSHAIR_SIZE, CROSSHAIR_THICKNESS, CROSSHAIR_COLOR,
     HOTBAR_SLOTS, HOTBAR_SLOT_SIZE, HOTBAR_SLOT_PADDING,
     HOTBAR_MARGIN_BOTTOM, HOTBAR_BG_COLOR, HOTBAR_SELECTED_COLOR,
     HOTBAR_BORDER_COLOR, DEBUG_LINE_HEIGHT, DEBUG_PADDING,
     DEBUG_BG_COLOR, DEBUG_TEXT_COLOR
 )
-from engine.state import GameState, PlayerState
-from engine.registry import Registry
+from ..state import GameState, PlayerState
+from ..registry import Registry
 
 
 class Crosshair:

@@ -50,6 +50,10 @@ class UISystem(FrameSystem):
 
         @param state: Game state (unused).
         """
+        # Guard against double initialization
+        if self._ui_renderer is not None:
+            return
+
         self._ui_renderer = UIRenderer(
             self._window.ctx,
             self._window.width,

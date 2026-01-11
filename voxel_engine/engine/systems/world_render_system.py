@@ -25,7 +25,7 @@ from voxel_engine.engine.rendering.shaders import (
     VOXEL_VERTEX_SHADER, VOXEL_FRAGMENT_SHADER
 )
 from voxel_engine.engine.rendering.camera import (
-    Camera, fps_view_matrix, rotation_only_view
+    Camera, rotation_only_view
 )
 from voxel_engine.engine.rendering.frustum import Frustum
 from voxel_engine.engine.rendering.texture import TextureAtlas
@@ -101,6 +101,10 @@ class WorldRenderSystem(FrameSystem):
         Args:
             state: Game state for initialization.
         """
+        # Guard against double initialization
+        if self._initialized:
+            return
+
         if self._window is None:
             return
 
@@ -141,6 +145,9 @@ class WorldRenderSystem(FrameSystem):
         if not self._initialized or self._window is None:
             return
 
+        # Poll window events to keep OS responsive
+        self._window.poll_events()
+
         ctx = self._window.ctx
         if ctx is None:
             return
@@ -152,8 +159,8 @@ class WorldRenderSystem(FrameSystem):
         eye_pos = pos.copy()
         eye_pos[1] += PLAYER_EYE_HEIGHT
 
-        # Update camera
-        view = fps_view_matrix(eye_pos.astype(np.float32), player.yaw, player.pitch)
+        # Update camera view matrix
+        view = self._camera.update_view(eye_pos.astype(np.float32), player.yaw, player.pitch)
         projection = self._camera.projection
 
         # Update frustum
@@ -201,27 +208,26 @@ class WorldRenderSystem(FrameSystem):
         self._program['u_model'].write(model.tobytes())
         self._program['u_view'].write(view.tobytes())
         self._program['u_projection'].write(projection.tobytes())
-        self._program['u_time'].value = state.tick_count * 0.05
 
         # Lighting uniforms
         sun_dir = self._sky_renderer.get_sun_direction(time_of_day)
-        day_factor = max(0.0, np.sin(time_of_day * np.pi)) ** 0.5
+        day_factor = float(max(0.0, np.sin(time_of_day * np.pi)) ** 0.5)
 
-        self._program['u_sun_direction'].write(sun_dir.tobytes())
-        self._program['u_sun_color'].write(
-            (np.array([1.0, 0.95, 0.9], dtype=np.float32) * day_factor).tobytes()
+        self._program['u_sun_direction'].value = tuple(sun_dir)
+        self._program['u_sun_color'].value = (
+            1.0 * day_factor,
+            0.95 * day_factor,
+            0.9 * day_factor
         )
-        self._program['u_ambient_color'].write(
-            np.array([
-                0.3 * day_factor + 0.1 * (1 - day_factor),
-                0.35 * day_factor + 0.1 * (1 - day_factor),
-                0.4 * day_factor + 0.15 * (1 - day_factor)
-            ], dtype=np.float32).tobytes()
+        self._program['u_ambient_color'].value = (
+            0.3 * day_factor + 0.1 * (1 - day_factor),
+            0.35 * day_factor + 0.1 * (1 - day_factor),
+            0.4 * day_factor + 0.15 * (1 - day_factor)
         )
 
         # Fog uniforms (match horizon color)
         _, sky_horizon = self._sky_renderer.get_sky_colors(time_of_day)
-        self._program['u_fog_color'].write(sky_horizon.tobytes())
+        self._program['u_fog_color'].value = tuple(sky_horizon)
         self._program['u_fog_start'].value = float(self.render_distance * CHUNK_SIZE_X * 0.75)
         self._program['u_fog_end'].value = float(self.render_distance * CHUNK_SIZE_X)
 
