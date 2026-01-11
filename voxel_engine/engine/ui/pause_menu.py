@@ -11,11 +11,13 @@ from .constants import (
 
 
 class MenuAction(Enum):
-    """Actions that can be triggered from the pause menu."""
+    """Actions that can be triggered from menus."""
     NONE = auto()
     RESUME = auto()
     SETTINGS = auto()
     QUIT = auto()
+    START_GAME = auto()
+    CREATE_WORLD = auto()
 
 
 class Button:
