@@ -208,23 +208,23 @@ class WorldRenderSystem(FrameSystem):
 
         # Lighting uniforms
         sun_dir = self._sky_renderer.get_sun_direction(time_of_day)
-        day_factor = max(0.0, np.sin(time_of_day * np.pi)) ** 0.5
+        day_factor = float(max(0.0, np.sin(time_of_day * np.pi)) ** 0.5)
 
-        self._program['u_sun_direction'].write(sun_dir.tobytes())
-        self._program['u_sun_color'].write(
-            (np.array([1.0, 0.95, 0.9], dtype=np.float32) * day_factor).tobytes()
+        self._program['u_sun_direction'].value = tuple(sun_dir)
+        self._program['u_sun_color'].value = (
+            1.0 * day_factor,
+            0.95 * day_factor,
+            0.9 * day_factor
         )
-        self._program['u_ambient_color'].write(
-            np.array([
-                0.3 * day_factor + 0.1 * (1 - day_factor),
-                0.35 * day_factor + 0.1 * (1 - day_factor),
-                0.4 * day_factor + 0.15 * (1 - day_factor)
-            ], dtype=np.float32).tobytes()
+        self._program['u_ambient_color'].value = (
+            0.3 * day_factor + 0.1 * (1 - day_factor),
+            0.35 * day_factor + 0.1 * (1 - day_factor),
+            0.4 * day_factor + 0.15 * (1 - day_factor)
         )
 
         # Fog uniforms (match horizon color)
         _, sky_horizon = self._sky_renderer.get_sky_colors(time_of_day)
-        self._program['u_fog_color'].write(sky_horizon.tobytes())
+        self._program['u_fog_color'].value = tuple(sky_horizon)
         self._program['u_fog_start'].value = float(self.render_distance * CHUNK_SIZE_X * 0.75)
         self._program['u_fog_end'].value = float(self.render_distance * CHUNK_SIZE_X)
 
