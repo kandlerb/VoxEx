@@ -25,7 +25,7 @@ from voxel_engine.engine.rendering.shaders import (
     VOXEL_VERTEX_SHADER, VOXEL_FRAGMENT_SHADER
 )
 from voxel_engine.engine.rendering.camera import (
-    Camera, fps_view_matrix, rotation_only_view
+    Camera, rotation_only_view
 )
 from voxel_engine.engine.rendering.frustum import Frustum
 from voxel_engine.engine.rendering.texture import TextureAtlas
@@ -159,8 +159,8 @@ class WorldRenderSystem(FrameSystem):
         eye_pos = pos.copy()
         eye_pos[1] += PLAYER_EYE_HEIGHT
 
-        # Update camera
-        view = fps_view_matrix(eye_pos.astype(np.float32), player.yaw, player.pitch)
+        # Update camera view matrix
+        view = self._camera.update_view(eye_pos.astype(np.float32), player.yaw, player.pitch)
         projection = self._camera.projection
 
         # Update frustum
