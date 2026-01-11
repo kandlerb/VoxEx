@@ -2,8 +2,8 @@
 from typing import List
 from enum import Enum, auto
 
-from engine.ui.ui_renderer import UIRenderer
-from engine.ui.constants import (
+from .ui_renderer import UIRenderer
+from .constants import (
     MENU_BG_COLOR, MENU_BUTTON_WIDTH, MENU_BUTTON_HEIGHT,
     MENU_BUTTON_SPACING, MENU_BUTTON_COLOR, MENU_BUTTON_HOVER_COLOR,
     MENU_TEXT_COLOR

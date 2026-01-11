@@ -4,12 +4,12 @@ from numpy.typing import NDArray
 import moderngl
 from typing import List, Tuple, Optional
 
-from engine.ui.shaders import (
+from .shaders import (
     SOLID_VERTEX_SHADER, SOLID_FRAGMENT_SHADER,
     TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER
 )
-from engine.ui.orthographic import orthographic_matrix
-from engine.ui.bitmap_font import BitmapFont
+from .orthographic import orthographic_matrix
+from .bitmap_font import BitmapFont
 
 
 class UIRenderer:

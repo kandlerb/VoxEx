@@ -27,10 +27,10 @@ from .constants import (
 try:
     import sounddevice as sd
     AUDIO_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as e:
     AUDIO_AVAILABLE = False
     sd = None
-    print("[Audio] Warning: sounddevice not available, audio disabled")
+    print(f"[Audio] Warning: sounddevice not available ({e}), audio disabled")
 
 
 class AudioSource:
