@@ -145,6 +145,9 @@ class WorldRenderSystem(FrameSystem):
         if not self._initialized or self._window is None:
             return
 
+        # Poll window events to keep OS responsive
+        self._window.poll_events()
+
         ctx = self._window.ctx
         if ctx is None:
             return
