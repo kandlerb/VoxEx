@@ -10,6 +10,10 @@ def orthographic_matrix(width: float, height: float) -> NDArray[np.float32]:
     Origin at top-left, Y increases downward (screen coordinates).
     Maps (0, 0) to (-1, 1) and (width, height) to (1, -1) in NDC.
 
+    The matrix is laid out for GLSL which reads matrices column-major.
+    When NumPy's row-major data is sent to GLSL, GLSL interprets
+    NumPy row N as GLSL column N. So we put translation in row 3.
+
     @param width: Screen width in pixels.
     @param height: Screen height in pixels.
     @returns: 4x4 orthographic projection matrix.
@@ -25,8 +29,8 @@ def orthographic_matrix(width: float, height: float) -> NDArray[np.float32]:
     # W
     result[3, 3] = 1.0
 
-    # Translation: shift origin from center to top-left
-    result[0, 3] = -1.0
-    result[1, 3] = 1.0
+    # Translation in row 3 (GLSL reads as column 3 due to column-major)
+    result[3, 0] = -1.0
+    result[3, 1] = 1.0
 
     return result

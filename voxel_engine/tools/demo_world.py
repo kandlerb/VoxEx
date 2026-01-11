@@ -55,14 +55,14 @@ def main():
         print("Install with: pip install glfw moderngl numpy")
         return 1
 
-    from voxel_engine.engine.window import Window, Keys
+    from voxel_engine.engine.window import Window, Keys, MouseButtons
     from voxel_engine.engine.state import GameState, GameMode
     from voxel_engine.engine.loops import GameLoop, Clock
     from voxel_engine.engine.systems import (
         InputSystem, PhysicsSystem, InteractionSystem, WorldRenderSystem, UISystem,
         SaveSystem, AudioSystem
     )
-    from voxel_engine.engine.ui import MenuAction
+    from voxel_engine.engine.ui import MenuAction, UIRenderer, StartMenu, SettingsPanel
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
     from voxel_engine.engine.interaction import BlockSelector
@@ -72,29 +72,11 @@ def main():
     from voxel_engine.systems.world.generation_system import TerrainGenerator
 
     print("=" * 60)
-    print("VoxEx - Full World Rendering Demo")
+    print("VoxEx - The Python Voxel Explorer")
     print("=" * 60)
     print()
-    print("Controls:")
-    print("  WASD        - Movement")
-    print("  Mouse       - Look around")
-    print("  Space       - Jump (double-tap for flight toggle)")
-    print("  Shift       - Sprint")
-    print("  C           - Crouch / Fly down")
-    print("  1-9         - Select hotbar slot")
-    print("  Left Click  - Break block")
-    print("  Right Click - Place block")
-    print("  F5          - Quick save")
-    print("  F9          - Quick load")
-    print("  ~           - Toggle debug overlay")
-    print("  ESC         - Pause menu")
-    print()
-    print("Audio: Footsteps, block sounds, ambient wind")
-    print()
-    print("Initializing...")
 
     # Configuration
-    SEED = 12345
     RENDER_DISTANCE = 4  # chunks in each direction
     WINDOW_WIDTH = 1280
     WINDOW_HEIGHT = 720
@@ -120,8 +102,166 @@ def main():
         window = Window(
             width=WINDOW_WIDTH,
             height=WINDOW_HEIGHT,
-            title="VoxEx - World Demo"
+            title="VoxEx"
         )
+        # Don't capture cursor yet - we're in the menu
+        window.set_cursor_captured(False)
+
+        # Create UI renderer for start menu
+        ui_renderer = UIRenderer(window.ctx, WINDOW_WIDTH, WINDOW_HEIGHT)
+
+        # Create and show start menu
+        start_menu = StartMenu()
+        start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+
+        # Create settings panel (hidden initially)
+        settings_panel = SettingsPanel()
+        settings_panel.render_distance = RENDER_DISTANCE
+
+        print("  Showing start menu...")
+        print()
+
+        # =====================================================================
+        # START MENU LOOP
+        # =====================================================================
+        game_started = False
+        SEED = start_menu.seed
+        click_held = False
+        space_held = False
+        esc_held = False
+        showing_settings = False
+
+        while not window.should_close and not game_started:
+            window.poll_events()
+
+            # Get mouse position
+            mx, my = window.get_mouse_position()
+
+            if showing_settings:
+                # Settings panel is active
+                settings_panel.update_mouse(mx, my)
+
+                # Handle mouse button
+                mouse_down = window.get_mouse_button(MouseButtons.LEFT)
+                if mouse_down:
+                    if not click_held:
+                        # Check for button click first
+                        action = settings_panel.click(mx, my)
+                        if action == MenuAction.BACK:
+                            # Return to main menu
+                            settings_panel.hide()
+                            start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            showing_settings = False
+                        else:
+                            # Try to start slider drag
+                            settings_panel.start_drag(mx, my)
+                        click_held = True
+                else:
+                    settings_panel.stop_drag()
+                    click_held = False
+
+                # Handle ESC to go back
+                if window.get_key(Keys.ESCAPE):
+                    if not esc_held:
+                        settings_panel.hide()
+                        start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                        showing_settings = False
+                        esc_held = True
+                else:
+                    esc_held = False
+
+                # Render settings panel
+                window.ctx.clear(0.08, 0.08, 0.12, 1.0)
+                ui_renderer.begin()
+                settings_panel.render(ui_renderer)
+                ui_renderer.end()
+                window.swap_buffers()
+
+            else:
+                # Main menu is active
+                start_menu.update_mouse(mx, my)
+
+                # Handle mouse click (with debounce)
+                if window.get_mouse_button(MouseButtons.LEFT):
+                    if not click_held:
+                        action = start_menu.click(mx, my)
+                        if action == MenuAction.CREATE_WORLD:
+                            SEED = start_menu.seed
+                            RENDER_DISTANCE = settings_panel.render_distance
+                            game_started = True
+                        elif action == MenuAction.SETTINGS:
+                            # Show settings panel
+                            start_menu.hide()
+                            settings_panel.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            showing_settings = True
+                        click_held = True
+                else:
+                    click_held = False
+
+                # Handle space key to start game
+                if window.get_key(Keys.SPACE):
+                    if not space_held:
+                        SEED = start_menu.seed
+                        RENDER_DISTANCE = settings_panel.render_distance
+                        game_started = True
+                        space_held = True
+                else:
+                    space_held = False
+
+                # Handle R key to randomize seed
+                if window.get_key(Keys.R):
+                    start_menu.randomize_seed()
+
+                # Handle ESC to quit from menu
+                if window.get_key(Keys.ESCAPE):
+                    if not esc_held:
+                        print("Exiting from start menu.")
+                        ui_renderer.release()
+                        window.close()
+                        return 0
+                else:
+                    esc_held = False
+
+                # Render start menu
+                window.ctx.clear(0.08, 0.08, 0.12, 1.0)
+                ui_renderer.begin()
+                start_menu.render(ui_renderer)
+                ui_renderer.end()
+                window.swap_buffers()
+
+        if window.should_close:
+            ui_renderer.release()
+            window.close()
+            return 0
+
+        # Hide menus and release renderer
+        start_menu.hide()
+        settings_panel.hide()
+        ui_renderer.release()
+
+        # =====================================================================
+        # GAME INITIALIZATION
+        # =====================================================================
+        print()
+        print("Starting game with seed:", SEED)
+        print()
+        print("Controls:")
+        print("  WASD        - Movement")
+        print("  Mouse       - Look around")
+        print("  Space       - Jump (double-tap for flight toggle)")
+        print("  Shift       - Sprint")
+        print("  C           - Crouch / Fly down")
+        print("  1-9         - Select hotbar slot")
+        print("  Left Click  - Break block")
+        print("  Right Click - Place block")
+        print("  F5          - Quick save")
+        print("  F9          - Quick load")
+        print("  ~           - Toggle debug overlay")
+        print("  ESC         - Pause menu")
+        print()
+        print("Initializing world...")
+
+        # Now capture cursor for FPS controls
         window.set_cursor_captured(True)
 
         # Create game state
@@ -317,7 +457,6 @@ def main():
             # Handle pause menu clicks
             if ui_system.paused:
                 # Check for mouse click in pause menu
-                from voxel_engine.engine.window import MouseButtons
                 if window.get_mouse_button(MouseButtons.LEFT):
                     mx, my = window.get_mouse_position()
                     action = ui_system.handle_click(mx, my)
