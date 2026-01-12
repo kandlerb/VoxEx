@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Optional, Callable
 from .modal import Modal, ModalResult, ConfirmDialog
 from .text_input import TextInput
 from .progress_bar import ProgressBar
-from .start_menu import StartMenuButton
+from .buttons import StartMenuButton
 from .pause_menu import MenuAction
 
 if TYPE_CHECKING:

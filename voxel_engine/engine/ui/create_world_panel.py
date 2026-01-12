@@ -19,7 +19,7 @@ from .slider import Slider
 from .checkbox import Checkbox
 from .preset_button import PresetButton, PresetButtonGroup
 from .collapsible import CollapsibleSection
-from .start_menu import StartMenuButton
+from .buttons import StartMenuButton
 
 if TYPE_CHECKING:
     pass

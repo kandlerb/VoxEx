@@ -45,7 +45,8 @@ from .bitmap_font import BitmapFont, FONT_DATA
 from .ui_renderer import UIRenderer
 from .hud import Crosshair, Hotbar, DebugOverlay
 from .pause_menu import PauseMenu, Button, MenuAction
-from .start_menu import StartMenu, StartMenuButton, SettingsPanel
+from .buttons import StartMenuButton
+from .start_menu import StartMenu, SettingsPanel
 from .text_input import TextInput
 from .world_card import WorldCard, WorldListPanel
 from .slider import Slider

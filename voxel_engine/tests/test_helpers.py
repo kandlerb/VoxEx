@@ -102,6 +102,23 @@ def load_module(module_path, module_name=None, package=None):
 _cached_modules = {}
 
 
+def get_start_menu_button():
+    """Get StartMenuButton class from buttons module.
+
+    This tests that the circular import fix is working.
+    """
+    if 'StartMenuButton' not in _cached_modules:
+        # Load full dependency chain
+        load_module('engine/ui/constants.py')
+        load_module('engine/ui/orthographic.py')
+        load_module('engine/ui/bitmap_font.py')
+        load_module('engine/ui/ui_renderer.py')
+        load_module('engine/ui/pause_menu.py')
+        mod = load_module('engine/ui/buttons.py')
+        _cached_modules['StartMenuButton'] = mod.StartMenuButton
+    return _cached_modules['StartMenuButton']
+
+
 def get_text_input():
     """Get TextInput class."""
     if 'TextInput' not in _cached_modules:

@@ -8,11 +8,12 @@ from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 import random
 
 from .ui_renderer import UIRenderer
-from .pause_menu import Button, MenuAction
+from .pause_menu import MenuAction
 from .text_input import TextInput
 from .world_card import WorldCard, WorldListPanel
 from .world_manage_modal import WorldManageModal
 from .modal import ModalResult
+from .buttons import StartMenuButton
 from .constants import (
     START_MENU_BUTTON_WIDTH, START_MENU_BUTTON_HEIGHT, START_MENU_BUTTON_SPACING,
     START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER,
@@ -49,46 +50,6 @@ RANDOM_BTN_HOVER = (100, 100, 130, 255)
 LOAD_BTN_COLOR = (60, 140, 90, 255)
 LOAD_BTN_HOVER = (80, 170, 110, 255)
 LOAD_BTN_DISABLED = (60, 60, 60, 255)
-
-
-class StartMenuButton(Button):
-    """Button with custom colors for start menu."""
-
-    __slots__ = ('_normal_color', '_hover_color')
-
-    def __init__(self, text: str, x: float, y: float,
-                 width: float, height: float, action: MenuAction,
-                 normal_color: tuple, hover_color: tuple):
-        """
-        Create a start menu button with custom colors.
-
-        @param text: Button label.
-        @param x: Left edge X coordinate.
-        @param y: Top edge Y coordinate.
-        @param width: Button width.
-        @param height: Button height.
-        @param action: Action to trigger when clicked.
-        @param normal_color: RGBA color when not hovered.
-        @param hover_color: RGBA color when hovered.
-        """
-        super().__init__(text, x, y, width, height, action)
-        self._normal_color = normal_color
-        self._hover_color = hover_color
-
-    def render(self, ui: UIRenderer) -> None:
-        """
-        Render button with custom colors.
-
-        @param ui: UI renderer.
-        """
-        color = self._hover_color if self.hovered else self._normal_color
-        ui.draw_rect(self.x, self.y, self.width, self.height, color)
-
-        # Center text
-        text_width, text_height = ui.measure_text(self.text)
-        text_x = self.x + (self.width - text_width) / 2
-        text_y = self.y + (self.height - text_height) / 2
-        ui.draw_text(self.text, text_x, text_y, MENU_TEXT_COLOR)
 
 
 class SettingsPanel:
