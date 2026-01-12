@@ -18,6 +18,8 @@ class MenuAction(Enum):
     QUIT = auto()
     START_GAME = auto()
     CREATE_WORLD = auto()
+    LOAD_WORLD = auto()
+    DELETE_WORLD = auto()
     BACK = auto()
 
 

@@ -456,3 +456,324 @@ class SaveManager:
         self._total_playtime = 0.0
         self._session_start_time = time.time()
         self._chunk_tracker.clear_all()
+
+    def get_world_storage_info(self, name: str) -> dict:
+        """
+        Get storage statistics for a world.
+
+        Args:
+            name: Save name.
+
+        Returns:
+            dict: Storage info with keys:
+                - chunk_count: Number of modified chunks
+                - cache_size_bytes: Total chunk cache size
+                - metadata_size_bytes: Save metadata size
+        """
+        result = {
+            'chunk_count': 0,
+            'cache_size_bytes': 0,
+            'metadata_size_bytes': 0,
+        }
+
+        try:
+            # Get metadata size from main save file
+            save_path = self._get_save_path(name)
+            if save_path.exists():
+                result['metadata_size_bytes'] = save_path.stat().st_size
+
+            # Get chunk count and cache size
+            chunks_dir = self._get_chunks_dir(name)
+            if chunks_dir.exists():
+                chunk_files = list(chunks_dir.glob(f"*{CHUNK_EXTENSION}"))
+                result['chunk_count'] = len(chunk_files)
+                result['cache_size_bytes'] = sum(f.stat().st_size for f in chunk_files)
+
+        except Exception as e:
+            print(f"[Save] Failed to get storage info: {e}")
+
+        return result
+
+    def rename_world(self, old_name: str, new_name: str) -> bool:
+        """
+        Rename a saved world.
+
+        Args:
+            old_name: Current save name.
+            new_name: New save name.
+
+        Returns:
+            bool: True if rename successful.
+        """
+        try:
+            # Check if new name already exists
+            new_save_path = self._get_save_path(new_name)
+            if new_save_path.exists():
+                print(f"[Save] Cannot rename: '{new_name}' already exists")
+                return False
+
+            old_save_path = self._get_save_path(old_name)
+            if not old_save_path.exists():
+                print(f"[Save] Cannot rename: '{old_name}' not found")
+                return False
+
+            # Read and update save file
+            with open(old_save_path, 'r') as f:
+                save_file = SaveFile.from_json(f.read())
+
+            save_file.metadata.name = new_name
+            save_file.metadata.modified_at = time.time()
+
+            # Write to new location
+            with open(new_save_path, 'w') as f:
+                f.write(save_file.to_json())
+
+            # Rename chunks directory
+            old_chunks_dir = self._save_dir / f"{self._sanitize_name(old_name)}_chunks"
+            new_chunks_dir = self._save_dir / f"{self._sanitize_name(new_name)}_chunks"
+
+            if old_chunks_dir.exists():
+                old_chunks_dir.rename(new_chunks_dir)
+
+            # Delete old save file
+            old_save_path.unlink()
+
+            # Update current save name if this is the active save
+            if self._current_save_name == old_name:
+                self._current_save_name = new_name
+
+            return True
+
+        except Exception as e:
+            print(f"[Save] Rename failed: {e}")
+            return False
+
+    def duplicate_world(self, source_name: str, new_name: str) -> bool:
+        """
+        Create a copy of a saved world.
+
+        Args:
+            source_name: Name of world to copy.
+            new_name: Name for the copy.
+
+        Returns:
+            bool: True if duplication successful.
+        """
+        try:
+            import shutil
+
+            # Check if new name already exists
+            new_save_path = self._get_save_path(new_name)
+            if new_save_path.exists():
+                print(f"[Save] Cannot duplicate: '{new_name}' already exists")
+                return False
+
+            source_save_path = self._get_save_path(source_name)
+            if not source_save_path.exists():
+                print(f"[Save] Cannot duplicate: '{source_name}' not found")
+                return False
+
+            # Read source save file
+            with open(source_save_path, 'r') as f:
+                save_file = SaveFile.from_json(f.read())
+
+            # Update metadata for new world
+            save_file.metadata.name = new_name
+            save_file.metadata.created_at = time.time()
+            save_file.metadata.modified_at = time.time()
+
+            # Write new save file
+            with open(new_save_path, 'w') as f:
+                f.write(save_file.to_json())
+
+            # Copy chunks directory
+            source_chunks_dir = self._save_dir / f"{self._sanitize_name(source_name)}_chunks"
+            new_chunks_dir = self._save_dir / f"{self._sanitize_name(new_name)}_chunks"
+
+            if source_chunks_dir.exists():
+                shutil.copytree(source_chunks_dir, new_chunks_dir)
+
+            return True
+
+        except Exception as e:
+            print(f"[Save] Duplicate failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def clear_chunk_cache(self, name: str) -> bool:
+        """
+        Delete all cached chunks for a world, keeping metadata.
+
+        Args:
+            name: Save name.
+
+        Returns:
+            bool: True if cache cleared successfully.
+        """
+        try:
+            chunks_dir = self._get_chunks_dir(name)
+            if chunks_dir.exists():
+                # Delete all chunk files
+                for chunk_file in chunks_dir.glob(f"*{CHUNK_EXTENSION}"):
+                    chunk_file.unlink()
+
+            # Update save file to reflect no modified chunks
+            save_path = self._get_save_path(name)
+            if save_path.exists():
+                with open(save_path, 'r') as f:
+                    save_file = SaveFile.from_json(f.read())
+
+                save_file.modified_chunks = []
+                save_file.metadata.chunk_count = 0
+                save_file.metadata.modified_at = time.time()
+
+                with open(save_path, 'w') as f:
+                    f.write(save_file.to_json())
+
+            return True
+
+        except Exception as e:
+            print(f"[Save] Clear cache failed: {e}")
+            return False
+
+    def export_world(self, name: str, filepath: str) -> bool:
+        """
+        Export world to a file.
+
+        Args:
+            name: Save name to export.
+            filepath: Destination file path.
+
+        Returns:
+            bool: True if export successful.
+        """
+        try:
+            import json
+            import gzip
+
+            save_path = self._get_save_path(name)
+            if not save_path.exists():
+                print(f"[Save] Cannot export: '{name}' not found")
+                return False
+
+            # Read save file
+            with open(save_path, 'r') as f:
+                save_file = SaveFile.from_json(f.read())
+
+            # Collect chunk data
+            chunks_data = {}
+            chunks_dir = self._get_chunks_dir(name)
+            if chunks_dir.exists():
+                for chunk_file in chunks_dir.glob(f"*{CHUNK_EXTENSION}"):
+                    with open(chunk_file, 'rb') as f:
+                        chunks_data[chunk_file.stem] = f.read().hex()
+
+            # Build export data
+            export_data = {
+                'version': 1,
+                'format': 'voxex_export',
+                'exported_at': time.time(),
+                'save_data': save_file.to_json(),
+                'chunks': chunks_data,
+            }
+
+            # Write compressed export file
+            with gzip.open(filepath, 'wt', encoding='utf-8') as f:
+                json.dump(export_data, f)
+
+            return True
+
+        except Exception as e:
+            print(f"[Save] Export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def import_world(self, filepath: str) -> Optional[str]:
+        """
+        Import world from file.
+
+        Args:
+            filepath: Source file path.
+
+        Returns:
+            str: Imported world name, or None if failed.
+        """
+        try:
+            import json
+            import gzip
+
+            # Read compressed export file
+            with gzip.open(filepath, 'rt', encoding='utf-8') as f:
+                export_data = json.load(f)
+
+            # Validate format
+            if export_data.get('format') != 'voxex_export':
+                print("[Save] Invalid export format")
+                return None
+
+            # Parse save data
+            save_file = SaveFile.from_json(export_data['save_data'])
+            original_name = save_file.metadata.name
+
+            # Generate unique name if needed
+            final_name = original_name
+            counter = 1
+            while self._get_save_path(final_name).exists():
+                final_name = f"{original_name} ({counter})"
+                counter += 1
+
+            # Update metadata
+            save_file.metadata.name = final_name
+            save_file.metadata.modified_at = time.time()
+
+            # Write save file
+            save_path = self._get_save_path(final_name)
+            with open(save_path, 'w') as f:
+                f.write(save_file.to_json())
+
+            # Write chunk files
+            chunks_data = export_data.get('chunks', {})
+            if chunks_data:
+                chunks_dir = self._get_chunks_dir(final_name)
+                for chunk_name, hex_data in chunks_data.items():
+                    chunk_path = chunks_dir / f"{chunk_name}{CHUNK_EXTENSION}"
+                    with open(chunk_path, 'wb') as f:
+                        f.write(bytes.fromhex(hex_data))
+
+            return final_name
+
+        except Exception as e:
+            print(f"[Save] Import failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def get_export_directory(self) -> Path:
+        """
+        Get the export directory path, creating it if needed.
+
+        Returns:
+            Path: Export directory path.
+        """
+        import os
+        export_dir = Path(os.path.expanduser("~")) / "VoxEx_Exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        return export_dir
+
+    def get_default_export_path(self, name: str) -> str:
+        """
+        Generate a default export file path.
+
+        Args:
+            name: World name.
+
+        Returns:
+            str: Full path for export file.
+        """
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = self._sanitize_name(name)
+        filename = f"{safe_name}_{timestamp}.voxex"
+        return str(self.get_export_directory() / filename)

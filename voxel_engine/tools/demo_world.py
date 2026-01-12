@@ -124,11 +124,20 @@ def main():
         # =====================================================================
         # START MENU LOOP
         # =====================================================================
+        # Create save manager early for world list
+        save_manager = SaveManager()
+
+        # Refresh saved worlds in start menu
+        start_menu.refresh_saved_worlds(save_manager)
+
         game_started = False
+        load_existing = False  # True if loading an existing save
+        world_to_load = None   # Name of world to load
         SEED = start_menu.seed
         click_held = False
         space_held = False
         esc_held = False
+        backspace_held = False
         showing_settings = False
 
         while not window.should_close and not game_started:
@@ -151,6 +160,7 @@ def main():
                             # Return to main menu
                             settings_panel.hide()
                             start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            start_menu.refresh_saved_worlds(save_manager)
                             showing_settings = False
                         else:
                             # Try to start slider drag
@@ -165,6 +175,7 @@ def main():
                     if not esc_held:
                         settings_panel.hide()
                         start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                        start_menu.refresh_saved_worlds(save_manager)
                         showing_settings = False
                         esc_held = True
                 else:
@@ -181,14 +192,46 @@ def main():
                 # Main menu is active
                 start_menu.update_mouse(mx, my)
 
+                # Handle character input for seed field
+                chars = window.get_char_input()
+                for char in chars:
+                    start_menu.handle_text_input(char)
+
+                # Handle special keys for seed field
+                if window.get_key(Keys.BACKSPACE):
+                    if not backspace_held:
+                        start_menu.handle_key('backspace')
+                        backspace_held = True
+                else:
+                    backspace_held = False
+
+                # Handle scroll for world list
+                scroll_x, scroll_y = window.get_scroll_delta()
+                if scroll_y != 0:
+                    start_menu.handle_scroll(scroll_y)
+
                 # Handle mouse click (with debounce)
                 if window.get_mouse_button(MouseButtons.LEFT):
                     if not click_held:
                         action = start_menu.click(mx, my)
-                        if action == MenuAction.CREATE_WORLD:
-                            SEED = start_menu.seed
+                        if action == MenuAction.START_GAME:
+                            # Create new world with seed from input
+                            SEED = start_menu.get_seed()
                             RENDER_DISTANCE = settings_panel.render_distance
                             game_started = True
+                        elif action == MenuAction.LOAD_WORLD:
+                            # Load existing world
+                            world_to_load = start_menu.get_selected_world_name()
+                            if world_to_load:
+                                load_existing = True
+                                game_started = True
+                        elif action == MenuAction.DELETE_WORLD:
+                            # Delete the selected world
+                            world_to_delete = start_menu.get_selected_world_name()
+                            if world_to_delete:
+                                if save_manager.delete_save(world_to_delete):
+                                    print(f"Deleted world: {world_to_delete}")
+                                    start_menu.refresh_saved_worlds(save_manager)
                         elif action == MenuAction.SETTINGS:
                             # Show settings panel
                             start_menu.hide()
@@ -198,19 +241,15 @@ def main():
                 else:
                     click_held = False
 
-                # Handle space key to start game
+                # Handle space key to start new game
                 if window.get_key(Keys.SPACE):
                     if not space_held:
-                        SEED = start_menu.seed
+                        SEED = start_menu.get_seed()
                         RENDER_DISTANCE = settings_panel.render_distance
                         game_started = True
                         space_held = True
                 else:
                     space_held = False
-
-                # Handle R key to randomize seed
-                if window.get_key(Keys.R):
-                    start_menu.randomize_seed()
 
                 # Handle ESC to quit from menu
                 if window.get_key(Keys.ESCAPE):
@@ -243,7 +282,10 @@ def main():
         # GAME INITIALIZATION
         # =====================================================================
         print()
-        print("Starting game with seed:", SEED)
+        if load_existing and world_to_load:
+            print(f"Loading world: {world_to_load}")
+        else:
+            print("Starting game with seed:", SEED)
         print()
         print("Controls:")
         print("  WASD        - Movement")
@@ -264,7 +306,7 @@ def main():
         # Now capture cursor for FPS controls
         window.set_cursor_captured(True)
 
-        # Create game state
+        # Create game state (seed will be overwritten if loading)
         print("  Creating game state...")
         state = GameState.create(seed=SEED, mode=GameMode.CREATIVE)
 
@@ -282,40 +324,71 @@ def main():
             if block:
                 blocks[block_id] = block
 
-        generator = TerrainGenerator(
-            biomes=biomes,
-            blocks=blocks,
-            seed=SEED,
-            chunk_size=16,
-            chunk_height=320,
-            sea_level=60
-        )
+        # Load existing world or generate new one
+        if load_existing and world_to_load:
+            print(f"  Loading save: {world_to_load}...")
+            if save_manager.load(world_to_load, state):
+                SEED = state.world.seed
+                print(f"  Loaded world with seed: {SEED}")
+                # Regenerate any missing chunks around player
+                generator = TerrainGenerator(
+                    biomes=biomes,
+                    blocks=blocks,
+                    seed=SEED,
+                    chunk_size=16,
+                    chunk_height=320,
+                    sea_level=60
+                )
+                # Generate chunks around player position
+                player_cx = int(state.player.position[0]) // 16
+                player_cz = int(state.player.position[2]) // 16
+                for dx in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
+                    for dz in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
+                        cx, cz = player_cx + dx, player_cz + dz
+                        if not state.world.has_chunk(cx, cz):
+                            chunk = generator.generate_chunk(cx, cz)
+                            generator.calculate_initial_skylight(chunk)
+                            state.world.set_chunk(cx, cz, chunk)
+                print(f"  Player position: ({state.player.position[0]:.1f}, {state.player.position[1]:.1f}, {state.player.position[2]:.1f})")
+            else:
+                print("  Load failed! Generating new world...")
+                load_existing = False
 
-        # Generate initial chunks
-        print(f"  Generating {(2*RENDER_DISTANCE+1)**2} chunks...")
-        t0 = time.perf_counter()
+        if not load_existing:
+            generator = TerrainGenerator(
+                biomes=biomes,
+                blocks=blocks,
+                seed=SEED,
+                chunk_size=16,
+                chunk_height=320,
+                sea_level=60
+            )
 
-        for dx in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
-            for dz in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
-                chunk = generator.generate_chunk(dx, dz)
-                generator.calculate_initial_skylight(chunk)
-                state.world.set_chunk(dx, dz, chunk)
+            # Generate initial chunks
+            print(f"  Generating {(2*RENDER_DISTANCE+1)**2} chunks...")
+            t0 = time.perf_counter()
 
-        gen_time = time.perf_counter() - t0
-        print(f"  Terrain generated in {gen_time:.2f}s")
+            for dx in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
+                for dz in range(-RENDER_DISTANCE, RENDER_DISTANCE + 1):
+                    chunk = generator.generate_chunk(dx, dz)
+                    generator.calculate_initial_skylight(chunk)
+                    state.world.set_chunk(dx, dz, chunk)
 
-        # Find spawn point (highest block near origin)
-        spawn_x, spawn_z = 8, 8
-        spawn_y = 64.0
-        for y in range(319, 0, -1):
-            block = state.world.get_block(spawn_x, y, spawn_z)
-            if block != 0:  # Not air
-                spawn_y = float(y + 2)  # Stand above surface
-                break
+            gen_time = time.perf_counter() - t0
+            print(f"  Terrain generated in {gen_time:.2f}s")
 
-        state.player.position[:] = [float(spawn_x), spawn_y, float(spawn_z)]
-        state.player.prev_position[:] = state.player.position
-        print(f"  Spawn position: ({spawn_x}, {spawn_y:.0f}, {spawn_z})")
+            # Find spawn point (highest block near origin)
+            spawn_x, spawn_z = 8, 8
+            spawn_y = 64.0
+            for y in range(319, 0, -1):
+                block = state.world.get_block(spawn_x, y, spawn_z)
+                if block != 0:  # Not air
+                    spawn_y = float(y + 2)  # Stand above surface
+                    break
+
+            state.player.position[:] = [float(spawn_x), spawn_y, float(spawn_z)]
+            state.player.prev_position[:] = state.player.position
+            print(f"  Spawn position: ({spawn_x}, {spawn_y:.0f}, {spawn_z})")
 
         # Create game loop and systems
         print("  Setting up game loop...")
@@ -334,9 +407,8 @@ def main():
         # Create block outline renderer
         outline_renderer = BlockOutlineRenderer(window.ctx)
 
-        # Create save manager and system
+        # Create save system (save_manager already created in menu loop)
         print("  Initializing save system...")
-        save_manager = SaveManager()
         save_system = SaveSystem(save_manager, autosave_enabled=True, autosave_interval=300.0)
 
         # Create audio manager and system
