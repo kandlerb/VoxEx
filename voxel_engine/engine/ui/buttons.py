@@ -8,6 +8,13 @@ from typing import TYPE_CHECKING
 from .pause_menu import Button, MenuAction
 from .constants import MENU_TEXT_COLOR
 
+# Debug logging with fallback
+try:
+    from ..utils.debug import debug_ui
+except ImportError:
+    def debug_ui(msg, *args, **kwargs):
+        pass
+
 if TYPE_CHECKING:
     from .ui_renderer import UIRenderer
 

@@ -21,6 +21,17 @@ from .constants import (
     MENU_TEXT_COLOR
 )
 
+# Debug logging - import with fallback
+try:
+    from ..utils.debug import debug_ui, format_button_info, format_point
+except ImportError:
+    def debug_ui(msg, *args, **kwargs):
+        pass
+    def format_button_info(btn):
+        return str(btn)
+    def format_point(mx, my):
+        return f"({mx}, {my})"
+
 if TYPE_CHECKING:
     from ..persistence.save_manager import SaveManager
 
@@ -304,6 +315,7 @@ class StartMenu:
 
     def __init__(self):
         """Create start menu."""
+        debug_ui("StartMenu.__init__ called")
         self._visible = False
         self._buttons: List[StartMenuButton] = []
         self._screen_width = 0
@@ -314,8 +326,10 @@ class StartMenu:
         self._panel_height = 0.0
 
         # Seed input component
+        initial_seed = str(random.randint(1, 999999))
+        debug_ui("  Initial seed: {}", initial_seed)
         self._seed_input = TextInput(
-            text=str(random.randint(1, 999999)),
+            text=initial_seed,
             placeholder="Enter seed...",
             max_length=12,
             numeric_only=True
@@ -337,6 +351,7 @@ class StartMenu:
         # World management modal
         self._manage_modal = WorldManageModal()
         self._save_manager: Optional["SaveManager"] = None
+        debug_ui("StartMenu initialized")
 
     def set_save_manager(self, save_manager: "SaveManager") -> None:
         """
@@ -446,10 +461,15 @@ class StartMenu:
 
         @returns: Integer seed value, or random if empty/invalid.
         """
+        debug_ui("StartMenu.get_seed called")
+        debug_ui("  Raw seed input text: '{}'", self._seed_input.get_value())
         seed = self._seed_input.get_int_value(0)
+        debug_ui("  Parsed int value: {}", seed)
         if seed == 0:
             seed = random.randint(1, 999999)
+            debug_ui("  Generated random seed: {}", seed)
             self._seed_input.set_text(str(seed))
+        debug_ui("  Returning seed: {}", seed)
         return seed
 
     def get_selected_world_name(self) -> Optional[str]:
@@ -509,6 +529,7 @@ class StartMenu:
         @param screen_width: Screen width in pixels.
         @param screen_height: Screen height in pixels.
         """
+        debug_ui("StartMenu.show called: {}x{}", screen_width, screen_height)
         self._visible = True
         self._screen_width = screen_width
         self._screen_height = screen_height
@@ -518,6 +539,8 @@ class StartMenu:
         self._panel_height = 520.0
         self._panel_x = (screen_width - self._panel_width) / 2
         self._panel_y = (screen_height - self._panel_height) / 2
+        debug_ui("  Panel position: ({:.0f}, {:.0f}), size: {:.0f}x{:.0f}",
+                 self._panel_x, self._panel_y, self._panel_width, self._panel_height)
 
         pad = float(self.PANEL_PADDING)
         btn_width = self._panel_width - 2 * pad
@@ -537,6 +560,9 @@ class StartMenu:
                 START_MENU_SETTINGS_COLOR, START_MENU_SETTINGS_HOVER
             ),
         ]
+        debug_ui("  Created {} buttons:", len(self._buttons))
+        for i, btn in enumerate(self._buttons):
+            debug_ui("    [{}] '{}' -> {}", i, btn.text, btn.action)
 
         # Random button next to seed input
         self._random_button = StartMenuButton(
@@ -557,6 +583,7 @@ class StartMenu:
         # Reset pending action
         self._pending_action = None
         self._selected_world_name = None
+        debug_ui("StartMenu.show complete, visible={}", self._visible)
 
     def hide(self) -> None:
         """Hide start menu."""
@@ -641,10 +668,15 @@ class StartMenu:
         @param my: Mouse Y coordinate.
         @returns: MenuAction if a button was clicked, else NONE.
         """
+        debug_ui("StartMenu.click at {}", format_point(mx, my))
+        debug_ui("  Menu visible: {}, modal visible: {}", self._visible, self._manage_modal.visible)
+
         # Handle modal first if visible
         if self._manage_modal.visible:
+            debug_ui("  Modal is visible, forwarding click to modal")
             result = self._manage_modal.handle_click(mx, my)
             # Modal consumes all clicks when visible
+            debug_ui("  Modal returned: {}, returning NONE", result)
             return MenuAction.NONE
 
         # Check seed input click
@@ -652,18 +684,25 @@ class StartMenu:
 
         # Check random button
         if self._random_button and self._random_button.contains(mx, my):
+            debug_ui("  Random button clicked")
             self.randomize_seed()
             return MenuAction.NONE
 
         # Check main buttons
-        for button in self._buttons:
-            if button.contains(mx, my):
+        debug_ui("  Checking {} main buttons:", len(self._buttons))
+        for i, button in enumerate(self._buttons):
+            in_bounds = button.contains(mx, my)
+            debug_ui("    [{}] '{}' bounds: ({:.0f},{:.0f}) {:.0f}x{:.0f}, contains: {}",
+                     i, button.text, button.x, button.y, button.width, button.height, in_bounds)
+            if in_bounds:
+                debug_ui(">>> BUTTON '{}' CLICKED -> action={} <<<", button.text, button.action)
                 return button.action
 
         # Check load button (only if a world is selected)
         if (self._load_button and
                 self._world_list.has_selection and
                 self._load_button.contains(mx, my)):
+            debug_ui("  Load button clicked")
             selected_card = self._world_list.selected_card
             if selected_card:
                 self._selected_world_name = selected_card.name
@@ -672,6 +711,7 @@ class StartMenu:
         # Check world list click
         action, index = self._world_list.handle_click(mx, my)
         if action == 'select' and index is not None:
+            debug_ui("  World list selection: index={}", index)
             selected_card = self._world_list.selected_card
             if selected_card:
                 self._selected_world_name = selected_card.name
@@ -679,13 +719,16 @@ class StartMenu:
         elif action == 'delete' and index is not None:
             if 0 <= index < len(self._world_list.cards):
                 self._selected_world_name = self._world_list.cards[index].name
+                debug_ui("  Delete world action: {}", self._selected_world_name)
                 return MenuAction.DELETE_WORLD
         elif action == 'manage' and index is not None:
             if 0 <= index < len(self._world_list.cards):
                 card = self._world_list.cards[index]
+                debug_ui("  Manage world action: {}", card.name)
                 self._open_manage_modal(card.name, card.seed)
             return MenuAction.NONE
 
+        debug_ui("  No button clicked, returning NONE")
         return MenuAction.NONE
 
     def render(self, ui: UIRenderer) -> None:

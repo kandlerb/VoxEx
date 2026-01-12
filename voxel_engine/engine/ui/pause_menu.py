@@ -9,6 +9,13 @@ from .constants import (
     MENU_TEXT_COLOR
 )
 
+# Debug logging with fallback
+try:
+    from ..utils.debug import debug_ui
+except ImportError:
+    def debug_ui(msg, *args, **kwargs):
+        pass
+
 
 class MenuAction(Enum):
     """Actions that can be triggered from menus."""
