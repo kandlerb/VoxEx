@@ -46,6 +46,8 @@ from .ui_renderer import UIRenderer
 from .hud import Crosshair, Hotbar, DebugOverlay
 from .pause_menu import PauseMenu, Button, MenuAction
 from .start_menu import StartMenu, StartMenuButton, SettingsPanel
+from .text_input import TextInput
+from .world_card import WorldCard, WorldListPanel
 
 __all__ = [
     # Projection
@@ -60,6 +62,10 @@ __all__ = [
     'PauseMenu', 'Button', 'MenuAction',
     # Start menu
     'StartMenu', 'StartMenuButton', 'SettingsPanel',
+    # Input components
+    'TextInput',
+    # World cards
+    'WorldCard', 'WorldListPanel',
     # Constants
     'CROSSHAIR_SIZE', 'CROSSHAIR_THICKNESS', 'CROSSHAIR_COLOR',
     'HOTBAR_SLOTS', 'HOTBAR_SLOT_SIZE', 'HOTBAR_SLOT_PADDING',

@@ -48,7 +48,8 @@ class Window:
         '_window', '_ctx', 'width', 'height', 'title',
         '_should_close', '_keys', '_mouse_buttons',
         '_mouse_pos', '_mouse_delta', '_last_mouse_pos',
-        '_cursor_captured', '_first_mouse'
+        '_cursor_captured', '_first_mouse',
+        '_char_buffer', '_scroll_delta'
     )
 
     def __init__(
@@ -89,6 +90,10 @@ class Window:
         self._last_mouse_pos = np.array([0.0, 0.0], dtype=np.float64)
         self._mouse_delta = np.array([0.0, 0.0], dtype=np.float64)
 
+        # Text input buffer and scroll delta
+        self._char_buffer: list = []
+        self._scroll_delta = np.array([0.0, 0.0], dtype=np.float64)
+
         # Initialize GLFW
         if not glfw.init():
             raise RuntimeError("Failed to initialize GLFW")
@@ -117,6 +122,8 @@ class Window:
         glfw.set_cursor_pos_callback(self._window, self._cursor_pos_callback)
         glfw.set_window_close_callback(self._window, self._close_callback)
         glfw.set_framebuffer_size_callback(self._window, self._resize_callback)
+        glfw.set_char_callback(self._window, self._char_callback)
+        glfw.set_scroll_callback(self._window, self._scroll_callback)
 
         # Initialize mouse position
         mx, my = glfw.get_cursor_pos(self._window)
@@ -179,6 +186,19 @@ class Window:
         self.height = height
         if self._ctx:
             self._ctx.viewport = (0, 0, width, height)
+
+    def _char_callback(self, window, codepoint: int) -> None:
+        """Handle character input (for text fields)."""
+        try:
+            char = chr(codepoint)
+            self._char_buffer.append(char)
+        except ValueError:
+            pass  # Invalid codepoint
+
+    def _scroll_callback(self, window, xoffset: float, yoffset: float) -> None:
+        """Handle mouse scroll wheel."""
+        self._scroll_delta[0] += xoffset
+        self._scroll_delta[1] += yoffset
 
     # =========================================================================
     # INPUT POLLING
@@ -248,6 +268,28 @@ class Window:
             tuple: (dx, dy) movement in pixels.
         """
         return (float(self._mouse_delta[0]), float(self._mouse_delta[1]))
+
+    def get_char_input(self) -> list:
+        """
+        Get and clear pending character input.
+
+        Returns:
+            list: List of characters typed since last call.
+        """
+        chars = self._char_buffer.copy()
+        self._char_buffer.clear()
+        return chars
+
+    def get_scroll_delta(self) -> Tuple[float, float]:
+        """
+        Get and clear mouse scroll delta.
+
+        Returns:
+            tuple: (x, y) scroll amounts since last call.
+        """
+        delta = (float(self._scroll_delta[0]), float(self._scroll_delta[1]))
+        self._scroll_delta[:] = [0.0, 0.0]
+        return delta
 
     # =========================================================================
     # CURSOR CONTROL
