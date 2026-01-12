@@ -14,6 +14,13 @@ import random
 
 from .ui_renderer import UIRenderer
 from .pause_menu import MenuAction
+
+# Debug logging imports
+try:
+    from ...utils.debug import debug_ui
+except ImportError:
+    def debug_ui(msg, *args, **kwargs):
+        pass  # Fallback if debug module not available
 from .text_input import TextInput
 from .slider import Slider
 from .checkbox import Checkbox
@@ -311,6 +318,7 @@ class CreateWorldPanel:
         @param screen_width: Screen width in pixels.
         @param screen_height: Screen height in pixels.
         """
+        debug_ui("CreateWorldPanel.show() called: screen={}x{}", screen_width, screen_height)
         self._visible = True
         self._screen_width = screen_width
         self._screen_height = screen_height
@@ -328,9 +336,11 @@ class CreateWorldPanel:
         self._seed_input.set_text(str(random.randint(1, 999999)))
         self._name_input.set_text("New World")
         self._sync_ui_from_settings()
+        debug_ui("  CreateWorldPanel now visible")
 
     def hide(self) -> None:
         """Hide the panel."""
+        debug_ui("CreateWorldPanel.hide() called")
         self._visible = False
         self._dragging_slider = None
 
@@ -339,6 +349,7 @@ class CreateWorldPanel:
         self._seed_input.focused = False
         self._spawn_x_input.focused = False
         self._spawn_z_input.focused = False
+        debug_ui("  CreateWorldPanel hidden")
 
     def get_settings(self) -> WorldGenSettings:
         """
@@ -346,7 +357,10 @@ class CreateWorldPanel:
 
         @returns: WorldGenSettings with current configuration.
         """
+        debug_ui("CreateWorldPanel.get_settings() called")
         self._sync_settings_from_ui()
+        debug_ui("  Settings: name='{}', seed={}, preset='{}'",
+                 self._settings.name, self._settings.seed, self._settings.preset)
         return self._settings
 
     def update_mouse(self, mx: float, my: float) -> None:
@@ -388,18 +402,24 @@ class CreateWorldPanel:
         @param my: Mouse Y coordinate.
         @returns: MenuAction if button clicked, else NONE.
         """
+        debug_ui("CreateWorldPanel.handle_click() at ({}, {})", mx, my)
+
         if not self._visible:
+            debug_ui("  Panel not visible, returning NONE")
             return MenuAction.NONE
 
         # Check navigation buttons first
         if self._back_button.contains(mx, my):
+            debug_ui("  >>> BACK button clicked -> returning BACK")
             return MenuAction.BACK
 
         if self._start_button.contains(mx, my):
+            debug_ui("  >>> START GAME button clicked -> returning START_GAME")
             return MenuAction.START_GAME
 
         # Check random button
         if self._random_button.contains(mx, my):
+            debug_ui("  Random button clicked - randomizing seed")
             self._seed_input.set_text(str(random.randint(1, 999999)))
             return MenuAction.NONE
 
@@ -409,6 +429,7 @@ class CreateWorldPanel:
 
         # Check preset buttons
         if self._preset_group.handle_click(mx, my):
+            debug_ui("  Preset button clicked")
             return MenuAction.NONE
 
         # Check biome checkboxes
@@ -442,6 +463,7 @@ class CreateWorldPanel:
             self._spawn_x_input.handle_click(mx, my)
             self._spawn_z_input.handle_click(mx, my)
 
+        debug_ui("  No button hit, returning NONE")
         return MenuAction.NONE
 
     def handle_release(self) -> None:
