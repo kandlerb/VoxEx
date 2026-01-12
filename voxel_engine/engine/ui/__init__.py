@@ -48,6 +48,11 @@ from .pause_menu import PauseMenu, Button, MenuAction
 from .start_menu import StartMenu, StartMenuButton, SettingsPanel
 from .text_input import TextInput
 from .world_card import WorldCard, WorldListPanel
+from .slider import Slider
+from .checkbox import Checkbox
+from .preset_button import PresetButton, PresetButtonGroup
+from .collapsible import CollapsibleSection
+from .create_world_panel import CreateWorldPanel
 
 __all__ = [
     # Projection
@@ -66,6 +71,9 @@ __all__ = [
     'TextInput',
     # World cards
     'WorldCard', 'WorldListPanel',
+    # New UI components
+    'Slider', 'Checkbox', 'PresetButton', 'PresetButtonGroup',
+    'CollapsibleSection', 'CreateWorldPanel',
     # Constants
     'CROSSHAIR_SIZE', 'CROSSHAIR_THICKNESS', 'CROSSHAIR_COLOR',
     'HOTBAR_SLOTS', 'HOTBAR_SLOT_SIZE', 'HOTBAR_SLOT_PADDING',

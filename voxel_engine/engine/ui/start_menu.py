@@ -473,7 +473,7 @@ class StartMenu:
             StartMenuButton(
                 "Create New World",
                 0, 0, btn_width, 42.0,
-                MenuAction.START_GAME,
+                MenuAction.CREATE_WORLD,
                 START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER
             ),
             StartMenuButton(
