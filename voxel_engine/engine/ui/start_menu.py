@@ -11,6 +11,8 @@ from .ui_renderer import UIRenderer
 from .pause_menu import Button, MenuAction
 from .text_input import TextInput
 from .world_card import WorldCard, WorldListPanel
+from .world_manage_modal import WorldManageModal
+from .modal import ModalResult
 from .constants import (
     START_MENU_BUTTON_WIDTH, START_MENU_BUTTON_HEIGHT, START_MENU_BUTTON_SPACING,
     START_MENU_CREATE_COLOR, START_MENU_CREATE_HOVER,
@@ -332,7 +334,7 @@ class StartMenu:
         '_visible', '_buttons', '_screen_width', '_screen_height',
         '_panel_x', '_panel_y', '_panel_width', '_panel_height',
         '_seed_input', '_random_button', '_world_list', '_load_button',
-        '_pending_action', '_selected_world_name'
+        '_pending_action', '_selected_world_name', '_manage_modal', '_save_manager'
     )
 
     # Panel dimensions
@@ -370,6 +372,97 @@ class StartMenu:
         # Pending action result
         self._pending_action: Optional[Tuple[MenuAction, Optional[str]]] = None
         self._selected_world_name: Optional[str] = None
+
+        # World management modal
+        self._manage_modal = WorldManageModal()
+        self._save_manager: Optional["SaveManager"] = None
+
+    def set_save_manager(self, save_manager: "SaveManager") -> None:
+        """
+        Set the save manager for world operations.
+
+        @param save_manager: SaveManager instance.
+        """
+        self._save_manager = save_manager
+        self._setup_modal_callbacks()
+
+    def _setup_modal_callbacks(self) -> None:
+        """Wire modal callbacks to save manager."""
+        if not self._save_manager:
+            return
+
+        self._manage_modal.on_rename = self._handle_world_rename
+        self._manage_modal.on_duplicate = self._handle_world_duplicate
+        self._manage_modal.on_export = self._handle_world_export
+        self._manage_modal.on_import = self._handle_world_import
+        self._manage_modal.on_clear_cache = self._handle_world_clear_cache
+
+    def _handle_world_rename(self, old_name: str, new_name: str) -> bool:
+        """Handle world rename from modal."""
+        if not self._save_manager:
+            return False
+        success = self._save_manager.rename_world(old_name, new_name)
+        if success:
+            self.refresh_saved_worlds(self._save_manager)
+        return success
+
+    def _handle_world_duplicate(self, source: str, new_name: str) -> bool:
+        """Handle world duplicate from modal."""
+        if not self._save_manager:
+            return False
+        success = self._save_manager.duplicate_world(source, new_name)
+        if success:
+            self.refresh_saved_worlds(self._save_manager)
+        return success
+
+    def _handle_world_export(self, world_name: str) -> bool:
+        """Handle world export from modal."""
+        if not self._save_manager:
+            return False
+        filepath = self._save_manager.get_default_export_path(world_name)
+        return self._save_manager.export_world(world_name, filepath)
+
+    def _handle_world_import(self) -> Optional[str]:
+        """Handle world import from modal."""
+        # For now, we don't have a file picker in the engine
+        # This would need platform-specific implementation
+        return None
+
+    def _handle_world_clear_cache(self, world_name: str) -> bool:
+        """Handle clear cache from modal."""
+        if not self._save_manager:
+            return False
+        success = self._save_manager.clear_chunk_cache(world_name)
+        if success:
+            # Refresh storage info in modal
+            storage_info = self._save_manager.get_world_storage_info(world_name)
+            self._manage_modal.set_storage_info(
+                storage_info['chunk_count'],
+                storage_info['cache_size_bytes'],
+                storage_info['metadata_size_bytes']
+            )
+        return success
+
+    def _open_manage_modal(self, world_name: str, world_seed: int) -> None:
+        """
+        Open the world management modal.
+
+        @param world_name: Name of the world to manage.
+        @param world_seed: Seed of the world.
+        """
+        self._manage_modal.set_world(world_name, world_seed)
+        self._manage_modal.update_screen_size(self._screen_width, self._screen_height)
+
+        # Get storage info if save manager is available
+        if self._save_manager:
+            storage_info = self._save_manager.get_world_storage_info(world_name)
+            self._manage_modal.set_storage_info(
+                storage_info['chunk_count'],
+                storage_info['cache_size_bytes'],
+                storage_info['metadata_size_bytes']
+            )
+
+        self._manage_modal.show()
 
     @property
     def visible(self) -> bool:
@@ -531,6 +624,10 @@ class StartMenu:
         # Update world list hover states
         self._world_list.update_mouse(mx, my)
 
+        # Update manage modal if visible
+        if self._manage_modal.visible:
+            self._manage_modal.update_mouse(mx, my)
+
     def handle_key(self, key: str, mods: int = 0) -> bool:
         """
         Handle keyboard input for the seed field.
@@ -539,6 +636,10 @@ class StartMenu:
         @param mods: Modifier key flags.
         @returns: True if key was handled.
         """
+        # Handle modal first if visible
+        if self._manage_modal.visible:
+            return self._manage_modal.handle_key(key, mods)
+
         return self._seed_input.handle_key(key, mods)
 
     def handle_text_input(self, char: str) -> bool:
@@ -548,6 +649,10 @@ class StartMenu:
         @param char: Character to insert.
         @returns: True if character was handled.
         """
+        # Handle modal first if visible
+        if self._manage_modal.visible:
+            return self._manage_modal.handle_text_input(char)
+
         return self._seed_input.handle_text_input(char)
 
     def handle_scroll(self, delta: float) -> None:
@@ -558,6 +663,15 @@ class StartMenu:
         """
         self._world_list.handle_scroll(delta)
 
+    def update(self, dt: float) -> None:
+        """
+        Update timers and animations.
+
+        @param dt: Delta time in seconds.
+        """
+        if self._manage_modal.visible:
+            self._manage_modal.update(dt)
+
     def click(self, mx: float, my: float) -> MenuAction:
         """
         Handle mouse click, return action if button clicked.
@@ -566,6 +680,12 @@ class StartMenu:
         @param my: Mouse Y coordinate.
         @returns: MenuAction if a button was clicked, else NONE.
         """
+        # Handle modal first if visible
+        if self._manage_modal.visible:
+            result = self._manage_modal.handle_click(mx, my)
+            # Modal consumes all clicks when visible
+            return MenuAction.NONE
+
         # Check seed input click
         self._seed_input.handle_click(mx, my)
 
@@ -599,6 +719,11 @@ class StartMenu:
             if 0 <= index < len(self._world_list.cards):
                 self._selected_world_name = self._world_list.cards[index].name
                 return MenuAction.DELETE_WORLD
+        elif action == 'manage' and index is not None:
+            if 0 <= index < len(self._world_list.cards):
+                card = self._world_list.cards[index]
+                self._open_manage_modal(card.name, card.seed)
+            return MenuAction.NONE
 
         return MenuAction.NONE
 
@@ -771,3 +896,7 @@ class StartMenu:
             HINT_COLOR,
             scale=0.75
         )
+
+        # Render manage modal on top of everything
+        if self._manage_modal.visible:
+            self._manage_modal.render(ui)

@@ -27,6 +27,11 @@ DELETE_BTN_COLOR = (120, 50, 50, 255)
 DELETE_BTN_HOVER = (160, 60, 60, 255)
 DELETE_BTN_TEXT = (255, 255, 255, 255)
 
+# Manage button colors
+MANAGE_BTN_COLOR = (70, 70, 85, 255)
+MANAGE_BTN_HOVER = (90, 90, 110, 255)
+MANAGE_BTN_TEXT = (200, 200, 200, 255)
+
 
 @dataclass
 class WorldCard:
@@ -53,8 +58,14 @@ class WorldCard:
     selected: bool = False
     hovered: bool = False
     delete_hovered: bool = False
+    manage_hovered: bool = False
 
-    # Delete button dimensions
+    # Button dimensions
+    BTN_SIZE: float = 24.0
+    BTN_MARGIN: float = 8.0
+    BTN_SPACING: float = 4.0
+
+    # Legacy aliases
     DELETE_BTN_SIZE: float = 24.0
     DELETE_BTN_MARGIN: float = 8.0
 
@@ -77,10 +88,24 @@ class WorldCard:
         @param my: Mouse Y coordinate.
         @returns: True if point is inside delete button.
         """
-        btn_x = self.x + self.width - self.DELETE_BTN_SIZE - self.DELETE_BTN_MARGIN
-        btn_y = self.y + self.DELETE_BTN_MARGIN
-        return (btn_x <= mx <= btn_x + self.DELETE_BTN_SIZE and
-                btn_y <= my <= btn_y + self.DELETE_BTN_SIZE)
+        btn_x = self.x + self.width - self.BTN_SIZE - self.BTN_MARGIN
+        btn_y = self.y + self.BTN_MARGIN
+        return (btn_x <= mx <= btn_x + self.BTN_SIZE and
+                btn_y <= my <= btn_y + self.BTN_SIZE)
+
+    def contains_manage(self, mx: float, my: float) -> bool:
+        """
+        Check if point is inside the manage button.
+
+        @param mx: Mouse X coordinate.
+        @param my: Mouse Y coordinate.
+        @returns: True if point is inside manage button.
+        """
+        # Manage button is to the left of delete button
+        btn_x = self.x + self.width - 2 * self.BTN_SIZE - self.BTN_MARGIN - self.BTN_SPACING
+        btn_y = self.y + self.BTN_MARGIN
+        return (btn_x <= mx <= btn_x + self.BTN_SIZE and
+                btn_y <= my <= btn_y + self.BTN_SIZE)
 
     def update_hover(self, mx: float, my: float) -> None:
         """
@@ -90,7 +115,12 @@ class WorldCard:
         @param my: Mouse Y coordinate.
         """
         self.hovered = self.contains(mx, my)
-        self.delete_hovered = self.contains_delete(mx, my) if self.hovered else False
+        if self.hovered:
+            self.delete_hovered = self.contains_delete(mx, my)
+            self.manage_hovered = self.contains_manage(mx, my)
+        else:
+            self.delete_hovered = False
+            self.manage_hovered = False
 
     def format_date(self) -> str:
         """
@@ -187,18 +217,32 @@ class WorldCard:
         ui.draw_text(detail_text, text_x, line3_y, CARD_DETAIL_COLOR, scale=0.7)
 
         # Draw delete button (X) in top-right corner
-        btn_x = self.x + self.width - self.DELETE_BTN_SIZE - self.DELETE_BTN_MARGIN
-        btn_y = self.y + self.DELETE_BTN_MARGIN
-        btn_color = DELETE_BTN_HOVER if self.delete_hovered else DELETE_BTN_COLOR
+        del_x = self.x + self.width - self.BTN_SIZE - self.BTN_MARGIN
+        del_y = self.y + self.BTN_MARGIN
+        del_color = DELETE_BTN_HOVER if self.delete_hovered else DELETE_BTN_COLOR
 
-        ui.draw_rect(btn_x, btn_y, self.DELETE_BTN_SIZE, self.DELETE_BTN_SIZE, btn_color)
+        ui.draw_rect(del_x, del_y, self.BTN_SIZE, self.BTN_SIZE, del_color)
 
-        # Draw X inside button
+        # Draw X inside delete button
         x_text = "X"
         x_w, x_h = ui.measure_text(x_text, scale=0.8)
-        x_x = btn_x + (self.DELETE_BTN_SIZE - x_w) / 2
-        x_y = btn_y + (self.DELETE_BTN_SIZE - x_h) / 2
+        x_x = del_x + (self.BTN_SIZE - x_w) / 2
+        x_y = del_y + (self.BTN_SIZE - x_h) / 2
         ui.draw_text(x_text, x_x, x_y, DELETE_BTN_TEXT, scale=0.8)
+
+        # Draw manage button (gear icon) to the left of delete
+        mgr_x = self.x + self.width - 2 * self.BTN_SIZE - self.BTN_MARGIN - self.BTN_SPACING
+        mgr_y = self.y + self.BTN_MARGIN
+        mgr_color = MANAGE_BTN_HOVER if self.manage_hovered else MANAGE_BTN_COLOR
+
+        ui.draw_rect(mgr_x, mgr_y, self.BTN_SIZE, self.BTN_SIZE, mgr_color)
+
+        # Draw gear icon (simple dots pattern as placeholder)
+        gear_text = "*"
+        g_w, g_h = ui.measure_text(gear_text, scale=0.9)
+        g_x = mgr_x + (self.BTN_SIZE - g_w) / 2
+        g_y = mgr_y + (self.BTN_SIZE - g_h) / 2
+        ui.draw_text(gear_text, g_x, g_y, MANAGE_BTN_TEXT, scale=0.9)
 
 
 @dataclass
@@ -301,6 +345,7 @@ class WorldListPanel:
             else:
                 card.hovered = False
                 card.delete_hovered = False
+                card.manage_hovered = False
 
     def handle_click(self, mx: float, my: float) -> Tuple[Optional[str], Optional[int]]:
         """
@@ -308,7 +353,7 @@ class WorldListPanel:
 
         @param mx: Mouse X coordinate.
         @param my: Mouse Y coordinate.
-        @returns: Tuple of (action, index) where action is 'select', 'delete', or None.
+        @returns: Tuple of (action, index) where action is 'select', 'delete', 'manage', or None.
         """
         # Check if click is within panel bounds
         if not (self.x <= mx <= self.x + self.width and
@@ -328,14 +373,16 @@ class WorldListPanel:
             card.width = self.width
             card.height = self.CARD_HEIGHT
 
-            # Check delete button first
+            # Check buttons first (manage, then delete)
+            if card.contains_manage(mx, my):
+                return ('manage', i)
+
             if card.contains_delete(mx, my):
                 return ('delete', i)
 
             # Check card body
             if card.contains(mx, my):
                 # Update selection
-                old_selection = self.selected_index
                 self.selected_index = i
 
                 # Update selected state on all cards

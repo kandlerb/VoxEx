@@ -53,6 +53,9 @@ from .checkbox import Checkbox
 from .preset_button import PresetButton, PresetButtonGroup
 from .collapsible import CollapsibleSection
 from .create_world_panel import CreateWorldPanel
+from .modal import Modal, ConfirmDialog, ModalResult
+from .progress_bar import ProgressBar
+from .world_manage_modal import WorldManageModal
 
 __all__ = [
     # Projection
@@ -74,6 +77,8 @@ __all__ = [
     # New UI components
     'Slider', 'Checkbox', 'PresetButton', 'PresetButtonGroup',
     'CollapsibleSection', 'CreateWorldPanel',
+    # Modal components
+    'Modal', 'ConfirmDialog', 'ModalResult', 'ProgressBar', 'WorldManageModal',
     # Constants
     'CROSSHAIR_SIZE', 'CROSSHAIR_THICKNESS', 'CROSSHAIR_COLOR',
     'HOTBAR_SLOTS', 'HOTBAR_SLOT_SIZE', 'HOTBAR_SLOT_PADDING',
