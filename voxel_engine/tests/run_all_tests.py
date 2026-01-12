@@ -13,8 +13,18 @@ import sys
 import os
 import time
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Get directory paths
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGE_DIR = os.path.dirname(TESTS_DIR)  # voxel_engine/
+PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)  # VoxEx/
+
+# Add both paths to allow different import styles:
+# - PROJECT_ROOT: for "from voxel_engine.X import Y" style imports
+# - PACKAGE_DIR: for "from engine.X import Y" style imports (used in tests)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, PACKAGE_DIR)
 
 
 def run_test_module(name, test_func):
@@ -23,7 +33,8 @@ def run_test_module(name, test_func):
 
     Args:
         name: Display name for the test module.
-        test_func: Function that runs tests and returns True/False.
+        test_func: Function that runs tests and returns True/False/None.
+            True = passed, False = failed, None = skipped.
 
     Returns:
         Tuple of (name, status, duration).
@@ -32,7 +43,12 @@ def run_test_module(name, test_func):
     try:
         result = test_func()
         duration = time.perf_counter() - start_time
-        status = "PASSED" if result else "FAILED"
+        if result is None:
+            status = "SKIPPED"
+        elif result:
+            status = "PASSED"
+        else:
+            status = "FAILED"
     except Exception as e:
         duration = time.perf_counter() - start_time
         status = f"ERROR: {e}"
@@ -82,7 +98,8 @@ def main():
         module_result = run_test_module(name, test_func)
         results.append(module_result)
 
-        if module_result[1] != "PASSED":
+        # Only count actual failures (not skipped tests)
+        if module_result[1] not in ("PASSED", "SKIPPED"):
             all_passed = False
 
     # Print summary
@@ -93,7 +110,12 @@ def main():
     total_time = sum(r[2] for r in results)
 
     for name, status, duration in results:
-        icon = "PASS" if status == "PASSED" else "FAIL"
+        if status == "PASSED":
+            icon = "PASS"
+        elif status == "SKIPPED":
+            icon = "SKIP"
+        else:
+            icon = "FAIL"
         print(f"  [{icon}] {name}: {status} ({duration:.2f}s)")
 
     print(f"\nTotal time: {total_time:.2f}s")

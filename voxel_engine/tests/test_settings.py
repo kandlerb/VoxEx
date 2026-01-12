@@ -1,23 +1,44 @@
 """Settings system tests for VoxEx.
 
 Tests GameSettings, SettingsManager, and SettingDefinitions.
+
+Uses test_helpers to load modules directly, bypassing engine/__init__.py
+which requires numpy.
 """
 
 import sys
 import os
 import tempfile
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Get directory paths
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGE_DIR = os.path.dirname(TESTS_DIR)  # voxel_engine/
+PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)  # VoxEx/
+
+# Add both paths to allow different import styles
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, PACKAGE_DIR)
+
+# Import helper functions for loading modules
+from tests.test_helpers import (
+    get_game_settings, get_profiles, get_settings_manager, _cached_modules
+)
 
 
 def test_game_settings():
     """Test GameSettings serialization and profiles."""
-    from engine.settings.game_settings import (
-        GameSettings, PerformanceSettings, GraphicsSettings,
-        GameplaySettings, WorldSettings, AudioSettings
-    )
-    from engine.settings.profiles import SETTINGS_PROFILES
+    GameSettings = get_game_settings()
+    # Get related classes from cache
+    PerformanceSettings = _cached_modules['PerformanceSettings']
+    GraphicsSettings = _cached_modules['GraphicsSettings']
+    GameplaySettings = _cached_modules['GameplaySettings']
+    WorldSettings = _cached_modules['WorldSettings']
+    AudioSettings = _cached_modules['AudioSettings']
+
+    profiles = get_profiles()
+    SETTINGS_PROFILES = profiles['SETTINGS_PROFILES']
 
     # Test default initialization
     settings = GameSettings()
@@ -84,7 +105,7 @@ def test_game_settings():
 
 def test_settings_manager():
     """Test SettingsManager persistence and listeners."""
-    from engine.settings.settings_manager import SettingsManager
+    SettingsManager = get_settings_manager()
     from pathlib import Path
     import tempfile
     import os
@@ -167,10 +188,14 @@ def test_settings_manager():
 
 def test_setting_definitions():
     """Test setting definitions and category lookup."""
-    from engine.settings.profiles import (
-        SETTING_DEFINITIONS, SETTINGS_PROFILES, CATEGORY_INFO,
-        SettingType, get_definition, get_all_definitions, search_settings
-    )
+    profiles = get_profiles()
+    SETTING_DEFINITIONS = profiles['SETTING_DEFINITIONS']
+    SETTINGS_PROFILES = profiles['SETTINGS_PROFILES']
+    CATEGORY_INFO = profiles['CATEGORY_INFO']
+    SettingType = profiles['SettingType']
+    get_definition = profiles['get_definition']
+    get_all_definitions = profiles['get_all_definitions']
+    search_settings = profiles['search_settings']
 
     # Test definitions exist
     assert len(SETTING_DEFINITIONS) > 0
@@ -244,7 +269,8 @@ def test_setting_definitions():
 
 def test_time_presets():
     """Test time of day presets."""
-    from engine.settings.profiles import TIME_PRESETS
+    profiles = get_profiles()
+    TIME_PRESETS = profiles['TIME_PRESETS']
 
     # Test presets exist
     assert 'dawn' in TIME_PRESETS

@@ -6,18 +6,35 @@ Tests individual UI components in isolation to verify:
 - Input handling (clicks, keys)
 - Value getting/setting
 - Bounds checking
+
+Uses test_helpers to load modules directly, bypassing engine/__init__.py
+which requires numpy.
 """
 
 import sys
 import os
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Get directory paths
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGE_DIR = os.path.dirname(TESTS_DIR)  # voxel_engine/
+PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)  # VoxEx/
+
+# Add both paths to allow different import styles
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, PACKAGE_DIR)
+
+# Import helper functions for loading modules
+from tests.test_helpers import (
+    get_text_input, get_checkbox, get_slider, get_dropdown,
+    get_collapsible, get_modal, get_progress_bar
+)
 
 
 def test_text_input():
     """Test TextInput component functionality."""
-    from engine.ui.text_input import TextInput
+    TextInput = get_text_input()
 
     # Test initialization
     input_field = TextInput(x=0, y=0, width=200, height=32)
@@ -87,7 +104,7 @@ def test_text_input():
 
 def test_checkbox():
     """Test Checkbox component functionality."""
-    from engine.ui.checkbox import Checkbox
+    Checkbox = get_checkbox()
 
     # Test initialization
     cb = Checkbox(x=0, y=0, label="Test Option")
@@ -130,7 +147,7 @@ def test_checkbox():
 
 def test_slider():
     """Test Slider component functionality."""
-    from engine.ui.slider import Slider
+    Slider = get_slider()
 
     # Test initialization
     slider = Slider(x=0, y=0, width=200, min_value=0, max_value=100, step=10)
@@ -189,7 +206,7 @@ def test_slider():
 
 def test_dropdown():
     """Test Dropdown component functionality."""
-    from engine.ui.dropdown import Dropdown
+    Dropdown = get_dropdown()
 
     # Test initialization
     dd = Dropdown(
@@ -210,8 +227,9 @@ def test_dropdown():
     # Test selection - click on second option
     dd.is_open = True
     # Options appear below the dropdown, starting at y=28
-    # Option height is 26 by default
-    dd.handle_click(75, 28 + 13)  # Click on second option (index 1)
+    # Option height is 26 by default, so:
+    # Option 0: y=28 to y=54, Option 1: y=54 to y=80
+    dd.handle_click(75, 28 + 26 + 13)  # Click on second option (index 1)
     assert dd.selected_index == 1
     assert dd.selected_value == 2
     assert dd.is_open is False
@@ -237,7 +255,7 @@ def test_dropdown():
         on_change=on_change
     )
     dd2.is_open = True
-    dd2.handle_click(75, 28 + 13)  # Select second option
+    dd2.handle_click(75, 28 + 26 + 13)  # Select second option (y=67)
     assert callback_called['value'] == 'b'
 
     print("  Dropdown tests passed")
@@ -245,7 +263,7 @@ def test_dropdown():
 
 def test_collapsible():
     """Test CollapsibleSection component functionality."""
-    from engine.ui.collapsible import CollapsibleSection
+    CollapsibleSection = get_collapsible()
 
     # Test initialization
     section = CollapsibleSection(x=0, y=0, width=300, title="Test Section")
@@ -288,7 +306,7 @@ def test_collapsible():
 
 def test_modal():
     """Test Modal base component functionality."""
-    from engine.ui.modal import Modal, ModalResult
+    Modal, ConfirmDialog, ModalResult = get_modal()
 
     # Test initialization
     modal = Modal(title="Test Modal", width=400, height=300)
@@ -336,7 +354,7 @@ def test_modal():
 
 def test_confirm_dialog():
     """Test ConfirmDialog functionality."""
-    from engine.ui.modal import ConfirmDialog, ModalResult
+    Modal, ConfirmDialog, ModalResult = get_modal()
 
     # Test initialization
     dialog = ConfirmDialog(message="Are you sure?")
@@ -381,7 +399,7 @@ def test_confirm_dialog():
 
 def test_progress_bar():
     """Test ProgressBar component functionality."""
-    from engine.ui.progress_bar import ProgressBar
+    ProgressBar = get_progress_bar()
 
     # Test initialization
     bar = ProgressBar(x=0, y=0, width=200, height=20)

@@ -6,6 +6,9 @@ Tests SaveManager world management operations including:
 - Storage info queries
 - Export/import functionality
 - Cache clearing
+
+Uses test_helpers to load modules directly, bypassing engine/__init__.py
+which requires numpy.
 """
 
 import sys
@@ -15,8 +18,19 @@ import tempfile
 import shutil
 import json
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Get directory paths
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGE_DIR = os.path.dirname(TESTS_DIR)  # voxel_engine/
+PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)  # VoxEx/
+
+# Add both paths to allow different import styles
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if PACKAGE_DIR not in sys.path:
+    sys.path.insert(0, PACKAGE_DIR)
+
+# Import helper functions for loading modules
+from tests.test_helpers import get_save_manager, is_numpy_available
 
 
 def create_mock_save(save_dir, name, seed=12345):
@@ -84,7 +98,7 @@ def create_mock_save(save_dir, name, seed=12345):
 
 def test_save_manager_init():
     """Test SaveManager initialization."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -102,7 +116,7 @@ def test_save_manager_init():
 
 def test_list_saves():
     """Test listing saves."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -137,7 +151,7 @@ def test_list_saves():
 
 def test_storage_info():
     """Test getting storage info for a world."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -165,7 +179,7 @@ def test_storage_info():
 
 def test_rename_world():
     """Test renaming a world."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -217,7 +231,7 @@ def test_rename_world():
 
 def test_duplicate_world():
     """Test duplicating a world."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -273,7 +287,7 @@ def test_duplicate_world():
 
 def test_clear_chunk_cache():
     """Test clearing chunk cache."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -315,7 +329,7 @@ def test_clear_chunk_cache():
 
 def test_delete_save():
     """Test deleting a save."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -348,7 +362,7 @@ def test_delete_save():
 
 def test_export_import():
     """Test export and import functionality."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -411,7 +425,7 @@ def test_export_import():
 
 def test_export_path_generation():
     """Test export path and directory generation."""
-    from engine.persistence.save_manager import SaveManager
+    SaveManager = get_save_manager()
     from pathlib import Path
 
     temp_dir = tempfile.mkdtemp()
@@ -441,6 +455,13 @@ def test_export_path_generation():
 def run_all_save_manager_tests():
     """Run all save manager tests."""
     print("Running save manager tests...\n")
+
+    # Check if numpy is available (required for SaveManager)
+    if not is_numpy_available():
+        print("  SKIPPED: numpy not available (required for save manager)")
+        print("\nResults: 0 passed, 0 failed (9 skipped)")
+        print("\nAll save manager tests skipped (numpy required)")
+        return None  # None indicates skipped, not failed
 
     passed = 0
     failed = 0
