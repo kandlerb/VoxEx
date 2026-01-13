@@ -39,6 +39,23 @@ BLOCK_COLORS = {
     BEDROCK: (48, 48, 48),   # Dark gray
 }
 
+# Face definitions for 3D rendering: (normal, light_factor, vertex_offsets, neighbor_offset)
+# Each face has 4 vertices in counter-clockwise order when viewed from outside
+FACE_DATA = (
+    # Top face
+    ((0, 1, 0), 1.0, ((0, 1, 0), (1, 1, 0), (1, 1, 1), (0, 1, 1)), (0, 1, 0)),
+    # Bottom face
+    ((0, -1, 0), 0.5, ((0, 0, 1), (1, 0, 1), (1, 0, 0), (0, 0, 0)), (0, -1, 0)),
+    # North face (Z-)
+    ((0, 0, -1), 0.7, ((1, 0, 0), (0, 0, 0), (0, 1, 0), (1, 1, 0)), (0, 0, -1)),
+    # South face (Z+)
+    ((0, 0, 1), 0.7, ((0, 0, 1), (1, 0, 1), (1, 1, 1), (0, 1, 1)), (0, 0, 1)),
+    # East face (X+)
+    ((1, 0, 0), 0.8, ((1, 0, 1), (1, 0, 0), (1, 1, 0), (1, 1, 1)), (1, 0, 0)),
+    # West face (X-)
+    ((-1, 0, 0), 0.6, ((0, 0, 0), (0, 0, 1), (0, 1, 1), (0, 1, 0)), (-1, 0, 0)),
+)
+
 
 class GameState:
     """
@@ -203,20 +220,18 @@ class GameState:
 
     def _render_world(self, screen, cam_pos, cam_dir):
         """
-        Render the voxel world using simple 3D projection.
+        Render the voxel world using proper 3D face projection.
 
-        This uses a basic raymarching/projection approach to render
-        visible blocks as colored rectangles.
+        Renders cube faces with correct world-space vertices and
+        face culling for exposed surfaces only.
 
         Args:
             screen: Pygame screen surface.
             cam_pos (tuple): Camera position (x, y, z).
             cam_dir (tuple): Camera look direction.
         """
-        width = WINDOW_WIDTH
-        height = WINDOW_HEIGHT
-        half_width = width // 2
-        half_height = height // 2
+        half_width = WINDOW_WIDTH // 2
+        half_height = WINDOW_HEIGHT // 2
 
         # Get sun for lighting
         sun = self.lighting.get_sun()
@@ -226,17 +241,20 @@ class GameState:
         yaw_rad = math.radians(self.camera.yaw)
         pitch_rad = math.radians(self.camera.pitch)
 
-        # Forward, right, up vectors
+        # Precompute trig values
         cos_yaw = math.cos(yaw_rad)
         sin_yaw = math.sin(yaw_rad)
         cos_pitch = math.cos(pitch_rad)
         sin_pitch = math.sin(pitch_rad)
 
+        # FOV projection factor
+        fov_factor = 1.0 / math.tan(math.radians(self.camera.fov / 2))
+
         # Collect visible faces
         faces = []
 
         # Render chunks in view
-        render_range = 3  # Chunks to render
+        render_range = 3
         player_cx = int(cam_pos[0]) // CHUNK_SIZE
         player_cz = int(cam_pos[2]) // CHUNK_SIZE
 
@@ -247,10 +265,10 @@ class GameState:
                 chunk = self.chunk_manager.get_chunk(cx, cz)
 
                 if chunk and chunk.blocks:
-                    self._collect_chunk_faces(
+                    self._collect_chunk_faces_3d(
                         faces, chunk, cam_pos,
                         sin_yaw, cos_yaw, sin_pitch, cos_pitch,
-                        sun_dir
+                        fov_factor, half_width, half_height, sun_dir
                     )
 
         # Sort faces by distance (painter's algorithm - back to front)
@@ -260,30 +278,74 @@ class GameState:
         for face in faces:
             pygame.draw.polygon(screen, face['color'], face['points'])
 
-    def _collect_chunk_faces(self, faces, chunk, cam_pos, sin_yaw, cos_yaw, sin_pitch, cos_pitch, sun_dir):
+    def _project_vertex(self, wx, wy, wz, cam_pos, sin_yaw, cos_yaw, sin_pitch, cos_pitch, fov_factor, half_width, half_height):
         """
-        Collect visible block faces from a chunk.
+        Project a 3D world vertex to 2D screen coordinates.
+
+        Args:
+            wx, wy, wz: World position of vertex.
+            cam_pos: Camera position tuple.
+            sin_yaw, cos_yaw, sin_pitch, cos_pitch: Precomputed trig values.
+            fov_factor: FOV projection factor.
+            half_width, half_height: Half screen dimensions.
+
+        Returns:
+            tuple: (screen_x, screen_y, depth) or None if behind camera.
+        """
+        # Translate to camera-relative position
+        dx = wx - cam_pos[0]
+        dy = wy - cam_pos[1]
+        dz = wz - cam_pos[2]
+
+        # Rotate around Y axis (yaw) - looking left/right
+        rx = dx * cos_yaw + dz * sin_yaw
+        rz = -dx * sin_yaw + dz * cos_yaw
+
+        # Rotate around X axis (pitch) - looking up/down
+        ry = dy * cos_pitch - rz * sin_pitch
+        depth = dy * sin_pitch + rz * cos_pitch
+
+        # Behind camera check
+        if depth < 0.1:
+            return None
+
+        # Perspective projection
+        screen_x = half_width + (rx / depth) * fov_factor * half_width
+        screen_y = half_height - (ry / depth) * fov_factor * half_height
+
+        return (screen_x, screen_y, depth)
+
+    def _collect_chunk_faces_3d(self, faces, chunk, cam_pos, sin_yaw, cos_yaw, sin_pitch, cos_pitch, fov_factor, half_width, half_height, sun_dir):
+        """
+        Collect visible block faces from a chunk with proper 3D projection.
+
+        Only renders exposed faces (adjacent to air) with correct world-space
+        vertices for proper block alignment.
 
         Args:
             faces (list): List to append face data to.
             chunk: Chunk to process.
             cam_pos (tuple): Camera position.
             sin_yaw, cos_yaw, sin_pitch, cos_pitch: Precomputed trig values.
+            fov_factor: FOV projection factor.
+            half_width, half_height: Half screen dimensions.
             sun_dir (tuple): Sun light direction.
         """
-        fov_factor = 1.0 / math.tan(math.radians(self.camera.fov / 2))
-        half_width = WINDOW_WIDTH // 2
-        half_height = WINDOW_HEIGHT // 2
-        aspect = WINDOW_WIDTH / WINDOW_HEIGHT
+        cam_x, cam_y, cam_z = cam_pos
 
-        # Only render blocks near the surface for performance
-        # For flat terrain, blocks are at y=0-63
-        min_y = max(0, int(cam_pos[1]) - 10)
-        max_y = min(CHUNK_HEIGHT, int(cam_pos[1]) + 10)
+        # Only render blocks near camera for performance
+        min_y = max(0, int(cam_y) - 16)
+        max_y = min(CHUNK_HEIGHT, int(cam_y) + 16)
 
         # World offset for this chunk
-        world_x_offset = chunk.cx * CHUNK_SIZE
-        world_z_offset = chunk.cz * CHUNK_SIZE
+        world_x = chunk.cx * CHUNK_SIZE
+        world_z = chunk.cz * CHUNK_SIZE
+
+        # Screen bounds with margin
+        screen_min_x = -100
+        screen_max_x = WINDOW_WIDTH + 100
+        screen_min_y = -100
+        screen_max_y = WINDOW_HEIGHT + 100
 
         for lx in range(CHUNK_SIZE):
             for lz in range(CHUNK_SIZE):
@@ -293,84 +355,95 @@ class GameState:
                     if block_type == AIR:
                         continue
 
-                    # World position of block center
-                    wx = world_x_offset + lx + 0.5
-                    wy = ly + 0.5
-                    wz = world_z_offset + lz + 0.5
+                    # World position of block origin (corner, not center)
+                    bx = world_x + lx
+                    by = ly
+                    bz = world_z + lz
 
-                    # Distance to camera
-                    dx = wx - cam_pos[0]
-                    dy = wy - cam_pos[1]
-                    dz = wz - cam_pos[2]
-                    dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+                    # Quick distance check to block center
+                    dx = bx + 0.5 - cam_x
+                    dy = by + 0.5 - cam_y
+                    dz = bz + 0.5 - cam_z
+                    dist_sq = dx*dx + dy*dy + dz*dz
 
-                    # Skip if too far
-                    if dist > 50:
+                    # Skip if too far (40 block radius for performance)
+                    if dist_sq > 1600:
                         continue
 
-                    # Skip if behind camera (basic culling)
-                    # Transform to camera space
-                    # Rotate around Y (yaw)
-                    rx = dx * cos_yaw - dz * sin_yaw
-                    rz = dx * sin_yaw + dz * cos_yaw
+                    dist = math.sqrt(dist_sq)
 
-                    # Skip if behind
-                    if rz < 0.1:
-                        continue
-
-                    # Get block color
-                    base_color = BLOCK_COLORS.get(block_type, (200, 200, 200))
+                    # Get block base color
+                    base_color = BLOCK_COLORS.get(block_type)
                     if base_color is None:
                         continue
 
-                    # Project block to screen
-                    # Simple perspective projection
-                    screen_x = half_width + (rx / rz) * fov_factor * half_width
+                    # Check and render each face using module-level FACE_DATA
+                    for normal, light, verts, offset in FACE_DATA:
+                        # Check if neighbor is air (face is exposed)
+                        ox, oy, oz = offset
+                        neighbor_x = lx + ox
+                        neighbor_y = ly + oy
+                        neighbor_z = lz + oz
 
-                    # Rotate around X (pitch)
-                    ry_pitched = dy * cos_pitch - rz * sin_pitch
-                    rz_pitched = dy * sin_pitch + rz * cos_pitch
+                        # Get neighbor block (handle chunk boundaries)
+                        if 0 <= neighbor_x < CHUNK_SIZE and 0 <= neighbor_z < CHUNK_SIZE:
+                            neighbor = chunk.get_block(neighbor_x, neighbor_y, neighbor_z)
+                        else:
+                            # Cross-chunk lookup
+                            neighbor = self.chunk_manager.get_block(bx + ox, neighbor_y, bz + oz)
 
-                    screen_y = half_height - (ry_pitched / rz) * fov_factor * half_height
+                        # Only render if neighbor is air
+                        if neighbor != AIR:
+                            continue
 
-                    # Block size on screen
-                    block_screen_size = (1.0 / rz) * fov_factor * half_width * 0.8
+                        # Back-face culling: skip faces pointing away from camera
+                        nx, ny, nz = normal
+                        # Vector from face center to camera
+                        to_cam_x = cam_x - (bx + 0.5 + nx * 0.5)
+                        to_cam_y = cam_y - (by + 0.5 + ny * 0.5)
+                        to_cam_z = cam_z - (bz + 0.5 + nz * 0.5)
+                        dot = nx * to_cam_x + ny * to_cam_y + nz * to_cam_z
+                        if dot < 0:
+                            continue  # Face pointing away from camera
 
-                    if block_screen_size < 1:
-                        continue
+                        # Project all 4 vertices
+                        screen_verts = []
+                        all_visible = True
+                        for vx, vy, vz in verts:
+                            proj = self._project_vertex(
+                                bx + vx, by + vy, bz + vz,
+                                cam_pos, sin_yaw, cos_yaw, sin_pitch, cos_pitch,
+                                fov_factor, half_width, half_height
+                            )
+                            if proj is None:
+                                all_visible = False
+                                break
+                            screen_verts.append((proj[0], proj[1]))
 
-                    # Calculate lighting based on block face
-                    # Top faces are brighter
-                    # Use simple directional lighting
-                    light_factor = 0.7 + 0.3 * max(0, -sun_dir[1])
+                        if not all_visible:
+                            continue
 
-                    # Apply lighting
-                    lit_color = (
-                        int(base_color[0] * light_factor),
-                        int(base_color[1] * light_factor),
-                        int(base_color[2] * light_factor)
-                    )
+                        # Check if any vertex is on screen
+                        on_screen = False
+                        for sx, sy in screen_verts:
+                            if screen_min_x <= sx <= screen_max_x and screen_min_y <= sy <= screen_max_y:
+                                on_screen = True
+                                break
+                        if not on_screen:
+                            continue
 
-                    # Create screen-space quad
-                    half_size = block_screen_size / 2
-                    points = [
-                        (screen_x - half_size, screen_y - half_size),
-                        (screen_x + half_size, screen_y - half_size),
-                        (screen_x + half_size, screen_y + half_size),
-                        (screen_x - half_size, screen_y + half_size),
-                    ]
+                        # Apply lighting
+                        lit_color = (
+                            min(255, int(base_color[0] * light)),
+                            min(255, int(base_color[1] * light)),
+                            min(255, int(base_color[2] * light))
+                        )
 
-                    # Skip if completely off screen
-                    if screen_x + half_size < 0 or screen_x - half_size > WINDOW_WIDTH:
-                        continue
-                    if screen_y + half_size < 0 or screen_y - half_size > WINDOW_HEIGHT:
-                        continue
-
-                    faces.append({
-                        'color': lit_color,
-                        'points': points,
-                        'dist': dist
-                    })
+                        faces.append({
+                            'color': lit_color,
+                            'points': screen_verts,
+                            'dist': dist
+                        })
 
     def _draw_crosshair(self, screen):
         """Draw crosshair in center of screen."""
