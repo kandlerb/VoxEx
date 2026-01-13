@@ -62,7 +62,7 @@ class CreateWorldMenu:
         self.section_positions = {}
 
         # Debug mode - set to True to visualize clickable areas
-        self.debug_hitboxes = True
+        self.debug_hitboxes = False
 
         # Initialize all UI components
         self._init_components()
