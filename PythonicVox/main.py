@@ -21,10 +21,11 @@ Architecture:
 import pygame
 from settings import (
     WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT,
-    FPS_CAP, COLOR_BG
+    FPS_CAP, COLOR_BG, COLOR_DARK_BG
 )
 from ui.main_menu import MainMenu
 from ui.settings_menu import SettingsMenu
+from ui.create_world_menu import CreateWorldMenu
 
 
 def main():
@@ -51,8 +52,10 @@ def main():
     current_state = "main_menu"
     main_menu = MainMenu(screen)
     settings_menu = SettingsMenu(screen)
+    create_world_menu = CreateWorldMenu(screen)
 
     print("Creating settings menu...")
+    print("Creating world menu...")
     print("Starting game loop...")
     print("=" * 40)
 
@@ -73,8 +76,8 @@ def main():
             if result == "quit":
                 running = False
             elif result == "start_game":
-                current_state = "game"
-                print("[Game] Starting new game... (moderngl integration pending)")
+                current_state = "create_world"
+                print("[Game] Opening world creation menu...")
             elif result == "load_game":
                 print("[Game] Load game not implemented yet")
             elif result == "settings":
@@ -94,6 +97,19 @@ def main():
             # Render settings menu
             screen.fill(COLOR_BG)
             settings_menu.draw(screen)
+
+        elif current_state == "create_world":
+            result, config = create_world_menu.update(events)
+
+            if result == "main_menu":
+                current_state = "main_menu"
+            elif result == "start_game":
+                print(f"[Game] Starting game with config: {config}")
+                current_state = "game"
+
+            # Render create world menu
+            screen.fill(COLOR_DARK_BG)
+            create_world_menu.draw(screen)
 
         elif current_state == "game":
             # Future: moderngl 3D rendering

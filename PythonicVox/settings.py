@@ -101,6 +101,83 @@ CLOSE_BUTTON_COLOR = (180, 60, 60)
 CLOSE_BUTTON_HOVER_COLOR = (220, 80, 80)
 
 # =============================================================================
+# UI Components - General
+# =============================================================================
+FONT_SIZE_SMALL = 14
+FONT_SIZE_MEDIUM = 18
+FONT_SIZE_LARGE = 24
+FONT_SIZE_TITLE = 36
+
+# Colors
+COLOR_PRIMARY = (76, 175, 80)        # Green #4caf50
+COLOR_PRIMARY_HOVER = (56, 142, 60)  # Darker green
+COLOR_DARK_BG = (26, 26, 26)         # #1a1a1a
+COLOR_PANEL_BG = (42, 42, 42)        # #2a2a2a
+COLOR_INPUT_BG = (51, 51, 51)        # #333333
+COLOR_BORDER = (68, 68, 68)          # #444444
+COLOR_TEXT_PRIMARY = (255, 255, 255)
+COLOR_TEXT_SECONDARY = (204, 204, 204)   # #cccccc
+COLOR_TEXT_PLACEHOLDER = (128, 128, 128)
+
+# Slider
+SLIDER_TRACK_HEIGHT = 6
+SLIDER_HANDLE_RADIUS = 8
+SLIDER_TRACK_COLOR = (68, 68, 68)
+SLIDER_FILL_COLOR = COLOR_PRIMARY
+
+# Toggle
+TOGGLE_WIDTH = 50
+TOGGLE_HEIGHT = 26
+TOGGLE_OFF_COLOR = (100, 100, 100)
+TOGGLE_ON_COLOR = COLOR_PRIMARY
+
+# Text Input
+INPUT_HEIGHT = 36
+INPUT_PADDING = 10
+INPUT_BORDER_COLOR = (68, 68, 68)
+INPUT_FOCUS_BORDER_COLOR = COLOR_PRIMARY
+
+# =============================================================================
+# World Types and Biomes
+# =============================================================================
+WORLD_TYPES = [
+    {"id": "default", "name": "Default", "icon": "D"},
+    {"id": "amplified", "name": "Amplified", "icon": "A"},
+    {"id": "flat", "name": "Flat", "icon": "F"},
+    {"id": "archipelago", "name": "Archipelago", "icon": "I"},
+    {"id": "superflat", "name": "Superflat", "icon": "S"},
+    {"id": "caves_plus", "name": "Caves+", "icon": "C"},
+]
+
+BIOMES = [
+    {"id": "plains", "name": "Plains", "icon": "P"},
+    {"id": "forest", "name": "Forest", "icon": "F"},
+    {"id": "desert", "name": "Desert", "icon": "D"},
+    {"id": "mountains", "name": "Mountains", "icon": "M"},
+    {"id": "swamp", "name": "Swamp", "icon": "S"},
+    {"id": "tundra", "name": "Tundra", "icon": "T"},
+]
+
+DEFAULT_WORLD_SETTINGS = {
+    "world_name": "New World",
+    "seed": "",
+    "world_type": "default",
+    "selected_biomes": ["plains", "forest", "desert", "mountains", "swamp", "tundra"],
+    "trees_enabled": True,
+    "caves_enabled": True,
+    "cave_density": 100,
+    "rivers_enabled": True,
+    "tree_density": 100,
+    "terrain_amplitude": 100,
+    "sea_level": 60,
+    "biome_size": 100,
+    "noise_persistence": 0.50,
+    "noise_lacunarity": 2.0,
+    "spawn_x": 0,
+    "spawn_z": 0,
+}
+
+# =============================================================================
 # Block Types
 # =============================================================================
 AIR = 0
