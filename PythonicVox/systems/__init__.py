@@ -7,6 +7,6 @@ Contains game systems such as camera, input, physics, and lighting.
 from .camera import CameraController
 from .input_handler import InputHandler
 from .physics import PhysicsSystem
-from .lighting import LightingSystem
+from .lighting import LightingSystem, Sun
 
-__all__ = ['CameraController', 'InputHandler', 'PhysicsSystem', 'LightingSystem']
+__all__ = ['CameraController', 'InputHandler', 'PhysicsSystem', 'LightingSystem', 'Sun']
