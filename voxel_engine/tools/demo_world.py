@@ -42,6 +42,14 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+# Debug logging imports
+try:
+    from voxel_engine.utils.debug import debug_ui, debug_game, debug_world
+except ImportError:
+    def debug_ui(msg, *args, **kwargs): pass
+    def debug_game(msg, *args, **kwargs): pass
+    def debug_world(msg, *args, **kwargs): pass
+
 
 def main():
     """Run the full world rendering demo."""
@@ -63,6 +71,7 @@ def main():
         SaveSystem, AudioSystem
     )
     from voxel_engine.engine.ui import MenuAction, UIRenderer, StartMenu, SettingsPanel
+    from voxel_engine.engine.ui.create_world_panel import CreateWorldPanel
     from voxel_engine.engine.meshing import ChunkBuilder
     from voxel_engine.engine.registry import Registry
     from voxel_engine.engine.interaction import BlockSelector
@@ -111,12 +120,18 @@ def main():
         ui_renderer = UIRenderer(window.ctx, WINDOW_WIDTH, WINDOW_HEIGHT)
 
         # Create and show start menu
+        debug_ui("Creating StartMenu...")
         start_menu = StartMenu()
         start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
 
         # Create settings panel (hidden initially)
+        debug_ui("Creating SettingsPanel...")
         settings_panel = SettingsPanel()
         settings_panel.render_distance = RENDER_DISTANCE
+
+        # Create world panel (hidden initially)
+        debug_ui("Creating CreateWorldPanel...")
+        create_world_panel = CreateWorldPanel()
 
         print("  Showing start menu...")
         print()
@@ -139,6 +154,9 @@ def main():
         esc_held = False
         backspace_held = False
         showing_settings = False
+        showing_create_world = False  # For CreateWorldPanel
+        world_gen_settings = None     # WorldGenSettings from CreateWorldPanel
+        debug_game("Menu loop initialized - showing start menu")
 
         while not window.should_close and not game_started:
             window.poll_events()
@@ -146,7 +164,79 @@ def main():
             # Get mouse position
             mx, my = window.get_mouse_position()
 
-            if showing_settings:
+            # ==================== CREATE WORLD PANEL ====================
+            if showing_create_world:
+                create_world_panel.update_mouse(mx, my)
+
+                # Handle character input for name/seed fields
+                chars = window.get_char_input()
+                for char in chars:
+                    create_world_panel.handle_text_input(char)
+
+                # Handle special keys
+                if window.get_key(Keys.BACKSPACE):
+                    if not backspace_held:
+                        create_world_panel.handle_key('backspace')
+                        backspace_held = True
+                else:
+                    backspace_held = False
+
+                # Handle scroll
+                scroll_x, scroll_y = window.get_scroll_delta()
+                if scroll_y != 0:
+                    create_world_panel.handle_scroll(scroll_y)
+
+                # Handle mouse button
+                mouse_down = window.get_mouse_button(MouseButtons.LEFT)
+                if mouse_down:
+                    if not click_held:
+                        debug_game("Create World Panel: Click at ({}, {})", mx, my)
+                        action = create_world_panel.handle_click(mx, my)
+                        debug_game("  Action returned: {}", action.name if action else 'None')
+
+                        if action == MenuAction.START_GAME:
+                            # Get settings and start game
+                            debug_game("  >>> START_GAME from CreateWorldPanel")
+                            world_gen_settings = create_world_panel.get_settings()
+                            SEED = world_gen_settings.seed if world_gen_settings.seed else start_menu.get_seed()
+                            RENDER_DISTANCE = settings_panel.render_distance
+                            debug_game("  Starting game with seed={}, render_distance={}", SEED, RENDER_DISTANCE)
+                            game_started = True
+
+                        elif action == MenuAction.BACK:
+                            # Return to main menu
+                            debug_game("  >>> BACK from CreateWorldPanel")
+                            create_world_panel.hide()
+                            start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            start_menu.refresh_saved_worlds(save_manager)
+                            showing_create_world = False
+
+                        click_held = True
+                else:
+                    create_world_panel.handle_release()
+                    click_held = False
+
+                # Handle ESC to go back
+                if window.get_key(Keys.ESCAPE):
+                    if not esc_held:
+                        debug_game("ESC pressed in CreateWorldPanel - going back to menu")
+                        create_world_panel.hide()
+                        start_menu.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                        start_menu.refresh_saved_worlds(save_manager)
+                        showing_create_world = False
+                        esc_held = True
+                else:
+                    esc_held = False
+
+                # Render create world panel
+                window.ctx.clear(0.08, 0.08, 0.12, 1.0)
+                ui_renderer.begin()
+                create_world_panel.render(ui_renderer)
+                ui_renderer.end()
+                window.swap_buffers()
+
+            # ==================== SETTINGS PANEL ====================
+            elif showing_settings:
                 # Settings panel is active
                 settings_panel.update_mouse(mx, my)
 
@@ -213,30 +303,55 @@ def main():
                 # Handle mouse click (with debounce)
                 if window.get_mouse_button(MouseButtons.LEFT):
                     if not click_held:
+                        debug_game("Main Menu: Click at ({}, {})", mx, my)
                         action = start_menu.click(mx, my)
-                        if action == MenuAction.START_GAME:
-                            # Create new world with seed from input
+                        debug_game("  Action returned: {}", action.name if action else 'None')
+
+                        if action == MenuAction.CREATE_WORLD:
+                            # Show create world panel
+                            debug_game("  >>> CREATE_WORLD action detected!")
+                            debug_game("  Hiding StartMenu, showing CreateWorldPanel")
+                            start_menu.hide()
+                            create_world_panel.show(WINDOW_WIDTH, WINDOW_HEIGHT)
+                            showing_create_world = True
+
+                        elif action == MenuAction.START_GAME:
+                            # Create new world with seed from input (direct start)
+                            debug_game("  >>> START_GAME action detected!")
                             SEED = start_menu.get_seed()
                             RENDER_DISTANCE = settings_panel.render_distance
+                            debug_game("  Starting game with seed={}, render_distance={}", SEED, RENDER_DISTANCE)
                             game_started = True
+
                         elif action == MenuAction.LOAD_WORLD:
                             # Load existing world
+                            debug_game("  >>> LOAD_WORLD action detected!")
                             world_to_load = start_menu.get_selected_world_name()
+                            debug_game("  World to load: '{}'", world_to_load)
                             if world_to_load:
                                 load_existing = True
                                 game_started = True
+
                         elif action == MenuAction.DELETE_WORLD:
                             # Delete the selected world
+                            debug_game("  >>> DELETE_WORLD action detected!")
                             world_to_delete = start_menu.get_selected_world_name()
+                            debug_game("  World to delete: '{}'", world_to_delete)
                             if world_to_delete:
                                 if save_manager.delete_save(world_to_delete):
                                     print(f"Deleted world: {world_to_delete}")
                                     start_menu.refresh_saved_worlds(save_manager)
+
                         elif action == MenuAction.SETTINGS:
                             # Show settings panel
+                            debug_game("  >>> SETTINGS action detected!")
                             start_menu.hide()
                             settings_panel.show(WINDOW_WIDTH, WINDOW_HEIGHT)
                             showing_settings = True
+
+                        elif action == MenuAction.NONE:
+                            debug_game("  No action (NONE)")
+
                         click_held = True
                 else:
                     click_held = False
