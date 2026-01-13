@@ -16,6 +16,8 @@ Usage:
     block = chunks.get_block(x, y, z)
 """
 
+from settings import CHUNK_SIZE, CHUNK_HEIGHT, AIR
+
 
 class Chunk:
     """
@@ -24,9 +26,9 @@ class Chunk:
     Attributes:
         cx (int): Chunk X coordinate.
         cz (int): Chunk Z coordinate.
-        blocks: Block data array.
-        sky_light: Skylight data array.
-        block_light: Block light data array.
+        blocks (list): Block data array.
+        sky_light (list): Skylight data array.
+        block_light (list): Block light data array.
         is_dirty (bool): Whether chunk needs re-rendering.
         mesh: Rendered mesh for this chunk.
     """
@@ -47,6 +49,32 @@ class Chunk:
         self.is_dirty = True
         self.mesh = None
 
+    def load_data(self, chunk_data):
+        """
+        Load chunk data from terrain generator.
+
+        Args:
+            chunk_data (dict): Dict with 'blocks', 'sky_light', 'block_light'.
+        """
+        self.blocks = chunk_data['blocks']
+        self.sky_light = chunk_data['sky_light']
+        self.block_light = chunk_data['block_light']
+        self.is_dirty = True
+
+    def _get_index(self, lx, ly, lz):
+        """
+        Convert local coordinates to array index.
+
+        Args:
+            lx (int): Local X (0-15).
+            ly (int): Local Y (0-319).
+            lz (int): Local Z (0-15).
+
+        Returns:
+            int: Array index.
+        """
+        return (lx * CHUNK_SIZE + lz) * CHUNK_HEIGHT + ly
+
     def get_block(self, lx, ly, lz):
         """
         Get block type at local coordinates.
@@ -57,9 +85,16 @@ class Chunk:
             lz (int): Local Z (0-15).
 
         Returns:
-            int: Block type ID.
+            int: Block type ID, or AIR if out of bounds or not loaded.
         """
-        pass
+        if self.blocks is None:
+            return AIR
+
+        if not (0 <= lx < CHUNK_SIZE and 0 <= lz < CHUNK_SIZE and 0 <= ly < CHUNK_HEIGHT):
+            return AIR
+
+        index = self._get_index(lx, ly, lz)
+        return self.blocks[index]
 
     def set_block(self, lx, ly, lz, block_type):
         """
@@ -71,7 +106,28 @@ class Chunk:
             lz (int): Local Z (0-15).
             block_type (int): Block type ID to set.
         """
-        pass
+        if self.blocks is None:
+            return
+
+        if not (0 <= lx < CHUNK_SIZE and 0 <= lz < CHUNK_SIZE and 0 <= ly < CHUNK_HEIGHT):
+            return
+
+        index = self._get_index(lx, ly, lz)
+        self.blocks[index] = block_type
+        self.is_dirty = True
+
+    def get_world_bounds(self):
+        """
+        Get world coordinate bounds for this chunk.
+
+        Returns:
+            tuple: ((min_x, min_z), (max_x, max_z)) in world coordinates.
+        """
+        min_x = self.cx * CHUNK_SIZE
+        min_z = self.cz * CHUNK_SIZE
+        max_x = min_x + CHUNK_SIZE
+        max_z = min_z + CHUNK_SIZE
+        return ((min_x, min_z), (max_x, max_z))
 
 
 class ChunkManager:
@@ -100,10 +156,40 @@ class ChunkManager:
         """
         Update loaded chunks based on player position.
 
+        Loads chunks within render distance and unloads distant chunks.
+
         Args:
             player_position (tuple): Player position (x, y, z).
         """
-        pass
+        px, py, pz = player_position
+        center_cx = int(px) // CHUNK_SIZE
+        center_cz = int(pz) // CHUNK_SIZE
+
+        # Load chunks within render distance
+        for dx in range(-self.render_distance, self.render_distance + 1):
+            for dz in range(-self.render_distance, self.render_distance + 1):
+                cx = center_cx + dx
+                cz = center_cz + dz
+                key = (cx, cz)
+
+                if key not in self.chunks:
+                    self._load_chunk(cx, cz)
+
+        # Unload distant chunks
+        self.unload_distant_chunks(center_cx, center_cz)
+
+    def _load_chunk(self, cx, cz):
+        """
+        Load or generate a chunk at coordinates.
+
+        Args:
+            cx (int): Chunk X coordinate.
+            cz (int): Chunk Z coordinate.
+        """
+        chunk = Chunk(cx, cz)
+        chunk_data = self.terrain_generator.generate_chunk(cx, cz)
+        chunk.load_data(chunk_data)
+        self.chunks[(cx, cz)] = chunk
 
     def get_chunk(self, cx, cz):
         """
@@ -116,7 +202,10 @@ class ChunkManager:
         Returns:
             Chunk: The chunk at the coordinates.
         """
-        pass
+        key = (cx, cz)
+        if key not in self.chunks:
+            self._load_chunk(cx, cz)
+        return self.chunks[key]
 
     def get_block(self, x, y, z):
         """
@@ -130,7 +219,25 @@ class ChunkManager:
         Returns:
             int: Block type ID, or 0 (AIR) if out of bounds.
         """
-        pass
+        if y < 0 or y >= CHUNK_HEIGHT:
+            return AIR
+
+        # Convert to chunk and local coordinates
+        cx = x // CHUNK_SIZE
+        cz = z // CHUNK_SIZE
+        lx = x % CHUNK_SIZE
+        lz = z % CHUNK_SIZE
+
+        # Handle negative coordinates
+        if x < 0 and lx != 0:
+            cx -= 1
+            lx = CHUNK_SIZE + (x % CHUNK_SIZE)
+        if z < 0 and lz != 0:
+            cz -= 1
+            lz = CHUNK_SIZE + (z % CHUNK_SIZE)
+
+        chunk = self.get_chunk(cx, cz)
+        return chunk.get_block(lx, y, lz)
 
     def set_block(self, x, y, z, block_type):
         """
@@ -142,7 +249,25 @@ class ChunkManager:
             z (int): World Z position.
             block_type (int): Block type ID to set.
         """
-        pass
+        if y < 0 or y >= CHUNK_HEIGHT:
+            return
+
+        # Convert to chunk and local coordinates
+        cx = x // CHUNK_SIZE
+        cz = z // CHUNK_SIZE
+        lx = x % CHUNK_SIZE
+        lz = z % CHUNK_SIZE
+
+        # Handle negative coordinates
+        if x < 0 and lx != 0:
+            cx -= 1
+            lx = CHUNK_SIZE + (x % CHUNK_SIZE)
+        if z < 0 and lz != 0:
+            cz -= 1
+            lz = CHUNK_SIZE + (z % CHUNK_SIZE)
+
+        chunk = self.get_chunk(cx, cz)
+        chunk.set_block(lx, y, lz, block_type)
 
     def unload_distant_chunks(self, center_cx, center_cz):
         """
@@ -152,4 +277,50 @@ class ChunkManager:
             center_cx (int): Center chunk X coordinate.
             center_cz (int): Center chunk Z coordinate.
         """
-        pass
+        # Use a slightly larger unload distance to prevent thrashing
+        unload_distance = self.render_distance + 2
+
+        chunks_to_unload = []
+        for key in self.chunks:
+            cx, cz = key
+            dx = abs(cx - center_cx)
+            dz = abs(cz - center_cz)
+            if dx > unload_distance or dz > unload_distance:
+                chunks_to_unload.append(key)
+
+        for key in chunks_to_unload:
+            del self.chunks[key]
+
+    def get_loaded_chunks(self):
+        """
+        Get all currently loaded chunks.
+
+        Returns:
+            list: List of Chunk objects.
+        """
+        return list(self.chunks.values())
+
+    def get_chunks_in_range(self, center_x, center_z, distance):
+        """
+        Get chunks within a distance from a world position.
+
+        Args:
+            center_x (float): Center X world position.
+            center_z (float): Center Z world position.
+            distance (int): Number of chunks in each direction.
+
+        Returns:
+            list: List of Chunk objects in range.
+        """
+        center_cx = int(center_x) // CHUNK_SIZE
+        center_cz = int(center_z) // CHUNK_SIZE
+
+        result = []
+        for dx in range(-distance, distance + 1):
+            for dz in range(-distance, distance + 1):
+                cx = center_cx + dx
+                cz = center_cz + dz
+                chunk = self.get_chunk(cx, cz)
+                result.append(chunk)
+
+        return result

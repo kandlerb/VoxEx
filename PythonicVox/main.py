@@ -8,14 +8,14 @@ Run this file to start the game.
 Usage:
     python main.py
 
-The game engine uses pygame-ce for windowing/input and moderngl for
-3D rendering. The main menu uses pygame's 2D rendering capabilities,
-while the game state will use moderngl for voxel rendering.
+The game engine uses pygame-ce for windowing/input and a custom
+3D renderer for voxel rendering.
 
 Architecture:
     - State machine pattern manages transitions between menu and game
     - Events collected once per frame and passed to active state
     - Menu returns signals for state transitions (doesn't call quit directly)
+    - GameState handles all in-game logic and rendering
 """
 
 import pygame
@@ -26,6 +26,7 @@ from settings import (
 from ui.main_menu import MainMenu
 from ui.settings_menu import SettingsMenu
 from ui.create_world_menu import CreateWorldMenu
+from game_state import GameState
 
 
 def main():
@@ -53,6 +54,8 @@ def main():
     main_menu = MainMenu(screen)
     settings_menu = SettingsMenu(screen)
     create_world_menu = CreateWorldMenu(screen)
+    game_state = None  # Created when entering game
+    world_config = None  # Stores config from create world menu
 
     print("Creating settings menu...")
     print("Creating world menu...")
@@ -61,6 +64,9 @@ def main():
 
     running = True
     while running:
+        # Calculate delta time
+        delta_time = clock.tick(FPS_CAP) / 1000.0  # Convert ms to seconds
+
         # Collect events once per frame
         events = pygame.event.get()
 
@@ -105,6 +111,9 @@ def main():
                 current_state = "main_menu"
             elif result == "start_game":
                 print(f"[Game] Starting game with config: {config}")
+                world_config = config
+                # Create the game state with world config
+                game_state = GameState(screen, world_config)
                 current_state = "game"
 
             # Render create world menu
@@ -112,28 +121,30 @@ def main():
             create_world_menu.draw(screen)
 
         elif current_state == "game":
-            # Future: moderngl 3D rendering
-            # ctx = moderngl.create_context()
-            screen.fill((30, 40, 50))
+            if game_state is None:
+                # Fallback: create game state without config
+                game_state = GameState(screen, {})
 
-            # Placeholder text
-            font = pygame.font.Font(None, 48)
-            text = font.render("Game State - Press ESC for menu", True, (200, 200, 200))
-            text_rect = text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))
-            screen.blit(text, text_rect)
+            # Update game state
+            result = game_state.update(events, delta_time)
 
-            # Handle ESC to return to menu
-            for event in events:
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                    current_state = "main_menu"
-                    print("[Game] Returning to main menu")
+            if result == "main_menu":
+                # Clean up game state
+                game_state.cleanup()
+                game_state = None
+                current_state = "main_menu"
+                print("[Game] Returning to main menu")
+            else:
+                # Render game
+                game_state.draw(screen)
 
         # Update display
         pygame.display.flip()
-        clock.tick(FPS_CAP)
 
     print("=" * 40)
     print("Shutting down...")
+    if game_state:
+        game_state.cleanup()
     pygame.quit()
 
 
