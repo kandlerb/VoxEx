@@ -5,13 +5,29 @@ This module contains all game settings, constants, and configuration values
 that control game behavior, rendering options, and gameplay parameters.
 
 Configuration Categories:
+    - Window settings (title, dimensions, fullscreen)
     - World settings (chunk size, render distance, world height)
     - Player settings (movement speed, jump force, health)
     - Graphics settings (FOV, draw distance, lighting options)
     - Audio settings (volume levels, sound toggles)
     - Control mappings (keyboard and mouse bindings)
+    - UI theming (colors for menus and buttons)
 """
 
+from ursina import color
+
+# Window Configuration
+WINDOW_TITLE = "PythonicVox"
+WINDOW_BORDERLESS = False
+FULLSCREEN = False
+WINDOW_SIZE = (1280, 720)  # Default window dimensions
+
+# UI Colors (for theming)
+MENU_BG_COLOR = color.color(0, 0, 0.1, 0.9)  # Dark semi-transparent background
+BUTTON_COLOR = color.color(0, 0, 0.2, 1)  # Dark gray button
+BUTTON_HOVER_COLOR = color.color(0, 0, 0.3, 1)  # Lighter on hover
+BUTTON_TEXT_COLOR = color.white
+TITLE_COLOR = color.color(120, 0.8, 0.9, 1)  # Cyan/teal title
 
 # World Configuration
 CHUNK_SIZE = 16  # Blocks per chunk (X and Z dimensions)
