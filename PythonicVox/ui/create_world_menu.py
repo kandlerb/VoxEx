@@ -61,6 +61,9 @@ class CreateWorldMenu:
         self.preview_y = 0
         self.section_positions = {}
 
+        # Debug mode - set to True to visualize clickable areas
+        self.debug_hitboxes = True
+
         # Initialize all UI components
         self._init_components()
 
@@ -290,12 +293,12 @@ class CreateWorldMenu:
         y += 30
         toggle_x = self.content_padding + 120
 
-        self.trees_toggle.rect.x = toggle_x
-        self.trees_toggle.rect.y = y
+        self.trees_toggle.rect.topleft = (toggle_x, y)
+        self.trees_toggle.rect.size = (settings.TOGGLE_WIDTH, settings.TOGGLE_HEIGHT)
         y += 35
 
-        self.caves_toggle.rect.x = toggle_x
-        self.caves_toggle.rect.y = y
+        self.caves_toggle.rect.topleft = (toggle_x, y)
+        self.caves_toggle.rect.size = (settings.TOGGLE_WIDTH, settings.TOGGLE_HEIGHT)
         y += 35
 
         if self.caves_toggle.is_on:
@@ -304,8 +307,8 @@ class CreateWorldMenu:
             self.cave_density_slider.rect.y = y
             y += 35
 
-        self.rivers_toggle.rect.x = toggle_x
-        self.rivers_toggle.rect.y = y
+        self.rivers_toggle.rect.topleft = (toggle_x, y)
+        self.rivers_toggle.rect.size = (settings.TOGGLE_WIDTH, settings.TOGGLE_HEIGHT)
         y += 45
 
         # 6. Terrain settings section
@@ -536,6 +539,10 @@ class CreateWorldMenu:
         # Draw scrollbar on top
         self.scroll_area.draw_scrollbar(screen)
 
+        # Debug: draw hitbox outlines
+        if self.debug_hitboxes:
+            self._draw_debug_hitboxes(screen)
+
     def _draw_header(self, screen):
         """Draw fixed header."""
         pygame.draw.rect(screen, settings.COLOR_PANEL_BG,
@@ -643,3 +650,62 @@ class CreateWorldMenu:
         """Draw a form label."""
         surf = self.label_font.render(text, True, settings.COLOR_TEXT_SECONDARY)
         screen.blit(surf, (x, y))
+
+    def _draw_debug_hitboxes(self, screen):
+        """Draw colored outlines showing where click detection happens."""
+        # World type buttons - red
+        for btn in self.world_type_buttons:
+            pygame.draw.rect(screen, (255, 0, 0), btn.rect, 2)
+
+        # Biome buttons - magenta
+        for btn in self.biome_buttons:
+            pygame.draw.rect(screen, (255, 0, 255), btn.rect, 2)
+
+        # Toggles - green
+        pygame.draw.rect(screen, (0, 255, 0), self.trees_toggle.rect, 2)
+        pygame.draw.rect(screen, (0, 255, 0), self.caves_toggle.rect, 2)
+        pygame.draw.rect(screen, (0, 255, 0), self.rivers_toggle.rect, 2)
+
+        # Sliders - cyan
+        pygame.draw.rect(screen, (0, 255, 255), self.tree_density_slider.rect, 2)
+        pygame.draw.rect(screen, (0, 255, 255), self.terrain_amplitude_slider.rect, 2)
+        pygame.draw.rect(screen, (0, 255, 255), self.sea_level_slider.rect, 2)
+        if self.caves_toggle.is_on:
+            pygame.draw.rect(screen, (0, 255, 255), self.cave_density_slider.rect, 2)
+
+        # Text inputs - yellow
+        pygame.draw.rect(screen, (255, 255, 0), self.world_name_input.rect, 2)
+        pygame.draw.rect(screen, (255, 255, 0), self.seed_input.rect, 2)
+
+        # Seed buttons - orange
+        pygame.draw.rect(screen, (255, 165, 0), self.random_seed_button.rect, 2)
+        pygame.draw.rect(screen, (255, 165, 0), self.copy_seed_button.rect, 2)
+
+        # Advanced section header - blue
+        pygame.draw.rect(screen, (0, 100, 255), self.advanced_section.header_rect, 2)
+
+        # Advanced sliders if expanded
+        if self.advanced_section.is_expanded:
+            pygame.draw.rect(screen, (0, 255, 255), self.biome_size_slider.rect, 2)
+            pygame.draw.rect(screen, (0, 255, 255), self.noise_persistence_slider.rect, 2)
+            pygame.draw.rect(screen, (0, 255, 255), self.noise_lacunarity_slider.rect, 2)
+            pygame.draw.rect(screen, (255, 255, 0), self.spawn_x_input.rect, 2)
+            pygame.draw.rect(screen, (255, 255, 0), self.spawn_z_input.rect, 2)
+
+        # Draw mouse position as white circle
+        mouse_pos = pygame.mouse.get_pos()
+        pygame.draw.circle(screen, (255, 255, 255), mouse_pos, 5)
+        pygame.draw.circle(screen, (0, 0, 0), mouse_pos, 5, 1)
+
+        # Draw scroll offset info
+        debug_font = pygame.font.Font(None, 20)
+        offset = self.scroll_area.get_offset()
+        max_scroll = max(0, self.scroll_area.content_height - self.scroll_area.rect.height)
+        offset_text = debug_font.render(
+            f"Scroll: {offset} / {max_scroll}  Mouse: {mouse_pos}",
+            True, (255, 255, 255)
+        )
+        # Draw on dark background for visibility
+        bg_rect = pygame.Rect(5, self.screen_height - 25, offset_text.get_width() + 10, 20)
+        pygame.draw.rect(screen, (0, 0, 0), bg_rect)
+        screen.blit(offset_text, (10, self.screen_height - 23))
