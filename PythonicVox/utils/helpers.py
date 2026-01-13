@@ -2,9 +2,11 @@
 Utility functions for PythonicVox.
 
 This module contains helper functions and utilities used throughout the
-project including coordinate conversions, math helpers, and common operations.
+project including coordinate conversions, math helpers, UI helpers,
+and common operations.
 
 Functions:
+    draw_text_centered: Render text centered at a position.
     world_to_chunk: Convert world coordinates to chunk coordinates.
     chunk_to_world: Convert chunk coordinates to world coordinates.
     local_to_index: Convert local block coordinates to array index.
@@ -13,16 +15,45 @@ Functions:
     lerp: Linear interpolation between two values.
 
 Usage:
-    from utils.helpers import world_to_chunk, clamp
+    from utils.helpers import world_to_chunk, clamp, draw_text_centered
 
     cx, cz = world_to_chunk(x, z)
     value = clamp(value, 0, 100)
+    draw_text_centered(screen, "Hello", font, color, (100, 100))
 """
 
 # Constants for coordinate conversions
 CHUNK_SIZE = 16
 CHUNK_HEIGHT = 320
 
+
+# =============================================================================
+# UI Helper Functions
+# =============================================================================
+
+def draw_text_centered(surface, text, font, color, center_pos):
+    """
+    Render text centered at the given position.
+
+    Args:
+        surface (pygame.Surface): Surface to draw on.
+        text (str): Text to render.
+        font (pygame.font.Font): Font to use for rendering.
+        color (tuple): RGB color tuple.
+        center_pos (tuple): (x, y) center position for the text.
+
+    Returns:
+        pygame.Rect: The bounding rectangle of the rendered text.
+    """
+    text_surface = font.render(text, True, color)
+    text_rect = text_surface.get_rect(center=center_pos)
+    surface.blit(text_surface, text_rect)
+    return text_rect
+
+
+# =============================================================================
+# Coordinate Conversion Functions
+# =============================================================================
 
 def world_to_chunk(x, z):
     """

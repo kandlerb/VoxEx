@@ -2,158 +2,196 @@
 Main menu for PythonicVox.
 
 This module contains the MainMenu class which manages the main menu screen
-including new game, load game, settings, and exit options.
+using pygame for 2D rendering. The menu handles user input for navigation
+and returns state change signals to the main game loop.
 
 Classes:
-    MainMenu: Manages the main menu interface.
+    MainMenu: Manages the main menu interface with pygame.
 
 Usage:
     from ui.main_menu import MainMenu
 
-    menu = MainMenu()
-    menu.show()
+    menu = MainMenu(screen)
+    result = menu.update(events)
+    menu.draw(screen)
 """
 
-from ursina import (
-    Entity, Text, Button, application, camera, color,
-    window, Vec2, Vec3, destroy
-)
+import pygame
 import settings
+from utils.helpers import draw_text_centered
 
 
-class MainMenu(Entity):
+class MainMenu:
     """
-    Manages the main menu interface.
+    Manages the main menu interface using pygame.
 
-    Inherits from Entity to integrate with Ursina's scene graph.
-    Creates a centered menu panel with title and navigation buttons.
+    Renders a centered menu with title text and navigation buttons.
+    Handles mouse hover states and click events, returning state
+    change signals to the main game loop.
 
     Attributes:
-        is_visible (bool): Whether the menu is currently visible.
-        buttons (list): List of menu button UI elements.
-        background (Entity): Background panel element.
-        title (Text): Title text element.
+        screen (pygame.Surface): Reference to the display surface.
+        buttons (list): List of (label, rect, callback) tuples.
+        hovered_button (int): Index of currently hovered button, or -1.
+        title_font (pygame.font.Font): Font for title text.
+        button_font (pygame.font.Font): Font for button text.
     """
 
-    def __init__(self):
-        """Initialize a new MainMenu instance and create UI elements."""
-        super().__init__(
-            parent=camera.ui,
-            name='main_menu'
-        )
-        self.is_visible = True
-        self.buttons = []
-        self.background = None
-        self.title = None
-        self._setup()
+    def __init__(self, screen):
+        """
+        Initialize a new MainMenu instance.
 
-    def _setup(self):
-        """Create main menu UI elements."""
-        # Background panel - full screen semi-transparent overlay
-        self.background = Entity(
-            parent=self,
-            model='quad',
-            color=settings.MENU_BG_COLOR,
-            scale=(2, 1),  # Cover full screen in UI space
-            z=0.1
-        )
+        Args:
+            screen (pygame.Surface): The pygame display surface.
+        """
+        self.screen = screen
+        self.hovered_button = -1
 
-        # Title text
-        self.title = Text(
-            parent=self,
-            text='PythonicVox',
-            scale=3,
-            origin=(0, 0),
-            y=0.35,
-            color=settings.TITLE_COLOR
-        )
+        # Initialize fonts
+        self.title_font = pygame.font.Font(None, settings.TITLE_FONT_SIZE)
+        self.subtitle_font = pygame.font.Font(None, 32)
+        self.button_font = pygame.font.Font(None, settings.BUTTON_FONT_SIZE)
+        self.version_font = pygame.font.Font(None, settings.VERSION_FONT_SIZE)
 
-        # Subtitle
-        self.subtitle = Text(
-            parent=self,
-            text='A Voxel Adventure',
-            scale=1.2,
-            origin=(0, 0),
-            y=0.25,
-            color=color.gray
-        )
-
-        # Button configuration
-        button_data = [
-            ('New Game', self.on_new_game),
-            ('Load Game', self.on_load_game),
-            ('Settings', self.on_settings),
-            ('Quit', self.on_quit),
+        # Button definitions: (label, callback_result)
+        self.button_data = [
+            ("New Game", "start_game"),
+            ("Load Game", "load_game"),
+            ("Settings", "settings"),
+            ("Quit", "quit"),
         ]
 
-        # Create buttons with vertical spacing
-        button_spacing = 0.1
-        start_y = 0.05
+        # Build button rectangles
+        self.buttons = self._create_buttons()
 
-        for i, (text, callback) in enumerate(button_data):
-            btn = Button(
-                parent=self,
-                text=text,
-                scale=(0.3, 0.08),
-                y=start_y - (i * button_spacing),
-                color=settings.BUTTON_COLOR,
-                highlight_color=settings.BUTTON_HOVER_COLOR,
-                text_color=settings.BUTTON_TEXT_COLOR
-            )
-            btn.on_click = callback
-            self.buttons.append(btn)
+    def _create_buttons(self):
+        """
+        Create button rectangles centered on screen.
 
-        # Version text in corner
-        self.version_text = Text(
-            parent=self,
-            text='v0.1.0',
-            scale=0.8,
-            origin=(1, -1),
-            position=(0.48, -0.45),
-            color=color.dark_gray
+        Returns:
+            list: List of (label, rect, result) tuples.
+        """
+        buttons = []
+        screen_width = self.screen.get_width()
+        screen_height = self.screen.get_height()
+
+        # Calculate total height of button group
+        num_buttons = len(self.button_data)
+        total_height = (
+            num_buttons * settings.BUTTON_HEIGHT +
+            (num_buttons - 1) * settings.BUTTON_SPACING
         )
 
-    def show(self):
-        """Show the main menu."""
-        self.enabled = True
-        self.is_visible = True
+        # Start position (centered vertically, slightly below center)
+        start_y = (screen_height - total_height) // 2 + 40
 
-    def hide(self):
-        """Hide the main menu."""
-        self.enabled = False
-        self.is_visible = False
+        for i, (label, result) in enumerate(self.button_data):
+            x = (screen_width - settings.BUTTON_WIDTH) // 2
+            y = start_y + i * (settings.BUTTON_HEIGHT + settings.BUTTON_SPACING)
+            rect = pygame.Rect(x, y, settings.BUTTON_WIDTH, settings.BUTTON_HEIGHT)
+            buttons.append((label, rect, result))
 
-    def on_new_game(self):
-        """Handle new game button click."""
-        print("[MainMenu] New Game clicked - starting new world...")
-        # Placeholder: Will initialize game world
+        return buttons
 
-    def on_load_game(self):
-        """Handle load game button click."""
-        print("[MainMenu] Load Game clicked - opening save selection...")
-        # Placeholder: Will show save file selection
+    def update(self, events):
+        """
+        Process input events and update menu state.
 
-    def on_settings(self):
-        """Handle settings button click."""
-        print("[MainMenu] Settings clicked - opening settings menu...")
-        # Placeholder: Will show settings menu
+        Args:
+            events (list): List of pygame events from the main loop.
 
-    def on_quit(self):
-        """Handle quit button click - exits the application."""
-        print("[MainMenu] Quit clicked - exiting application...")
-        application.quit()
+        Returns:
+            str or None: State change signal ("quit", "start_game", etc.)
+                         or None if no state change.
+        """
+        mouse_pos = pygame.mouse.get_pos()
 
-    def destroy(self):
-        """Clean up menu UI elements."""
-        for btn in self.buttons:
-            destroy(btn)
-        self.buttons.clear()
-        if self.background:
-            destroy(self.background)
-        if self.title:
-            destroy(self.title)
-        if hasattr(self, 'subtitle'):
-            destroy(self.subtitle)
-        if hasattr(self, 'version_text'):
-            destroy(self.version_text)
-        super().disable()
+        # Update hover state
+        self.hovered_button = -1
+        for i, (label, rect, result) in enumerate(self.buttons):
+            if rect.collidepoint(mouse_pos):
+                self.hovered_button = i
+                break
+
+        # Handle click events
+        for event in events:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for i, (label, rect, result) in enumerate(self.buttons):
+                    if rect.collidepoint(event.pos):
+                        return self._handle_button_click(i, result)
+
+        return None
+
+    def _handle_button_click(self, index, result):
+        """
+        Handle a button click and return appropriate signal.
+
+        Args:
+            index (int): Button index that was clicked.
+            result (str): The result string for this button.
+
+        Returns:
+            str: State change signal.
+        """
+        label = self.button_data[index][0]
+        print(f"[MainMenu] {label} clicked")
+        return result
+
+    def draw(self, screen):
+        """
+        Render the main menu to the screen.
+
+        Args:
+            screen (pygame.Surface): Surface to draw on.
+        """
+        screen_width = screen.get_width()
+        screen_height = screen.get_height()
+
+        # Draw title
+        title_y = screen_height // 4
+        draw_text_centered(
+            screen,
+            "PythonicVox",
+            self.title_font,
+            settings.COLOR_TITLE,
+            (screen_width // 2, title_y)
+        )
+
+        # Draw subtitle
+        draw_text_centered(
+            screen,
+            "A Voxel Adventure",
+            self.subtitle_font,
+            settings.COLOR_SUBTITLE,
+            (screen_width // 2, title_y + 50)
+        )
+
+        # Draw buttons
+        for i, (label, rect, result) in enumerate(self.buttons):
+            # Determine button color based on hover state
+            if i == self.hovered_button:
+                color = settings.COLOR_BUTTON_HOVER
+            else:
+                color = settings.COLOR_BUTTON
+
+            # Draw button background
+            pygame.draw.rect(screen, color, rect, border_radius=8)
+
+            # Draw button border
+            border_color = (100, 100, 130) if i == self.hovered_button else (80, 80, 100)
+            pygame.draw.rect(screen, border_color, rect, width=2, border_radius=8)
+
+            # Draw button text
+            draw_text_centered(
+                screen,
+                label,
+                self.button_font,
+                settings.COLOR_TEXT,
+                rect.center
+            )
+
+        # Draw version text in bottom right
+        version_text = "v0.1.0"
+        version_surface = self.version_font.render(version_text, True, settings.COLOR_VERSION)
+        version_rect = version_surface.get_rect(bottomright=(screen_width - 20, screen_height - 20))
+        screen.blit(version_surface, version_rect)

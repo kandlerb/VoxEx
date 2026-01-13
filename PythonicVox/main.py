@@ -8,56 +8,103 @@ Run this file to start the game.
 Usage:
     python main.py
 
-The game engine uses Ursina for rendering and provides a Minecraft-inspired
-voxel exploration experience with procedural terrain generation.
+The game engine uses pygame-ce for windowing/input and moderngl for
+3D rendering. The main menu uses pygame's 2D rendering capabilities,
+while the game state will use moderngl for voxel rendering.
+
+Architecture:
+    - State machine pattern manages transitions between menu and game
+    - Events collected once per frame and passed to active state
+    - Menu returns signals for state transitions (doesn't call quit directly)
 """
 
-from ursina import Ursina, window, color
-
-import settings
+import pygame
+from settings import (
+    WINDOW_TITLE, WINDOW_WIDTH, WINDOW_HEIGHT,
+    FPS_CAP, COLOR_BG
+)
 from ui.main_menu import MainMenu
-
-
-# Global references for game state
-app = None
-main_menu = None
 
 
 def main():
     """
     Initialize and run the voxel engine.
 
-    This function sets up the Ursina application with window settings,
-    creates the main menu, and enters the main game loop.
+    Sets up the pygame display, creates the main menu, and enters
+    the main game loop with state-based update and rendering.
     """
-    global app, main_menu
-
     print("PythonicVox - Voxel Engine")
     print("=" * 40)
-    print("Initializing Ursina...")
+    print("Initializing pygame...")
 
-    # Initialize Ursina application with window settings
-    app = Ursina(
-        title=settings.WINDOW_TITLE,
-        borderless=settings.WINDOW_BORDERLESS,
-        fullscreen=settings.FULLSCREEN,
-        size=settings.WINDOW_SIZE,
-        development_mode=True,
-        vsync=True
-    )
+    # Initialize pygame
+    pygame.init()
+    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    pygame.display.set_caption(WINDOW_TITLE)
+    clock = pygame.time.Clock()
 
-    # Set window background color
-    window.color = color.color(0, 0, 0.05)
-
-    # Create and display the main menu
+    print(f"Window: {WINDOW_WIDTH}x{WINDOW_HEIGHT}")
     print("Creating main menu...")
-    main_menu = MainMenu()
+
+    # Game state management
+    current_state = "main_menu"
+    main_menu = MainMenu(screen)
 
     print("Starting game loop...")
     print("=" * 40)
 
-    # Run the application
-    app.run()
+    running = True
+    while running:
+        # Collect events once per frame
+        events = pygame.event.get()
+
+        # Handle global events
+        for event in events:
+            if event.type == pygame.QUIT:
+                running = False
+
+        # State-based update and render
+        if current_state == "main_menu":
+            result = main_menu.update(events)
+
+            if result == "quit":
+                running = False
+            elif result == "start_game":
+                current_state = "game"
+                print("[Game] Starting new game... (moderngl integration pending)")
+            elif result == "load_game":
+                print("[Game] Load game not implemented yet")
+            elif result == "settings":
+                print("[Game] Settings menu not implemented yet")
+
+            # Render menu
+            screen.fill(COLOR_BG)
+            main_menu.draw(screen)
+
+        elif current_state == "game":
+            # Future: moderngl 3D rendering
+            # ctx = moderngl.create_context()
+            screen.fill((30, 40, 50))
+
+            # Placeholder text
+            font = pygame.font.Font(None, 48)
+            text = font.render("Game State - Press ESC for menu", True, (200, 200, 200))
+            text_rect = text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))
+            screen.blit(text, text_rect)
+
+            # Handle ESC to return to menu
+            for event in events:
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    current_state = "main_menu"
+                    print("[Game] Returning to main menu")
+
+        # Update display
+        pygame.display.flip()
+        clock.tick(FPS_CAP)
+
+    print("=" * 40)
+    print("Shutting down...")
+    pygame.quit()
 
 
 if __name__ == "__main__":
