@@ -57,17 +57,21 @@ class CreateWorldMenu:
         # Initialize terrain preview
         self.preview = TerrainPreview(280, 160)
 
+        # Layout position tracking (set by _update_layout)
+        self.preview_y = 0
+        self.section_positions = {}
+
         # Initialize all UI components
         self._init_components()
 
-        # Calculate total content height
-        self._calculate_content_height()
+        # Initial layout calculation
+        self._update_layout()
 
     def _init_components(self):
         """Initialize all UI components."""
         content_width = self.screen_width - (self.content_padding * 2) - 20
 
-        # Header components
+        # Header components (fixed position)
         self.start_button = Button(
             rect=(self.screen_width - 180, 15, 150, 40),
             text="Start Game",
@@ -75,7 +79,7 @@ class CreateWorldMenu:
             hover_color=settings.COLOR_PRIMARY_HOVER
         )
 
-        # Footer
+        # Footer (fixed position)
         self.back_button = Button(
             rect=(self.content_padding, self.screen_height - 50, 150, 40),
             text="< Back",
@@ -216,18 +220,149 @@ class CreateWorldMenu:
             max_length=6
         )
 
-    def _calculate_content_height(self):
-        """Calculate total scrollable content height."""
-        height = 30  # Initial padding
-        height += 180  # Preview section
-        height += 140  # World type section
-        height += 130  # World info section
-        height += 90   # Biome selection
-        height += 160  # Structures section
-        height += 160  # Terrain settings
-        height += 50 + (self.advanced_section.content_height if self.advanced_section.is_expanded else 0)
-        height += 50   # Bottom padding
-        self.scroll_area.set_content_height(height)
+    def _update_layout(self):
+        """
+        Calculate screen positions for all components based on scroll state.
+
+        This method MUST be called before hit detection so that component
+        rects are in the correct screen-space positions.
+        """
+        scroll_offset = self.scroll_area.get_offset()
+        base_y = self.header_height - scroll_offset
+        content_width = self.screen_width - (self.content_padding * 2) - 20
+
+        y = base_y + 20  # Starting content y in screen space
+
+        # 1. Preview section
+        self.section_positions['preview_title'] = y
+        y += 30  # Section title height
+        self.preview_y = y
+        y += 170
+
+        # 2. World type section
+        self.section_positions['world_type_title'] = y
+        y += 30
+        button_width = (content_width - 20) // 3
+        for i, btn in enumerate(self.world_type_buttons):
+            col = i % 3
+            row = i // 3
+            btn.rect.x = self.content_padding + col * (button_width + 10)
+            btn.rect.y = y + row * 55
+            btn.rect.width = button_width - 10
+            btn.rect.height = 45
+        y += 120
+
+        # 3. World info section
+        self.section_positions['world_info_title'] = y
+        y += 30
+        # World name
+        self.section_positions['world_name_label'] = y
+        self.world_name_input.rect.x = self.content_padding
+        self.world_name_input.rect.y = y + 20
+        y += 60
+        # Seed
+        self.section_positions['seed_label'] = y
+        seed_input_width = content_width - 180
+        self.seed_input.rect.x = self.content_padding
+        self.seed_input.rect.y = y + 20
+        self.seed_input.rect.width = seed_input_width
+        self.random_seed_button.rect.x = self.content_padding + seed_input_width + 10
+        self.random_seed_button.rect.y = y + 20
+        self.copy_seed_button.rect.x = self.content_padding + seed_input_width + 70
+        self.copy_seed_button.rect.y = y + 20
+        y += 70
+
+        # 4. Biome selection section
+        self.section_positions['biome_title'] = y
+        y += 30
+        btn_width = (content_width - 20) // 3
+        for i, btn in enumerate(self.biome_buttons):
+            col = i % 3
+            row = i // 3
+            btn.rect.x = self.content_padding + col * (btn_width + 10)
+            btn.rect.y = y + row * 48
+            btn.rect.width = btn_width - 10
+            btn.rect.height = 38
+        y += 100
+
+        # 5. Structures section
+        self.section_positions['structures_title'] = y
+        y += 30
+        toggle_x = self.content_padding + 120
+
+        self.trees_toggle.rect.x = toggle_x
+        self.trees_toggle.rect.y = y
+        y += 35
+
+        self.caves_toggle.rect.x = toggle_x
+        self.caves_toggle.rect.y = y
+        y += 35
+
+        if self.caves_toggle.is_on:
+            self.section_positions['cave_density_label'] = y + 5
+            self.cave_density_slider.rect.x = self.content_padding + 130
+            self.cave_density_slider.rect.y = y
+            y += 35
+
+        self.rivers_toggle.rect.x = toggle_x
+        self.rivers_toggle.rect.y = y
+        y += 45
+
+        # 6. Terrain settings section
+        self.section_positions['terrain_title'] = y
+        y += 30
+        slider_x = self.content_padding + 160
+
+        self.section_positions['tree_density_label'] = y + 5
+        self.tree_density_slider.rect.x = slider_x
+        self.tree_density_slider.rect.y = y
+        y += 40
+
+        self.section_positions['amplitude_label'] = y + 5
+        self.terrain_amplitude_slider.rect.x = slider_x
+        self.terrain_amplitude_slider.rect.y = y
+        y += 40
+
+        self.section_positions['sea_level_label'] = y + 5
+        self.sea_level_slider.rect.x = slider_x
+        self.sea_level_slider.rect.y = y
+        y += 50
+
+        # 7. Advanced options section
+        self.advanced_section.header_rect.x = self.content_padding
+        self.advanced_section.header_rect.y = y
+        y += self.advanced_section.header_height
+
+        if self.advanced_section.is_expanded:
+            self.section_positions['advanced_box'] = y
+            inner_y = y + 12
+
+            self.section_positions['biome_size_label'] = inner_y + 5
+            self.biome_size_slider.rect.x = slider_x
+            self.biome_size_slider.rect.y = inner_y
+            inner_y += 38
+
+            self.section_positions['persistence_label'] = inner_y + 5
+            self.noise_persistence_slider.rect.x = slider_x
+            self.noise_persistence_slider.rect.y = inner_y
+            inner_y += 38
+
+            self.section_positions['lacunarity_label'] = inner_y + 5
+            self.noise_lacunarity_slider.rect.x = slider_x
+            self.noise_lacunarity_slider.rect.y = inner_y
+            inner_y += 38
+
+            self.section_positions['spawn_label'] = inner_y + 5
+            self.spawn_x_input.rect.x = slider_x + 25
+            self.spawn_x_input.rect.y = inner_y
+            self.spawn_z_input.rect.x = slider_x + 155
+            self.spawn_z_input.rect.y = inner_y
+
+            y += self.advanced_section.content_height
+
+        # Update total content height for scroll area
+        total_content = y - base_y + 50  # Add bottom padding
+        self.scroll_area.set_content_height(total_content)
 
     def update(self, events):
         """
@@ -250,69 +385,88 @@ class CreateWorldMenu:
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mouse_clicked = True
 
-        # Update scroll area
+        # Update scroll area FIRST
         self.scroll_area.update(events, mouse_pos)
-        scroll_offset = self.scroll_area.get_offset()
 
-        # Adjust mouse pos for scrolled content
-        content_mouse_pos = (mouse_pos[0], mouse_pos[1] + scroll_offset - self.header_height)
+        # Calculate all component positions based on current scroll
+        # This ensures rects are in screen space before hit detection
+        self._update_layout()
 
-        # Header buttons (not scrolled)
+        # Now all rects are in screen space - use mouse_pos directly
+
+        # Header buttons (always check these - fixed position)
         if self.start_button.update(mouse_pos, mouse_clicked):
             return ("start_game", self._collect_settings())
 
-        # Footer button (not scrolled)
+        # Footer button (always check - fixed position)
         if self.back_button.update(mouse_pos, mouse_clicked):
             return ("main_menu", None)
 
-        # Random seed button
-        if self.random_seed_button.update(content_mouse_pos, mouse_clicked):
-            self.seed_input.text = str(random.randint(0, 999999999))
+        # Define scrollable content area
+        content_area = pygame.Rect(
+            0, self.header_height,
+            self.screen_width,
+            self.screen_height - self.header_height - self.footer_height
+        )
 
-        # World type selection
-        for btn in self.world_type_buttons:
-            if btn.update(content_mouse_pos, mouse_clicked):
-                self.world_settings["world_type"] = btn.data_id
-                for b in self.world_type_buttons:
-                    b.is_selected = (b.data_id == self.world_settings["world_type"])
+        # Only check scrollable content if mouse is in content area
+        if content_area.collidepoint(mouse_pos):
+            # World type buttons
+            for btn in self.world_type_buttons:
+                if btn.update(mouse_pos, mouse_clicked):
+                    self.world_settings["world_type"] = btn.data_id
+                    for b in self.world_type_buttons:
+                        b.is_selected = (b.data_id == self.world_settings["world_type"])
 
-        # Biome toggles
-        for btn in self.biome_buttons:
-            if btn.update(content_mouse_pos, mouse_clicked):
-                btn.is_selected = not btn.is_selected
-                if btn.is_selected:
-                    if btn.data_id not in self.world_settings["selected_biomes"]:
-                        self.world_settings["selected_biomes"].append(btn.data_id)
-                else:
-                    if btn.data_id in self.world_settings["selected_biomes"]:
-                        self.world_settings["selected_biomes"].remove(btn.data_id)
+            # Seed buttons
+            if self.random_seed_button.update(mouse_pos, mouse_clicked):
+                self.seed_input.text = str(random.randint(0, 999999999))
 
-        # Text inputs
-        self.world_name_input.update(events, content_mouse_pos, mouse_clicked)
-        self.seed_input.update(events, content_mouse_pos, mouse_clicked)
+            if self.copy_seed_button.update(mouse_pos, mouse_clicked):
+                # Copy to clipboard if available
+                try:
+                    pygame.scrap.init()
+                    pygame.scrap.put(pygame.SCRAP_TEXT, self.seed_input.text.encode())
+                except Exception:
+                    pass
 
-        # Structure toggles
-        self.trees_toggle.update(content_mouse_pos, mouse_clicked)
-        self.caves_toggle.update(content_mouse_pos, mouse_clicked)
-        self.rivers_toggle.update(content_mouse_pos, mouse_clicked)
+            # Biome buttons
+            for btn in self.biome_buttons:
+                if btn.update(mouse_pos, mouse_clicked):
+                    btn.is_selected = not btn.is_selected
+                    if btn.is_selected:
+                        if btn.data_id not in self.world_settings["selected_biomes"]:
+                            self.world_settings["selected_biomes"].append(btn.data_id)
+                    else:
+                        if btn.data_id in self.world_settings["selected_biomes"]:
+                            self.world_settings["selected_biomes"].remove(btn.data_id)
 
-        # Sliders
-        self.cave_density_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-        self.tree_density_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-        self.terrain_amplitude_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-        self.sea_level_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
+            # Text inputs
+            self.world_name_input.update(events, mouse_pos, mouse_clicked)
+            self.seed_input.update(events, mouse_pos, mouse_clicked)
 
-        # Advanced section
-        self.advanced_section.update(content_mouse_pos, mouse_clicked)
-        if self.advanced_section.is_content_visible():
-            self.biome_size_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-            self.noise_persistence_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-            self.noise_lacunarity_slider.update(content_mouse_pos, mouse_down, mouse_clicked)
-            self.spawn_x_input.update(events, content_mouse_pos, mouse_clicked)
-            self.spawn_z_input.update(events, content_mouse_pos, mouse_clicked)
+            # Toggles
+            self.trees_toggle.update(mouse_pos, mouse_clicked)
+            self.caves_toggle.update(mouse_pos, mouse_clicked)
+            self.rivers_toggle.update(mouse_pos, mouse_clicked)
 
-        # Recalculate content height
-        self._calculate_content_height()
+            # Sliders
+            if self.caves_toggle.is_on:
+                self.cave_density_slider.update(mouse_pos, mouse_down, mouse_clicked)
+            self.tree_density_slider.update(mouse_pos, mouse_down, mouse_clicked)
+            self.terrain_amplitude_slider.update(mouse_pos, mouse_down, mouse_clicked)
+            self.sea_level_slider.update(mouse_pos, mouse_down, mouse_clicked)
+
+            # Advanced section toggle
+            self.advanced_section.update(mouse_pos, mouse_clicked)
+
+            # Advanced options (only if expanded)
+            if self.advanced_section.is_expanded:
+                self.biome_size_slider.update(mouse_pos, mouse_down, mouse_clicked)
+                self.noise_persistence_slider.update(mouse_pos, mouse_down, mouse_clicked)
+                self.noise_lacunarity_slider.update(mouse_pos, mouse_down, mouse_clicked)
+                self.spawn_x_input.update(events, mouse_pos, mouse_clicked)
+                self.spawn_z_input.update(events, mouse_pos, mouse_clicked)
 
         # Update terrain preview
         self._update_preview()
@@ -359,19 +513,27 @@ class CreateWorldMenu:
         """
         screen.fill(settings.COLOR_DARK_BG)
 
-        scroll_offset = self.scroll_area.get_offset()
-        base_y = self.header_height - scroll_offset
+        # Draw header (fixed)
+        self._draw_header(screen)
 
-        # Clip rect for scrollable content
+        # Set clip rect for scrollable content
         content_clip = pygame.Rect(
             0, self.header_height,
             self.screen_width,
             self.screen_height - self.header_height - self.footer_height
         )
+        screen.set_clip(content_clip)
 
-        self._draw_header(screen)
-        self._draw_content(screen, base_y, content_clip)
+        # Draw all sections using pre-calculated positions
+        self._draw_sections(screen)
+
+        # Remove clip
+        screen.set_clip(None)
+
+        # Draw footer (fixed)
         self._draw_footer(screen)
+
+        # Draw scrollbar on top
         self.scroll_area.draw_scrollbar(screen)
 
     def _draw_header(self, screen):
@@ -389,208 +551,95 @@ class CreateWorldMenu:
         footer_y = self.screen_height - self.footer_height
         pygame.draw.rect(screen, settings.COLOR_PANEL_BG,
                          (0, footer_y, self.screen_width, self.footer_height))
-        self.back_button.rect.y = footer_y + 10
         self.back_button.draw(screen)
 
-    def _draw_content(self, screen, base_y, clip_rect):
-        """Draw all scrollable content."""
-        screen.set_clip(clip_rect)
-        content_width = self.screen_width - (self.content_padding * 2) - 20
-
-        y = base_y + 20
+    def _draw_sections(self, screen):
+        """Draw all scrollable content sections using pre-calculated positions."""
+        slider_x = self.content_padding + 160
 
         # 1. Preview section
-        y = self._draw_section_title(screen, "Terrain Preview", y)
-        self.preview.draw(screen, (self.content_padding, y))
-        y += 170
+        self._draw_section_title(screen, "Terrain Preview", self.section_positions.get('preview_title', 0))
+        self.preview.draw(screen, (self.content_padding, self.preview_y))
 
         # 2. World Type
-        y = self._draw_section_title(screen, "World Type", y)
-        y = self._draw_world_type_grid(screen, y)
+        self._draw_section_title(screen, "World Type", self.section_positions.get('world_type_title', 0))
+        for btn in self.world_type_buttons:
+            btn.is_selected = (btn.data_id == self.world_settings["world_type"])
+            btn.draw(screen)
 
         # 3. World Info
-        y = self._draw_section_title(screen, "World Info", y)
-        self._draw_label(screen, "World Name", self.content_padding, y)
-        self.world_name_input.rect.x = self.content_padding
-        self.world_name_input.rect.y = y + 20
+        self._draw_section_title(screen, "World Info", self.section_positions.get('world_info_title', 0))
+        self._draw_label(screen, "World Name", self.content_padding, self.section_positions.get('world_name_label', 0))
         self.world_name_input.draw(screen)
-        y += 60
 
-        self._draw_label(screen, "Seed", self.content_padding, y)
-        self.seed_input.rect.x = self.content_padding
-        self.seed_input.rect.y = y + 20
-        seed_right = self.seed_input.rect.right
-        self.random_seed_button.rect.x = seed_right + 10
-        self.random_seed_button.rect.y = y + 20
-        self.copy_seed_button.rect.x = seed_right + 70
-        self.copy_seed_button.rect.y = y + 20
+        self._draw_label(screen, "Seed", self.content_padding, self.section_positions.get('seed_label', 0))
         self.seed_input.draw(screen)
         self.random_seed_button.draw(screen)
         self.copy_seed_button.draw(screen)
-        y += 70
 
         # 4. Biome Selection
-        y = self._draw_section_title(screen, "Biome Selection", y)
-        y = self._draw_biome_grid(screen, y)
+        self._draw_section_title(screen, "Biome Selection", self.section_positions.get('biome_title', 0))
+        for btn in self.biome_buttons:
+            btn.draw(screen)
 
         # 5. Structures
-        y = self._draw_section_title(screen, "Structures", y)
-        y = self._draw_structures(screen, y)
+        self._draw_section_title(screen, "Structures", self.section_positions.get('structures_title', 0))
+        self.trees_toggle.draw(screen)
+        self.caves_toggle.draw(screen)
+
+        if self.caves_toggle.is_on:
+            self._draw_label(screen, "Density", self.content_padding + 50, self.section_positions.get('cave_density_label', 0))
+            self.cave_density_slider.draw(screen)
+
+        self.rivers_toggle.draw(screen)
 
         # 6. Terrain Settings
-        y = self._draw_section_title(screen, "Terrain Settings", y)
-        y = self._draw_terrain_sliders(screen, y)
+        self._draw_section_title(screen, "Terrain Settings", self.section_positions.get('terrain_title', 0))
+
+        self._draw_label(screen, "Tree Density", self.content_padding, self.section_positions.get('tree_density_label', 0))
+        self.tree_density_slider.draw(screen)
+
+        self._draw_label(screen, "Amplitude", self.content_padding, self.section_positions.get('amplitude_label', 0))
+        self.terrain_amplitude_slider.draw(screen)
+
+        self._draw_label(screen, "Sea Level", self.content_padding, self.section_positions.get('sea_level_label', 0))
+        self.sea_level_slider.draw(screen)
 
         # 7. Advanced Options
-        self.advanced_section.x = self.content_padding
-        self.advanced_section.y = y
-        self.advanced_section.header_rect.x = self.content_padding
-        self.advanced_section.header_rect.y = y
         self.advanced_section.draw_header(screen)
-        y += self.advanced_section.header_height
 
         if self.advanced_section.is_content_visible():
-            y = self._draw_advanced_options(screen, y)
+            # Draw box background
+            box_y = self.section_positions.get('advanced_box', 0)
+            box_rect = pygame.Rect(
+                self.content_padding, box_y,
+                self.screen_width - self.content_padding * 2 - 20,
+                self.advanced_section.content_height - 10
+            )
+            pygame.draw.rect(screen, settings.COLOR_PANEL_BG, box_rect)
+            pygame.draw.rect(screen, settings.COLOR_BORDER, box_rect, 1)
 
-        screen.set_clip(None)
+            self._draw_label(screen, "Biome Size", self.content_padding + 15, self.section_positions.get('biome_size_label', 0))
+            self.biome_size_slider.draw(screen)
+
+            self._draw_label(screen, "Persistence", self.content_padding + 15, self.section_positions.get('persistence_label', 0))
+            self.noise_persistence_slider.draw(screen)
+
+            self._draw_label(screen, "Lacunarity", self.content_padding + 15, self.section_positions.get('lacunarity_label', 0))
+            self.noise_lacunarity_slider.draw(screen)
+
+            self._draw_label(screen, "Spawn", self.content_padding + 15, self.section_positions.get('spawn_label', 0))
+            self._draw_label(screen, "X:", slider_x, self.section_positions.get('spawn_label', 0))
+            self.spawn_x_input.draw(screen)
+            self._draw_label(screen, "Z:", slider_x + 110, self.section_positions.get('spawn_label', 0))
+            self.spawn_z_input.draw(screen)
 
     def _draw_section_title(self, screen, title, y):
-        """Draw section title and return new y."""
+        """Draw section title at given y position."""
         surf = self.section_font.render(title, True, settings.COLOR_TEXT_PRIMARY)
         screen.blit(surf, (self.content_padding, y))
-        return y + 30
 
     def _draw_label(self, screen, text, x, y):
         """Draw a form label."""
         surf = self.label_font.render(text, True, settings.COLOR_TEXT_SECONDARY)
         screen.blit(surf, (x, y))
-
-    def _draw_world_type_grid(self, screen, y):
-        """Draw world type button grid."""
-        content_width = self.screen_width - (self.content_padding * 2) - 20
-        btn_width = (content_width - 20) // 3
-
-        for i, btn in enumerate(self.world_type_buttons):
-            col = i % 3
-            row = i // 3
-            btn.rect.x = self.content_padding + col * (btn_width + 10)
-            btn.rect.y = y + row * 55
-            btn.is_selected = (btn.data_id == self.world_settings["world_type"])
-            btn.draw(screen)
-
-        return y + 120
-
-    def _draw_biome_grid(self, screen, y):
-        """Draw biome selection buttons."""
-        content_width = self.screen_width - (self.content_padding * 2) - 20
-        btn_width = (content_width - 20) // 3
-
-        for i, btn in enumerate(self.biome_buttons):
-            col = i % 3
-            row = i // 3
-            btn.rect.x = self.content_padding + col * (btn_width + 10)
-            btn.rect.y = y + row * 48
-            btn.draw(screen)
-
-        return y + 100
-
-    def _draw_structures(self, screen, y):
-        """Draw structure toggles."""
-        toggle_x = self.content_padding + 120
-
-        self.trees_toggle.x = toggle_x
-        self.trees_toggle.y = y
-        self.trees_toggle.rect.x = toggle_x
-        self.trees_toggle.rect.y = y
-        self.trees_toggle.draw(screen)
-        y += 35
-
-        self.caves_toggle.x = toggle_x
-        self.caves_toggle.y = y
-        self.caves_toggle.rect.x = toggle_x
-        self.caves_toggle.rect.y = y
-        self.caves_toggle.draw(screen)
-        y += 35
-
-        if self.caves_toggle.get_value():
-            self._draw_label(screen, "Density", self.content_padding + 50, y + 5)
-            self.cave_density_slider.rect.x = self.content_padding + 130
-            self.cave_density_slider.rect.y = y
-            self.cave_density_slider.draw(screen)
-            y += 35
-
-        self.rivers_toggle.x = toggle_x
-        self.rivers_toggle.y = y
-        self.rivers_toggle.rect.x = toggle_x
-        self.rivers_toggle.rect.y = y
-        self.rivers_toggle.draw(screen)
-        y += 45
-
-        return y
-
-    def _draw_terrain_sliders(self, screen, y):
-        """Draw terrain setting sliders."""
-        slider_x = self.content_padding + 160
-
-        self._draw_label(screen, "Tree Density", self.content_padding, y + 5)
-        self.tree_density_slider.rect.x = slider_x
-        self.tree_density_slider.rect.y = y
-        self.tree_density_slider.draw(screen)
-        y += 40
-
-        self._draw_label(screen, "Amplitude", self.content_padding, y + 5)
-        self.terrain_amplitude_slider.rect.x = slider_x
-        self.terrain_amplitude_slider.rect.y = y
-        self.terrain_amplitude_slider.draw(screen)
-        y += 40
-
-        self._draw_label(screen, "Sea Level", self.content_padding, y + 5)
-        self.sea_level_slider.rect.x = slider_x
-        self.sea_level_slider.rect.y = y
-        self.sea_level_slider.draw(screen)
-        y += 50
-
-        return y
-
-    def _draw_advanced_options(self, screen, y):
-        """Draw advanced options content."""
-        box_rect = pygame.Rect(
-            self.content_padding, y,
-            self.screen_width - self.content_padding * 2 - 20,
-            self.advanced_section.content_height - 10
-        )
-        pygame.draw.rect(screen, settings.COLOR_PANEL_BG, box_rect)
-        pygame.draw.rect(screen, settings.COLOR_BORDER, box_rect, 1)
-
-        inner_y = y + 12
-        slider_x = self.content_padding + 160
-
-        self._draw_label(screen, "Biome Size", self.content_padding + 15, inner_y + 5)
-        self.biome_size_slider.rect.x = slider_x
-        self.biome_size_slider.rect.y = inner_y
-        self.biome_size_slider.draw(screen)
-        inner_y += 38
-
-        self._draw_label(screen, "Persistence", self.content_padding + 15, inner_y + 5)
-        self.noise_persistence_slider.rect.x = slider_x
-        self.noise_persistence_slider.rect.y = inner_y
-        self.noise_persistence_slider.draw(screen)
-        inner_y += 38
-
-        self._draw_label(screen, "Lacunarity", self.content_padding + 15, inner_y + 5)
-        self.noise_lacunarity_slider.rect.x = slider_x
-        self.noise_lacunarity_slider.rect.y = inner_y
-        self.noise_lacunarity_slider.draw(screen)
-        inner_y += 38
-
-        self._draw_label(screen, "Spawn", self.content_padding + 15, inner_y + 5)
-        self._draw_label(screen, "X:", slider_x, inner_y + 5)
-        self.spawn_x_input.rect.x = slider_x + 20
-        self.spawn_x_input.rect.y = inner_y
-        self.spawn_x_input.draw(screen)
-        self._draw_label(screen, "Z:", slider_x + 110, inner_y + 5)
-        self.spawn_z_input.rect.x = slider_x + 130
-        self.spawn_z_input.rect.y = inner_y
-        self.spawn_z_input.draw(screen)
-
-        return y + self.advanced_section.content_height

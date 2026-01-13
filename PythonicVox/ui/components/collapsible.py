@@ -72,9 +72,9 @@ class CollapsibleSection:
         Args:
             surface (pygame.Surface): Surface to draw on.
         """
-        # Update header rect position
-        self.header_rect.x = self.x
-        self.header_rect.y = self.y
+        # Use header_rect coordinates for consistency
+        x = self.header_rect.x
+        y = self.header_rect.y
 
         # Draw header background
         pygame.draw.rect(surface, settings.COLOR_PANEL_BG, self.header_rect, border_radius=4)
@@ -83,13 +83,13 @@ class CollapsibleSection:
         # Draw icon + title
         title_text = f"{self.icon} {self.title}" if self.icon else self.title
         title_surface = self.font.render(title_text, True, settings.COLOR_TEXT_PRIMARY)
-        title_x = self.x + 15
-        title_y = self.y + (self.header_height - title_surface.get_height()) // 2
+        title_x = x + 15
+        title_y = y + (self.header_height - title_surface.get_height()) // 2
         surface.blit(title_surface, (title_x, title_y))
 
         # Draw chevron (rotates based on animation_progress)
-        chevron_x = self.x + self.width - 25
-        chevron_y = self.y + self.header_height // 2
+        chevron_x = x + self.width - 25
+        chevron_y = y + self.header_height // 2
 
         # Calculate chevron points based on animation
         if self.animation_progress > 0.5:
@@ -118,8 +118,8 @@ class CollapsibleSection:
         """
         visible_height = int(self.content_height * self.animation_progress)
         return pygame.Rect(
-            self.x,
-            self.y + self.header_height,
+            self.header_rect.x,
+            self.header_rect.y + self.header_height,
             self.width,
             visible_height
         )

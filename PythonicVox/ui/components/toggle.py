@@ -76,12 +76,16 @@ class Toggle:
         Args:
             surface (pygame.Surface): Surface to draw on.
         """
+        # Use rect coordinates for consistency
+        x = self.rect.x
+        y = self.rect.y
+
         # Draw label to the left
         if self.label or self.icon:
             label_text = f"{self.icon} {self.label}" if self.icon else self.label
             label_surface = self.font.render(label_text, True, settings.COLOR_TEXT_PRIMARY)
-            label_x = self.x - label_surface.get_width() - 15
-            label_y = self.y + (settings.TOGGLE_HEIGHT - label_surface.get_height()) // 2
+            label_x = x - label_surface.get_width() - 15
+            label_y = y + (settings.TOGGLE_HEIGHT - label_surface.get_height()) // 2
             surface.blit(label_surface, (label_x, label_y))
 
         # Interpolate track color
@@ -98,10 +102,10 @@ class Toggle:
 
         # Calculate handle position
         handle_radius = (settings.TOGGLE_HEIGHT - 6) // 2
-        handle_left = self.x + handle_radius + 3
-        handle_right = self.x + settings.TOGGLE_WIDTH - handle_radius - 3
+        handle_left = x + handle_radius + 3
+        handle_right = x + settings.TOGGLE_WIDTH - handle_radius - 3
         handle_x = handle_left + (handle_right - handle_left) * self.animation_progress
-        handle_y = self.y + settings.TOGGLE_HEIGHT // 2
+        handle_y = y + settings.TOGGLE_HEIGHT // 2
 
         # Draw handle
         pygame.draw.circle(surface, settings.COLOR_TEXT_PRIMARY,
