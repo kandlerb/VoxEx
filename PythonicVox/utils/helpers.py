@@ -7,6 +7,7 @@ and common operations.
 
 Functions:
     draw_text_centered: Render text centered at a position.
+    draw_close_button: Draw an X close button within a rect.
     world_to_chunk: Convert world coordinates to chunk coordinates.
     chunk_to_world: Convert chunk coordinates to world coordinates.
     local_to_index: Convert local block coordinates to array index.
@@ -21,6 +22,8 @@ Usage:
     value = clamp(value, 0, 100)
     draw_text_centered(screen, "Hello", font, color, (100, 100))
 """
+
+import pygame
 
 # Constants for coordinate conversions
 CHUNK_SIZE = 16
@@ -49,6 +52,36 @@ def draw_text_centered(surface, text, font, color, center_pos):
     text_rect = text_surface.get_rect(center=center_pos)
     surface.blit(text_surface, text_rect)
     return text_rect
+
+
+def draw_close_button(surface, rect, color, line_width=2):
+    """
+    Draw an X close button within the given rect.
+
+    Draws two diagonal lines forming an X shape, with padding from
+    the rectangle edges.
+
+    Args:
+        surface (pygame.Surface): Surface to draw on.
+        rect (pygame.Rect): Rectangle defining the button bounds.
+        color (tuple): RGB color tuple for the X lines.
+        line_width (int): Width of the X lines. Default is 2.
+    """
+    padding = rect.width // 4
+    # Draw first diagonal (top-left to bottom-right)
+    pygame.draw.line(
+        surface, color,
+        (rect.left + padding, rect.top + padding),
+        (rect.right - padding, rect.bottom - padding),
+        line_width
+    )
+    # Draw second diagonal (top-right to bottom-left)
+    pygame.draw.line(
+        surface, color,
+        (rect.right - padding, rect.top + padding),
+        (rect.left + padding, rect.bottom - padding),
+        line_width
+    )
 
 
 # =============================================================================

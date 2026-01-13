@@ -76,6 +76,31 @@ MUSIC_VOLUME = 0.5  # Music volume (0.0 - 1.0)
 SFX_VOLUME = 0.8  # Sound effects volume (0.0 - 1.0)
 
 # =============================================================================
+# Settings Menu Configuration
+# =============================================================================
+SETTINGS_TABS = ["General", "Quality", "Performance", "Physics", "World"]
+
+# Tab styling
+TAB_HEIGHT = 40
+TAB_PADDING = 20
+TAB_COLOR = (50, 50, 70)
+TAB_ACTIVE_COLOR = (80, 80, 120)
+TAB_HOVER_COLOR = (65, 65, 90)
+TAB_UNDERLINE_COLOR = (120, 180, 255)
+TAB_UNDERLINE_HEIGHT = 3
+TAB_FONT_SIZE = 22
+
+# Settings panel
+SETTINGS_PANEL_MARGIN = 60
+SETTINGS_PANEL_COLOR = (35, 35, 50)
+SETTINGS_PANEL_BORDER_COLOR = (60, 60, 80)
+
+# Close button
+CLOSE_BUTTON_SIZE = 32
+CLOSE_BUTTON_COLOR = (180, 60, 60)
+CLOSE_BUTTON_HOVER_COLOR = (220, 80, 80)
+
+# =============================================================================
 # Block Types
 # =============================================================================
 AIR = 0

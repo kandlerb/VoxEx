@@ -24,6 +24,7 @@ from settings import (
     FPS_CAP, COLOR_BG
 )
 from ui.main_menu import MainMenu
+from ui.settings_menu import SettingsMenu
 
 
 def main():
@@ -49,7 +50,9 @@ def main():
     # Game state management
     current_state = "main_menu"
     main_menu = MainMenu(screen)
+    settings_menu = SettingsMenu(screen)
 
+    print("Creating settings menu...")
     print("Starting game loop...")
     print("=" * 40)
 
@@ -75,11 +78,22 @@ def main():
             elif result == "load_game":
                 print("[Game] Load game not implemented yet")
             elif result == "settings":
-                print("[Game] Settings menu not implemented yet")
+                current_state = "settings"
+                print("[Game] Opening settings menu...")
 
             # Render menu
             screen.fill(COLOR_BG)
             main_menu.draw(screen)
+
+        elif current_state == "settings":
+            result = settings_menu.update(events)
+
+            if result == "main_menu":
+                current_state = "main_menu"
+
+            # Render settings menu
+            screen.fill(COLOR_BG)
+            settings_menu.draw(screen)
 
         elif current_state == "game":
             # Future: moderngl 3D rendering
