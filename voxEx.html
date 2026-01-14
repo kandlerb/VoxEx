@@ -6583,6 +6583,8 @@
                  * @param {BlockId} blockId - Block ID to set
                  * @param {boolean} [createIfMissing=true] - Create chunk if it doesn't exist
                  * @returns {boolean} True if block was changed
+                 * @note This is the RAW data method. For gameplay block changes, use the global
+                 * setBlock() function which wraps this method with shadow, cache, and lighting updates.
                  */
                 setBlock(x, y, z, blockId, createIfMissing = true) {
                     if (isDebug) this._callCounts.setBlock++;
@@ -8385,38 +8387,6 @@
                         this.camera.position.copy(this.position);
                         this.camera.position.y += this.eyeHeight;
                     }
-                }
-
-                /**
-                 * Handle block break/place interaction.
-                 * @param {BlockHit|null} hit - The block hit from raycasting
-                 * @param {number} button - Mouse button (0 = left/break, 2 = right/place)
-                 * @returns {BlockInteractionResult|null} Result of the interaction or null
-                 */
-                handleBlockInteraction(hit, button) {
-                    if (!hit) return;
-
-                    const { x, y, z, face } = hit;
-
-                    if (button === 0) {
-                        // Break block
-                        if (this.world.getBlock(x, y, z) !== BLOCKS.BEDROCK) {
-                            this.world.setBlock(x, y, z, BLOCKS.AIR);
-                            return { type: 'break', x, y, z };
-                        }
-                    } else if (button === 2 && face) {
-                        // Place block
-                        const nx = x + face[0];
-                        const ny = y + face[1];
-                        const nz = z + face[2];
-
-                        // Check player collision
-                        if (!this.wouldCollideWithPlayer(nx, ny, nz)) {
-                            this.world.setBlock(nx, ny, nz, this.selectedBlockId);
-                            return { type: 'place', x: nx, y: ny, z: nz, blockId: this.selectedBlockId };
-                        }
-                    }
-                    return null;
                 }
 
                 /**
@@ -15618,12 +15588,6 @@
                         </div>
                     `;
 
-                    card.addEventListener('click', (e) => {
-                        if (e.target.classList.contains('delete') || e.target.classList.contains('manage')) return;
-                        selectWorldCard(saveName);
-                    });
-                    card.querySelector('.delete').addEventListener('click', async (e) => { e.stopPropagation(); await deleteWorld(saveName); });
-                    card.querySelector('.manage').addEventListener('click', (e) => { e.stopPropagation(); openWorldManageModal(saveName); });
                     container.appendChild(card);
                 });
 
@@ -15731,6 +15695,33 @@
             document.getElementById('world-modal-close')?.addEventListener('click', closeWorldManageModal);
             document.getElementById('world-manage-modal')?.addEventListener('click', (e) => {
                 if (e.target.id === 'world-manage-modal') closeWorldManageModal();
+            });
+
+            // Delegated event listener for world card actions (delete, manage)
+            document.getElementById('saved-worlds-container')?.addEventListener('click', async (e) => {
+                const deleteBtn = e.target.closest('.world-card-btn.delete');
+                const manageBtn = e.target.closest('.world-card-btn.manage');
+                const card = e.target.closest('.world-card');
+
+                if (deleteBtn) {
+                    e.stopPropagation();
+                    const saveName = deleteBtn.dataset.save;
+                    if (saveName) await deleteWorld(saveName);
+                    return;
+                }
+
+                if (manageBtn) {
+                    e.stopPropagation();
+                    const saveName = manageBtn.dataset.save;
+                    if (saveName) openWorldManageModal(saveName);
+                    return;
+                }
+
+                // Card click (not on buttons) selects the world
+                if (card && !deleteBtn && !manageBtn) {
+                    const saveName = card.dataset.save;
+                    if (saveName) selectWorldCard(saveName);
+                }
             });
 
             // Calculate storage for a world
@@ -17171,6 +17162,24 @@
                     }
                 }
             }
+            /**
+             * setBlock - Facade function for block modifications with full side effects.
+             * =========================================================================
+             * This is the PRIMARY entry point for gameplay block changes. Do NOT use
+             * voxelWorld.setBlock() directly unless you intentionally want to skip:
+             * - Shadow recalculation (markShadowsDirty)
+             * - Cache invalidation (collision, face, neighbor caches)
+             * - Lighting propagation (light update queue)
+             *
+             * The architecture analyzer reports this as a "cycle" because this function
+             * references voxelWorld which has its own setBlock method. This is intentional
+             * - it's a Facade Pattern, not a problematic circular dependency.
+             *
+             * @param {GlobalCoord} x - World X coordinate
+             * @param {GlobalCoord} y - World Y coordinate
+             * @param {GlobalCoord} z - World Z coordinate
+             * @param {BlockId} id - Block ID to set
+             */
             function setBlock(x, y, z, id) {
                 // Get old block ID before setting
                 const oldId = voxelWorld.getBlock(x, y, z);
@@ -26483,6 +26492,9 @@
             //   - Fills caves, overhangs, and shaded areas
             // Note: Cross-chunk propagation happens in propagateLightFromNeighbors()
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
+                // ARCHITECTURE NOTE: This is the FULL-RECALC path for chunk lighting.
+                // Used during: (1) initial chunk generation, (2) SunlightTask bailout.
+                // For single-block changes, the incremental path uses SunlightTask instead.
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
                 // Ensure skyLight array is correct size (handles old cached chunks with different height)
@@ -26535,7 +26547,7 @@
                 // Phase 2: BFS horizontal propagation
                 // Spreads light sideways into caves and overhangs
                 // Note: Only propagates within chunk bounds during initial generation
-                // Cross-chunk propagation happens via updateSunlightAt() when blocks change
+                // Cross-chunk propagation is handled separately by the incremental lighting system
                 let qIdx = 0;
                 while (qIdx < queue.length) {
                     const lx = queue[qIdx++];
@@ -26622,7 +26634,7 @@
 
                 // BFS propagation within chunk bounds
                 // Note: Light doesn't cross chunk boundaries during initial generation
-                // Cross-chunk propagation happens via updateBlockLightAt() when blocks change
+                // Cross-chunk propagation is handled separately by the incremental lighting system
                 let qIdx = 0;
                 while (qIdx < queue.length) {
                     const lx = queue[qIdx++];
@@ -29463,7 +29475,7 @@
                     }
                 }
 
-                // Update particle system (dt passed from animate loop for framerate independence)
+                // Update particle system (dt passed from main loop for framerate independence)
                 if (particleSystem && controls) {
                     const playerWorldPos = getPlayerWorldPosition();
                     particleSystem.update(dt, playerWorldPos);
@@ -30226,6 +30238,17 @@
                     requestAnimationFrame(animate);
                 }
             }
+            /**
+             * Check if user is currently typing in an input field.
+             * @returns {boolean} True if focused on input, textarea, or contentEditable element.
+             */
+            function isTypingInInput() {
+                const active = document.activeElement;
+                if (!active) return false;
+                const tag = active.tagName.toLowerCase();
+                return tag === 'input' || tag === 'textarea' || active.isContentEditable;
+            }
+
             const onKeyDown = function (event) {
                 // 1. Global Keys (Works in Menu & Game)
                 if (event.code === "Backquote") {
@@ -30236,8 +30259,9 @@
                     if (perfOverlay) { perfOverlay.style.display = isDebug ? "block" : "none"; }
                     return;
                 }
-                // Pose Debug Mode (P key)
+                // Pose Debug Mode (P key) - skip if typing
                 if (event.code === "KeyP" && !event.repeat) {
+                    if (isTypingInInput()) return;
                     togglePoseDebug();
                     return;
                 }
@@ -30283,8 +30307,9 @@
                         return;
                     }
                 }
-                // E key to toggle inventory (works globally)
+                // E key to toggle inventory - skip if typing
                 if (event.code === "KeyE") {
+                    if (isTypingInInput()) return;
                     if (uiManager.isInventoryOpen()) {
                         uiManager.closeInventory(controls);
                     } else if (controls.isLocked) {
