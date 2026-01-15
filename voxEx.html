@@ -5533,8 +5533,14 @@
                         isFullySolid: false, // Assume not solid until analyzed
                         hasMesh: false,      // No mesh initially
                         faceCount: 0,        // No faces initially
+                        // Y bounds
                         minBlockY: i * SECTION_HEIGHT,  // Section start Y
                         maxBlockY: i * SECTION_HEIGHT,  // Will be updated during analysis
+                        // X/Z bounds (local coordinates 0-15)
+                        minBlockX: 0,        // Will be updated during analysis
+                        maxBlockX: 15,       // Full extent until analyzed
+                        minBlockZ: 0,        // Will be updated during analysis
+                        maxBlockZ: 15,       // Full extent until analyzed
                         analyzed: false      // Whether section has been analyzed
                     };
                 }
@@ -5595,6 +5601,11 @@
                     let isFullySolid = true;
                     let minBlockY = baseY + SECTION_HEIGHT; // Start beyond section
                     let maxBlockY = baseY - 1;              // Start before section
+                    // Track X/Z bounds (start inverted, will be corrected as blocks found)
+                    let minBlockX = chunkSize;  // 16 (beyond valid range)
+                    let maxBlockX = -1;         // Before valid range
+                    let minBlockZ = chunkSize;
+                    let maxBlockZ = -1;
 
                     // Scan all blocks in section
                     for (let ly = 0; ly < SECTION_HEIGHT; ly++) {
@@ -5612,9 +5623,15 @@
                                     // Found non-air block
                                     isEmpty = false;
 
-                                    // Update bounds
+                                    // Update Y bounds
                                     if (y < minBlockY) minBlockY = y;
                                     if (y > maxBlockY) maxBlockY = y;
+
+                                    // Update X/Z bounds
+                                    if (lx < minBlockX) minBlockX = lx;
+                                    if (lx > maxBlockX) maxBlockX = lx;
+                                    if (lz < minBlockZ) minBlockZ = lz;
+                                    if (lz > maxBlockZ) maxBlockZ = lz;
 
                                     // Check if block breaks "fully solid" status
                                     if (isFullySolid) {
@@ -5632,11 +5649,16 @@
                         }
                     }
 
-                    // If section is empty, it's not fully solid (no blocks = nothing solid)
+                    // If section is empty, it's not fully solid and bounds are meaningless
                     if (isEmpty) {
                         isFullySolid = false;
                         minBlockY = baseY;
                         maxBlockY = baseY;
+                        // Reset X/Z to full extent for empty sections (won't be used anyway)
+                        minBlockX = 0;
+                        maxBlockX = chunkSize - 1;
+                        minBlockZ = 0;
+                        maxBlockZ = chunkSize - 1;
                     }
 
                     // Update section data
@@ -5644,9 +5666,61 @@
                     section.isFullySolid = isFullySolid;
                     section.minBlockY = minBlockY;
                     section.maxBlockY = maxBlockY;
+                    // Store X/Z bounds
+                    section.minBlockX = minBlockX;
+                    section.maxBlockX = maxBlockX;
+                    section.minBlockZ = minBlockZ;
+                    section.maxBlockZ = maxBlockZ;
                     section.analyzed = true;
                 }
             }
+
+            /**
+             * Compute world-space bounding box for a section.
+             * Uses tight bounds from section analysis.
+             * @param {number} cx - Chunk X coordinate
+             * @param {number} cz - Chunk Z coordinate
+             * @param {Object} section - Section metadata object
+             * @param {THREE.Box3} targetBox - Box3 to populate (avoids allocation)
+             * @returns {THREE.Box3} The populated bounding box
+             */
+            function getSectionWorldBounds(cx, cz, section, targetBox) {
+                const chunkWorldX = cx * WORLD_DIMS.chunkSize;
+                const chunkWorldZ = cz * WORLD_DIMS.chunkSize;
+                const yOffset = WORLD_DIMS.yOffset;
+
+                // Use tight bounds if analyzed, otherwise full section extent
+                if (section.analyzed && !section.isEmpty) {
+                    targetBox.min.set(
+                        chunkWorldX + section.minBlockX,
+                        section.minBlockY - yOffset,
+                        chunkWorldZ + section.minBlockZ
+                    );
+                    targetBox.max.set(
+                        chunkWorldX + section.maxBlockX + 1,  // +1 for block extent
+                        section.maxBlockY + 1 - yOffset,      // +1 for block extent
+                        chunkWorldZ + section.maxBlockZ + 1   // +1 for block extent
+                    );
+                } else {
+                    // Full section extent (fallback)
+                    const sectionIdx = Math.floor(section.minBlockY / SECTION_HEIGHT);
+                    targetBox.min.set(
+                        chunkWorldX,
+                        sectionIdx * SECTION_HEIGHT - yOffset,
+                        chunkWorldZ
+                    );
+                    targetBox.max.set(
+                        chunkWorldX + WORLD_DIMS.chunkSize,
+                        (sectionIdx + 1) * SECTION_HEIGHT - yOffset,
+                        chunkWorldZ + WORLD_DIMS.chunkSize
+                    );
+                }
+
+                return targetBox;
+            }
+
+            // Pooled Box3 for section bounds calculations (avoid per-call allocation)
+            const _sectionBox3 = new THREE.Box3();
 
             // Chunk memory constants for LRU eviction
             const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
@@ -21229,6 +21303,7 @@
                 for (const v of chunkRenderedFaces.values()) { totalFaces += v; }
                 // Calculate section stats for debug overlay
                 let totalSections = 0, emptySections = 0, solidSections = 0, analyzedSections = 0;
+                let tightBoundsCount = 0, fullBoundsCount = 0;
                 for (const chunk of chunks.values()) {
                     if (chunk.sections) {
                         for (let i = 0; i < chunk.sections.length; i++) {
@@ -21238,6 +21313,16 @@
                                 analyzedSections++;
                                 if (sec.isEmpty) emptySections++;
                                 if (sec.isFullySolid) solidSections++;
+                                // Check if bounds are tighter than full 16×16
+                                if (!sec.isEmpty) {
+                                    const xExtent = sec.maxBlockX - sec.minBlockX + 1;
+                                    const zExtent = sec.maxBlockZ - sec.minBlockZ + 1;
+                                    if (xExtent < 16 || zExtent < 16) {
+                                        tightBoundsCount++;
+                                    } else {
+                                        fullBoundsCount++;
+                                    }
+                                }
                             }
                         }
                     }
@@ -21294,6 +21379,11 @@
                     " | analyzed: " +
                     analyzedSections +
                     ")\n" +
+                    "Section Bounds: tight=" +
+                    tightBoundsCount +
+                    " full=" +
+                    fullBoundsCount +
+                    "\n" +
                     "Rendered faces (quads): " +
                     totalFaces.toLocaleString() +
                     "\n" +
