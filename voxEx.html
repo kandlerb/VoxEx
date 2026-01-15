@@ -4916,6 +4916,10 @@
                 maxRenderDistance: 16,
                 buildQueueLimit: savedSettings.buildQueueLimit || 2,
                 maxCachedChunks: savedSettings.maxCachedChunks || 350,
+                // Chunk Data Pool settings (Nvidium-style persistence)
+                dataKeepDistance: savedSettings.dataKeepDistance ?? 48,          // Keep chunk DATA within this radius (chunks, larger than renderDistance)
+                maxChunkDataMemoryMB: savedSettings.maxChunkDataMemoryMB ?? 1024, // Memory budget for chunk data in MB
+                chunkDataEvictionBatch: savedSettings.chunkDataEvictionBatch ?? 50, // How many chunks to evict per cleanup cycle
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5105,6 +5109,10 @@
                 renderDistance: 8,
                 buildQueueLimit: 2,
                 maxCachedChunks: 350,
+                // Chunk Data Pool defaults (Nvidium-style persistence)
+                dataKeepDistance: 48,          // Keep chunk DATA within this radius (chunks)
+                maxChunkDataMemoryMB: 1024,    // Memory budget for chunk data in MB
+                chunkDataEvictionBatch: 50,    // How many chunks to evict per cleanup cycle
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -5476,6 +5484,29 @@
                 worldHeight: 320,
             };
             const CHUNK_BOUNDING_RADIUS = Math.sqrt(8 * 8 + Math.pow(WORLD_DIMS.chunkHeight * 0.5, 2) + 8 * 8);
+
+            // =====================================================
+            // CHUNK MESH STATES
+            // =====================================================
+            // Tracks lifecycle of chunk meshes for state machine management
+            const MESH_STATE = {
+                NONE: 0,      // No mesh exists, data may or may not exist
+                QUEUED: 1,    // In build queue, waiting to be meshed
+                BUILDING: 2,  // Currently being meshed (async)
+                READY: 3,     // Mesh exists and is current
+                STALE: 4,     // Mesh exists but needs rebuild (block changed)
+                DISPOSED: 5   // Mesh was disposed, data may still exist
+            };
+            Object.freeze(MESH_STATE);
+
+            // Section constants for 16×16×16 vertical subdivision
+            const SECTION_HEIGHT = 16;
+            const SECTIONS_PER_CHUNK = Math.ceil(WORLD_DIMS.chunkHeight / SECTION_HEIGHT); // 20 sections for 320 height
+
+            // Chunk memory constants for LRU eviction
+            const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
+            const DEFAULT_DATA_KEEP_DISTANCE = 48; // chunks - larger than max render distance
+            const DEFAULT_MEMORY_BUDGET_MB = 512; // MB - default memory budget for chunk data
 
             // --- THREE.js Built-in Pooled Objects (avoid per-call allocation) ---
             const _box3Player = new THREE.Box3();
@@ -6535,6 +6566,8 @@
                 ensureChunk(cx, cz) {
                     const key = this.getChunkKey(cx, cz);
                     if (this.chunks.has(key)) {
+                        // Update LRU access time
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                         return this.chunks.get(key);
                     }
                     // Queue for generation
@@ -6562,10 +6595,15 @@
                     const cz = (z >> 4) | 0;
                     const key = `${cx},${cz}`;  // Inline to avoid getChunkKey function call
                     // OPTIMIZATION: Chunk cache for sequential block access in same chunk
-                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    const isCacheHit = key === this._lastChunkKey;
+                    const chunk = isCacheHit ? this._lastChunk : this.chunks.get(key);
                     if (!chunk) return undefined;
-                    this._lastChunkKey = key;
-                    this._lastChunk = chunk;
+                    // Update LRU access time only on cache miss (new chunk access)
+                    if (!isCacheHit) {
+                        this._lastChunkKey = key;
+                        this._lastChunk = chunk;
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
+                    }
                     // OPTIMIZATION: Bitwise ops for local coords and index
                     const lx = x & 15;
                     const lz = z & 15;
@@ -6608,6 +6646,7 @@
                             startZ: cz * WORLD_DIMS.chunkSize,
                         };
                         this.chunks.set(key, chunk);
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                         this.activeChunks.add(key);
                     } else if (!chunk.blocks) {
                         // Upgrade legacy chunk format to include lighting buffers
@@ -6619,9 +6658,12 @@
                             blockLight: new Uint8Array(legacySize).fill(1),
                         };
                         this.chunks.set(key, chunk);
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                        // Update LRU access time for existing chunk
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                     }
 
                     // OPTIMIZATION: Bitwise for local coords and index
@@ -6897,6 +6939,10 @@
                     this.modifiedChunks.delete(key);
                     this.activeChunks.delete(key);
                     this.queuedChunkKeys.delete(key);
+                    // Notify ChunkDataPool that chunk data was removed
+                    if (typeof chunkDataPool !== 'undefined') {
+                        chunkDataPool.unregister(key);
+                    }
                 }
 
                 /**
@@ -6915,6 +6961,481 @@
                     for (const key in this._callCounts) {
                         this._callCounts[key] = 0;
                     }
+                }
+            }
+
+            // =====================================================
+            // CHUNK DATA POOL
+            // =====================================================
+            // Manages chunk data lifecycle separately from mesh lifecycle.
+            // Keeps chunk data in memory longer than meshes for fast rebuilds.
+            // Uses LRU eviction when memory budget is exceeded.
+            // =====================================================
+            class ChunkDataPool {
+                /**
+                 * Create a ChunkDataPool to manage chunk data lifecycle.
+                 * @param {Map<string, Object>} chunksMap - Reference to global chunks Map
+                 * @param {Object} settings - Reference to SETTINGS object
+                 */
+                constructor(chunksMap, settings) {
+                    this.chunks = chunksMap;           // Reference to global chunks Map
+                    this.settings = settings;          // Reference to SETTINGS object
+                    this.metadata = new Map();         // ChunkKey -> { lastAccessed, dataSize, hasData }
+                    this.totalDataSize = 0;            // Estimated total memory usage in bytes
+                    this._callCounts = { get: 0, touch: 0, evict: 0, estimateSize: 0 };
+                }
+
+                /**
+                 * Get chunk data, updating access time.
+                 * @param {string} key - Chunk key
+                 * @returns {Object|undefined} Chunk data or undefined
+                 */
+                get(key) {
+                    if (isDebug) this._callCounts.get++;
+                    const data = this.chunks.get(key);
+                    if (data) {
+                        this.touch(key);
+                    }
+                    return data;
+                }
+
+                /**
+                 * Check if chunk data exists without updating access time.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if chunk data exists
+                 */
+                has(key) {
+                    return this.chunks.has(key);
+                }
+
+                /**
+                 * Update last accessed time for a chunk.
+                 * @param {string} key - Chunk key
+                 */
+                touch(key) {
+                    if (isDebug) this._callCounts.touch++;
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = this._createDefaultMeta();
+                        this.metadata.set(key, meta);
+                    }
+                    meta.lastAccessed = performance.now();
+                    meta.hasData = this.chunks.has(key);
+
+                    // Update size estimate if we haven't yet
+                    if (meta.dataSize === 0 && meta.hasData) {
+                        meta.dataSize = this.estimateChunkSize(this.chunks.get(key));
+                        this.totalDataSize += meta.dataSize;
+                    }
+                }
+
+                /**
+                 * Register new chunk data.
+                 * @param {string} key - Chunk key
+                 * @param {Object} data - Chunk data
+                 */
+                register(key, data) {
+                    const size = this.estimateChunkSize(data);
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = this._createDefaultMeta();
+                        meta.dataSize = size;
+                        meta.hasData = true;
+                        this.metadata.set(key, meta);
+                    } else {
+                        // Update existing metadata
+                        this.totalDataSize -= meta.dataSize; // Remove old size
+                        meta.lastAccessed = performance.now();
+                        meta.dataSize = size;
+                        meta.hasData = true;
+                    }
+                    this.totalDataSize += size;
+                    // Trigger section analysis for newly registered chunk
+                    this.analyzeChunkSections(key, data);
+                }
+
+                /**
+                 * Unregister chunk data (called when chunk is purged).
+                 * @param {string} key - Chunk key
+                 */
+                unregister(key) {
+                    const meta = this.metadata.get(key);
+                    if (meta) {
+                        this.totalDataSize -= meta.dataSize;
+                        meta.hasData = false;
+                        meta.dataSize = 0;
+                        // Keep metadata for LRU tracking even after data is gone
+                    }
+                }
+
+                /**
+                 * Estimate memory size of chunk data in bytes.
+                 * @param {Object} chunk - Chunk data object
+                 * @returns {number} Estimated size in bytes
+                 */
+                estimateChunkSize(chunk) {
+                    if (isDebug) this._callCounts.estimateSize++;
+                    if (!chunk) return 0;
+
+                    let size = 0;
+                    // Block data: Uint8Array
+                    if (chunk.blocks) {
+                        size += chunk.blocks.byteLength || chunk.blocks.length;
+                    } else if (chunk.length) {
+                        // Legacy format: chunk itself is the array
+                        size += chunk.length;
+                    }
+                    // Light data: Uint8Arrays
+                    if (chunk.skyLight) size += chunk.skyLight.byteLength || chunk.skyLight.length;
+                    if (chunk.blockLight) size += chunk.blockLight.byteLength || chunk.blockLight.length;
+
+                    // Object overhead estimate
+                    size += 100; // Metadata, keys, etc.
+
+                    return size;
+                }
+
+                /**
+                 * Get chunks eligible for eviction (outside dataKeepDistance, not modified).
+                 * @param {number} playerCX - Player chunk X
+                 * @param {number} playerCZ - Player chunk Z
+                 * @param {Set<string>} modifiedChunks - Set of modified chunk keys
+                 * @returns {Array<{key: string, lastAccessed: number, dist: number}>} Eviction candidates sorted by priority
+                 */
+                getEvictionCandidates(playerCX, playerCZ, modifiedChunks) {
+                    const dataKeepDist = this.settings.dataKeepDistance || 48;
+                    const dataKeepDistSq = dataKeepDist * dataKeepDist;
+                    const candidates = [];
+
+                    for (const [key, meta] of this.metadata) {
+                        if (!meta.hasData) continue;
+                        if (modifiedChunks.has(key)) continue; // Never evict modified chunks
+
+                        const [cx, cz] = key.split(',').map(Number);
+                        const distSq = (cx - playerCX) ** 2 + (cz - playerCZ) ** 2;
+
+                        // Only consider chunks outside dataKeepDistance
+                        if (distSq > dataKeepDistSq) {
+                            candidates.push({
+                                key,
+                                lastAccessed: meta.lastAccessed,
+                                dist: distSq,
+                                size: meta.dataSize
+                            });
+                        }
+                    }
+
+                    // Sort by: outside keep distance first, then by last accessed (oldest first)
+                    candidates.sort((a, b) => {
+                        // Primary: older access time = higher eviction priority
+                        return a.lastAccessed - b.lastAccessed;
+                    });
+
+                    return candidates;
+                }
+
+                /**
+                 * Evict chunks to stay within memory budget.
+                 * @param {number} playerCX - Player chunk X
+                 * @param {number} playerCZ - Player chunk Z
+                 * @param {Set<string>} modifiedChunks - Set of modified chunk keys
+                 * @param {function} purgeCallback - Function to call to actually purge chunk
+                 * @returns {number} Number of chunks evicted
+                 */
+                evictIfNeeded(playerCX, playerCZ, modifiedChunks, purgeCallback) {
+                    const maxBytes = (this.settings.maxChunkDataMemoryMB || 1024) * 1024 * 1024;
+
+                    if (this.totalDataSize <= maxBytes) {
+                        return 0; // Under budget, no eviction needed
+                    }
+
+                    const candidates = this.getEvictionCandidates(playerCX, playerCZ, modifiedChunks);
+                    const batchSize = this.settings.chunkDataEvictionBatch || 50;
+                    let evicted = 0;
+                    let freedBytes = 0;
+                    const targetFree = this.totalDataSize - maxBytes + (maxBytes * 0.1); // Free 10% extra
+
+                    for (const candidate of candidates) {
+                        if (evicted >= batchSize) break;
+                        if (freedBytes >= targetFree) break;
+
+                        if (isDebug) this._callCounts.evict++;
+                        purgeCallback(candidate.key);
+                        this.unregister(candidate.key);
+                        freedBytes += candidate.size;
+                        evicted++;
+                    }
+
+                    if (evicted > 0 && isDebug) {
+                        logDebug(`[ChunkDataPool] Evicted ${evicted} chunks, freed ~${(freedBytes / 1024 / 1024).toFixed(1)}MB`);
+                    }
+
+                    return evicted;
+                }
+
+                /**
+                 * Get statistics about the chunk data pool.
+                 * @returns {Object} Pool statistics
+                 */
+                getStats() {
+                    let chunksWithData = 0;
+                    for (const [, meta] of this.metadata) {
+                        if (meta.hasData) chunksWithData++;
+                    }
+
+                    return {
+                        totalChunks: this.chunks.size,
+                        trackedChunks: this.metadata.size,
+                        chunksWithData,
+                        totalDataSizeMB: (this.totalDataSize / 1024 / 1024).toFixed(1),
+                        maxDataSizeMB: this.settings.maxChunkDataMemoryMB || 1024,
+                        callCounts: { ...this._callCounts }
+                    };
+                }
+
+                /**
+                 * Reset call counters for profiling.
+                 */
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
+                }
+
+                /**
+                 * Create default metadata object with expanded fields.
+                 * @private
+                 * @returns {Object} Default metadata object
+                 */
+                _createDefaultMeta() {
+                    return {
+                        lastAccessed: performance.now(),
+                        dataSize: 0,
+                        hasData: false,
+                        // Mesh lifecycle state
+                        meshState: MESH_STATE.NONE,
+                        // Y bounds (actual blocks, not full height)
+                        minY: 0,
+                        maxY: 0,
+                        boundsComputed: false,
+                        // Section visibility bitmap (20 bits for 20 sections)
+                        // Bit N = 1 means section N has at least one non-air block
+                        visibleSections: 0,
+                        // Block counts per section for isEmpty/isFullySolid detection
+                        sectionBlockCounts: null, // Lazily allocated Int16Array[20]
+                        // Section flags: packed as 2 bits per section (empty=0, mixed=1, solid=2)
+                        sectionFlags: 0
+                    };
+                }
+
+                /**
+                 * Analyze chunk data to compute section visibility and Y bounds.
+                 * Called once when chunk data is first loaded/generated.
+                 * @param {string} key - Chunk key
+                 * @param {Object} chunkData - Chunk block data
+                 * @returns {Object|null} Computed metadata { minY, maxY, visibleSections, sectionBlockCounts }
+                 */
+                analyzeChunkSections(key, chunkData) {
+                    const blocks = chunkData.blocks || chunkData;
+                    const meta = this.metadata.get(key);
+                    if (!meta) return null;
+
+                    // Already computed?
+                    if (meta.boundsComputed) {
+                        return {
+                            minY: meta.minY,
+                            maxY: meta.maxY,
+                            visibleSections: meta.visibleSections,
+                            sectionBlockCounts: meta.sectionBlockCounts
+                        };
+                    }
+
+                    // Initialize section tracking
+                    const sectionCounts = new Int16Array(SECTIONS_PER_CHUNK);
+                    let visibleSections = 0;
+                    let globalMinY = WORLD_DIMS.chunkHeight;
+                    let globalMaxY = 0;
+
+                    const chunkSize = WORLD_DIMS.chunkSize; // 16
+                    const chunkHeight = WORLD_DIMS.chunkHeight; // 320
+                    const blocksPerLayer = chunkSize * chunkSize; // 256
+
+                    // Scan all blocks, tracking per-section statistics
+                    for (let y = 0; y < chunkHeight; y++) {
+                        const sectionIdx = Math.floor(y / SECTION_HEIGHT);
+                        const yOffset = y * blocksPerLayer;
+
+                        for (let z = 0; z < chunkSize; z++) {
+                            const zOffset = z * chunkSize;
+                            for (let x = 0; x < chunkSize; x++) {
+                                const blockId = blocks[x + zOffset + yOffset];
+
+                                if (blockId !== 0) { // AIR = 0
+                                    sectionCounts[sectionIdx]++;
+
+                                    // Update global Y bounds
+                                    if (y < globalMinY) globalMinY = y;
+                                    if (y > globalMaxY) globalMaxY = y;
+
+                                    // Mark section as having blocks (set bit)
+                                    visibleSections |= (1 << sectionIdx);
+                                }
+                            }
+                        }
+                    }
+
+                    // Compute section flags (empty=0, mixed=1, solid=2)
+                    // Each section is 16×16×16 = 4096 blocks
+                    const blocksPerSection = SECTION_HEIGHT * chunkSize * chunkSize;
+                    let sectionFlags = 0;
+                    for (let s = 0; s < SECTIONS_PER_CHUNK; s++) {
+                        const count = sectionCounts[s];
+                        let flag = 0;
+                        if (count === 0) {
+                            flag = 0; // Empty
+                        } else if (count === blocksPerSection) {
+                            flag = 2; // Fully solid (no visible faces inside)
+                        } else {
+                            flag = 1; // Mixed (has visible faces)
+                        }
+                        sectionFlags |= (flag << (s * 2));
+                    }
+
+                    // Handle edge case: no blocks found
+                    if (globalMinY > globalMaxY) {
+                        globalMinY = 0;
+                        globalMaxY = 0;
+                    } else {
+                        // Add 1 to maxY for top face rendering
+                        globalMaxY = Math.min(chunkHeight - 1, globalMaxY + 1);
+                    }
+
+                    // Store computed values
+                    meta.minY = globalMinY;
+                    meta.maxY = globalMaxY;
+                    meta.visibleSections = visibleSections;
+                    meta.sectionBlockCounts = sectionCounts;
+                    meta.sectionFlags = sectionFlags;
+                    meta.boundsComputed = true;
+
+                    return {
+                        minY: globalMinY,
+                        maxY: globalMaxY,
+                        visibleSections,
+                        sectionBlockCounts: sectionCounts,
+                        sectionFlags
+                    };
+                }
+
+                /**
+                 * Invalidate cached section analysis (call when blocks change).
+                 * @param {string} key - Chunk key
+                 */
+                invalidateSectionAnalysis(key) {
+                    const meta = this.metadata.get(key);
+                    if (meta) {
+                        meta.boundsComputed = false;
+                        meta.meshState = MESH_STATE.STALE;
+                    }
+                }
+
+                /**
+                 * Get section info for a chunk.
+                 * @param {string} key - Chunk key
+                 * @returns {Object|null} Section metadata or null
+                 */
+                getSectionInfo(key) {
+                    const meta = this.metadata.get(key);
+                    if (!meta || !meta.boundsComputed) return null;
+
+                    return {
+                        minY: meta.minY,
+                        maxY: meta.maxY,
+                        visibleSections: meta.visibleSections,
+                        sectionBlockCounts: meta.sectionBlockCounts,
+                        sectionFlags: meta.sectionFlags,
+                        // Helper: count of non-empty sections
+                        activeSectionCount: this.countBits(meta.visibleSections)
+                    };
+                }
+
+                /**
+                 * Count set bits in a 32-bit integer (population count).
+                 * @param {number} n - Integer to count bits in
+                 * @returns {number} Number of set bits
+                 */
+                countBits(n) {
+                    n = n - ((n >>> 1) & 0x55555555);
+                    n = (n & 0x33333333) + ((n >>> 2) & 0x33333333);
+                    return (((n + (n >>> 4)) & 0x0F0F0F0F) * 0x01010101) >>> 24;
+                }
+
+                /**
+                 * Check if a specific section is empty.
+                 * @param {string} key - Chunk key
+                 * @param {number} sectionIdx - Section index (0-19)
+                 * @returns {boolean} True if section is empty
+                 */
+                isSectionEmpty(key, sectionIdx) {
+                    const meta = this.metadata.get(key);
+                    if (!meta || !meta.boundsComputed) return false;
+                    return (meta.visibleSections & (1 << sectionIdx)) === 0;
+                }
+
+                /**
+                 * Check if a specific section is fully solid (no internal faces).
+                 * @param {string} key - Chunk key
+                 * @param {number} sectionIdx - Section index (0-19)
+                 * @returns {boolean} True if section is fully solid
+                 */
+                isSectionSolid(key, sectionIdx) {
+                    const meta = this.metadata.get(key);
+                    if (!meta || !meta.boundsComputed) return false;
+                    const flag = (meta.sectionFlags >>> (sectionIdx * 2)) & 0x3;
+                    return flag === 2;
+                }
+
+                /**
+                 * Set mesh state for a chunk.
+                 * @param {string} key - Chunk key
+                 * @param {number} state - MESH_STATE value
+                 */
+                setMeshState(key, state) {
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = this._createDefaultMeta();
+                        this.metadata.set(key, meta);
+                    }
+                    meta.meshState = state;
+                }
+
+                /**
+                 * Get mesh state for a chunk.
+                 * @param {string} key - Chunk key
+                 * @returns {number} MESH_STATE value
+                 */
+                getMeshState(key) {
+                    const meta = this.metadata.get(key);
+                    return meta ? meta.meshState : MESH_STATE.NONE;
+                }
+
+                /**
+                 * Check if chunk needs mesh build.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if mesh should be built
+                 */
+                needsMeshBuild(key) {
+                    const state = this.getMeshState(key);
+                    return state === MESH_STATE.NONE || state === MESH_STATE.STALE;
+                }
+
+                /**
+                 * Check if chunk mesh is ready.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if mesh exists and is current
+                 */
+                isMeshReady(key) {
+                    return this.getMeshState(key) === MESH_STATE.READY;
                 }
             }
 
@@ -9643,7 +10164,7 @@
                     }
                 }
             }
-            const chunkDataPool = new Uint8ArrayPool();
+            const uint8ArrayPool = new Uint8ArrayPool();
 
             // --- OPTIMIZATION 4: LOD System Configuration ---
             const LOD_CONFIG = {
@@ -10972,6 +11493,34 @@
                 const waitingLightLen = typeof chunksNeedingLightingUpdate !== 'undefined' ? chunksNeedingLightingUpdate.size : 0;
                 html += `EdgeLight: ${edgeLightQLen} | Wait: ${waitingLightLen}\n`;
                 html += `Built: ${perfMetrics.chunksBuilt} | Skip: ${perfMetrics.chunksSkipped}\n`;
+                // Chunk Data Pool stats (Nvidium-style persistence)
+                const poolStats = chunkDataPool.getStats();
+                const poolMemColor = parseFloat(poolStats.totalDataSizeMB) > poolStats.maxDataSizeMB * 0.9 ? 'perf-warn' : '';
+                html += `<span class="perf-section">── Data Pool ──</span>\n`;
+                html += `<span class="${poolMemColor}">Memory: ${poolStats.totalDataSizeMB}/${poolStats.maxDataSizeMB}MB</span>\n`;
+                html += `Tracked: ${poolStats.chunksWithData} chunks\n`;
+                // Count mesh states
+                let meshStateCount = { none: 0, queued: 0, building: 0, ready: 0, stale: 0 };
+                for (const [, meta] of chunkDataPool.metadata) {
+                    switch (meta.meshState) {
+                        case MESH_STATE.NONE: meshStateCount.none++; break;
+                        case MESH_STATE.QUEUED: meshStateCount.queued++; break;
+                        case MESH_STATE.BUILDING: meshStateCount.building++; break;
+                        case MESH_STATE.READY: meshStateCount.ready++; break;
+                        case MESH_STATE.STALE: meshStateCount.stale++; break;
+                    }
+                }
+                html += `Mesh: R:${meshStateCount.ready} Q:${meshStateCount.queued} B:${meshStateCount.building} S:${meshStateCount.stale}\n`;
+                // Calculate raw chunk memory and oldest access time
+                const chunkMemoryMB = (chunks.size * CHUNK_DATA_SIZE / (1024 * 1024)).toFixed(1);
+                let oldestAccess = performance.now();
+                for (const [, meta] of chunkDataPool.metadata) {
+                    if (meta.hasData && meta.lastAccessed < oldestAccess) {
+                        oldestAccess = meta.lastAccessed;
+                    }
+                }
+                const oldestAgeSeconds = ((performance.now() - oldestAccess) / 1000).toFixed(1);
+                html += `Raw Mem: ${chunkMemoryMB}MB | Oldest: ${oldestAgeSeconds}s\n`;
                 html += `<span class="perf-section">── Rendering ──</span>\n`;
                 html += `Faces: ${(totalFaces/1000).toFixed(1)}K\n`;
                 html += `Culled: ${culled} chunks\n`;
@@ -11130,6 +11679,8 @@
             const chunks = new Map();
             // Create global VoxelWorld instance bound to the chunks Map
             const voxelWorld = new VoxelWorld(chunks);
+            // Create ChunkDataPool for Nvidium-style data persistence
+            const chunkDataPool = new ChunkDataPool(chunks, SETTINGS);
             const chunkMeshes = new Map();
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
@@ -14038,7 +14589,15 @@
                 chunkUpdateDiagnostics.lastDispatchTime = performance.now();
                 if (keys.length === 0) { if (isDebug) logDebug(`[ChunkUpdate] Dispatch '${reason}' ran with no pending keys.`); return; }
                 // Use unshift for priority
-                for (const k of keys) { const [c, z] = k.split(",").map(Number); if (!queuedChunkKeys.has(k)) { const allowLightingBypass = forceLightingBypassKeys.has(k); chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0, allowLightingBypass }); queuedChunkKeys.add(k); }}
+                for (const k of keys) {
+                    const [c, z] = k.split(",").map(Number);
+                    if (!queuedChunkKeys.has(k)) {
+                        const allowLightingBypass = forceLightingBypassKeys.has(k);
+                        chunkBuildQueue.unshift({ key: k, cx: c, cz: z, dist: 0, allowLightingBypass });
+                        queuedChunkKeys.add(k);
+                        chunkDataPool.setMeshState(k, MESH_STATE.QUEUED);
+                    }
+                }
                 pendingChunkUpdates.clear();
             }
             function heartbeatChunkUpdates(now = performance.now()) {
@@ -14701,6 +15260,8 @@
                 edgeLightingUpdateQueue.delete(key);
                 chunksNeedingLightingUpdate.delete(key);
                 edgeLightingPassCount.delete(key);
+                // Notify ChunkDataPool that chunk data was removed
+                chunkDataPool.unregister(key);
             }
             const worldConfig = {
                 seed: WORLD_CONFIG.seed,
@@ -17199,6 +17760,8 @@
                 chunkNeighborCache.invalidate(cx, cz);
                 invalidateCollisionGrid(cx, cz);
                 invalidateFaceCache(key);
+                // Invalidate section analysis (Y bounds, visibility bitmap may have changed)
+                chunkDataPool.invalidateSectionAnalysis(key);
                 const jobKey = `${x},${y},${z}`;
                 if (!queuedLightUpdates.has(jobKey)) {
                     queuedLightUpdates.add(jobKey);
@@ -17740,7 +18303,10 @@
                         // generateChunkData already checks the cache, generates if missing, and returns the data
                         const data = await generateChunkData(chunk.cx, chunk.cz);
                         // Just ensure it's in the active memory map (generateChunkData handles this too, but this is safe)
-                        if (!chunks.has(chunk.key)) chunks.set(chunk.key, data);
+                        if (!chunks.has(chunk.key)) {
+                            chunks.set(chunk.key, data);
+                            chunkDataPool.register(chunk.key, data);
+                        }
                         generatedChunks.push(chunk); // Track all chunks (cached + generated)
                         generated++;
                     }
@@ -27158,6 +27724,7 @@
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
                         chunks.set(key, cachedData);
+                        chunkDataPool.register(key, cachedData);
                         // Queue neighbor updates for cached chunks too (may have missed cross-chunk features)
                         queueAdjacentChunksForUpdate(cx, cz, key);
                         return cachedData;
@@ -27220,6 +27787,7 @@
                     chunk.genState |= GEN_PASS.BLOCKLIGHT;
 
                     chunks.set(key, chunk);
+                    chunkDataPool.register(key, chunk);
                     pristineChunks.add(key);
 
                     // Queue adjacent chunks for update (cross-chunk features like trees, lighting)
@@ -28090,6 +28658,12 @@
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
 
+                    // Track chunk access for LRU eviction
+                    chunkDataPool.touch(cKey);
+
+                    // Mark chunk as being built
+                    chunkDataPool.setMeshState(cKey, MESH_STATE.BUILDING);
+
                     // CRITICAL: Release any existing meshes before creating new ones
                     // This prevents duplicate meshes from accumulating in the scene
                     // (which causes visual artifacts like darker water from z-fighting)
@@ -28186,32 +28760,54 @@
                     const useBlocksFormat = !!centerData.blocks;
                     const blockData = useBlocksFormat ? centerData.blocks : centerData;
 
-                    // OPTIMIZATION: Find max Y with non-air blocks to skip empty sky regions
-                    // This can save processing hundreds of empty Y layers
-                    let maxY = 0;
-                    for (let y = height - 1; y >= 0; y--) {
-                        const yOffset = y * 256;
-                        let foundBlock = false;
-                        for (let z = 0; z < 16 && !foundBlock; z++) {
-                            const zOffset = z * 16;
-                            for (let x = 0; x < 16; x++) {
-                                const id = blockData[x + zOffset + yOffset];
-                                if (id !== AIR) {
-                                    maxY = y + 1; // Include one layer above for top faces
-                                    foundBlock = true;
-                                    break;
-                                }
-                            }
+                    // OPTIMIZATION: Use cached Y bounds from section analysis
+                    // This avoids scanning hundreds of Y layers every mesh rebuild
+                    let maxY = height;
+                    let minY = 0;
+                    const sectionInfo = chunkDataPool.getSectionInfo(cKey);
+                    if (sectionInfo) {
+                        minY = sectionInfo.minY;
+                        maxY = Math.min(height, sectionInfo.maxY + 1);
+                        // Skip entirely if no blocks in this chunk
+                        if (sectionInfo.visibleSections === 0) {
+                            queuedChunkKeys.delete(cKey);
+                            chunkDataPool.setMeshState(cKey, MESH_STATE.READY);
+                            return;
                         }
-                        if (foundBlock) break;
+                    } else {
+                        // Trigger section analysis if not done yet
+                        chunkDataPool.analyzeChunkSections(cKey, centerData);
+                        const info = chunkDataPool.getSectionInfo(cKey);
+                        if (info) {
+                            minY = info.minY;
+                            maxY = Math.min(height, info.maxY + 1);
+                        } else {
+                            // Fallback: scan for maxY (original code)
+                            maxY = 0;
+                            for (let y = height - 1; y >= 0; y--) {
+                                const yOffset = y * 256;
+                                let foundBlock = false;
+                                for (let z = 0; z < 16 && !foundBlock; z++) {
+                                    const zOffset = z * 16;
+                                    for (let x = 0; x < 16; x++) {
+                                        const id = blockData[x + zOffset + yOffset];
+                                        if (id !== AIR) {
+                                            maxY = y + 1;
+                                            foundBlock = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (foundBlock) break;
+                            }
+                            maxY = Math.min(height, maxY + 1);
+                        }
                     }
-                    // Clamp maxY and add 1 for safety (to render top faces)
-                    maxY = Math.min(height, maxY + 1);
-                    const skippedLayers = height - maxY;
+                    const skippedLayers = height - maxY + minY;
                     if (skippedLayers > 0) perfMetrics.facesSkipped += skippedLayers * 256; // Rough estimate
 
-                    // Main Generation Loop - only process up to maxY
-                    for (let y = 0; y < maxY; y++) {
+                    // Main Generation Loop - only process from minY to maxY
+                    for (let y = minY; y < maxY; y++) {
                         const yOffset = y * 256;
                         for (let z = 0; z < 16; z++) {
                             const zOffset = z * 16;
@@ -28355,6 +28951,8 @@
                         terrainMesh.updateMatrix();
                         scene.add(terrainMesh);
                         chunkMeshes.set(cKey, terrainMesh);
+                        terrainMeshCount++;
+                        meshLifecycleStats.mark("attach", { key: cKey, isWater: false, terrainMeshCount, waterMeshCount });
                     }
                     // --- CREATE WATER MESH (INDEXED GEOMETRY) ---
                     if (wFaceCount > 0) {
@@ -28393,6 +28991,8 @@
                         waterMesh.updateMatrix();
                         scene.add(waterMesh);
                         chunkMeshes.set(cKey + "_WATER", waterMesh);
+                        waterMeshCount++;
+                        meshLifecycleStats.mark("attach", { key: cKey + "_WATER", isWater: true, terrainMeshCount, waterMeshCount });
                     }
                     // --- CREATE TORCH MODELS ---
                     // Clean up old torches first
@@ -28434,6 +29034,8 @@
                     // OPTIMIZATION: Clear AO cache after chunk is done
                     clearAOCache();
                     meshedChunkKeys.add(cKey);
+                    // Mark mesh as ready after successful build
+                    chunkDataPool.setMeshState(cKey, MESH_STATE.READY);
                     chunkRenderedFaces.set(cKey, tFaceCount + wFaceCount);
                     // OPTIMIZATION: Mark shadows dirty when new mesh is created
                     markShadowsDirty();
@@ -28646,7 +29248,13 @@
                 // Sort by distance (closest first)
                 if (recomputedFrustum) { needed.sort((a, b) => a.dist - b.dist); }
                 // Double check using the fast Set lookup
-                for (const job of needed) { if (!queuedChunkKeys.has(job.key)) { chunkBuildQueue.push(job); queuedChunkKeys.add(job.key); }}
+                for (const job of needed) {
+                    if (!queuedChunkKeys.has(job.key)) {
+                        chunkBuildQueue.push(job);
+                        queuedChunkKeys.add(job.key);
+                        chunkDataPool.setMeshState(job.key, MESH_STATE.QUEUED);
+                    }
+                }
                 // Optional: Clean queue set occasionally to prevent memory leaks
                 // (if chunks are cancelled but remain in set)
                 if (queuedChunkKeys.size > chunkBuildQueue.length * 2) { queuedChunkKeys.clear(); chunkBuildQueue.forEach((j) => queuedChunkKeys.add(j.key)); }
@@ -28656,21 +29264,10 @@
                 // Aggressively discard pristine chunks that aren't currently needed
                 // No need to check if mesh exists - IndexedDB will cache the data
                 if (pristineChunks.size > 0) { for (const key of pristineChunks) { if (!neededKeys.has(key) && canEvictChunk(key)) { purgeChunkData(key); }}}
-                // --- 8. Cache Pruning (Moved to end for safety) ---
-                if (chunks.size > SETTINGS.maxCachedChunks) {
-                    const allChunks = Array.from(chunks.keys()).map((key) => { const [c, z] = key.split(",").map(Number); return { key, dist: (c - chunkX) ** 2 + (z - chunkZ) ** 2 }; });
-                    allChunks.sort((a, b) => b.dist - a.dist); // Furthest first
-                    const toRemove = Math.floor(chunks.size * 0.25); // Remove 25% at a time (increased from 10% for more aggressive cleanup)
-                    // NEVER delete a chunk that is currently visible (needed)
-                    let removed = 0;
-                    for (let i = 0; i < allChunks.length && removed < toRemove; i++) {
-                        const targetKey = allChunks[i].key;
-                        if (neededKeys.has(targetKey)) continue;
-                        if (!canEvictChunk(targetKey, { persistModified: true })) continue;
-                        purgeChunkData(targetKey);
-                        removed++;
-                    }
-                }
+                // --- 8. Chunk Data Pool Eviction ---
+                // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
+                // This replaces the old maxCachedChunks approach with memory-budget-based eviction
+                chunkDataPool.evictIfNeeded(chunkX, chunkZ, modifiedChunks, purgeChunkData);
                 // --- BIOME CACHE CLEANUP ---
                 // Prevent memory leak by removing distant biome cells
                 if (biomeCellCache.size > 10000) {
