@@ -5504,6 +5504,22 @@
             const SECTIONS_PER_CHUNK = Math.ceil(WORLD_DIMS.chunkHeight / SECTION_HEIGHT); // 20 sections for 320 height
             const BLOCKS_PER_SECTION = SECTION_HEIGHT * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize; // 4096 blocks per section
 
+            // =====================================================
+            // GEOMETRY BUFFER POOL CONSTANTS
+            // =====================================================
+            // Maximum faces per chunk (conservative estimate for worst-case terrain)
+            // 16×16×320 chunk = ~150K max exposed faces, but typical is ~20-40K
+            const MAX_FACES_PER_CHUNK = 65536;  // 64K faces = 256K vertices = ~10MB per geometry
+            const MAX_VERTICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 4;  // 4 vertices per face (quads)
+            const MAX_INDICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 6;   // 6 indices per face (2 triangles)
+
+            // Buffer sizes (floats/uints)
+            const GEO_POS_SIZE = MAX_VERTICES_PER_CHUNK * 3;    // position: x,y,z
+            const GEO_NORM_SIZE = MAX_VERTICES_PER_CHUNK * 3;   // normal: nx,ny,nz
+            const GEO_UV_SIZE = MAX_VERTICES_PER_CHUNK * 2;     // uv: u,v
+            const GEO_COL_SIZE = MAX_VERTICES_PER_CHUNK * 3;    // color: r,g,b
+            const GEO_IDX_SIZE = MAX_INDICES_PER_CHUNK;         // indices
+
             /**
              * Create default section data array for a chunk.
              * Each section is a 16×16×16 vertical subdivision of the chunk.
@@ -11651,6 +11667,12 @@
                     }
                 }
                 html += `Mesh: R:${meshStateCount.ready} Q:${meshStateCount.queued} B:${meshStateCount.building} S:${meshStateCount.stale}\n`;
+                // Geometry buffer pool stats
+                if (typeof geometryPool !== 'undefined') {
+                    const geoStats = geometryPool.getStats();
+                    html += `GeoPool: T:${geoStats.terrainPoolSize}/${geoStats.maxPoolSize} W:${geoStats.waterPoolSize}/${geoStats.maxPoolSize}\n`;
+                    html += `GeoAlloc: T:${geoStats.terrainCreated} W:${geoStats.waterCreated}\n`;
+                }
                 // Calculate raw chunk memory and oldest access time
                 const chunkMemoryMB = (chunks.size * CHUNK_DATA_SIZE / (1024 * 1024)).toFixed(1);
                 let oldestAccess = performance.now();
@@ -15673,6 +15695,193 @@
             const indexPool = new Uint32ArrayPool();
             const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
             const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
+
+            // =====================================================
+            // GEOMETRY BUFFER POOL
+            // =====================================================
+            // Pools BufferGeometry objects with pre-allocated attribute buffers
+            // to eliminate allocation overhead during chunk rebuilds.
+            class GeometryBufferPool {
+                constructor(maxPoolSize = 32) {
+                    this.terrainPool = [];
+                    this.waterPool = [];
+                    this.maxPoolSize = maxPoolSize;
+
+                    // Debug stats
+                    this._stats = {
+                        terrainAcquired: 0,
+                        terrainReleased: 0,
+                        terrainCreated: 0,
+                        waterAcquired: 0,
+                        waterReleased: 0,
+                        waterCreated: 0
+                    };
+                }
+
+                /**
+                 * Create a new terrain geometry with pre-allocated buffers.
+                 * @private
+                 * @returns {THREE.BufferGeometry}
+                 */
+                _createTerrainGeometry() {
+                    const geo = new THREE.BufferGeometry();
+
+                    // Pre-allocate attribute buffers at max size
+                    const posArray = new Float32Array(GEO_POS_SIZE);
+                    const normArray = new Float32Array(GEO_NORM_SIZE);
+                    const uvArray = new Float32Array(GEO_UV_SIZE);
+                    const colArray = new Float32Array(GEO_COL_SIZE);
+                    const idxArray = new Uint32Array(GEO_IDX_SIZE);
+
+                    // Create attributes with DynamicDrawUsage for efficient updates
+                    const posAttr = new THREE.Float32BufferAttribute(posArray, 3);
+                    const normAttr = new THREE.Float32BufferAttribute(normArray, 3);
+                    const uvAttr = new THREE.Float32BufferAttribute(uvArray, 2);
+                    const colAttr = new THREE.Float32BufferAttribute(colArray, 3);
+                    const idxAttr = new THREE.Uint32BufferAttribute(idxArray, 1);
+
+                    posAttr.setUsage(THREE.DynamicDrawUsage);
+                    normAttr.setUsage(THREE.DynamicDrawUsage);
+                    uvAttr.setUsage(THREE.DynamicDrawUsage);
+                    colAttr.setUsage(THREE.DynamicDrawUsage);
+                    idxAttr.setUsage(THREE.DynamicDrawUsage);
+
+                    geo.setAttribute('position', posAttr);
+                    geo.setAttribute('normal', normAttr);
+                    geo.setAttribute('uv', uvAttr);
+                    geo.setAttribute('color', colAttr);
+                    geo.setIndex(idxAttr);
+
+                    // Pre-compute bounding sphere (will be overwritten per-chunk)
+                    geo.boundingSphere = new THREE.Sphere();
+                    geo.boundingBox = new THREE.Box3();
+
+                    this._stats.terrainCreated++;
+                    return geo;
+                }
+
+                /**
+                 * Create a new water geometry with pre-allocated buffers.
+                 * Water has extra attributes for shore distance and thickness.
+                 * @private
+                 * @returns {THREE.BufferGeometry}
+                 */
+                _createWaterGeometry() {
+                    const geo = new THREE.BufferGeometry();
+
+                    // Water typically has far fewer faces than terrain
+                    const waterMaxVerts = MAX_VERTICES_PER_CHUNK / 4;  // 1/4 of terrain max
+                    const waterMaxIdx = MAX_INDICES_PER_CHUNK / 4;
+
+                    const posArray = new Float32Array(waterMaxVerts * 3);
+                    const normArray = new Float32Array(waterMaxVerts * 3);
+                    const uvArray = new Float32Array(waterMaxVerts * 2);
+                    const colArray = new Float32Array(waterMaxVerts * 3);
+                    const shoreArray = new Float32Array(waterMaxVerts);      // shoreDist
+                    const thickArray = new Float32Array(waterMaxVerts);      // waterThickness
+                    const idxArray = new Uint32Array(waterMaxIdx);
+
+                    const posAttr = new THREE.Float32BufferAttribute(posArray, 3);
+                    const normAttr = new THREE.Float32BufferAttribute(normArray, 3);
+                    const uvAttr = new THREE.Float32BufferAttribute(uvArray, 2);
+                    const colAttr = new THREE.Float32BufferAttribute(colArray, 3);
+                    const shoreAttr = new THREE.Float32BufferAttribute(shoreArray, 1);
+                    const thickAttr = new THREE.Float32BufferAttribute(thickArray, 1);
+                    const idxAttr = new THREE.Uint32BufferAttribute(idxArray, 1);
+
+                    posAttr.setUsage(THREE.DynamicDrawUsage);
+                    normAttr.setUsage(THREE.DynamicDrawUsage);
+                    uvAttr.setUsage(THREE.DynamicDrawUsage);
+                    colAttr.setUsage(THREE.DynamicDrawUsage);
+                    shoreAttr.setUsage(THREE.DynamicDrawUsage);
+                    thickAttr.setUsage(THREE.DynamicDrawUsage);
+                    idxAttr.setUsage(THREE.DynamicDrawUsage);
+
+                    geo.setAttribute('position', posAttr);
+                    geo.setAttribute('normal', normAttr);
+                    geo.setAttribute('uv', uvAttr);
+                    geo.setAttribute('color', colAttr);
+                    geo.setAttribute('shoreDist', shoreAttr);
+                    geo.setAttribute('waterThickness', thickAttr);
+                    geo.setIndex(idxAttr);
+
+                    geo.boundingSphere = new THREE.Sphere();
+                    geo.boundingBox = new THREE.Box3();
+
+                    this._stats.waterCreated++;
+                    return geo;
+                }
+
+                /**
+                 * Acquire a terrain geometry from pool or create new.
+                 * @returns {THREE.BufferGeometry}
+                 */
+                acquireTerrain() {
+                    this._stats.terrainAcquired++;
+                    if (this.terrainPool.length > 0) {
+                        return this.terrainPool.pop();
+                    }
+                    return this._createTerrainGeometry();
+                }
+
+                /**
+                 * Acquire a water geometry from pool or create new.
+                 * @returns {THREE.BufferGeometry}
+                 */
+                acquireWater() {
+                    this._stats.waterAcquired++;
+                    if (this.waterPool.length > 0) {
+                        return this.waterPool.pop();
+                    }
+                    return this._createWaterGeometry();
+                }
+
+                /**
+                 * Release a terrain geometry back to pool.
+                 * @param {THREE.BufferGeometry} geo
+                 */
+                releaseTerrain(geo) {
+                    this._stats.terrainReleased++;
+                    if (this.terrainPool.length < this.maxPoolSize) {
+                        // Reset draw range for next use
+                        geo.setDrawRange(0, 0);
+                        this.terrainPool.push(geo);
+                    } else {
+                        // Pool full, must dispose
+                        geo.dispose();
+                    }
+                }
+
+                /**
+                 * Release a water geometry back to pool.
+                 * @param {THREE.BufferGeometry} geo
+                 */
+                releaseWater(geo) {
+                    this._stats.waterReleased++;
+                    if (this.waterPool.length < this.maxPoolSize) {
+                        geo.setDrawRange(0, 0);
+                        this.waterPool.push(geo);
+                    } else {
+                        geo.dispose();
+                    }
+                }
+
+                /**
+                 * Get pool statistics.
+                 * @returns {Object}
+                 */
+                getStats() {
+                    return {
+                        terrainPoolSize: this.terrainPool.length,
+                        waterPoolSize: this.waterPool.length,
+                        maxPoolSize: this.maxPoolSize,
+                        ...this._stats
+                    };
+                }
+            }
+
+            // Geometry buffer pool for pre-allocated BufferGeometry objects
+            const geometryPool = new GeometryBufferPool(32);
 
             const perm = new Uint8Array(512);
             const p = new Uint8Array(256).map((_, i) => i);
@@ -28724,8 +28933,8 @@
             function acquireChunkMesh(type) {
                 const pool = type === "water" ? waterMeshPool : terrainMeshPool;
                 const mesh = pool.pop() || new THREE.Mesh(undefined, type === "water" ? waterMaterial : chunkMaterial);
-                // Ensure no stale geometry is kept between uses
-                if (mesh.geometry) { mesh.geometry.dispose(); mesh.geometry = null; }
+                // Don't dispose geometry here - it's pooled separately via geometryPool
+                mesh.geometry = null;
                 mesh.matrixAutoUpdate = false;
                 mesh.material = type === "water" ? waterMaterial : chunkMaterial;
                 mesh.frustumCulled = type === "water" ? false : SETTINGS.enableFrustumCulling;
@@ -28741,7 +28950,15 @@
             function releaseChunkMesh(mesh, type) {
                 if (!mesh) return;
                 if (mesh.parent) mesh.parent.remove(mesh);
-                if (mesh.geometry) mesh.geometry.dispose();
+                // Return geometry to pool instead of disposing
+                if (mesh.geometry) {
+                    const isWater = type === 'water';
+                    if (isWater) {
+                        geometryPool.releaseWater(mesh.geometry);
+                    } else {
+                        geometryPool.releaseTerrain(mesh.geometry);
+                    }
+                }
                 mesh.geometry = null;
                 mesh.userData.chunkKey = null;
                 mesh.userData.chunkType = type;
@@ -29128,30 +29345,39 @@
                         perfMetrics.blocksSkipped = (perfMetrics.blocksSkipped || 0) + blocksSkipped;
                     }
 
-                    // --- CREATE TERRAIN MESH (INDEXED GEOMETRY) ---
+                    // --- CREATE TERRAIN MESH (INDEXED GEOMETRY WITH POOLED BUFFERS) ---
                     if (tFaceCount > 0) {
-                        // Copy vertex data to correctly-sized arrays
-                        const tPosArray = new Float32Array(tVIdx);
-                        tPosArray.set(terrainPos.subarray(0, tVIdx));
-                        const tNormArray = new Float32Array(tVIdx);
-                        tNormArray.set(terrainNorm.subarray(0, tVIdx));
-                        const tUvArray = new Float32Array(tUvIdx);
-                        tUvArray.set(terrainUvs.subarray(0, tUvIdx));
-                        const tColArray = new Float32Array(tCIdx);
-                        tColArray.set(terrainCols.subarray(0, tCIdx));
-                        const tIdxArray = new Uint32Array(tIIdx);
-                        tIdxArray.set(terrainIndices.subarray(0, tIIdx));
+                        // Acquire pooled geometry with pre-allocated buffers
+                        const terrainGeo = geometryPool.acquireTerrain();
 
-                        const terrainGeo = new THREE.BufferGeometry();
-                        // Set indexed geometry - uses 33% less vertex data
-                        terrainGeo.setIndex(new THREE.Uint32BufferAttribute(tIdxArray, 1));
-                        terrainGeo.setAttribute("position", new THREE.Float32BufferAttribute(tPosArray, 3));
-                        terrainGeo.setAttribute("normal", new THREE.Float32BufferAttribute(tNormArray, 3));
-                        terrainGeo.setAttribute("uv", new THREE.Float32BufferAttribute(tUvArray, 2));
-                        terrainGeo.setAttribute("color", new THREE.Float32BufferAttribute(tColArray, 3));
+                        // Update buffer data in-place (no allocation)
+                        const posAttr = terrainGeo.attributes.position;
+                        const normAttr = terrainGeo.attributes.normal;
+                        const uvAttr = terrainGeo.attributes.uv;
+                        const colAttr = terrainGeo.attributes.color;
+                        const idxAttr = terrainGeo.index;
+
+                        // Copy from work buffers to geometry buffers
+                        posAttr.array.set(terrainPos.subarray(0, tVIdx));
+                        normAttr.array.set(terrainNorm.subarray(0, tVIdx));
+                        uvAttr.array.set(terrainUvs.subarray(0, tUvIdx));
+                        colAttr.array.set(terrainCols.subarray(0, tCIdx));
+                        idxAttr.array.set(terrainIndices.subarray(0, tIIdx));
+
+                        // Mark attributes as needing GPU upload
+                        posAttr.needsUpdate = true;
+                        normAttr.needsUpdate = true;
+                        uvAttr.needsUpdate = true;
+                        colAttr.needsUpdate = true;
+                        idxAttr.needsUpdate = true;
+
+                        // Set draw range to only render valid portion
+                        terrainGeo.setDrawRange(0, tIIdx);
+
+                        // Update bounds
                         applyChunkBounds(terrainGeo, startX, startZ);
-                        // Mark as DynamicDrawUsage since chunk geometry updates when blocks change
-                        optimizeChunkGeometryForGPU(terrainGeo);
+
+                        // Attach to mesh (attributes already have DynamicDrawUsage from pool)
                         const terrainMesh = acquireChunkMesh("terrain");
                         terrainMesh.name = "CHUNK_TERRAIN_" + cKey;
                         terrainMesh.geometry = terrainGeo;
@@ -29164,34 +29390,45 @@
                         terrainMeshCount++;
                         meshLifecycleStats.mark("attach", { key: cKey, isWater: false, terrainMeshCount, waterMeshCount });
                     }
-                    // --- CREATE WATER MESH (INDEXED GEOMETRY) ---
+                    // --- CREATE WATER MESH (INDEXED GEOMETRY WITH POOLED BUFFERS) ---
                     if (wFaceCount > 0) {
-                        const wPosArray = new Float32Array(wVIdx);
-                        wPosArray.set(waterPos.subarray(0, wVIdx));
-                        const wNormArray = new Float32Array(wVIdx);
-                        wNormArray.set(waterNorm.subarray(0, wVIdx));
-                        const wUvArray = new Float32Array(wUvIdx);
-                        wUvArray.set(waterUvs.subarray(0, wUvIdx));
-                        const wColArray = new Float32Array(wCIdx);
-                        wColArray.set(waterCols.subarray(0, wCIdx));
-                        const wIdxArray = new Uint32Array(wIIdx);
-                        wIdxArray.set(waterIndices.subarray(0, wIIdx));
-                        const wShoreArray = new Float32Array(wSIdx);
-                        wShoreArray.set(waterShore.subarray(0, wSIdx));
-                        const wThicknessArray = new Float32Array(wTIdx);
-                        wThicknessArray.set(waterThickness.subarray(0, wTIdx));
+                        // Acquire pooled geometry with pre-allocated buffers
+                        const waterGeo = geometryPool.acquireWater();
 
-                        const waterGeo = new THREE.BufferGeometry();
-                        // Set indexed geometry
-                        waterGeo.setIndex(new THREE.Uint32BufferAttribute(wIdxArray, 1));
-                        waterGeo.setAttribute("position", new THREE.Float32BufferAttribute(wPosArray, 3));
-                        waterGeo.setAttribute("normal", new THREE.Float32BufferAttribute(wNormArray, 3));
-                        waterGeo.setAttribute("uv", new THREE.Float32BufferAttribute(wUvArray, 2));
-                        waterGeo.setAttribute("color", new THREE.Float32BufferAttribute(wColArray, 3));
-                        waterGeo.setAttribute("shoreDist", new THREE.Float32BufferAttribute(wShoreArray, 1));
-                        waterGeo.setAttribute("waterThickness", new THREE.Float32BufferAttribute(wThicknessArray, 1));
+                        // Update buffer data in-place (no allocation)
+                        const posAttr = waterGeo.attributes.position;
+                        const normAttr = waterGeo.attributes.normal;
+                        const uvAttr = waterGeo.attributes.uv;
+                        const colAttr = waterGeo.attributes.color;
+                        const shoreAttr = waterGeo.attributes.shoreDist;
+                        const thickAttr = waterGeo.attributes.waterThickness;
+                        const idxAttr = waterGeo.index;
+
+                        // Copy from work buffers to geometry buffers
+                        posAttr.array.set(waterPos.subarray(0, wVIdx));
+                        normAttr.array.set(waterNorm.subarray(0, wVIdx));
+                        uvAttr.array.set(waterUvs.subarray(0, wUvIdx));
+                        colAttr.array.set(waterCols.subarray(0, wCIdx));
+                        shoreAttr.array.set(waterShore.subarray(0, wSIdx));
+                        thickAttr.array.set(waterThickness.subarray(0, wTIdx));
+                        idxAttr.array.set(waterIndices.subarray(0, wIIdx));
+
+                        // Mark attributes as needing GPU upload
+                        posAttr.needsUpdate = true;
+                        normAttr.needsUpdate = true;
+                        uvAttr.needsUpdate = true;
+                        colAttr.needsUpdate = true;
+                        shoreAttr.needsUpdate = true;
+                        thickAttr.needsUpdate = true;
+                        idxAttr.needsUpdate = true;
+
+                        // Set draw range to only render valid portion
+                        waterGeo.setDrawRange(0, wIIdx);
+
+                        // Update bounds
                         applyChunkBounds(waterGeo, startX, startZ);
-                        optimizeChunkGeometryForGPU(waterGeo);
+
+                        // Attach to mesh (attributes already have DynamicDrawUsage from pool)
                         const waterMesh = acquireChunkMesh("water");
                         waterMesh.name = "CHUNK_WATER_" + cKey;
                         waterMesh.geometry = waterGeo;
