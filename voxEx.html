@@ -4928,6 +4928,7 @@
                 frameUpdateInterval: 5,
                 enableFrustumCulling: savedSettings.enableFrustumCulling !== undefined ? savedSettings.enableFrustumCulling : true,
                 enableSectionLOD: savedSettings.enableSectionLOD !== undefined ? savedSettings.enableSectionLOD : true,
+                enableHorizonOcclusion: savedSettings.enableHorizonOcclusion !== undefined ? savedSettings.enableHorizonOcclusion : true,
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -5120,6 +5121,7 @@
                 upperBoundFPS: 50,
                 enableFrustumCulling: true,
                 enableSectionLOD: true,
+                enableHorizonOcclusion: true,
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -14852,6 +14854,154 @@
                 cameraAspect: null,
                 dirty: true,
             };
+
+            // --- OPTIMIZATION: Horizon Occlusion Configuration ---
+            const HORIZON_OCCLUSION_CONFIG = {
+                enabled: true,
+                numSectors: 16,              // Angular divisions (16 = 22.5° each)
+                minDistance: 3,              // Don't occlude chunks within this range (in chunks)
+                minElevationAngle: -0.3,     // Minimum horizon angle in radians (~-17°)
+                cacheValidFrames: 3          // How many frames to cache horizon before recalculating
+            };
+
+            // Horizon state - tracks max elevation angle per sector
+            const horizonState = {
+                angles: new Float32Array(HORIZON_OCCLUSION_CONFIG.numSectors), // Current horizon angles per sector
+                playerX: 0,
+                playerY: 0,
+                playerZ: 0,
+                framesSinceUpdate: 0,
+                dirty: true
+            };
+
+            // Horizon occlusion statistics
+            const horizonOcclusionStats = {
+                chunksChecked: 0,
+                chunksOccluded: 0,
+                lastUpdate: 0
+            };
+            window.horizonOcclusionStats = horizonOcclusionStats;
+
+            /**
+             * Get the maximum block height for a chunk from its section data.
+             * Returns world-space Y coordinate.
+             * @param {string} key - Chunk key "cx,cz"
+             * @returns {number} Maximum Y in world space, or sea level if unknown
+             */
+            function getChunkMaxHeight(key) {
+                const chunkData = chunks.get(key);
+                if (!chunkData || !chunkData.sections) {
+                    return WORLD_DIMS.seaLevel; // Default to sea level if no data
+                }
+
+                let maxY = 0;
+                for (const sec of chunkData.sections) {
+                    if (!sec.isEmpty && sec.analyzed && sec.maxBlockY > maxY) {
+                        maxY = sec.maxBlockY;
+                    }
+                }
+
+                return maxY - WORLD_DIMS.yOffset; // Convert to world space
+            }
+
+            /**
+             * Get angular sector index for a direction from player.
+             * @param {number} dx - X offset from player
+             * @param {number} dz - Z offset from player
+             * @returns {number} Sector index (0 to numSectors-1)
+             */
+            function getHorizonSector(dx, dz) {
+                const angle = Math.atan2(dz, dx); // -PI to PI
+                const normalized = (angle + Math.PI) / (2 * Math.PI); // 0 to 1
+                return Math.floor(normalized * HORIZON_OCCLUSION_CONFIG.numSectors) % HORIZON_OCCLUSION_CONFIG.numSectors;
+            }
+
+            /**
+             * Calculate elevation angle from player to a point.
+             * @param {number} horizontalDist - Horizontal distance to point
+             * @param {number} heightDiff - Height difference (target - player)
+             * @returns {number} Elevation angle in radians
+             */
+            function getElevationAngle(horizontalDist, heightDiff) {
+                if (horizontalDist < 0.001) return Math.PI / 2; // Directly above/below
+                return Math.atan2(heightDiff, horizontalDist);
+            }
+
+            /**
+             * Reset horizon angles to minimum (clear sky).
+             */
+            function resetHorizon() {
+                horizonState.angles.fill(HORIZON_OCCLUSION_CONFIG.minElevationAngle);
+            }
+
+            /**
+             * Update horizon angle for a sector based on a chunk's height.
+             * @param {number} sector - Sector index
+             * @param {number} elevationAngle - Elevation angle to chunk's top
+             */
+            function updateHorizonSector(sector, elevationAngle) {
+                if (elevationAngle > horizonState.angles[sector]) {
+                    horizonState.angles[sector] = elevationAngle;
+                    // Also update adjacent sectors slightly (terrain doesn't have sharp edges)
+                    const prev = (sector - 1 + HORIZON_OCCLUSION_CONFIG.numSectors) % HORIZON_OCCLUSION_CONFIG.numSectors;
+                    const next = (sector + 1) % HORIZON_OCCLUSION_CONFIG.numSectors;
+                    const spillover = elevationAngle * 0.7; // Partial influence on neighbors
+                    if (spillover > horizonState.angles[prev]) horizonState.angles[prev] = spillover;
+                    if (spillover > horizonState.angles[next]) horizonState.angles[next] = spillover;
+                }
+            }
+
+            /**
+             * Check if a chunk is occluded by the horizon.
+             * @param {number} cx - Chunk X coordinate
+             * @param {number} cz - Chunk Z coordinate
+             * @param {number} playerX - Player world X
+             * @param {number} playerY - Player world Y
+             * @param {number} playerZ - Player world Z
+             * @param {number} distSq - Squared distance in chunks
+             * @returns {boolean} True if chunk is occluded
+             */
+            function isChunkOccludedByHorizon(cx, cz, playerX, playerY, playerZ, distSq) {
+                if (!HORIZON_OCCLUSION_CONFIG.enabled || !SETTINGS.enableHorizonOcclusion) return false;
+
+                // Don't occlude nearby chunks
+                if (distSq < HORIZON_OCCLUSION_CONFIG.minDistance * HORIZON_OCCLUSION_CONFIG.minDistance) {
+                    return false;
+                }
+
+                // Get chunk center in world space
+                const chunkCenterX = (cx + 0.5) * WORLD_DIMS.chunkSize;
+                const chunkCenterZ = (cz + 0.5) * WORLD_DIMS.chunkSize;
+
+                // Calculate direction and distance
+                const dx = chunkCenterX - playerX;
+                const dz = chunkCenterZ - playerZ;
+                const horizontalDist = Math.sqrt(dx * dx + dz * dz);
+
+                // Get chunk's maximum height
+                const key = getChunkKey(cx, cz);
+                const chunkMaxY = getChunkMaxHeight(key);
+
+                // Calculate elevation angle to chunk's highest point
+                const heightDiff = chunkMaxY - playerY;
+                const chunkElevation = getElevationAngle(horizontalDist, heightDiff);
+
+                // Get the sector this chunk is in
+                const sector = getHorizonSector(dx, dz);
+
+                // Check if chunk is below horizon
+                // Add small margin to avoid popping at exact horizon line
+                const margin = 0.02; // ~1 degree
+                const isOccluded = chunkElevation < horizonState.angles[sector] - margin;
+
+                // If not occluded, this chunk may raise the horizon for chunks behind it
+                if (!isOccluded) {
+                    updateHorizonSector(sector, chunkElevation);
+                }
+
+                return isOccluded;
+            }
+
             function invalidateFrustumCache() { frustumCacheState.dirty = true; }
             function markPendingLight(chunkKey) {
                 if (!chunkKey) return;
@@ -21533,6 +21683,9 @@
                     (tightBoundsStats.totalChunks > 0 ?
                         "Bounds: " + (tightBoundsStats.avgHeightReduction * 100).toFixed(0) + "% height, " +
                         (tightBoundsStats.avgVolumeReduction * 100).toFixed(0) + "% volume reduction\n" : "") +
+                    (horizonOcclusionStats.chunksChecked > 0 ?
+                        "Horizon: " + horizonOcclusionStats.chunksOccluded +
+                        " occluded (" + ((horizonOcclusionStats.chunksOccluded / horizonOcclusionStats.chunksChecked) * 100).toFixed(1) + "%)\n" : "") +
                     "Camera FOV: " +
                     camera.fov.toFixed(0) +
                     "°\n" +
@@ -29947,19 +30100,47 @@
                     needed = [];
                     culled = 0; // Reset counter only when recomputing
                     totalChecked = 0;
+
+                    // Reset horizon for fresh calculation
+                    resetHorizon();
+                    horizonOcclusionStats.chunksChecked = 0;
+                    horizonOcclusionStats.chunksOccluded = 0;
+
+                    // Build sorted chunk list for horizon occlusion (near to far)
+                    // This ensures horizon is built correctly from nearby terrain first
+                    const chunkList = [];
                     for (let dx = -maxR; dx <= maxR; dx++) {
                         for (let dz = -maxR; dz <= maxR; dz++) {
                             const distSq = dx * dx + dz * dz;
                             if (distSq > maxRSq) continue;
-                            const cx = chunkX + dx;
-                            const cz = chunkZ + dz;
-                            // FRUSTUM CULLING with inner radius exception
-                            totalChecked++;
-                            if (!isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir)) { culled++; continue; }
-                            const key = getChunkKey(cx, cz);
-                            neededKeys.add(key);
-                            if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) { needed.push({ key, cx, cz, dist: distSq }); }
+                            chunkList.push({ dx, dz, distSq });
                         }
+                    }
+                    // Sort by distance (near to far) for correct horizon building
+                    chunkList.sort((a, b) => a.distSq - b.distSq);
+
+                    // Process chunks in distance order
+                    for (const { dx, dz, distSq } of chunkList) {
+                        const cx = chunkX + dx;
+                        const cz = chunkZ + dz;
+                        // FRUSTUM CULLING with inner radius exception
+                        totalChecked++;
+                        if (!isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir)) { culled++; continue; }
+
+                        // HORIZON OCCLUSION - skip chunks hidden behind terrain
+                        if (HORIZON_OCCLUSION_CONFIG.enabled && SETTINGS.enableHorizonOcclusion &&
+                            distSq >= HORIZON_OCCLUSION_CONFIG.minDistance * HORIZON_OCCLUSION_CONFIG.minDistance) {
+                            horizonOcclusionStats.chunksChecked++;
+                            if (isChunkOccludedByHorizon(cx, cz, playerPos.x, playerPos.y, playerPos.z, distSq)) {
+                                horizonOcclusionStats.chunksOccluded++;
+                                culled++;
+                                continue;
+                            }
+                        }
+
+                        const key = getChunkKey(cx, cz);
+                        neededKeys.add(key);
+                        if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) { needed.push({ key, cx, cz, dist: distSq }); }
                     }
                     // Refresh cache snapshot when recomputed
                     frustumCacheState.chunkX = chunkX;
