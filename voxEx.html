@@ -4916,6 +4916,10 @@
                 maxRenderDistance: 16,
                 buildQueueLimit: savedSettings.buildQueueLimit || 2,
                 maxCachedChunks: savedSettings.maxCachedChunks || 350,
+                // Chunk Data Pool settings (Nvidium-style persistence)
+                dataKeepDistance: savedSettings.dataKeepDistance ?? 48,          // Keep chunk DATA within this radius (chunks, larger than renderDistance)
+                maxChunkDataMemoryMB: savedSettings.maxChunkDataMemoryMB ?? 1024, // Memory budget for chunk data in MB
+                chunkDataEvictionBatch: savedSettings.chunkDataEvictionBatch ?? 50, // How many chunks to evict per cleanup cycle
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5105,6 +5109,10 @@
                 renderDistance: 8,
                 buildQueueLimit: 2,
                 maxCachedChunks: 350,
+                // Chunk Data Pool defaults (Nvidium-style persistence)
+                dataKeepDistance: 48,          // Keep chunk DATA within this radius (chunks)
+                maxChunkDataMemoryMB: 1024,    // Memory budget for chunk data in MB
+                chunkDataEvictionBatch: 50,    // How many chunks to evict per cleanup cycle
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -6608,6 +6616,7 @@
                             startZ: cz * WORLD_DIMS.chunkSize,
                         };
                         this.chunks.set(key, chunk);
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                         this.activeChunks.add(key);
                     } else if (!chunk.blocks) {
                         // Upgrade legacy chunk format to include lighting buffers
@@ -6619,6 +6628,7 @@
                             blockLight: new Uint8Array(legacySize).fill(1),
                         };
                         this.chunks.set(key, chunk);
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
@@ -6897,6 +6907,10 @@
                     this.modifiedChunks.delete(key);
                     this.activeChunks.delete(key);
                     this.queuedChunkKeys.delete(key);
+                    // Notify ChunkDataPool that chunk data was removed
+                    if (typeof chunkDataPool !== 'undefined') {
+                        chunkDataPool.unregister(key);
+                    }
                 }
 
                 /**
@@ -6910,6 +6924,241 @@
                 /**
                  * Reset debug call counters (call at start of frame to measure per-frame calls).
                  * @returns {void}
+                 */
+                resetCallStats() {
+                    for (const key in this._callCounts) {
+                        this._callCounts[key] = 0;
+                    }
+                }
+            }
+
+            // =====================================================
+            // CHUNK DATA POOL
+            // =====================================================
+            // Manages chunk data lifecycle separately from mesh lifecycle.
+            // Keeps chunk data in memory longer than meshes for fast rebuilds.
+            // Uses LRU eviction when memory budget is exceeded.
+            // =====================================================
+            class ChunkDataPool {
+                /**
+                 * Create a ChunkDataPool to manage chunk data lifecycle.
+                 * @param {Map<string, Object>} chunksMap - Reference to global chunks Map
+                 * @param {Object} settings - Reference to SETTINGS object
+                 */
+                constructor(chunksMap, settings) {
+                    this.chunks = chunksMap;           // Reference to global chunks Map
+                    this.settings = settings;          // Reference to SETTINGS object
+                    this.metadata = new Map();         // ChunkKey -> { lastAccessed, dataSize, hasData }
+                    this.totalDataSize = 0;            // Estimated total memory usage in bytes
+                    this._callCounts = { get: 0, touch: 0, evict: 0, estimateSize: 0 };
+                }
+
+                /**
+                 * Get chunk data, updating access time.
+                 * @param {string} key - Chunk key
+                 * @returns {Object|undefined} Chunk data or undefined
+                 */
+                get(key) {
+                    if (isDebug) this._callCounts.get++;
+                    const data = this.chunks.get(key);
+                    if (data) {
+                        this.touch(key);
+                    }
+                    return data;
+                }
+
+                /**
+                 * Check if chunk data exists without updating access time.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if chunk data exists
+                 */
+                has(key) {
+                    return this.chunks.has(key);
+                }
+
+                /**
+                 * Update last accessed time for a chunk.
+                 * @param {string} key - Chunk key
+                 */
+                touch(key) {
+                    if (isDebug) this._callCounts.touch++;
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = { lastAccessed: 0, dataSize: 0, hasData: false };
+                        this.metadata.set(key, meta);
+                    }
+                    meta.lastAccessed = performance.now();
+                    meta.hasData = this.chunks.has(key);
+
+                    // Update size estimate if we haven't yet
+                    if (meta.dataSize === 0 && meta.hasData) {
+                        meta.dataSize = this.estimateChunkSize(this.chunks.get(key));
+                        this.totalDataSize += meta.dataSize;
+                    }
+                }
+
+                /**
+                 * Register new chunk data.
+                 * @param {string} key - Chunk key
+                 * @param {Object} data - Chunk data
+                 */
+                register(key, data) {
+                    const size = this.estimateChunkSize(data);
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = { lastAccessed: performance.now(), dataSize: size, hasData: true };
+                        this.metadata.set(key, meta);
+                    } else {
+                        // Update existing metadata
+                        this.totalDataSize -= meta.dataSize; // Remove old size
+                        meta.lastAccessed = performance.now();
+                        meta.dataSize = size;
+                        meta.hasData = true;
+                    }
+                    this.totalDataSize += size;
+                }
+
+                /**
+                 * Unregister chunk data (called when chunk is purged).
+                 * @param {string} key - Chunk key
+                 */
+                unregister(key) {
+                    const meta = this.metadata.get(key);
+                    if (meta) {
+                        this.totalDataSize -= meta.dataSize;
+                        meta.hasData = false;
+                        meta.dataSize = 0;
+                        // Keep metadata for LRU tracking even after data is gone
+                    }
+                }
+
+                /**
+                 * Estimate memory size of chunk data in bytes.
+                 * @param {Object} chunk - Chunk data object
+                 * @returns {number} Estimated size in bytes
+                 */
+                estimateChunkSize(chunk) {
+                    if (isDebug) this._callCounts.estimateSize++;
+                    if (!chunk) return 0;
+
+                    let size = 0;
+                    // Block data: Uint8Array
+                    if (chunk.blocks) {
+                        size += chunk.blocks.byteLength || chunk.blocks.length;
+                    } else if (chunk.length) {
+                        // Legacy format: chunk itself is the array
+                        size += chunk.length;
+                    }
+                    // Light data: Uint8Arrays
+                    if (chunk.skyLight) size += chunk.skyLight.byteLength || chunk.skyLight.length;
+                    if (chunk.blockLight) size += chunk.blockLight.byteLength || chunk.blockLight.length;
+
+                    // Object overhead estimate
+                    size += 100; // Metadata, keys, etc.
+
+                    return size;
+                }
+
+                /**
+                 * Get chunks eligible for eviction (outside dataKeepDistance, not modified).
+                 * @param {number} playerCX - Player chunk X
+                 * @param {number} playerCZ - Player chunk Z
+                 * @param {Set<string>} modifiedChunks - Set of modified chunk keys
+                 * @returns {Array<{key: string, lastAccessed: number, dist: number}>} Eviction candidates sorted by priority
+                 */
+                getEvictionCandidates(playerCX, playerCZ, modifiedChunks) {
+                    const dataKeepDist = this.settings.dataKeepDistance || 48;
+                    const dataKeepDistSq = dataKeepDist * dataKeepDist;
+                    const candidates = [];
+
+                    for (const [key, meta] of this.metadata) {
+                        if (!meta.hasData) continue;
+                        if (modifiedChunks.has(key)) continue; // Never evict modified chunks
+
+                        const [cx, cz] = key.split(',').map(Number);
+                        const distSq = (cx - playerCX) ** 2 + (cz - playerCZ) ** 2;
+
+                        // Only consider chunks outside dataKeepDistance
+                        if (distSq > dataKeepDistSq) {
+                            candidates.push({
+                                key,
+                                lastAccessed: meta.lastAccessed,
+                                dist: distSq,
+                                size: meta.dataSize
+                            });
+                        }
+                    }
+
+                    // Sort by: outside keep distance first, then by last accessed (oldest first)
+                    candidates.sort((a, b) => {
+                        // Primary: older access time = higher eviction priority
+                        return a.lastAccessed - b.lastAccessed;
+                    });
+
+                    return candidates;
+                }
+
+                /**
+                 * Evict chunks to stay within memory budget.
+                 * @param {number} playerCX - Player chunk X
+                 * @param {number} playerCZ - Player chunk Z
+                 * @param {Set<string>} modifiedChunks - Set of modified chunk keys
+                 * @param {function} purgeCallback - Function to call to actually purge chunk
+                 * @returns {number} Number of chunks evicted
+                 */
+                evictIfNeeded(playerCX, playerCZ, modifiedChunks, purgeCallback) {
+                    const maxBytes = (this.settings.maxChunkDataMemoryMB || 1024) * 1024 * 1024;
+
+                    if (this.totalDataSize <= maxBytes) {
+                        return 0; // Under budget, no eviction needed
+                    }
+
+                    const candidates = this.getEvictionCandidates(playerCX, playerCZ, modifiedChunks);
+                    const batchSize = this.settings.chunkDataEvictionBatch || 50;
+                    let evicted = 0;
+                    let freedBytes = 0;
+                    const targetFree = this.totalDataSize - maxBytes + (maxBytes * 0.1); // Free 10% extra
+
+                    for (const candidate of candidates) {
+                        if (evicted >= batchSize) break;
+                        if (freedBytes >= targetFree) break;
+
+                        if (isDebug) this._callCounts.evict++;
+                        purgeCallback(candidate.key);
+                        this.unregister(candidate.key);
+                        freedBytes += candidate.size;
+                        evicted++;
+                    }
+
+                    if (evicted > 0 && isDebug) {
+                        logDebug(`[ChunkDataPool] Evicted ${evicted} chunks, freed ~${(freedBytes / 1024 / 1024).toFixed(1)}MB`);
+                    }
+
+                    return evicted;
+                }
+
+                /**
+                 * Get statistics about the chunk data pool.
+                 * @returns {Object} Pool statistics
+                 */
+                getStats() {
+                    let chunksWithData = 0;
+                    for (const [, meta] of this.metadata) {
+                        if (meta.hasData) chunksWithData++;
+                    }
+
+                    return {
+                        totalChunks: this.chunks.size,
+                        trackedChunks: this.metadata.size,
+                        chunksWithData,
+                        totalDataSizeMB: (this.totalDataSize / 1024 / 1024).toFixed(1),
+                        maxDataSizeMB: this.settings.maxChunkDataMemoryMB || 1024,
+                        callCounts: { ...this._callCounts }
+                    };
+                }
+
+                /**
+                 * Reset call counters for profiling.
                  */
                 resetCallStats() {
                     for (const key in this._callCounts) {
@@ -10972,6 +11221,12 @@
                 const waitingLightLen = typeof chunksNeedingLightingUpdate !== 'undefined' ? chunksNeedingLightingUpdate.size : 0;
                 html += `EdgeLight: ${edgeLightQLen} | Wait: ${waitingLightLen}\n`;
                 html += `Built: ${perfMetrics.chunksBuilt} | Skip: ${perfMetrics.chunksSkipped}\n`;
+                // Chunk Data Pool stats (Nvidium-style persistence)
+                const poolStats = chunkDataPool.getStats();
+                const poolMemColor = parseFloat(poolStats.totalDataSizeMB) > poolStats.maxDataSizeMB * 0.9 ? 'perf-warn' : '';
+                html += `<span class="perf-section">── Data Pool ──</span>\n`;
+                html += `<span class="${poolMemColor}">Memory: ${poolStats.totalDataSizeMB}/${poolStats.maxDataSizeMB}MB</span>\n`;
+                html += `Tracked: ${poolStats.chunksWithData} chunks\n`;
                 html += `<span class="perf-section">── Rendering ──</span>\n`;
                 html += `Faces: ${(totalFaces/1000).toFixed(1)}K\n`;
                 html += `Culled: ${culled} chunks\n`;
@@ -11130,6 +11385,8 @@
             const chunks = new Map();
             // Create global VoxelWorld instance bound to the chunks Map
             const voxelWorld = new VoxelWorld(chunks);
+            // Create ChunkDataPool for Nvidium-style data persistence
+            const chunkDataPool = new ChunkDataPool(chunks, SETTINGS);
             const chunkMeshes = new Map();
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
@@ -14701,6 +14958,8 @@
                 edgeLightingUpdateQueue.delete(key);
                 chunksNeedingLightingUpdate.delete(key);
                 edgeLightingPassCount.delete(key);
+                // Notify ChunkDataPool that chunk data was removed
+                chunkDataPool.unregister(key);
             }
             const worldConfig = {
                 seed: WORLD_CONFIG.seed,
@@ -17740,7 +17999,10 @@
                         // generateChunkData already checks the cache, generates if missing, and returns the data
                         const data = await generateChunkData(chunk.cx, chunk.cz);
                         // Just ensure it's in the active memory map (generateChunkData handles this too, but this is safe)
-                        if (!chunks.has(chunk.key)) chunks.set(chunk.key, data);
+                        if (!chunks.has(chunk.key)) {
+                            chunks.set(chunk.key, data);
+                            chunkDataPool.register(chunk.key, data);
+                        }
                         generatedChunks.push(chunk); // Track all chunks (cached + generated)
                         generated++;
                     }
@@ -27158,6 +27420,7 @@
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
                         chunks.set(key, cachedData);
+                        chunkDataPool.register(key, cachedData);
                         // Queue neighbor updates for cached chunks too (may have missed cross-chunk features)
                         queueAdjacentChunksForUpdate(cx, cz, key);
                         return cachedData;
@@ -27220,6 +27483,7 @@
                     chunk.genState |= GEN_PASS.BLOCKLIGHT;
 
                     chunks.set(key, chunk);
+                    chunkDataPool.register(key, chunk);
                     pristineChunks.add(key);
 
                     // Queue adjacent chunks for update (cross-chunk features like trees, lighting)
@@ -28090,6 +28354,9 @@
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
 
+                    // Track chunk access for LRU eviction
+                    chunkDataPool.touch(cKey);
+
                     // CRITICAL: Release any existing meshes before creating new ones
                     // This prevents duplicate meshes from accumulating in the scene
                     // (which causes visual artifacts like darker water from z-fighting)
@@ -28656,21 +28923,10 @@
                 // Aggressively discard pristine chunks that aren't currently needed
                 // No need to check if mesh exists - IndexedDB will cache the data
                 if (pristineChunks.size > 0) { for (const key of pristineChunks) { if (!neededKeys.has(key) && canEvictChunk(key)) { purgeChunkData(key); }}}
-                // --- 8. Cache Pruning (Moved to end for safety) ---
-                if (chunks.size > SETTINGS.maxCachedChunks) {
-                    const allChunks = Array.from(chunks.keys()).map((key) => { const [c, z] = key.split(",").map(Number); return { key, dist: (c - chunkX) ** 2 + (z - chunkZ) ** 2 }; });
-                    allChunks.sort((a, b) => b.dist - a.dist); // Furthest first
-                    const toRemove = Math.floor(chunks.size * 0.25); // Remove 25% at a time (increased from 10% for more aggressive cleanup)
-                    // NEVER delete a chunk that is currently visible (needed)
-                    let removed = 0;
-                    for (let i = 0; i < allChunks.length && removed < toRemove; i++) {
-                        const targetKey = allChunks[i].key;
-                        if (neededKeys.has(targetKey)) continue;
-                        if (!canEvictChunk(targetKey, { persistModified: true })) continue;
-                        purgeChunkData(targetKey);
-                        removed++;
-                    }
-                }
+                // --- 8. Chunk Data Pool Eviction ---
+                // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
+                // This replaces the old maxCachedChunks approach with memory-budget-based eviction
+                chunkDataPool.evictIfNeeded(chunkX, chunkZ, modifiedChunks, purgeChunkData);
                 // --- BIOME CACHE CLEANUP ---
                 // Prevent memory leak by removing distant biome cells
                 if (biomeCellCache.size > 10000) {
