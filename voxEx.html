@@ -4927,6 +4927,7 @@
                 targetFPS: 60,
                 frameUpdateInterval: 5,
                 enableFrustumCulling: savedSettings.enableFrustumCulling !== undefined ? savedSettings.enableFrustumCulling : true,
+                enableSectionLOD: savedSettings.enableSectionLOD !== undefined ? savedSettings.enableSectionLOD : true,
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -5118,6 +5119,7 @@
                 lowerBoundFPS: 30,
                 upperBoundFPS: 50,
                 enableFrustumCulling: true,
+                enableSectionLOD: true,
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -10502,6 +10504,44 @@
                     if (dist <= level.maxDistance) return level.skipFaces;
                 }
                 return 0.4;
+            }
+
+            // --- OPTIMIZATION 4b: Section-Level LOD Configuration ---
+            // Skip entire underground sections at distance (they're occluded by surface)
+            const SECTION_LOD_CONFIG = {
+                enabled: true,
+                // Y threshold below which sections may be skipped (in block coordinates)
+                // Sections with maxBlockY below this are "underground"
+                undergroundThreshold: 48, // Below Y=48 is considered underground
+                levels: [
+                    { maxDistanceSq: 16, skipUndergroundBelow: 0 },      // 0-4 chunks: Full detail
+                    { maxDistanceSq: 64, skipUndergroundBelow: 32 },     // 4-8 chunks: Skip deep caves (Y<32)
+                    { maxDistanceSq: 144, skipUndergroundBelow: 48 },    // 8-12 chunks: Skip most underground (Y<48)
+                    { maxDistanceSq: Infinity, skipUndergroundBelow: 56 } // 12+ chunks: Skip below sea level (Y<56)
+                ]
+            };
+
+            // Track section LOD statistics
+            const sectionLODStats = {
+                sectionsChecked: 0,
+                sectionsSkippedByLOD: 0,
+                lastUpdate: 0
+            };
+            window.sectionLODStats = sectionLODStats;
+
+            /**
+             * Get the Y threshold below which sections should be skipped for LOD.
+             * @param {number} distSq - Squared distance in chunks
+             * @returns {number} Y threshold (0 = no LOD skipping)
+             */
+            function getSectionLODThreshold(distSq) {
+                if (!SECTION_LOD_CONFIG.enabled || !SETTINGS.enableSectionLOD) return 0;
+                for (const level of SECTION_LOD_CONFIG.levels) {
+                    if (distSq <= level.maxDistanceSq) {
+                        return level.skipUndergroundBelow;
+                    }
+                }
+                return SECTION_LOD_CONFIG.undergroundThreshold;
             }
 
             // --- OPTIMIZATION 5: Greedy meshing helper - combines adjacent same-type faces ---
@@ -21481,6 +21521,9 @@
                     " full=" +
                     fullBoundsCount +
                     "\n" +
+                    (sectionLODStats.sectionsChecked > 0 ?
+                        "LOD Skip: " + sectionLODStats.sectionsSkippedByLOD +
+                        " (" + ((sectionLODStats.sectionsSkippedByLOD / sectionLODStats.sectionsChecked) * 100).toFixed(1) + "%)\n" : "") +
                     "Rendered faces (quads): " +
                     totalFaces.toLocaleString() +
                     "\n" +
@@ -29306,6 +29349,11 @@
                     const lodSkipFactor = getLODSkipFactor(distSq);
                     const useDeferredLight = shouldUseDeferredLighting(distSq);
                     let skipCounter = 0; // For LOD face skipping
+
+                    // NEW: Calculate section LOD threshold based on distance
+                    const sectionLODYThreshold = getSectionLODThreshold(distSq);
+                    let sectionsLODSkipped = 0;
+
                     // OPTIMIZATION: Pre-calculate all neighbor keys at once (reduces string concatenations)
                     const czM1 = cz - 1, czP1 = cz + 1;
                     const cxM1 = cx - 1, cxP1 = cx + 1;
@@ -29413,6 +29461,25 @@
                             sectionsSkipped++;
                             blocksSkipped += BLOCKS_PER_SECTION;
                             continue;
+                        }
+
+                        // Section LOD - skip deep underground sections at distance
+                        // Underground sections are occluded by surface terrain and invisible at distance
+                        if (section && section.analyzed && sectionLODYThreshold > 0) {
+                            sectionLODStats.sectionsChecked++;
+
+                            // Safety: Never skip sections near or above sea level to preserve surface detail
+                            const safetyMargin = 16; // One section height below sea level
+                            const absoluteMinY = Math.min(sectionLODYThreshold, WORLD_DIMS.seaLevel - safetyMargin);
+
+                            // Skip if entire section is deep underground (well below surface)
+                            if (section.maxBlockY < absoluteMinY) {
+                                sectionsLODSkipped++;
+                                sectionsSkipped++;
+                                blocksSkipped += BLOCKS_PER_SECTION;
+                                sectionLODStats.sectionsSkippedByLOD++;
+                                continue;
+                            }
                         }
 
                         // Calculate Y bounds for this section
@@ -29554,6 +29621,9 @@
                     if (sectionsSkipped > 0) {
                         perfMetrics.sectionsSkipped = (perfMetrics.sectionsSkipped || 0) + sectionsSkipped;
                         perfMetrics.blocksSkipped = (perfMetrics.blocksSkipped || 0) + blocksSkipped;
+                    }
+                    if (sectionsLODSkipped > 0) {
+                        perfMetrics.sectionsLODSkipped = (perfMetrics.sectionsLODSkipped || 0) + sectionsLODSkipped;
                     }
 
                     // Compute tight bounds once for both terrain and water meshes
