@@ -5580,6 +5580,94 @@
             }
 
             /**
+             * Compute tight bounding box for a chunk from its section data.
+             * Returns world-space bounds based on actual block positions.
+             * @param {number} cx - Chunk X coordinate
+             * @param {number} cz - Chunk Z coordinate
+             * @param {Array} sections - Array of section metadata
+             * @returns {Object} Tight bounds {minX, maxX, minY, maxY, minZ, maxZ} in world space
+             */
+            function computeTightChunkBounds(cx, cz, sections) {
+                const chunkWorldX = cx * WORLD_DIMS.chunkSize;
+                const chunkWorldZ = cz * WORLD_DIMS.chunkSize;
+                const yOffset = WORLD_DIMS.yOffset;
+
+                // Start with inverted bounds
+                let minX = chunkWorldX + WORLD_DIMS.chunkSize;
+                let maxX = chunkWorldX;
+                let minY = WORLD_DIMS.chunkHeight;
+                let maxY = 0;
+                let minZ = chunkWorldZ + WORLD_DIMS.chunkSize;
+                let maxZ = chunkWorldZ;
+
+                let hasContent = false;
+
+                if (sections) {
+                    for (let i = 0; i < sections.length; i++) {
+                        const sec = sections[i];
+                        if (sec.isEmpty || !sec.analyzed) continue;
+
+                        hasContent = true;
+
+                        // Update Y bounds
+                        if (sec.minBlockY < minY) minY = sec.minBlockY;
+                        if (sec.maxBlockY > maxY) maxY = sec.maxBlockY;
+
+                        // Update X bounds (convert local to world)
+                        const secMinX = chunkWorldX + sec.minBlockX;
+                        const secMaxX = chunkWorldX + sec.maxBlockX;
+                        if (secMinX < minX) minX = secMinX;
+                        if (secMaxX > maxX) maxX = secMaxX;
+
+                        // Update Z bounds (convert local to world)
+                        const secMinZ = chunkWorldZ + sec.minBlockZ;
+                        const secMaxZ = chunkWorldZ + sec.maxBlockZ;
+                        if (secMinZ < minZ) minZ = secMinZ;
+                        if (secMaxZ > maxZ) maxZ = secMaxZ;
+                    }
+                }
+
+                // Fallback to full chunk bounds if no content found
+                if (!hasContent) {
+                    minX = chunkWorldX;
+                    maxX = chunkWorldX + WORLD_DIMS.chunkSize;
+                    minY = 0;
+                    maxY = WORLD_DIMS.chunkHeight;
+                    minZ = chunkWorldZ;
+                    maxZ = chunkWorldZ + WORLD_DIMS.chunkSize;
+                }
+
+                // Track bounds reduction stats
+                if (hasContent && typeof tightBoundsStats !== 'undefined') {
+                    const fullHeight = WORLD_DIMS.chunkHeight;
+                    const tightHeight = maxY - minY + 1;
+                    const heightReduction = 1 - (tightHeight / fullHeight);
+
+                    const fullVolume = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * fullHeight;
+                    const tightVolume = (maxX - minX + 1) * (maxZ - minZ + 1) * tightHeight;
+                    const volumeReduction = 1 - (tightVolume / fullVolume);
+
+                    // Update rolling average
+                    tightBoundsStats.totalChunks++;
+                    const n = tightBoundsStats.totalChunks;
+                    tightBoundsStats.avgHeightReduction =
+                        tightBoundsStats.avgHeightReduction * ((n - 1) / n) + heightReduction * (1 / n);
+                    tightBoundsStats.avgVolumeReduction =
+                        tightBoundsStats.avgVolumeReduction * ((n - 1) / n) + volumeReduction * (1 / n);
+                }
+
+                // Convert Y to world space and add block extent (+1)
+                return {
+                    minX: minX,
+                    maxX: maxX + 1,           // +1 for block extent
+                    minY: minY - yOffset,
+                    maxY: maxY + 1 - yOffset, // +1 for block extent
+                    minZ: minZ,
+                    maxZ: maxZ + 1            // +1 for block extent
+                };
+            }
+
+            /**
              * Analyze all sections in a chunk and populate visibility flags.
              * Uses early-exit optimization - stops scanning a section once we know
              * it's neither fully empty nor fully solid.
@@ -11935,6 +12023,14 @@
             const chunkBuildQueue = [];
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
+            // Track tight bounds effectiveness for frustum culling
+            const tightBoundsStats = {
+                totalChunks: 0,
+                avgHeightReduction: 0,      // Percentage reduction in Y extent
+                avgVolumeReduction: 0,      // Percentage reduction in bounding volume
+                lastUpdate: 0
+            };
+            window.tightBoundsStats = tightBoundsStats;
             const lightUpdateQueue = [];
             const queuedLightUpdates = new Set();
             const MAX_LIGHT_UPDATES_PER_FRAME = 4;
@@ -21390,6 +21486,9 @@
                     "Frustum Culling: " +
                     (culled ? `${culled} chunks hidden` : "OFF") +
                     "\n" +
+                    (tightBoundsStats.totalChunks > 0 ?
+                        "Bounds: " + (tightBoundsStats.avgHeightReduction * 100).toFixed(0) + "% height, " +
+                        (tightBoundsStats.avgVolumeReduction * 100).toFixed(0) + "% volume reduction\n" : "") +
                     "Camera FOV: " +
                     camera.fov.toFixed(0) +
                     "°\n" +
@@ -29021,6 +29120,26 @@
                 sphere.radius = CHUNK_BOUNDING_RADIUS;
                 geo.boundingSphere = sphere;
             }
+
+            /**
+             * Apply tight bounding box to chunk geometry based on actual content.
+             * Uses pre-computed bounds from section analysis for more accurate frustum culling.
+             * @param {THREE.BufferGeometry} geo - Geometry to update
+             * @param {Object} bounds - Tight bounds {minX, maxX, minY, maxY, minZ, maxZ}
+             */
+            function applyTightChunkBounds(geo, bounds) {
+                const box = geo.boundingBox || new THREE.Box3();
+                box.min.set(bounds.minX, bounds.minY, bounds.minZ);
+                box.max.set(bounds.maxX, bounds.maxY, bounds.maxZ);
+                geo.boundingBox = box;
+
+                // Compute bounding sphere from tight box
+                const sphere = geo.boundingSphere || new THREE.Sphere();
+                box.getCenter(sphere.center);
+                sphere.radius = box.min.distanceTo(box.max) * 0.5;
+                geo.boundingSphere = sphere;
+            }
+
             function acquireChunkMesh(type) {
                 const pool = type === "water" ? waterMeshPool : terrainMeshPool;
                 const mesh = pool.pop() || new THREE.Mesh(undefined, type === "water" ? waterMaterial : chunkMaterial);
@@ -29436,6 +29555,9 @@
                         perfMetrics.blocksSkipped = (perfMetrics.blocksSkipped || 0) + blocksSkipped;
                     }
 
+                    // Compute tight bounds once for both terrain and water meshes
+                    const tightBounds = computeTightChunkBounds(cx, cz, sections);
+
                     // --- CREATE TERRAIN MESH (INDEXED GEOMETRY WITH POOLED BUFFERS) ---
                     if (tFaceCount > 0) {
                         // Safety check: ensure we don't exceed buffer capacity
@@ -29487,8 +29609,8 @@
                         // Set draw range to only render valid portion
                         terrainGeo.setDrawRange(0, tIIdx);
 
-                        // Update bounds
-                        applyChunkBounds(terrainGeo, startX, startZ);
+                        // Update bounds using pre-computed tight bounds from section data
+                        applyTightChunkBounds(terrainGeo, tightBounds);
 
                         // Attach to mesh (attributes already have DynamicDrawUsage from pool)
                         const terrainMesh = acquireChunkMesh("terrain");
@@ -29558,8 +29680,8 @@
                         // Set draw range to only render valid portion
                         waterGeo.setDrawRange(0, wIIdx);
 
-                        // Update bounds
-                        applyChunkBounds(waterGeo, startX, startZ);
+                        // Update bounds using pre-computed tight bounds from section data
+                        applyTightChunkBounds(waterGeo, tightBounds);
 
                         // Attach to mesh (attributes already have DynamicDrawUsage from pool)
                         const waterMesh = acquireChunkMesh("water");
