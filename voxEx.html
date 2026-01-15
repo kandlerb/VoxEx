@@ -5557,6 +5557,81 @@
                 return lx + lz * SECTION_HEIGHT + ly * SECTION_HEIGHT * SECTION_HEIGHT;
             }
 
+            /**
+             * Analyze all sections in a chunk and populate visibility flags.
+             * Uses early-exit optimization - stops scanning a section once we know
+             * it's neither fully empty nor fully solid.
+             * @param {Object} chunk - Chunk object with blocks and sections arrays
+             */
+            function analyzeChunkSections(chunk) {
+                if (!chunk || !chunk.blocks || !chunk.sections) return;
+
+                const blocks = chunk.blocks;
+                const sections = chunk.sections;
+                const chunkSize = WORLD_DIMS.chunkSize; // 16
+
+                for (let s = 0; s < SECTIONS_PER_CHUNK; s++) {
+                    const section = sections[s];
+                    const baseY = s * SECTION_HEIGHT;
+
+                    // Reset section state
+                    let isEmpty = true;
+                    let isFullySolid = true;
+                    let minBlockY = baseY + SECTION_HEIGHT; // Start beyond section
+                    let maxBlockY = baseY - 1;              // Start before section
+
+                    // Scan all blocks in section
+                    for (let ly = 0; ly < SECTION_HEIGHT; ly++) {
+                        const y = baseY + ly;
+                        const yOffset = y * 256; // y * chunkSize * chunkSize
+
+                        for (let lz = 0; lz < chunkSize; lz++) {
+                            const zOffset = lz * chunkSize;
+
+                            for (let lx = 0; lx < chunkSize; lx++) {
+                                const idx = lx + zOffset + yOffset;
+                                const blockId = blocks[idx];
+
+                                if (blockId !== AIR) {
+                                    // Found non-air block
+                                    isEmpty = false;
+
+                                    // Update bounds
+                                    if (y < minBlockY) minBlockY = y;
+                                    if (y > maxBlockY) maxBlockY = y;
+
+                                    // Check if block breaks "fully solid" status
+                                    if (isFullySolid) {
+                                        if (!BLOCK_IS_SOLID[blockId] || !BLOCK_IS_OPAQUE[blockId]) {
+                                            isFullySolid = false;
+                                        }
+                                    }
+                                } else {
+                                    // Found air block - can't be fully solid
+                                    if (isFullySolid) {
+                                        isFullySolid = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If section is empty, it's not fully solid (no blocks = nothing solid)
+                    if (isEmpty) {
+                        isFullySolid = false;
+                        minBlockY = baseY;
+                        maxBlockY = baseY;
+                    }
+
+                    // Update section data
+                    section.isEmpty = isEmpty;
+                    section.isFullySolid = isFullySolid;
+                    section.minBlockY = minBlockY;
+                    section.maxBlockY = maxBlockY;
+                    section.analyzed = true;
+                }
+            }
+
             // Chunk memory constants for LRU eviction
             const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
             const DEFAULT_DATA_KEEP_DISTANCE = 48; // chunks - larger than max render distance
@@ -6731,6 +6806,14 @@
                     if (oldId === blockId) return false;
 
                     if (chunk.blocks) { chunk.blocks[idx] = blockId; } else { chunk[idx] = blockId; }
+
+                    // Mark affected section as needing re-analysis
+                    if (chunk.sections) {
+                        const sectionIdx = Math.floor(ly / SECTION_HEIGHT);
+                        if (sectionIdx >= 0 && sectionIdx < chunk.sections.length) {
+                            chunk.sections[sectionIdx].analyzed = false;
+                        }
+                    }
 
                     // Invalidate cache
                     this._lastChunkKey = null;
@@ -27814,6 +27897,8 @@
                         // Recalculate lighting for cached chunks to fix any old broken values
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
+                        // Analyze sections for visibility optimization
+                        analyzeChunkSections(cachedData);
                         chunks.set(key, cachedData);
                         chunkDataPool.register(key, cachedData);
                         // Queue neighbor updates for cached chunks too (may have missed cross-chunk features)
@@ -27877,6 +27962,9 @@
                     // --- PASS 5: Calculate block light ---
                     calculateBlockLight(chunk, chunkSize, chunkHeight);
                     chunk.genState |= GEN_PASS.BLOCKLIGHT;
+
+                    // --- PASS 6: Analyze sections for visibility optimization ---
+                    analyzeChunkSections(chunk);
 
                     chunks.set(key, chunk);
                     chunkDataPool.register(key, chunk);
@@ -28749,6 +28837,20 @@
                     const cKey = getChunkKey(cx, cz);
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
+
+                    // Re-analyze sections if any are dirty (block was modified)
+                    if (centerData.sections) {
+                        let needsAnalysis = false;
+                        for (let i = 0; i < centerData.sections.length; i++) {
+                            if (!centerData.sections[i].analyzed) {
+                                needsAnalysis = true;
+                                break;
+                            }
+                        }
+                        if (needsAnalysis) {
+                            analyzeChunkSections(centerData);
+                        }
+                    }
 
                     // Track chunk access for LRU eviction
                     chunkDataPool.touch(cKey);
