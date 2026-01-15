@@ -5503,6 +5503,11 @@
             const SECTION_HEIGHT = 16;
             const SECTIONS_PER_CHUNK = Math.ceil(WORLD_DIMS.chunkHeight / SECTION_HEIGHT); // 20 sections for 320 height
 
+            // Chunk memory constants for LRU eviction
+            const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
+            const DEFAULT_DATA_KEEP_DISTANCE = 48; // chunks - larger than max render distance
+            const DEFAULT_MEMORY_BUDGET_MB = 512; // MB - default memory budget for chunk data
+
             // --- THREE.js Built-in Pooled Objects (avoid per-call allocation) ---
             const _box3Player = new THREE.Box3();
             const _box3Block = new THREE.Box3();
@@ -6561,6 +6566,8 @@
                 ensureChunk(cx, cz) {
                     const key = this.getChunkKey(cx, cz);
                     if (this.chunks.has(key)) {
+                        // Update LRU access time
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                         return this.chunks.get(key);
                     }
                     // Queue for generation
@@ -6588,10 +6595,15 @@
                     const cz = (z >> 4) | 0;
                     const key = `${cx},${cz}`;  // Inline to avoid getChunkKey function call
                     // OPTIMIZATION: Chunk cache for sequential block access in same chunk
-                    const chunk = key === this._lastChunkKey ? this._lastChunk : this.chunks.get(key);
+                    const isCacheHit = key === this._lastChunkKey;
+                    const chunk = isCacheHit ? this._lastChunk : this.chunks.get(key);
                     if (!chunk) return undefined;
-                    this._lastChunkKey = key;
-                    this._lastChunk = chunk;
+                    // Update LRU access time only on cache miss (new chunk access)
+                    if (!isCacheHit) {
+                        this._lastChunkKey = key;
+                        this._lastChunk = chunk;
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
+                    }
                     // OPTIMIZATION: Bitwise ops for local coords and index
                     const lx = x & 15;
                     const lz = z & 15;
@@ -6650,6 +6662,8 @@
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                        // Update LRU access time for existing chunk
+                        if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                     }
 
                     // OPTIMIZATION: Bitwise for local coords and index
@@ -11497,6 +11511,16 @@
                     }
                 }
                 html += `Mesh: R:${meshStateCount.ready} Q:${meshStateCount.queued} B:${meshStateCount.building} S:${meshStateCount.stale}\n`;
+                // Calculate raw chunk memory and oldest access time
+                const chunkMemoryMB = (chunks.size * CHUNK_DATA_SIZE / (1024 * 1024)).toFixed(1);
+                let oldestAccess = performance.now();
+                for (const [, meta] of chunkDataPool.metadata) {
+                    if (meta.hasData && meta.lastAccessed < oldestAccess) {
+                        oldestAccess = meta.lastAccessed;
+                    }
+                }
+                const oldestAgeSeconds = ((performance.now() - oldestAccess) / 1000).toFixed(1);
+                html += `Raw Mem: ${chunkMemoryMB}MB | Oldest: ${oldestAgeSeconds}s\n`;
                 html += `<span class="perf-section">── Rendering ──</span>\n`;
                 html += `Faces: ${(totalFaces/1000).toFixed(1)}K\n`;
                 html += `Culled: ${culled} chunks\n`;
