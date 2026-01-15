@@ -5502,6 +5502,135 @@
             // Section constants for 16×16×16 vertical subdivision
             const SECTION_HEIGHT = 16;
             const SECTIONS_PER_CHUNK = Math.ceil(WORLD_DIMS.chunkHeight / SECTION_HEIGHT); // 20 sections for 320 height
+            const BLOCKS_PER_SECTION = SECTION_HEIGHT * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize; // 4096 blocks per section
+
+            /**
+             * Create default section data array for a chunk.
+             * Each section is a 16×16×16 vertical subdivision of the chunk.
+             * @returns {Array<Object>} Array of section metadata objects (one per section)
+             */
+            function createSectionData() {
+                const sections = new Array(SECTIONS_PER_CHUNK);
+                for (let i = 0; i < SECTIONS_PER_CHUNK; i++) {
+                    sections[i] = {
+                        isEmpty: true,       // Assume empty until analyzed
+                        isFullySolid: false, // Assume not solid until analyzed
+                        hasMesh: false,      // No mesh initially
+                        faceCount: 0,        // No faces initially
+                        minBlockY: i * SECTION_HEIGHT,  // Section start Y
+                        maxBlockY: i * SECTION_HEIGHT,  // Will be updated during analysis
+                        analyzed: false      // Whether section has been analyzed
+                    };
+                }
+                return sections;
+            }
+
+            /**
+             * Get section index from Y coordinate.
+             * @param {number} y - Block Y coordinate (0-319)
+             * @returns {number} Section index (0-19)
+             */
+            function getSectionIndex(y) {
+                return Math.floor(y / SECTION_HEIGHT);
+            }
+
+            /**
+             * Get Y range for a section.
+             * @param {number} sectionIndex - Section index (0-19)
+             * @returns {{minY: number, maxY: number}} Y range (inclusive min, exclusive max)
+             */
+            function getSectionYRange(sectionIndex) {
+                return {
+                    minY: sectionIndex * SECTION_HEIGHT,
+                    maxY: (sectionIndex + 1) * SECTION_HEIGHT
+                };
+            }
+
+            /**
+             * Get block index within section from local coordinates.
+             * @param {number} lx - Local X (0-15)
+             * @param {number} ly - Y within section (0-15)
+             * @param {number} lz - Local Z (0-15)
+             * @returns {number} Index within section (0-4095)
+             */
+            function getSectionBlockIndex(lx, ly, lz) {
+                return lx + lz * SECTION_HEIGHT + ly * SECTION_HEIGHT * SECTION_HEIGHT;
+            }
+
+            /**
+             * Analyze all sections in a chunk and populate visibility flags.
+             * Uses early-exit optimization - stops scanning a section once we know
+             * it's neither fully empty nor fully solid.
+             * @param {Object} chunk - Chunk object with blocks and sections arrays
+             */
+            function analyzeChunkSections(chunk) {
+                if (!chunk || !chunk.blocks || !chunk.sections) return;
+
+                const blocks = chunk.blocks;
+                const sections = chunk.sections;
+                const chunkSize = WORLD_DIMS.chunkSize; // 16
+
+                for (let s = 0; s < SECTIONS_PER_CHUNK; s++) {
+                    const section = sections[s];
+                    const baseY = s * SECTION_HEIGHT;
+
+                    // Reset section state
+                    let isEmpty = true;
+                    let isFullySolid = true;
+                    let minBlockY = baseY + SECTION_HEIGHT; // Start beyond section
+                    let maxBlockY = baseY - 1;              // Start before section
+
+                    // Scan all blocks in section
+                    for (let ly = 0; ly < SECTION_HEIGHT; ly++) {
+                        const y = baseY + ly;
+                        const yOffset = y * 256; // y * chunkSize * chunkSize
+
+                        for (let lz = 0; lz < chunkSize; lz++) {
+                            const zOffset = lz * chunkSize;
+
+                            for (let lx = 0; lx < chunkSize; lx++) {
+                                const idx = lx + zOffset + yOffset;
+                                const blockId = blocks[idx];
+
+                                if (blockId !== AIR) {
+                                    // Found non-air block
+                                    isEmpty = false;
+
+                                    // Update bounds
+                                    if (y < minBlockY) minBlockY = y;
+                                    if (y > maxBlockY) maxBlockY = y;
+
+                                    // Check if block breaks "fully solid" status
+                                    if (isFullySolid) {
+                                        if (!BLOCK_IS_SOLID[blockId] || !BLOCK_IS_OPAQUE[blockId]) {
+                                            isFullySolid = false;
+                                        }
+                                    }
+                                } else {
+                                    // Found air block - can't be fully solid
+                                    if (isFullySolid) {
+                                        isFullySolid = false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // If section is empty, it's not fully solid (no blocks = nothing solid)
+                    if (isEmpty) {
+                        isFullySolid = false;
+                        minBlockY = baseY;
+                        maxBlockY = baseY;
+                    }
+
+                    // Update section data
+                    section.isEmpty = isEmpty;
+                    section.isFullySolid = isFullySolid;
+                    section.minBlockY = minBlockY;
+                    section.maxBlockY = maxBlockY;
+                    section.analyzed = true;
+                }
+            }
 
             // Chunk memory constants for LRU eviction
             const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
@@ -6644,6 +6773,7 @@
                             cz: cz,
                             startX: cx * WORLD_DIMS.chunkSize,
                             startZ: cz * WORLD_DIMS.chunkSize,
+                            sections: createSectionData(), // Per-section metadata for rendering optimization
                         };
                         this.chunks.set(key, chunk);
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
@@ -6656,12 +6786,14 @@
                             blocks: legacy,
                             skyLight: new Uint8Array(legacySize).fill(15),
                             blockLight: new Uint8Array(legacySize).fill(1),
+                            sections: createSectionData(), // Per-section metadata for rendering optimization
                         };
                         this.chunks.set(key, chunk);
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                        if (!chunk.sections) chunk.sections = createSectionData(); // Ensure sections exist
                         // Update LRU access time for existing chunk
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                     }
@@ -6674,6 +6806,14 @@
                     if (oldId === blockId) return false;
 
                     if (chunk.blocks) { chunk.blocks[idx] = blockId; } else { chunk[idx] = blockId; }
+
+                    // Mark affected section as needing re-analysis
+                    if (chunk.sections) {
+                        const sectionIdx = Math.floor(ly / SECTION_HEIGHT);
+                        if (sectionIdx >= 0 && sectionIdx < chunk.sections.length) {
+                            chunk.sections[sectionIdx].analyzed = false;
+                        }
+                    }
 
                     // Invalidate cache
                     this._lastChunkKey = null;
@@ -11679,6 +11819,8 @@
             const chunks = new Map();
             // Create global VoxelWorld instance bound to the chunks Map
             const voxelWorld = new VoxelWorld(chunks);
+            window.voxelWorld = voxelWorld; // Expose for console debugging
+            window.chunks = chunks; // Expose chunks Map for console debugging
             // Create ChunkDataPool for Nvidium-style data persistence
             const chunkDataPool = new ChunkDataPool(chunks, SETTINGS);
             const chunkMeshes = new Map();
@@ -20875,6 +21017,21 @@
                 // Sum rendered faces across all active chunks
                 let totalFaces = 0;
                 for (const v of chunkRenderedFaces.values()) { totalFaces += v; }
+                // Calculate section stats for debug overlay
+                let totalSections = 0, emptySections = 0, solidSections = 0, analyzedSections = 0;
+                for (const chunk of chunks.values()) {
+                    if (chunk.sections) {
+                        for (let i = 0; i < chunk.sections.length; i++) {
+                            totalSections++;
+                            const sec = chunk.sections[i];
+                            if (sec.analyzed) {
+                                analyzedSections++;
+                                if (sec.isEmpty) emptySections++;
+                                if (sec.isFullySolid) solidSections++;
+                            }
+                        }
+                    }
+                }
                 overlay.innerText =
                     "World Seed: " +
                     finalSeedDisplay +
@@ -20918,6 +21075,15 @@
                     " / " +
                     chunkMeshCount +
                     "\n" +
+                    "Sections: " +
+                    totalSections +
+                    " (empty: " +
+                    emptySections +
+                    " | solid: " +
+                    solidSections +
+                    " | analyzed: " +
+                    analyzedSections +
+                    ")\n" +
                     "Rendered faces (quads): " +
                     totalFaces.toLocaleString() +
                     "\n" +
@@ -27720,9 +27886,19 @@
                         if (typeof cachedData.genState === 'undefined') {
                             cachedData.genState = GEN_PASS.ALL; // Assume fully generated
                         }
+                        // Ensure cached chunks have sections (for backward compatibility)
+                        if (!cachedData.sections) {
+                            cachedData.sections = createSectionData();
+                            // Mark sections as needing analysis since they weren't saved
+                            for (let i = 0; i < cachedData.sections.length; i++) {
+                                cachedData.sections[i].analyzed = false;
+                            }
+                        }
                         // Recalculate lighting for cached chunks to fix any old broken values
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
+                        // Analyze sections for visibility optimization
+                        analyzeChunkSections(cachedData);
                         chunks.set(key, cachedData);
                         chunkDataPool.register(key, cachedData);
                         // Queue neighbor updates for cached chunks too (may have missed cross-chunk features)
@@ -27776,6 +27952,7 @@
                         startX,
                         startZ,
                         genState, // Track which generation passes have completed
+                        sections: createSectionData(), // Per-section metadata for rendering optimization
                     };
 
                     // --- PASS 4: Calculate sunlight ---
@@ -27785,6 +27962,9 @@
                     // --- PASS 5: Calculate block light ---
                     calculateBlockLight(chunk, chunkSize, chunkHeight);
                     chunk.genState |= GEN_PASS.BLOCKLIGHT;
+
+                    // --- PASS 6: Analyze sections for visibility optimization ---
+                    analyzeChunkSections(chunk);
 
                     chunks.set(key, chunk);
                     chunkDataPool.register(key, chunk);
@@ -28658,6 +28838,20 @@
                     const centerData = chunks.get(cKey);
                     if (!centerData) { return; }
 
+                    // Re-analyze sections if any are dirty (block was modified)
+                    if (centerData.sections) {
+                        let needsAnalysis = false;
+                        for (let i = 0; i < centerData.sections.length; i++) {
+                            if (!centerData.sections[i].analyzed) {
+                                needsAnalysis = true;
+                                break;
+                            }
+                        }
+                        if (needsAnalysis) {
+                            analyzeChunkSections(centerData);
+                        }
+                    }
+
                     // Track chunk access for LRU eviction
                     chunkDataPool.touch(cKey);
 
@@ -28760,162 +28954,178 @@
                     const useBlocksFormat = !!centerData.blocks;
                     const blockData = useBlocksFormat ? centerData.blocks : centerData;
 
-                    // OPTIMIZATION: Use cached Y bounds from section analysis
-                    // This avoids scanning hundreds of Y layers every mesh rebuild
-                    let maxY = height;
-                    let minY = 0;
-                    const sectionInfo = chunkDataPool.getSectionInfo(cKey);
-                    if (sectionInfo) {
-                        minY = sectionInfo.minY;
-                        maxY = Math.min(height, sectionInfo.maxY + 1);
-                        // Skip entirely if no blocks in this chunk
-                        if (sectionInfo.visibleSections === 0) {
+                    // OPTIMIZATION: Section-aware meshing - skip empty sections entirely
+                    // Uses pre-computed section data from chunk generation (steps 2.1/2.2)
+                    const sections = centerData.sections;
+                    let sectionsSkipped = 0;
+                    let blocksSkipped = 0;
+
+                    // Skip entirely if chunk has no visible sections
+                    if (sections) {
+                        let hasVisibleSections = false;
+                        for (let i = 0; i < sections.length; i++) {
+                            if (!sections[i].isEmpty) {
+                                hasVisibleSections = true;
+                                break;
+                            }
+                        }
+                        if (!hasVisibleSections) {
                             queuedChunkKeys.delete(cKey);
                             chunkDataPool.setMeshState(cKey, MESH_STATE.READY);
                             return;
                         }
-                    } else {
-                        // Trigger section analysis if not done yet
-                        chunkDataPool.analyzeChunkSections(cKey, centerData);
-                        const info = chunkDataPool.getSectionInfo(cKey);
-                        if (info) {
-                            minY = info.minY;
-                            maxY = Math.min(height, info.maxY + 1);
-                        } else {
-                            // Fallback: scan for maxY (original code)
-                            maxY = 0;
-                            for (let y = height - 1; y >= 0; y--) {
-                                const yOffset = y * 256;
-                                let foundBlock = false;
-                                for (let z = 0; z < 16 && !foundBlock; z++) {
-                                    const zOffset = z * 16;
-                                    for (let x = 0; x < 16; x++) {
-                                        const id = blockData[x + zOffset + yOffset];
-                                        if (id !== AIR) {
-                                            maxY = y + 1;
-                                            foundBlock = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (foundBlock) break;
-                            }
-                            maxY = Math.min(height, maxY + 1);
-                        }
                     }
-                    const skippedLayers = height - maxY + minY;
-                    if (skippedLayers > 0) perfMetrics.facesSkipped += skippedLayers * 256; // Rough estimate
 
-                    // Main Generation Loop - only process from minY to maxY
-                    for (let y = minY; y < maxY; y++) {
-                        const yOffset = y * 256;
-                        for (let z = 0; z < 16; z++) {
-                            const zOffset = z * 16;
-                            for (let x = 0; x < 16; x++) {
-                                const idx = x + zOffset + yOffset;
-                                const id = blockData[idx];
-                                if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
-                                const wx = startX + x;
-                                const wy = y - WORLD_DIMS.yOffset;
-                                const wz = startZ + z;
-                                const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
-                                // Determine if this is water
-                                const isWater = id === WATER;
-                                // Choose the correct buffers
-                                const pos = isWater ? waterPos : terrainPos;
-                                const norm = isWater ? waterNorm : terrainNorm;
-                                const uvs = isWater ? waterUvs : terrainUvs;
-                                const cols = isWater ? waterCols : terrainCols;
-                                let vIdx = isWater ? wVIdx : tVIdx;
-                                let uvIdx = isWater ? wUvIdx : tUvIdx;
-                                let cIdx = isWater ? wCIdx : tCIdx;
-                                // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
-                                // UV lookup: index 0=top, 1=bottom, 2-5=side
-                                const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
-                                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
-                                    const face = FACE_DIRECTIONS[faceIdx];
-                                    const lx = x + face[0];
-                                    const ly = y + face[1];
-                                    const lz = z + face[2];
-                                    const nx = face[3];
-                                    const ny = face[4];
-                                    const nz = face[5];
-                                    // OPTIMIZATION: Use pre-computed UV values instead of array lookup
-                                    const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
-                                    const nid = getLocal(lx, ly, lz);
-                                    // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                    let draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+                    // Section-aware iteration: process each 16-block vertical section
+                    for (let sectionIdx = 0; sectionIdx < SECTIONS_PER_CHUNK; sectionIdx++) {
+                        const section = sections ? sections[sectionIdx] : null;
 
-                                    // OPTIMIZATION: LOD face skipping for distant chunks
-                                    // Skip some internal side faces based on distance (keeps chunk borders intact)
-                                    // DISABLED for now - was causing visual artifacts. Can be re-enabled after testing.
-                                    // if (draw && lodSkipFactor > 0 && !isWater) {
-                                    //     const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
-                                    //     if (isInternalFace && faceIdx >= 2) {
-                                    //         skipCounter++;
-                                    //         const keepEvery = Math.max(2, Math.floor(1 / lodSkipFactor));
-                                    //         if ((skipCounter % keepEvery) !== 0) draw = false;
-                                    //     }
-                                    // }
+                        // Skip empty sections entirely - no blocks to process
+                        if (section && section.isEmpty) {
+                            sectionsSkipped++;
+                            blocksSkipped += BLOCKS_PER_SECTION;
+                            continue;
+                        }
 
-                                    if (draw) {
-                                        // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
-                                        // But calculate AO from the solid block position (x,y,z), not the neighbor
-                                        // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
-                                        // Get vertex count for index offset calculation
-                                        const vertCount = isWater ? wVertCount : tVertCount;
-                                        const iIdx = isWater ? wIIdx : tIIdx;
-                                        const indices = isWater ? waterIndices : terrainIndices;
+                        // Calculate Y bounds for this section
+                        // Use section bounds if available, otherwise full section range
+                        const sectionBaseY = sectionIdx * SECTION_HEIGHT;
+                        const sectionTopY = sectionBaseY + SECTION_HEIGHT;
+                        const startY = (section && section.analyzed) ? section.minBlockY : sectionBaseY;
+                        const endY = (section && section.analyzed) ? Math.min(section.maxBlockY + 1, sectionTopY) : sectionTopY;
 
-                                        // OPTIMIZATION: Use simplified lighting for distant chunks
-                                        if (useDeferredLight) {
-                                            addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
-                                        } else if (isWater) {
-                                            // Calculate water depth (search DOWN to find bottom)
-                                            let waterDepth = 0;
-                                            for (let dy = y - 1; dy >= 0; dy--) {
-                                                const belowId = getLocal(x, dy, z);
-                                                if (belowId !== WATER) break;
-                                                waterDepth++;
-                                            }
-                                            // Calculate shore distance - check horizontal neighbors for solid blocks
-                                            const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                            let shoreDist = 4;
-                                            if (hasAirAbove) {
-                                                const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-                                                for (const [dx, dz] of directions) {
-                                                    for (let d = 1; d <= 4; d++) {
-                                                        const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                        if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
-                                                            shoreDist = Math.min(shoreDist, d);
-                                                            break;
-                                                        }
-                                                        if (checkId === AIR) {
-                                                            shoreDist = Math.min(shoreDist, d);
-                                                            break;
+                        // Skip if bounds indicate nothing to process
+                        if (startY >= endY) {
+                            sectionsSkipped++;
+                            continue;
+                        }
+
+                        // Track faces generated in this section
+                        const sectionFaceCountStart = tFaceCount + wFaceCount;
+
+                        // Process blocks in this section's Y range
+                        for (let y = startY; y < endY; y++) {
+                            const yOffset = y * 256;
+                            for (let z = 0; z < 16; z++) {
+                                const zOffset = z * 16;
+                                for (let x = 0; x < 16; x++) {
+                                    const idx = x + zOffset + yOffset;
+                                    const id = blockData[idx];
+                                    if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
+                                    const wx = startX + x;
+                                    const wy = y - WORLD_DIMS.yOffset;
+                                    const wz = startZ + z;
+                                    const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
+                                    // Determine if this is water
+                                    const isWater = id === WATER;
+                                    // Choose the correct buffers
+                                    const pos = isWater ? waterPos : terrainPos;
+                                    const norm = isWater ? waterNorm : terrainNorm;
+                                    const uvs = isWater ? waterUvs : terrainUvs;
+                                    const cols = isWater ? waterCols : terrainCols;
+                                    let vIdx = isWater ? wVIdx : tVIdx;
+                                    let uvIdx = isWater ? wUvIdx : tUvIdx;
+                                    let cIdx = isWater ? wCIdx : tCIdx;
+                                    // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
+                                    // UV lookup: index 0=top, 1=bottom, 2-5=side
+                                    const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                    for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                        const face = FACE_DIRECTIONS[faceIdx];
+                                        const lx = x + face[0];
+                                        const ly = y + face[1];
+                                        const lz = z + face[2];
+                                        const nx = face[3];
+                                        const ny = face[4];
+                                        const nz = face[5];
+                                        // OPTIMIZATION: Use pre-computed UV values instead of array lookup
+                                        const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
+                                        const nid = getLocal(lx, ly, lz);
+                                        // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
+                                        let draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+
+                                        // OPTIMIZATION: LOD face skipping for distant chunks
+                                        // Skip some internal side faces based on distance (keeps chunk borders intact)
+                                        // DISABLED for now - was causing visual artifacts. Can be re-enabled after testing.
+                                        // if (draw && lodSkipFactor > 0 && !isWater) {
+                                        //     const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
+                                        //     if (isInternalFace && faceIdx >= 2) {
+                                        //         skipCounter++;
+                                        //         const keepEvery = Math.max(2, Math.floor(1 / lodSkipFactor));
+                                        //         if ((skipCounter % keepEvery) !== 0) draw = false;
+                                        //     }
+                                        // }
+
+                                        if (draw) {
+                                            // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
+                                            // But calculate AO from the solid block position (x,y,z), not the neighbor
+                                            // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
+                                            // Get vertex count for index offset calculation
+                                            const vertCount = isWater ? wVertCount : tVertCount;
+                                            const iIdx = isWater ? wIIdx : tIIdx;
+                                            const indices = isWater ? waterIndices : terrainIndices;
+
+                                            // OPTIMIZATION: Use simplified lighting for distant chunks
+                                            if (useDeferredLight) {
+                                                addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
+                                            } else if (isWater) {
+                                                // Calculate water depth (search DOWN to find bottom)
+                                                let waterDepth = 0;
+                                                for (let dy = y - 1; dy >= 0; dy--) {
+                                                    const belowId = getLocal(x, dy, z);
+                                                    if (belowId !== WATER) break;
+                                                    waterDepth++;
+                                                }
+                                                // Calculate shore distance - check horizontal neighbors for solid blocks
+                                                const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                                let shoreDist = 4;
+                                                if (hasAirAbove) {
+                                                    const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                    for (const [dx, dz] of directions) {
+                                                        for (let d = 1; d <= 4; d++) {
+                                                            const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                            if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
+                                                                shoreDist = Math.min(shoreDist, d);
+                                                                break;
+                                                            }
+                                                            if (checkId === AIR) {
+                                                                shoreDist = Math.min(shoreDist, d);
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
+                                                // Indexed water face rendering
+                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                            } else {
+                                                // Indexed terrain face rendering
+                                                addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
                                             }
-                                            // Indexed water face rendering
-                                            addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
-                                        } else {
-                                            // Indexed terrain face rendering
-                                            addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
-                                        }
-                                        // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
-                                        vIdx += 12; uvIdx += 8; cIdx += 12;
-                                        if (isWater) {
-                                            wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
-                                            wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
-                                        } else {
-                                            tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
-                                            tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                            // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
+                                            vIdx += 12; uvIdx += 8; cIdx += 12;
+                                            if (isWater) {
+                                                wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
+                                                wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
+                                            } else {
+                                                tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
+                                                tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        // Update section mesh tracking
+                        if (section) {
+                            section.faceCount = (tFaceCount + wFaceCount) - sectionFaceCountStart;
+                            section.hasMesh = section.faceCount > 0;
+                        }
+                    }
+
+                    // Track section skipping performance
+                    if (sectionsSkipped > 0) {
+                        perfMetrics.sectionsSkipped = (perfMetrics.sectionsSkipped || 0) + sectionsSkipped;
+                        perfMetrics.blocksSkipped = (perfMetrics.blocksSkipped || 0) + blocksSkipped;
                     }
 
                     // --- CREATE TERRAIN MESH (INDEXED GEOMETRY) ---
