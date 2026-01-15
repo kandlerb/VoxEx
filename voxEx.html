@@ -28954,162 +28954,178 @@
                     const useBlocksFormat = !!centerData.blocks;
                     const blockData = useBlocksFormat ? centerData.blocks : centerData;
 
-                    // OPTIMIZATION: Use cached Y bounds from section analysis
-                    // This avoids scanning hundreds of Y layers every mesh rebuild
-                    let maxY = height;
-                    let minY = 0;
-                    const sectionInfo = chunkDataPool.getSectionInfo(cKey);
-                    if (sectionInfo) {
-                        minY = sectionInfo.minY;
-                        maxY = Math.min(height, sectionInfo.maxY + 1);
-                        // Skip entirely if no blocks in this chunk
-                        if (sectionInfo.visibleSections === 0) {
+                    // OPTIMIZATION: Section-aware meshing - skip empty sections entirely
+                    // Uses pre-computed section data from chunk generation (steps 2.1/2.2)
+                    const sections = centerData.sections;
+                    let sectionsSkipped = 0;
+                    let blocksSkipped = 0;
+
+                    // Skip entirely if chunk has no visible sections
+                    if (sections) {
+                        let hasVisibleSections = false;
+                        for (let i = 0; i < sections.length; i++) {
+                            if (!sections[i].isEmpty) {
+                                hasVisibleSections = true;
+                                break;
+                            }
+                        }
+                        if (!hasVisibleSections) {
                             queuedChunkKeys.delete(cKey);
                             chunkDataPool.setMeshState(cKey, MESH_STATE.READY);
                             return;
                         }
-                    } else {
-                        // Trigger section analysis if not done yet
-                        chunkDataPool.analyzeChunkSections(cKey, centerData);
-                        const info = chunkDataPool.getSectionInfo(cKey);
-                        if (info) {
-                            minY = info.minY;
-                            maxY = Math.min(height, info.maxY + 1);
-                        } else {
-                            // Fallback: scan for maxY (original code)
-                            maxY = 0;
-                            for (let y = height - 1; y >= 0; y--) {
-                                const yOffset = y * 256;
-                                let foundBlock = false;
-                                for (let z = 0; z < 16 && !foundBlock; z++) {
-                                    const zOffset = z * 16;
-                                    for (let x = 0; x < 16; x++) {
-                                        const id = blockData[x + zOffset + yOffset];
-                                        if (id !== AIR) {
-                                            maxY = y + 1;
-                                            foundBlock = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                                if (foundBlock) break;
-                            }
-                            maxY = Math.min(height, maxY + 1);
-                        }
                     }
-                    const skippedLayers = height - maxY + minY;
-                    if (skippedLayers > 0) perfMetrics.facesSkipped += skippedLayers * 256; // Rough estimate
 
-                    // Main Generation Loop - only process from minY to maxY
-                    for (let y = minY; y < maxY; y++) {
-                        const yOffset = y * 256;
-                        for (let z = 0; z < 16; z++) {
-                            const zOffset = z * 16;
-                            for (let x = 0; x < 16; x++) {
-                                const idx = x + zOffset + yOffset;
-                                const id = blockData[idx];
-                                if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
-                                const wx = startX + x;
-                                const wy = y - WORLD_DIMS.yOffset;
-                                const wz = startZ + z;
-                                const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
-                                // Determine if this is water
-                                const isWater = id === WATER;
-                                // Choose the correct buffers
-                                const pos = isWater ? waterPos : terrainPos;
-                                const norm = isWater ? waterNorm : terrainNorm;
-                                const uvs = isWater ? waterUvs : terrainUvs;
-                                const cols = isWater ? waterCols : terrainCols;
-                                let vIdx = isWater ? wVIdx : tVIdx;
-                                let uvIdx = isWater ? wUvIdx : tUvIdx;
-                                let cIdx = isWater ? wCIdx : tCIdx;
-                                // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
-                                // UV lookup: index 0=top, 1=bottom, 2-5=side
-                                const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
-                                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
-                                    const face = FACE_DIRECTIONS[faceIdx];
-                                    const lx = x + face[0];
-                                    const ly = y + face[1];
-                                    const lz = z + face[2];
-                                    const nx = face[3];
-                                    const ny = face[4];
-                                    const nz = face[5];
-                                    // OPTIMIZATION: Use pre-computed UV values instead of array lookup
-                                    const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
-                                    const nid = getLocal(lx, ly, lz);
-                                    // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                    let draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+                    // Section-aware iteration: process each 16-block vertical section
+                    for (let sectionIdx = 0; sectionIdx < SECTIONS_PER_CHUNK; sectionIdx++) {
+                        const section = sections ? sections[sectionIdx] : null;
 
-                                    // OPTIMIZATION: LOD face skipping for distant chunks
-                                    // Skip some internal side faces based on distance (keeps chunk borders intact)
-                                    // DISABLED for now - was causing visual artifacts. Can be re-enabled after testing.
-                                    // if (draw && lodSkipFactor > 0 && !isWater) {
-                                    //     const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
-                                    //     if (isInternalFace && faceIdx >= 2) {
-                                    //         skipCounter++;
-                                    //         const keepEvery = Math.max(2, Math.floor(1 / lodSkipFactor));
-                                    //         if ((skipCounter % keepEvery) !== 0) draw = false;
-                                    //     }
-                                    // }
+                        // Skip empty sections entirely - no blocks to process
+                        if (section && section.isEmpty) {
+                            sectionsSkipped++;
+                            blocksSkipped += BLOCKS_PER_SECTION;
+                            continue;
+                        }
 
-                                    if (draw) {
-                                        // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
-                                        // But calculate AO from the solid block position (x,y,z), not the neighbor
-                                        // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
-                                        // Get vertex count for index offset calculation
-                                        const vertCount = isWater ? wVertCount : tVertCount;
-                                        const iIdx = isWater ? wIIdx : tIIdx;
-                                        const indices = isWater ? waterIndices : terrainIndices;
+                        // Calculate Y bounds for this section
+                        // Use section bounds if available, otherwise full section range
+                        const sectionBaseY = sectionIdx * SECTION_HEIGHT;
+                        const sectionTopY = sectionBaseY + SECTION_HEIGHT;
+                        const startY = (section && section.analyzed) ? section.minBlockY : sectionBaseY;
+                        const endY = (section && section.analyzed) ? Math.min(section.maxBlockY + 1, sectionTopY) : sectionTopY;
 
-                                        // OPTIMIZATION: Use simplified lighting for distant chunks
-                                        if (useDeferredLight) {
-                                            addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
-                                        } else if (isWater) {
-                                            // Calculate water depth (search DOWN to find bottom)
-                                            let waterDepth = 0;
-                                            for (let dy = y - 1; dy >= 0; dy--) {
-                                                const belowId = getLocal(x, dy, z);
-                                                if (belowId !== WATER) break;
-                                                waterDepth++;
-                                            }
-                                            // Calculate shore distance - check horizontal neighbors for solid blocks
-                                            const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                            let shoreDist = 4;
-                                            if (hasAirAbove) {
-                                                const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-                                                for (const [dx, dz] of directions) {
-                                                    for (let d = 1; d <= 4; d++) {
-                                                        const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                        if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
-                                                            shoreDist = Math.min(shoreDist, d);
-                                                            break;
-                                                        }
-                                                        if (checkId === AIR) {
-                                                            shoreDist = Math.min(shoreDist, d);
-                                                            break;
+                        // Skip if bounds indicate nothing to process
+                        if (startY >= endY) {
+                            sectionsSkipped++;
+                            continue;
+                        }
+
+                        // Track faces generated in this section
+                        const sectionFaceCountStart = tFaceCount + wFaceCount;
+
+                        // Process blocks in this section's Y range
+                        for (let y = startY; y < endY; y++) {
+                            const yOffset = y * 256;
+                            for (let z = 0; z < 16; z++) {
+                                const zOffset = z * 16;
+                                for (let x = 0; x < 16; x++) {
+                                    const idx = x + zOffset + yOffset;
+                                    const id = blockData[idx];
+                                    if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
+                                    const wx = startX + x;
+                                    const wy = y - WORLD_DIMS.yOffset;
+                                    const wz = startZ + z;
+                                    const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
+                                    // Determine if this is water
+                                    const isWater = id === WATER;
+                                    // Choose the correct buffers
+                                    const pos = isWater ? waterPos : terrainPos;
+                                    const norm = isWater ? waterNorm : terrainNorm;
+                                    const uvs = isWater ? waterUvs : terrainUvs;
+                                    const cols = isWater ? waterCols : terrainCols;
+                                    let vIdx = isWater ? wVIdx : tVIdx;
+                                    let uvIdx = isWater ? wUvIdx : tUvIdx;
+                                    let cIdx = isWater ? wCIdx : tCIdx;
+                                    // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
+                                    // UV lookup: index 0=top, 1=bottom, 2-5=side
+                                    const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                    for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                        const face = FACE_DIRECTIONS[faceIdx];
+                                        const lx = x + face[0];
+                                        const ly = y + face[1];
+                                        const lz = z + face[2];
+                                        const nx = face[3];
+                                        const ny = face[4];
+                                        const nz = face[5];
+                                        // OPTIMIZATION: Use pre-computed UV values instead of array lookup
+                                        const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
+                                        const nid = getLocal(lx, ly, lz);
+                                        // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
+                                        let draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+
+                                        // OPTIMIZATION: LOD face skipping for distant chunks
+                                        // Skip some internal side faces based on distance (keeps chunk borders intact)
+                                        // DISABLED for now - was causing visual artifacts. Can be re-enabled after testing.
+                                        // if (draw && lodSkipFactor > 0 && !isWater) {
+                                        //     const isInternalFace = x > 0 && x < 15 && z > 0 && z < 15;
+                                        //     if (isInternalFace && faceIdx >= 2) {
+                                        //         skipCounter++;
+                                        //         const keepEvery = Math.max(2, Math.floor(1 / lodSkipFactor));
+                                        //         if ((skipCounter % keepEvery) !== 0) draw = false;
+                                        //     }
+                                        // }
+
+                                        if (draw) {
+                                            // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
+                                            // But calculate AO from the solid block position (x,y,z), not the neighbor
+                                            // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
+                                            // Get vertex count for index offset calculation
+                                            const vertCount = isWater ? wVertCount : tVertCount;
+                                            const iIdx = isWater ? wIIdx : tIIdx;
+                                            const indices = isWater ? waterIndices : terrainIndices;
+
+                                            // OPTIMIZATION: Use simplified lighting for distant chunks
+                                            if (useDeferredLight) {
+                                                addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
+                                            } else if (isWater) {
+                                                // Calculate water depth (search DOWN to find bottom)
+                                                let waterDepth = 0;
+                                                for (let dy = y - 1; dy >= 0; dy--) {
+                                                    const belowId = getLocal(x, dy, z);
+                                                    if (belowId !== WATER) break;
+                                                    waterDepth++;
+                                                }
+                                                // Calculate shore distance - check horizontal neighbors for solid blocks
+                                                const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                                let shoreDist = 4;
+                                                if (hasAirAbove) {
+                                                    const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                    for (const [dx, dz] of directions) {
+                                                        for (let d = 1; d <= 4; d++) {
+                                                            const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                            if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
+                                                                shoreDist = Math.min(shoreDist, d);
+                                                                break;
+                                                            }
+                                                            if (checkId === AIR) {
+                                                                shoreDist = Math.min(shoreDist, d);
+                                                                break;
+                                                            }
                                                         }
                                                     }
                                                 }
+                                                // Indexed water face rendering
+                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                            } else {
+                                                // Indexed terrain face rendering
+                                                addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
                                             }
-                                            // Indexed water face rendering
-                                            addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
-                                        } else {
-                                            // Indexed terrain face rendering
-                                            addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
-                                        }
-                                        // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
-                                        vIdx += 12; uvIdx += 8; cIdx += 12;
-                                        if (isWater) {
-                                            wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
-                                            wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
-                                        } else {
-                                            tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
-                                            tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                            // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
+                                            vIdx += 12; uvIdx += 8; cIdx += 12;
+                                            if (isWater) {
+                                                wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
+                                                wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
+                                            } else {
+                                                tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
+                                                tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        // Update section mesh tracking
+                        if (section) {
+                            section.faceCount = (tFaceCount + wFaceCount) - sectionFaceCountStart;
+                            section.hasMesh = section.faceCount > 0;
+                        }
+                    }
+
+                    // Track section skipping performance
+                    if (sectionsSkipped > 0) {
+                        perfMetrics.sectionsSkipped = (perfMetrics.sectionsSkipped || 0) + sectionsSkipped;
+                        perfMetrics.blocksSkipped = (perfMetrics.blocksSkipped || 0) + blocksSkipped;
                     }
 
                     // --- CREATE TERRAIN MESH (INDEXED GEOMETRY) ---
