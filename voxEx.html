@@ -29798,14 +29798,41 @@
                             job.dist = (job.cx - playerChunkX) * (job.cx - playerChunkX) + (job.cz - playerChunkZ) * (job.cz - playerChunkZ);
                         }
                     }
-                    chunkBuildQueue.sort((a, b) => (a.dist || 0) - (b.dist || 0));
+                    chunkBuildQueue.sort((a, b) => {
+                        const distA = a.dist || 0;
+                        const distB = b.dist || 0;
+                        // Dirty chunks (block changes) get highest priority
+                        if (dirtyChunks.has(a.key) && !dirtyChunks.has(b.key)) return -1;
+                        if (dirtyChunks.has(b.key) && !dirtyChunks.has(a.key)) return 1;
+                        // Then sort by distance (closer = higher priority)
+                        return distA - distB;
+                    });
                 }
                 // OPTIMIZATION: Use frame budget to limit chunk builds
-                // Reserve 8ms for chunk building (half of 16.67ms frame budget)
-                const CHUNK_BUILD_BUDGET_MS = 8;
-                while (builds < SETTINGS.buildQueueLimit && chunkBuildQueue.length > 0 && inspected < initialQueueLength + chunkBuildQueue.length) {
+                // Reserve 5ms for chunk building (more conservative to prevent frame spikes)
+                const CHUNK_BUILD_BUDGET_MS = 5;
+
+                // Track rolling average of chunk build time for rate smoothing
+                if (typeof chunkBuildTimeAvg === 'undefined') {
+                    window.chunkBuildTimeAvg = 4; // Initial estimate: 4ms per chunk
+                }
+
+                // Detect rapid movement and reduce build rate
+                const playerSpeed = typeof playerVelocity !== 'undefined'
+                    ? Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z)
+                    : 0;
+                const isMovingFast = playerSpeed > 5; // ~5 m/s threshold
+                const effectiveBudget = isMovingFast ? CHUNK_BUILD_BUDGET_MS * 0.5 : CHUNK_BUILD_BUDGET_MS;
+
+                // Estimate how many chunks we can afford this frame
+                const estimatedChunksAllowed = Math.max(1, Math.floor(effectiveBudget / chunkBuildTimeAvg));
+                const maxBuildsThisFrame = isMovingFast
+                    ? Math.min(2, estimatedChunksAllowed, SETTINGS.buildQueueLimit)
+                    : Math.min(estimatedChunksAllowed, SETTINGS.buildQueueLimit);
+
+                while (builds < maxBuildsThisFrame && chunkBuildQueue.length > 0 && inspected < initialQueueLength + chunkBuildQueue.length) {
                     // OPTIMIZATION: Check frame budget - stop if we've exceeded our chunk build time
-                    if (builds > 0 && (performance.now() - chunkBuildStartMs) > CHUNK_BUILD_BUDGET_MS) {
+                    if (builds > 0 && (performance.now() - chunkBuildStartMs) > effectiveBudget) {
                         perfMetrics.chunksSkipped += chunkBuildQueue.length;
                         break;
                     }
@@ -29837,8 +29864,12 @@
                     builds++;
                     perfMetrics.chunksBuilt++;
                 }
-                // Track chunk build time
+                // Track chunk build time and update rolling average
                 perfMetrics.chunkBuildTime = performance.now() - chunkBuildStartMs;
+                if (builds > 0) {
+                    const timePerChunk = perfMetrics.chunkBuildTime / builds;
+                    chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + timePerChunk * 0.1; // Exponential moving average
+                }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
                 // OPTIMIZATION: Skip neighbor updates if we're over budget
                 const remainingBudget = CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs);
