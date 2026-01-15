@@ -5502,6 +5502,60 @@
             // Section constants for 16×16×16 vertical subdivision
             const SECTION_HEIGHT = 16;
             const SECTIONS_PER_CHUNK = Math.ceil(WORLD_DIMS.chunkHeight / SECTION_HEIGHT); // 20 sections for 320 height
+            const BLOCKS_PER_SECTION = SECTION_HEIGHT * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize; // 4096 blocks per section
+
+            /**
+             * Create default section data array for a chunk.
+             * Each section is a 16×16×16 vertical subdivision of the chunk.
+             * @returns {Array<Object>} Array of section metadata objects (one per section)
+             */
+            function createSectionData() {
+                const sections = new Array(SECTIONS_PER_CHUNK);
+                for (let i = 0; i < SECTIONS_PER_CHUNK; i++) {
+                    sections[i] = {
+                        isEmpty: true,       // Assume empty until analyzed
+                        isFullySolid: false, // Assume not solid until analyzed
+                        hasMesh: false,      // No mesh initially
+                        faceCount: 0,        // No faces initially
+                        minBlockY: i * SECTION_HEIGHT,  // Section start Y
+                        maxBlockY: i * SECTION_HEIGHT,  // Will be updated during analysis
+                        analyzed: false      // Whether section has been analyzed
+                    };
+                }
+                return sections;
+            }
+
+            /**
+             * Get section index from Y coordinate.
+             * @param {number} y - Block Y coordinate (0-319)
+             * @returns {number} Section index (0-19)
+             */
+            function getSectionIndex(y) {
+                return Math.floor(y / SECTION_HEIGHT);
+            }
+
+            /**
+             * Get Y range for a section.
+             * @param {number} sectionIndex - Section index (0-19)
+             * @returns {{minY: number, maxY: number}} Y range (inclusive min, exclusive max)
+             */
+            function getSectionYRange(sectionIndex) {
+                return {
+                    minY: sectionIndex * SECTION_HEIGHT,
+                    maxY: (sectionIndex + 1) * SECTION_HEIGHT
+                };
+            }
+
+            /**
+             * Get block index within section from local coordinates.
+             * @param {number} lx - Local X (0-15)
+             * @param {number} ly - Y within section (0-15)
+             * @param {number} lz - Local Z (0-15)
+             * @returns {number} Index within section (0-4095)
+             */
+            function getSectionBlockIndex(lx, ly, lz) {
+                return lx + lz * SECTION_HEIGHT + ly * SECTION_HEIGHT * SECTION_HEIGHT;
+            }
 
             // Chunk memory constants for LRU eviction
             const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
@@ -6644,6 +6698,7 @@
                             cz: cz,
                             startX: cx * WORLD_DIMS.chunkSize,
                             startZ: cz * WORLD_DIMS.chunkSize,
+                            sections: createSectionData(), // Per-section metadata for rendering optimization
                         };
                         this.chunks.set(key, chunk);
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
@@ -6656,12 +6711,14 @@
                             blocks: legacy,
                             skyLight: new Uint8Array(legacySize).fill(15),
                             blockLight: new Uint8Array(legacySize).fill(1),
+                            sections: createSectionData(), // Per-section metadata for rendering optimization
                         };
                         this.chunks.set(key, chunk);
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
                         if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                        if (!chunk.sections) chunk.sections = createSectionData(); // Ensure sections exist
                         // Update LRU access time for existing chunk
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
                     }
@@ -20875,6 +20932,21 @@
                 // Sum rendered faces across all active chunks
                 let totalFaces = 0;
                 for (const v of chunkRenderedFaces.values()) { totalFaces += v; }
+                // Calculate section stats for debug overlay
+                let totalSections = 0, emptySections = 0, solidSections = 0, analyzedSections = 0;
+                for (const chunk of chunks.values()) {
+                    if (chunk.sections) {
+                        for (let i = 0; i < chunk.sections.length; i++) {
+                            totalSections++;
+                            const sec = chunk.sections[i];
+                            if (sec.analyzed) {
+                                analyzedSections++;
+                                if (sec.isEmpty) emptySections++;
+                                if (sec.isFullySolid) solidSections++;
+                            }
+                        }
+                    }
+                }
                 overlay.innerText =
                     "World Seed: " +
                     finalSeedDisplay +
@@ -20918,6 +20990,15 @@
                     " / " +
                     chunkMeshCount +
                     "\n" +
+                    "Sections: " +
+                    totalSections +
+                    " (empty: " +
+                    emptySections +
+                    " | solid: " +
+                    solidSections +
+                    " | analyzed: " +
+                    analyzedSections +
+                    ")\n" +
                     "Rendered faces (quads): " +
                     totalFaces.toLocaleString() +
                     "\n" +
@@ -27720,6 +27801,14 @@
                         if (typeof cachedData.genState === 'undefined') {
                             cachedData.genState = GEN_PASS.ALL; // Assume fully generated
                         }
+                        // Ensure cached chunks have sections (for backward compatibility)
+                        if (!cachedData.sections) {
+                            cachedData.sections = createSectionData();
+                            // Mark sections as needing analysis since they weren't saved
+                            for (let i = 0; i < cachedData.sections.length; i++) {
+                                cachedData.sections[i].analyzed = false;
+                            }
+                        }
                         // Recalculate lighting for cached chunks to fix any old broken values
                         calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                         calculateBlockLight(cachedData, chunkSize, chunkHeight);
@@ -27776,6 +27865,7 @@
                         startX,
                         startZ,
                         genState, // Track which generation passes have completed
+                        sections: createSectionData(), // Per-section metadata for rendering optimization
                     };
 
                     // --- PASS 4: Calculate sunlight ---
