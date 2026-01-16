@@ -6944,10 +6944,15 @@
                     const key = `${cx},${cz}`;  // Inline to avoid getChunkKey function call
                     // OPTIMIZATION: Chunk cache for sequential block access in same chunk
                     const isCacheHit = key === this._lastChunkKey;
-                    const chunk = isCacheHit ? this._lastChunk : this.chunks.get(key);
+                    let chunk = isCacheHit ? this._lastChunk : (typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key));
                     if (!chunk) return undefined;
+                    // Safety: If cached chunk is compressed, fetch fresh decompressed version
+                    if (chunk._compressed) {
+                        chunk = typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key);
+                        if (!chunk) return undefined;
+                    }
                     // Update LRU access time only on cache miss (new chunk access)
-                    if (!isCacheHit) {
+                    if (!isCacheHit || this._lastChunk !== chunk) {
                         this._lastChunkKey = key;
                         this._lastChunk = chunk;
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
@@ -6978,7 +6983,7 @@
                     const cx = x >> 4;
                     const cz = z >> 4;
                     const key = `${cx},${cz}`;  // Inline key generation
-                    let chunk = this.chunks.get(key);
+                    let chunk = typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key);
 
                     if (!chunk) {
                         if (!createIfMissing) return false;
@@ -7248,15 +7253,18 @@
                  * @returns {{north: ChunkData|undefined, south: ChunkData|undefined, east: ChunkData|undefined, west: ChunkData|undefined, northWest: ChunkData|undefined, northEast: ChunkData|undefined, southWest: ChunkData|undefined, southEast: ChunkData|undefined}} Neighbor chunks
                  */
                 getNeighborChunks(cx, cz) {
+                    const get = typeof chunkDataPool !== 'undefined'
+                        ? (k) => chunkDataPool.get(k)
+                        : (k) => this.chunks.get(k);
                     return {
-                        north: this.chunks.get(this.getChunkKey(cx, cz - 1)),
-                        south: this.chunks.get(this.getChunkKey(cx, cz + 1)),
-                        east: this.chunks.get(this.getChunkKey(cx + 1, cz)),
-                        west: this.chunks.get(this.getChunkKey(cx - 1, cz)),
-                        northWest: this.chunks.get(this.getChunkKey(cx - 1, cz - 1)),
-                        northEast: this.chunks.get(this.getChunkKey(cx + 1, cz - 1)),
-                        southWest: this.chunks.get(this.getChunkKey(cx - 1, cz + 1)),
-                        southEast: this.chunks.get(this.getChunkKey(cx + 1, cz + 1))
+                        north: get(this.getChunkKey(cx, cz - 1)),
+                        south: get(this.getChunkKey(cx, cz + 1)),
+                        east: get(this.getChunkKey(cx + 1, cz)),
+                        west: get(this.getChunkKey(cx - 1, cz)),
+                        northWest: get(this.getChunkKey(cx - 1, cz - 1)),
+                        northEast: get(this.getChunkKey(cx + 1, cz - 1)),
+                        southWest: get(this.getChunkKey(cx - 1, cz + 1)),
+                        southEast: get(this.getChunkKey(cx + 1, cz + 1))
                     };
                 }
 
@@ -7352,14 +7360,21 @@
                  */
                 get(key) {
                     if (isDebug) this._callCounts.get++;
-                    const data = this.chunks.get(key);
+                    let data = this.chunks.get(key);
                     if (data) {
-                        // Auto-decompress if compressed
-                        const meta = this.metadata.get(key);
-                        if (meta && meta.isCompressed && data._compressed) {
+                        // Auto-decompress if compressed - check data directly, not metadata
+                        // This is more robust than relying on metadata which may be out of sync
+                        if (data._compressed) {
+                            // Ensure metadata is synced before decompressing
+                            let meta = this.metadata.get(key);
+                            if (!meta) {
+                                meta = this._createDefaultMeta();
+                                this.metadata.set(key, meta);
+                            }
+                            meta.isCompressed = true; // Sync metadata
+
                             this.decompressChunk(key);
-                            // Return the decompressed data
-                            return this.chunks.get(key);
+                            data = this.chunks.get(key); // Get fresh reference after decompression
                         }
                         this.touch(key);
                     }
@@ -7628,10 +7643,16 @@
                  */
                 decompressChunk(key) {
                     const chunk = this.chunks.get(key);
-                    const meta = this.metadata.get(key);
-
-                    if (!chunk || !meta || !meta.isCompressed || !chunk._compressed) {
+                    // Check chunk directly, not just metadata
+                    if (!chunk || !chunk._compressed) {
                         return false;
+                    }
+
+                    // Create metadata if missing
+                    let meta = this.metadata.get(key);
+                    if (!meta) {
+                        meta = this._createDefaultMeta();
+                        this.metadata.set(key, meta);
                     }
 
                     const startTime = performance.now();
@@ -11965,24 +11986,35 @@
                     };
                 }
 
-                getNeighbors(cx, cz, chunks) {
+                getNeighbors(cx, cz, chunks) {  // chunks param kept for backwards compat but not used
                     this._callCounts.getNeighbors++;
                     const key = `${cx},${cz}`;
                     if (this.cache.has(key)) {
                         this._callCounts.getNeighborsHit++;
-                        return this.cache.get(key);
+                        // Verify cached neighbors aren't compressed - if any are, refetch
+                        const cached = this.cache.get(key);
+                        if (cached.north?._compressed || cached.south?._compressed ||
+                            cached.east?._compressed || cached.west?._compressed ||
+                            cached.ne?._compressed || cached.nw?._compressed ||
+                            cached.se?._compressed || cached.sw?._compressed) {
+                            this.cache.delete(key);  // Invalidate stale cache
+                        } else {
+                            return cached;
+                        }
                     }
 
                     this._callCounts.getNeighborsMiss++;
+                    // Use chunkDataPool.get() for auto-decompression
+                    const get = typeof chunkDataPool !== 'undefined' ? (k) => chunkDataPool.get(k) : (k) => chunks.get(k);
                     const neighbors = {
-                        north: chunks.get(`${cx},${cz-1}`),
-                        south: chunks.get(`${cx},${cz+1}`),
-                        east: chunks.get(`${cx+1},${cz}`),
-                        west: chunks.get(`${cx-1},${cz}`),
-                        ne: chunks.get(`${cx+1},${cz-1}`),
-                        nw: chunks.get(`${cx-1},${cz-1}`),
-                        se: chunks.get(`${cx+1},${cz+1}`),
-                        sw: chunks.get(`${cx-1},${cz+1}`)
+                        north: get(`${cx},${cz-1}`),
+                        south: get(`${cx},${cz+1}`),
+                        east: get(`${cx+1},${cz}`),
+                        west: get(`${cx-1},${cz}`),
+                        ne: get(`${cx+1},${cz-1}`),
+                        nw: get(`${cx-1},${cz-1}`),
+                        se: get(`${cx+1},${cz+1}`),
+                        sw: get(`${cx-1},${cz+1}`)
                     };
 
                     if (this.cache.size >= this.maxSize) {
@@ -12760,6 +12792,403 @@
                         torchLightPool.clear();
                         console.log('[Lights] Torch light pool cleared');
                     }
+                },
+
+                // === GEOMETRY LEAK DETECTION ===
+
+                /**
+                 * Display geometry statistics and detect potential leaks.
+                 * @returns {Object} Geometry stats with leak detection info.
+                 */
+                geometryStats: () => {
+                    console.log('=== Geometry Statistics ===');
+                    const geoCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+                    const texCount = typeof renderer !== 'undefined' ? renderer.info.memory.textures : 0;
+
+                    // Count active chunk geometries
+                    const terrainMeshCount = typeof chunkMeshes !== 'undefined' ?
+                        Array.from(chunkMeshes.keys()).filter(k => !k.includes('_WATER')).length : 0;
+                    const waterMeshCount = typeof chunkMeshes !== 'undefined' ?
+                        Array.from(chunkMeshes.keys()).filter(k => k.includes('_WATER')).length : 0;
+
+                    // Pool stats
+                    const poolStats = typeof geometryPool !== 'undefined' ? geometryPool.getStats() : {};
+
+                    // Count torch geometries (3 per torch)
+                    let torchCount = 0;
+                    if (typeof chunkTorches !== 'undefined') {
+                        for (const torches of chunkTorches.values()) {
+                            torchCount += torches.length;
+                        }
+                    }
+                    const torchGeoCount = torchCount * 3; // Each torch has 3 geometries
+
+                    // Expected geometry count (rough estimate)
+                    const expectedChunkGeos = terrainMeshCount + waterMeshCount;
+                    const pooledGeos = (poolStats.terrainPoolSize || 0) + (poolStats.waterPoolSize || 0);
+                    const staticGeos = 50; // Stars, clouds, sky, viewmodel, outline, etc.
+                    const expectedTotal = expectedChunkGeos + pooledGeos + torchGeoCount + staticGeos;
+
+                    const stats = {
+                        rendererGeometries: geoCount,
+                        rendererTextures: texCount,
+                        terrainMeshes: terrainMeshCount,
+                        waterMeshes: waterMeshCount,
+                        pooledTerrain: poolStats.terrainPoolSize || 0,
+                        pooledWater: poolStats.waterPoolSize || 0,
+                        worldTorches: torchCount,
+                        torchGeometries: torchGeoCount,
+                        expectedTotal: expectedTotal,
+                        possibleLeak: geoCount - expectedTotal
+                    };
+
+                    console.table(stats);
+
+                    if (stats.possibleLeak > 100) {
+                        console.warn(`[LEAK WARNING] ${stats.possibleLeak} geometries unaccounted for!`);
+                    }
+
+                    return stats;
+                },
+
+                /**
+                 * Emergency cleanup of leaked geometries.
+                 * Finds and disposes all geometries not actively in use.
+                 * @returns {Object} Cleanup results.
+                 */
+                fixLeaks: () => {
+                    console.log('=== Fixing Geometry Leaks ===');
+                    const beforeCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+
+                    // Collect geometries from active chunk meshes
+                    const activeGeos = new Set();
+                    if (typeof chunkMeshes !== 'undefined') {
+                        for (const mesh of chunkMeshes.values()) {
+                            if (mesh && mesh.geometry) activeGeos.add(mesh.geometry);
+                        }
+                    }
+
+                    // Collect geometries in pools
+                    if (typeof geometryPool !== 'undefined') {
+                        for (const geo of geometryPool.terrainPool || []) {
+                            activeGeos.add(geo);
+                        }
+                        for (const geo of geometryPool.waterPool || []) {
+                            activeGeos.add(geo);
+                        }
+                    }
+
+                    // Collect torch geometries
+                    if (typeof chunkTorches !== 'undefined') {
+                        for (const torches of chunkTorches.values()) {
+                            for (const torch of torches) {
+                                torch.traverse((node) => {
+                                    if (node.isMesh && node.geometry) {
+                                        activeGeos.add(node.geometry);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // Find and dispose orphaned geometries in scene
+                    let disposed = 0;
+                    const toRemove = [];
+
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isMesh && obj.geometry && !activeGeos.has(obj.geometry)) {
+                                // Skip known singleton geometries by checking parent chain
+                                let isKnownSingleton = false;
+                                let parent = obj.parent;
+                                while (parent) {
+                                    if (parent.name && (
+                                        parent.name.includes('torch') ||
+                                        parent.name.includes('viewmodel') ||
+                                        parent.name.includes('sky') ||
+                                        parent.name.includes('star') ||
+                                        parent.name.includes('cloud')
+                                    )) {
+                                        isKnownSingleton = true;
+                                        break;
+                                    }
+                                    parent = parent.parent;
+                                }
+
+                                if (!isKnownSingleton && !obj.name?.includes('CHUNK')) {
+                                    toRemove.push(obj);
+                                }
+                            }
+                        });
+
+                        for (const obj of toRemove) {
+                            if (obj.parent) obj.parent.remove(obj);
+                            // Skip disposing shared geometry/materials
+                            if (obj.geometry && !obj.geometry.userData?.isShared) {
+                                obj.geometry.dispose();
+                                disposed++;
+                            }
+                            if (obj.material) {
+                                if (Array.isArray(obj.material)) {
+                                    obj.material.forEach(m => {
+                                        if (m.dispose && !m.userData?.isShared) m.dispose();
+                                    });
+                                } else if (obj.material.dispose && !obj.material.userData?.isShared) {
+                                    obj.material.dispose();
+                                }
+                            }
+                        }
+                    }
+
+                    // Force garbage collection hint
+                    if (typeof renderer !== 'undefined') {
+                        renderer.renderLists.dispose();
+                    }
+
+                    const afterCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+
+                    const result = {
+                        disposedGeometries: disposed,
+                        beforeCount: beforeCount,
+                        afterCount: afterCount,
+                        reduction: beforeCount - afterCount
+                    };
+
+                    console.log(`Disposed ${disposed} orphaned objects`);
+                    console.log(`Geometries: ${beforeCount} → ${afterCount} (${result.reduction} freed)`);
+
+                    return result;
+                },
+
+                // === TORCH DIAGNOSTICS ===
+
+                /**
+                 * Diagnose torch duplication issues.
+                 * Shows torch counts per chunk and identifies anomalies.
+                 * @returns {Object} Diagnostic info.
+                 */
+                torchDiagnostics: () => {
+                    console.log('=== Torch Diagnostics ===');
+
+                    if (typeof chunkTorches === 'undefined') {
+                        console.warn('chunkTorches not defined');
+                        return null;
+                    }
+
+                    let totalTorches = 0;
+                    let chunksWithTorches = 0;
+                    const torchesPerChunk = [];
+
+                    for (const [chunkKey, torches] of chunkTorches) {
+                        const count = torches ? torches.length : 0;
+                        totalTorches += count;
+                        if (count > 0) {
+                            chunksWithTorches++;
+                            torchesPerChunk.push({ chunkKey, count });
+                        }
+                    }
+
+                    // Sort by count to find anomalies
+                    torchesPerChunk.sort((a, b) => b.count - a.count);
+
+                    console.log(`Total torches: ${totalTorches}`);
+                    console.log(`Chunks with torches: ${chunksWithTorches}`);
+                    console.log(`ChunkTorches Map size: ${chunkTorches.size}`);
+
+                    // Show top 10 chunks by torch count
+                    if (torchesPerChunk.length > 0) {
+                        console.log('Top chunks by torch count:');
+                        console.table(torchesPerChunk.slice(0, 10));
+                    }
+
+                    // Check for anomalies (chunks with >10 torches are suspicious)
+                    const anomalies = torchesPerChunk.filter(c => c.count > 10);
+                    if (anomalies.length > 0) {
+                        console.warn(`ANOMALY: ${anomalies.length} chunks have >10 torches!`);
+                        console.table(anomalies);
+                    }
+
+                    // Count scene torch groups directly
+                    let sceneGroups = 0;
+                    let sceneTorchMeshes = 0;
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isGroup && obj.children.length === 3) {
+                                // Check if it looks like a torch (3 meshes: stick, flame, glow)
+                                const hasStick = obj.children[0]?.isMesh;
+                                const hasFlame = obj.children[1]?.isMesh;
+                                const hasGlow = obj.children[2]?.isMesh;
+                                if (hasStick && hasFlame && hasGlow) {
+                                    sceneGroups++;
+                                    sceneTorchMeshes += 3;
+                                }
+                            }
+                        });
+                    }
+                    console.log(`Scene torch-like groups: ${sceneGroups}`);
+                    console.log(`Scene torch meshes: ${sceneTorchMeshes}`);
+
+                    return {
+                        totalTorches,
+                        chunksWithTorches,
+                        mapSize: chunkTorches.size,
+                        sceneGroups,
+                        sceneTorchMeshes,
+                        topChunks: torchesPerChunk.slice(0, 10),
+                        anomalies
+                    };
+                },
+
+                /**
+                 * Clear all torches and rebuild from block data.
+                 * Use this to fix torch accumulation issues.
+                 * @returns {Object} Cleanup results.
+                 */
+                rebuildTorches: () => {
+                    console.log('=== Rebuilding All Torches ===');
+
+                    if (typeof chunkTorches === 'undefined') {
+                        console.warn('chunkTorches not defined');
+                        return null;
+                    }
+
+                    const beforeCount = chunkTorches.size;
+                    let torchesRemoved = 0;
+                    let geometriesDisposed = 0;
+
+                    // Clear all existing torches
+                    for (const [chunkKey, torches] of chunkTorches) {
+                        if (torches) {
+                            for (const torch of torches) {
+                                if (torch.parent) torch.parent.remove(torch);
+                                torch.traverse((node) => {
+                                    // Skip disposing shared geometry/materials
+                                    if (node.isMesh && node.geometry && !node.geometry.userData?.isShared) {
+                                        node.geometry.dispose();
+                                        geometriesDisposed++;
+                                    }
+                                    if (node.isMesh && node.material) {
+                                        if (Array.isArray(node.material)) {
+                                            node.material.forEach(m => {
+                                                if (m.dispose && !m.userData?.isShared) m.dispose();
+                                            });
+                                        } else if (node.material.dispose && !node.material.userData?.isShared) {
+                                            node.material.dispose();
+                                        }
+                                    }
+                                });
+                                torchesRemoved++;
+                            }
+                        }
+                    }
+                    chunkTorches.clear();
+
+                    console.log(`Removed ${torchesRemoved} torches, disposed ${geometriesDisposed} non-shared geometries`);
+
+                    // Force re-render of all visible chunks to recreate torches
+                    if (typeof queuedChunkKeys !== 'undefined' && typeof chunks !== 'undefined') {
+                        let chunksQueued = 0;
+                        for (const chunkKey of chunks.keys()) {
+                            queuedChunkKeys.add(chunkKey);
+                            chunksQueued++;
+                        }
+                        console.log(`Queued ${chunksQueued} chunks for re-render`);
+                    }
+
+                    return {
+                        beforeCount,
+                        torchesRemoved,
+                        geometriesDisposed
+                    };
+                },
+
+                /**
+                 * Remove duplicate torch entries from scene.
+                 * Scans scene for torch groups at same position and removes duplicates.
+                 * @returns {Object} Cleanup results.
+                 */
+                deduplicateTorches: () => {
+                    console.log('=== Deduplicating Torches ===');
+
+                    const positionMap = new Map(); // position key -> first torch
+                    const duplicates = [];
+
+                    // First, scan scene for all torch-like groups
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isGroup && obj.children.length === 3) {
+                                const hasStick = obj.children[0]?.isMesh;
+                                const hasFlame = obj.children[1]?.isMesh;
+                                const hasGlow = obj.children[2]?.isMesh;
+                                if (hasStick && hasFlame && hasGlow) {
+                                    const posKey = `${obj.position.x.toFixed(2)},${obj.position.y.toFixed(2)},${obj.position.z.toFixed(2)}`;
+                                    if (positionMap.has(posKey)) {
+                                        duplicates.push(obj);
+                                    } else {
+                                        positionMap.set(posKey, obj);
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    console.log(`Found ${positionMap.size} unique torch positions`);
+                    console.log(`Found ${duplicates.length} duplicate torches`);
+
+                    // Remove duplicates (skip disposing shared geometry/materials)
+                    let removed = 0;
+                    let disposed = 0;
+                    for (const torch of duplicates) {
+                        if (torch.parent) torch.parent.remove(torch);
+                        torch.traverse((node) => {
+                            if (node.isMesh && node.geometry && !node.geometry.userData?.isShared) {
+                                node.geometry.dispose();
+                                disposed++;
+                            }
+                            if (node.isMesh && node.material) {
+                                if (Array.isArray(node.material)) {
+                                    node.material.forEach(m => {
+                                        if (m.dispose && !m.userData?.isShared) m.dispose();
+                                    });
+                                } else if (node.material.dispose && !node.material.userData?.isShared) {
+                                    node.material.dispose();
+                                }
+                            }
+                        });
+                        removed++;
+                    }
+
+                    // Now rebuild chunkTorches Map from remaining scene torches
+                    if (typeof chunkTorches !== 'undefined') {
+                        // Clear the map
+                        const oldEntries = chunkTorches.size;
+                        chunkTorches.clear();
+
+                        // Rebuild from scene (remaining unique torches)
+                        for (const [posKey, torch] of positionMap) {
+                            // Calculate chunk key from torch position
+                            const cx = Math.floor(torch.position.x / 16);
+                            const cz = Math.floor(torch.position.z / 16);
+                            const chunkKey = `${cx},${cz}`;
+
+                            if (!chunkTorches.has(chunkKey)) {
+                                chunkTorches.set(chunkKey, []);
+                            }
+                            chunkTorches.get(chunkKey).push(torch);
+                        }
+
+                        console.log(`Rebuilt chunkTorches: ${oldEntries} entries → ${chunkTorches.size} entries`);
+                    }
+
+                    const result = {
+                        uniquePositions: positionMap.size,
+                        duplicatesFound: duplicates.length,
+                        removed,
+                        geometriesDisposed: disposed
+                    };
+
+                    console.log('Deduplication complete:', result);
+                    return result;
                 }
             };
             const chunkMeshes = new Map();
@@ -12939,7 +13368,7 @@
                 released: { terrain: 0, water: 0 },
                 attached: new Map(),
                 detached: new Map(),
-                mark(event, payload = {}) { if (!isDebug) return; logDebug(`[MeshLifecycle] ${event}`, payload); },
+                mark(event, payload = {}) { /* Disabled - too verbose */ },
             };
             const activeChunks = new Set();
             const globalPendingMods = new Map();
@@ -16977,6 +17406,61 @@
             // Geometry buffer pool for pre-allocated BufferGeometry objects
             const geometryPool = new GeometryBufferPool(256);
             window.geometryPool = geometryPool; // Expose for console debugging
+
+            // Geometry leak detection state
+            let lastGeometryLeakCheck = 0;
+            const GEOMETRY_LEAK_CHECK_INTERVAL = 5000; // Check every 5 seconds
+            const GEOMETRY_LEAK_WARNING_THRESHOLD = 500; // Warn if 500+ unexpected geometries
+            const GEOMETRY_LEAK_CRITICAL_THRESHOLD = 1500; // Auto-cleanup if 1500+ unexpected geometries
+
+            /**
+             * Periodic geometry leak detection.
+             * Compares actual geometry count to expected count and warns/cleans up if needed.
+             * @param {number} now - Current timestamp from performance.now().
+             */
+            function checkGeometryLeaks(now) {
+                if (now - lastGeometryLeakCheck < GEOMETRY_LEAK_CHECK_INTERVAL) return;
+                lastGeometryLeakCheck = now;
+
+                // Get actual geometry count from renderer
+                const geoCount = typeof renderer !== 'undefined' ? renderer.info?.memory?.geometries || 0 : 0;
+                if (geoCount === 0) return; // Renderer not ready
+
+                // Calculate expected geometry count
+                const terrainCount = typeof chunkMeshes !== 'undefined' ?
+                    Array.from(chunkMeshes.keys()).filter(k => !k.includes('_WATER')).length : 0;
+                const waterCount = typeof chunkMeshes !== 'undefined' ?
+                    Array.from(chunkMeshes.keys()).filter(k => k.includes('_WATER')).length : 0;
+                const pooledCount = (geometryPool.terrainPool?.length || 0) + (geometryPool.waterPool?.length || 0);
+
+                // Count torch geometries (3 per torch)
+                let torchCount = 0;
+                if (typeof chunkTorches !== 'undefined') {
+                    for (const torches of chunkTorches.values()) {
+                        torchCount += torches.length;
+                    }
+                }
+                const torchGeos = torchCount * 3;
+
+                // Static geometries: stars (3), clouds (1), sky (1), viewmodel torch (3), outline (1), particle (1), misc (~40)
+                const staticGeos = 50;
+
+                const expectedMax = terrainCount + waterCount + pooledCount + torchGeos + staticGeos;
+                const excess = geoCount - expectedMax;
+
+                // Log warning if significant leak detected
+                if (excess > GEOMETRY_LEAK_WARNING_THRESHOLD) {
+                    logDebug(`[GeoLeak] WARNING: ${geoCount} geometries (expected ~${expectedMax}, excess: ${excess})`);
+
+                    // Auto-cleanup for critical leaks
+                    if (excess > GEOMETRY_LEAK_CRITICAL_THRESHOLD) {
+                        logDebug(`[GeoLeak] CRITICAL: Auto-cleanup triggered`);
+                        if (typeof window.memoryDebug !== 'undefined' && typeof window.memoryDebug.fixLeaks === 'function') {
+                            window.memoryDebug.fixLeaks();
+                        }
+                    }
+                }
+            }
 
             /**
              * MemoryBudgetManager - Tracks total memory usage across all systems
@@ -30511,34 +30995,94 @@
             }
 
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
+            // SHARED TORCH GEOMETRY AND MATERIALS
+            // Created once and reused for all world torches to prevent geometry explosion
+            let _sharedTorchStickGeo = null;
+            let _sharedTorchFlameGeo = null;
+            let _sharedTorchGlowGeo = null;
+            let _sharedTorchStickMat = null;
+            let _sharedTorchFlameMat = null;
+            let _sharedTorchGlowMat = null;
+
+            /**
+             * Get or create shared torch geometries and materials.
+             * These are created once and reused for all world torches.
+             * @returns {Object} Shared geometries and materials
+             */
+            function getSharedTorchResources() {
+                if (!_sharedTorchStickGeo) {
+                    _sharedTorchStickGeo = new THREE.BoxGeometry(0.08, 0.5, 0.08);
+                    _sharedTorchStickGeo.userData.isShared = true;
+                }
+                if (!_sharedTorchFlameGeo) {
+                    _sharedTorchFlameGeo = new THREE.BoxGeometry(0.08, 0.04, 0.08);
+                    _sharedTorchFlameGeo.userData.isShared = true;
+                }
+                if (!_sharedTorchGlowGeo) {
+                    _sharedTorchGlowGeo = new THREE.BoxGeometry(0.08, 0.08, 0.08);
+                    _sharedTorchGlowGeo.userData.isShared = true;
+                }
+                if (!_sharedTorchStickMat) {
+                    _sharedTorchStickMat = new THREE.MeshLambertMaterial({ color: 0x4a2511 });
+                    _sharedTorchStickMat.userData = { isShared: true };
+                }
+                if (!_sharedTorchFlameMat) {
+                    _sharedTorchFlameMat = new THREE.MeshLambertMaterial({
+                        color: 0xffaa33,
+                        emissive: 0xffaa33,
+                        emissiveIntensity: 0.5
+                    });
+                    _sharedTorchFlameMat.userData = { isShared: true };
+                }
+                if (!_sharedTorchGlowMat) {
+                    _sharedTorchGlowMat = new THREE.MeshLambertMaterial({
+                        color: 0xffff66,
+                        emissive: 0xffff66,
+                        emissiveIntensity: 1.0
+                    });
+                    _sharedTorchGlowMat.userData = { isShared: true };
+                }
+                return {
+                    stickGeo: _sharedTorchStickGeo,
+                    flameGeo: _sharedTorchFlameGeo,
+                    glowGeo: _sharedTorchGlowGeo,
+                    stickMat: _sharedTorchStickMat,
+                    flameMat: _sharedTorchFlameMat,
+                    glowMat: _sharedTorchGlowMat
+                };
+            }
+
+            /**
+             * Create a 3D torch model for world placement using SHARED geometry.
+             * This prevents geometry explosion when many torches are placed.
+             * @param {number} x - World X coordinate
+             * @param {number} y - World Y coordinate
+             * @param {number} z - World Z coordinate
+             * @returns {THREE.Group} Torch model group
+             */
             function createWorldTorch(x, y, z) {
+                const shared = getSharedTorchResources();
                 const torchGroup = new THREE.Group();
-                // Torch stick (brown/dark wood color) - 2x bigger
-                const stickGeo = new THREE.BoxGeometry(0.08, 0.5, 0.08);
-                const stickMat = new THREE.MeshLambertMaterial({ color: 0x4a2511 });
-                const stick = new THREE.Mesh(stickGeo, stickMat);
+
+                // Torch stick using SHARED geometry and material
+                const stick = new THREE.Mesh(shared.stickGeo, shared.stickMat);
                 stick.position.set(0, 0, 0);
-                stick.castShadow = true; // Cast shadows onto other objects/torches
-                stick.receiveShadow = true; // Receive shadows from other torches
+                stick.castShadow = true;
+                stick.receiveShadow = true;
                 torchGroup.add(stick);
-                // Torch flame (orange) - 2x bigger
-                const flameGeo = new THREE.BoxGeometry(0.08, 0.04, 0.08);
-                const flameMat = new THREE.MeshLambertMaterial({ color: 0xffaa33, emissive: 0xffaa33, emissiveIntensity: 0.5, });
-                const flame = new THREE.Mesh(flameGeo, flameMat);
+
+                // Torch flame using SHARED geometry and material
+                const flame = new THREE.Mesh(shared.flameGeo, shared.flameMat);
                 flame.position.set(0, 0.27, 0);
                 flame.castShadow = false;
                 torchGroup.add(flame);
-                // Torch glow (bright yellow center) - 2x bigger
-                const glowGeo = new THREE.BoxGeometry(0.08, 0.08, 0.08);
-                const glowMat = new THREE.MeshLambertMaterial({ color: 0xffff66, emissive: 0xffff66, emissiveIntensity: 1.0, });
-                const glow = new THREE.Mesh(glowGeo, glowMat);
+
+                // Torch glow using SHARED geometry and material
+                const glow = new THREE.Mesh(shared.glowGeo, shared.glowMat);
                 glow.position.set(0, 0.33, 0);
                 glow.castShadow = false;
                 torchGroup.add(glow);
-                // NOTE: PointLights are now managed by torchLightPool to prevent WebGL uniform overflow.
-                // The pool limits total PointLights to MAX_POINT_LIGHTS (8) and dynamically assigns
-                // them to the closest torches to the player. This prevents the shader from
-                // exceeding MAX_FRAGMENT_UNIFORM_VECTORS (1024).
+
                 // Position at block location (centered, on ground)
                 torchGroup.position.set(x + 0.5, y + 0.25, z + 0.5);
                 return torchGroup;
@@ -30622,13 +31166,34 @@
                 const torches = chunkTorches.get(baseKey);
                 if (!torches) return;
                 for (const torch of torches) {
-                    if (torch.parent) torch.parent.remove(torch);
-                    torch.traverse((node) => {     if (node.isMesh) {
-                            if (node.geometry) node.geometry.dispose();
+                    // Remove from scene hierarchy (prefer parent.remove, fallback to scene.remove)
+                    if (torch.parent) {
+                        torch.parent.remove(torch);
+                    } else if (typeof scene !== 'undefined') {
+                        scene.remove(torch); // Fallback if parent is null
+                    }
+                    // Dispose geometries and materials ONLY if not shared
+                    // Shared resources are reused across all torches
+                    torch.traverse((node) => {
+                        if (node.isMesh) {
+                            // Skip disposing shared geometry
+                            if (node.geometry && !node.geometry.userData?.isShared) {
+                                node.geometry.dispose();
+                            }
+                            // Skip disposing shared material
                             const mat = node.material;
-                            if (Array.isArray(mat)) { for (const m of mat) { if (m && typeof m.dispose === "function") m.dispose(); }
-                            } else if (mat && typeof mat.dispose === "function") { mat.dispose(); }
-                        } else if (node.isLight && typeof node.dispose === "function") { node.dispose(); }
+                            if (Array.isArray(mat)) {
+                                for (const m of mat) {
+                                    if (m && typeof m.dispose === "function" && !m.userData?.isShared) {
+                                        m.dispose();
+                                    }
+                                }
+                            } else if (mat && typeof mat.dispose === "function" && !mat.userData?.isShared) {
+                                mat.dispose();
+                            }
+                        } else if (node.isLight && typeof node.dispose === "function") {
+                            node.dispose();
+                        }
                     });
                 }
                 chunkTorches.delete(baseKey);
@@ -30697,7 +31262,10 @@
             function renderChunk(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
-                    const centerData = chunks.get(cKey);
+                    // CRITICAL: Use chunkDataPool.get() for auto-decompression
+                    // Using chunks.get() directly bypasses decompression, causing
+                    // garbage data to be read as block IDs (fake torches, etc.)
+                    const centerData = chunkDataPool.get(cKey);
                     if (!centerData) { return; }
 
                     // Re-analyze sections if any are dirty (block was modified)
@@ -30748,16 +31316,17 @@
                     // OPTIMIZATION: Pre-calculate all neighbor keys at once (reduces string concatenations)
                     const czM1 = cz - 1, czP1 = cz + 1;
                     const cxM1 = cx - 1, cxP1 = cx + 1;
-                    // Pre-fetch neighbors using pre-calculated coords
-                    const nN = chunks.get(`${cx},${czM1}`);
-                    const nS = chunks.get(`${cx},${czP1}`);
-                    const nE = chunks.get(`${cxP1},${cz}`);
-                    const nW = chunks.get(`${cxM1},${cz}`);
+                    // Pre-fetch neighbors using chunkDataPool.get() for auto-decompression
+                    // This prevents reading garbage data from compressed chunks
+                    const nN = chunkDataPool.get(`${cx},${czM1}`);
+                    const nS = chunkDataPool.get(`${cx},${czP1}`);
+                    const nE = chunkDataPool.get(`${cxP1},${cz}`);
+                    const nW = chunkDataPool.get(`${cxM1},${cz}`);
                     // Also diagonals for AO corners
-                    const nNW = chunks.get(`${cxM1},${czM1}`);
-                    const nNE = chunks.get(`${cxP1},${czM1}`);
-                    const nSW = chunks.get(`${cxM1},${czP1}`);
-                    const nSE = chunks.get(`${cxP1},${czP1}`);
+                    const nNW = chunkDataPool.get(`${cxM1},${czM1}`);
+                    const nNE = chunkDataPool.get(`${cxP1},${czM1}`);
+                    const nSW = chunkDataPool.get(`${cxM1},${czP1}`);
+                    const nSE = chunkDataPool.get(`${cxP1},${czP1}`);
                     // OPTIMIZED getLocal: No internal functions, fast center path
                     const getLocal = (lx, ly, lz) => {     // 1. Height check (Fastest fail)
                         if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
@@ -30820,6 +31389,20 @@
                     // OPTIMIZATION: Pre-check data format once instead of per-block
                     const useBlocksFormat = !!centerData.blocks;
                     const blockData = useBlocksFormat ? centerData.blocks : centerData;
+
+                    // SAFETY: Verify chunk data isn't compressed (would cause garbage reads)
+                    if (centerData._compressed || blockData._compressed) {
+                        const meta = chunkDataPool.metadata.get(cKey);
+                        console.error(`[Mesh] COMPRESSION BYPASS: Chunk ${cKey}`, {
+                            dataCompressed: centerData._compressed,
+                            metaExists: !!meta,
+                            metaIsCompressed: meta?.isCompressed,
+                            metaHasData: meta?.hasData
+                        });
+                        // Force decompress and retry once
+                        chunkDataPool.decompressChunk(cKey);
+                        return;
+                    }
 
                     // OPTIMIZATION: Section-aware meshing - skip empty sections entirely
                     // Uses pre-computed section data from chunk generation (steps 2.1/2.2)
@@ -31159,11 +31742,21 @@
                         meshLifecycleStats.mark("attach", { key: cKey + "_WATER", isWater: true, terrainMeshCount, waterMeshCount });
                     }
                     // --- CREATE TORCH MODELS ---
-                    // Clean up old torches first
-                    const oldTorches = chunkTorches.get(cKey);
-                    if (oldTorches) { for (const torch of oldTorches) { scene.remove(torch); }}
+                    // Clean up old torches first (CRITICAL: must dispose geometries to prevent leak)
+                    // This handles the edge case where torches exist but no mesh was created
+                    // (e.g., chunk with only torch blocks and no visible terrain faces)
+                    releaseChunkTorches(cKey);
+                    // Safety: ensure chunkTorches entry is cleared (defensive programming)
+                    if (chunkTorches.has(cKey)) {
+                        logDebug(`[Torch] WARNING: chunkTorches entry for ${cKey} not cleared by releaseChunkTorches`);
+                        chunkTorches.delete(cKey);
+                    }
                     // Create individual torch models with lighting
+                    // SAFETY: Limit torches per chunk to prevent runaway creation
+                    const MAX_TORCHES_PER_CHUNK = 64;
                     const torchArray = [];
+                    let torchLimitWarned = false;
+                    torchLoop:
                     for (let y = 0; y < height; y++) {
                         const yOff = y * 256;
                         for (let z = 0; z < 16; z++) {
@@ -31171,6 +31764,14 @@
                             for (let x = 0; x < 16; x++) {
                                 const idx = x + zOff + yOff;
                                 if (blockData[idx] === TORCH) {
+                                    // Safety limit check
+                                    if (torchArray.length >= MAX_TORCHES_PER_CHUNK) {
+                                        if (!torchLimitWarned) {
+                                            logDebug(`[Torch] WARNING: Chunk ${cKey} hit torch limit (${MAX_TORCHES_PER_CHUNK}), skipping remaining`);
+                                            torchLimitWarned = true;
+                                        }
+                                        break torchLoop;
+                                    }
                                     const wx = startX + x;
                                     const wy = y - WORLD_DIMS.yOffset;
                                     const wz = startZ + z;
@@ -31181,7 +31782,10 @@
                             }
                         }
                     }
-                    if (torchArray.length > 0) { chunkTorches.set(cKey, torchArray); }
+                    // Store torches for this chunk (overwrites any existing entry)
+                    if (torchArray.length > 0) {
+                        chunkTorches.set(cKey, torchArray);
+                    }
                     // Release all pools (including indexed geometry pools)
                     posPool.release(terrainPos);
                     normPool.release(terrainNorm);
@@ -31295,6 +31899,7 @@
                 const maxR = currentRenderRadius;
                 const maxRSq = maxR * maxR;
                 let neededKeys;
+                let chunksInRange;
                 let needed;
                 let recomputedFrustum = false;
                 // GET CAMERA DIRECTION AND POSITION FOR FRUSTUM CULLING
@@ -31330,11 +31935,13 @@
                 if (frustumUnchanged) {
                     // Reuse previous visibility results to skip heavy per-chunk iteration
                     neededKeys = frustumCacheState.neededKeys;
+                    chunksInRange = frustumCacheState.chunksInRange;
                     needed = frustumCacheState.neededList;
                     culled = frustumCacheState.culled;
                     totalChecked = frustumCacheState.totalChecked;
                 } else {
-                    neededKeys = new Set();
+                    neededKeys = new Set();     // Chunks visible (pass frustum) - for queueing
+                    chunksInRange = new Set();  // ALL chunks in render distance - for cleanup
                     needed = [];
                     culled = 0; // Reset counter only when recomputing
                     totalChecked = 0;
@@ -31344,10 +31951,12 @@
                             if (distSq > maxRSq) continue;
                             const cx = chunkX + dx;
                             const cz = chunkZ + dz;
+                            const key = getChunkKey(cx, cz);
+                            // Add to chunksInRange BEFORE frustum check - all chunks in distance
+                            chunksInRange.add(key);
                             // FRUSTUM CULLING with inner radius exception
                             totalChecked++;
                             if (!isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir)) { culled++; continue; }
-                            const key = getChunkKey(cx, cz);
                             neededKeys.add(key);
                             if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) { needed.push({ key, cx, cz, dist: distSq }); }
                         }
@@ -31360,6 +31969,7 @@
                     frustumCacheState.normCamZ = normCamZ;
                     frustumCacheState.hasHorizontalCameraDir = hasHorizontalCameraDir;
                     frustumCacheState.neededKeys = neededKeys;
+                    frustumCacheState.chunksInRange = chunksInRange;
                     frustumCacheState.neededList = needed;
                     frustumCacheState.culled = culled;
                     frustumCacheState.totalChecked = totalChecked;
@@ -31390,7 +32000,7 @@
                     const toRemove = Math.ceil(excess * 0.3);
                     for (let i = 0; i < toRemove && i < chunkDistances.length; i++) {
                         const targetKey = chunkDistances[i].key;
-                        if (!neededKeys.has(targetKey)) {
+                        if (!chunksInRange.has(targetKey)) {
                             // Remove terrain mesh
                             releaseMeshForKey(targetKey);
                             // Remove water mesh
@@ -31406,7 +32016,7 @@
                 // Strip _WATER suffix to check if the base chunk is needed
                 // If it's not in our "Needed" list, KILL IT IMMEDIATELY
                 const meshKeys = Array.from(chunkMeshes.keys());
-                for (const key of meshKeys) { const baseKey = key.replace("_WATER", ""); if (!neededKeys.has(baseKey)) { releaseMeshForKey(key); meshPrunedDuringUpdate = true; }}
+                for (const key of meshKeys) { const baseKey = key.replace("_WATER", ""); if (!chunksInRange.has(baseKey)) { releaseMeshForKey(key); meshPrunedDuringUpdate = true; }}
                 if (meshPrunedDuringUpdate) { invalidateFrustumCache(); }
                 // --- 7. Smart Queueing ---
                 // Sort by distance (closest first)
@@ -31427,7 +32037,7 @@
                 // so we can aggressively free their memory. Modified chunks must be kept.
                 // Aggressively discard pristine chunks that aren't currently needed
                 // No need to check if mesh exists - IndexedDB will cache the data
-                if (pristineChunks.size > 0) { for (const key of pristineChunks) { if (!neededKeys.has(key) && canEvictChunk(key)) { purgeChunkData(key); }}}
+                if (pristineChunks.size > 0) { for (const key of pristineChunks) { if (!chunksInRange.has(key) && canEvictChunk(key)) { purgeChunkData(key); }}}
                 // --- 8. Chunk Data Pool Eviction ---
                 // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
                 // This replaces the old maxCachedChunks approach with memory-budget-based eviction
@@ -31635,7 +32245,7 @@
                     // Optimized block lookup with chunk caching
                     const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
                     // Only fetch chunk if we moved to a new chunk
-                    if (chunkKey !== lastChunkKey) { cachedChunk = chunks.get(chunkKey); lastChunkKey = chunkKey; }
+                    if (chunkKey !== lastChunkKey) { cachedChunk = chunkDataPool.get(chunkKey); lastChunkKey = chunkKey; }
                     if (!cachedChunk) return null;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return null;
@@ -33007,6 +33617,8 @@
                     prevTime = time;
                     // Update memory budget manager (throttled internally)
                     if (memoryBudgetManager) memoryBudgetManager.update();
+                    // Periodic geometry leak detection (every 5 seconds)
+                    checkGeometryLeaks(time);
                     // Update torch light pool (throttled internally)
                     if (typeof torchLightPool !== 'undefined' && controls.isLocked) {
                         torchLightPool.update(getPlayerWorldPosition());
