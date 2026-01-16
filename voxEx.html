@@ -14859,7 +14859,7 @@
             const HORIZON_OCCLUSION_CONFIG = {
                 enabled: true,
                 numSectors: 16,              // Angular divisions (16 = 22.5° each)
-                minDistance: 3,              // Don't occlude chunks within this range (in chunks)
+                minDistance: 5,              // Don't occlude chunks within this range (in chunks) - increased from 3
                 minElevationAngle: -0.3,     // Minimum horizon angle in radians (~-17°)
                 cacheValidFrames: 3          // How many frames to cache horizon before recalculating
             };
@@ -14886,19 +14886,29 @@
              * Get the maximum block height for a chunk from its section data.
              * Returns world-space Y coordinate.
              * @param {string} key - Chunk key "cx,cz"
-             * @returns {number} Maximum Y in world space, or sea level if unknown
+             * @returns {number} Maximum Y in world space, or HIGH VALUE if unknown (to prevent false occlusion)
              */
             function getChunkMaxHeight(key) {
                 const chunkData = chunks.get(key);
                 if (!chunkData || !chunkData.sections) {
-                    return WORLD_DIMS.seaLevel; // Default to sea level if no data
+                    // CRITICAL: Return high value for unknown chunks to prevent false occlusion
+                    // Unknown chunks might have tall terrain - don't assume they're low
+                    return WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset; // Max possible height (~256)
                 }
 
                 let maxY = 0;
+                let hasAnalyzedSection = false;
+
                 for (const sec of chunkData.sections) {
                     if (!sec.isEmpty && sec.analyzed && sec.maxBlockY > maxY) {
                         maxY = sec.maxBlockY;
+                        hasAnalyzedSection = true;
                     }
+                }
+
+                // If no sections analyzed yet, return high value to be safe
+                if (!hasAnalyzedSection) {
+                    return WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset;
                 }
 
                 return maxY - WORLD_DIMS.yOffset; // Convert to world space
@@ -14943,9 +14953,10 @@
                 if (elevationAngle > horizonState.angles[sector]) {
                     horizonState.angles[sector] = elevationAngle;
                     // Also update adjacent sectors slightly (terrain doesn't have sharp edges)
+                    // REDUCED: Less spillover to prevent over-occlusion
                     const prev = (sector - 1 + HORIZON_OCCLUSION_CONFIG.numSectors) % HORIZON_OCCLUSION_CONFIG.numSectors;
                     const next = (sector + 1) % HORIZON_OCCLUSION_CONFIG.numSectors;
-                    const spillover = elevationAngle * 0.7; // Partial influence on neighbors
+                    const spillover = elevationAngle * 0.5; // Reduced from 0.7 to 0.5
                     if (spillover > horizonState.angles[prev]) horizonState.angles[prev] = spillover;
                     if (spillover > horizonState.angles[next]) horizonState.angles[next] = spillover;
                 }
@@ -14969,6 +14980,25 @@
                     return false;
                 }
 
+                // Don't occlude chunks we don't have data for - we don't know their height
+                const key = getChunkKey(cx, cz);
+                const chunkData = chunks.get(key);
+                if (!chunkData || !chunkData.sections) {
+                    return false; // Can't occlude unknown chunks
+                }
+
+                // Check if chunk has any analyzed sections
+                let hasAnalyzedSection = false;
+                for (const sec of chunkData.sections) {
+                    if (sec.analyzed) {
+                        hasAnalyzedSection = true;
+                        break;
+                    }
+                }
+                if (!hasAnalyzedSection) {
+                    return false; // Can't occlude unanalyzed chunks
+                }
+
                 // Get chunk center in world space
                 const chunkCenterX = (cx + 0.5) * WORLD_DIMS.chunkSize;
                 const chunkCenterZ = (cz + 0.5) * WORLD_DIMS.chunkSize;
@@ -14979,7 +15009,6 @@
                 const horizontalDist = Math.sqrt(dx * dx + dz * dz);
 
                 // Get chunk's maximum height
-                const key = getChunkKey(cx, cz);
                 const chunkMaxY = getChunkMaxHeight(key);
 
                 // Calculate elevation angle to chunk's highest point
@@ -14990,8 +15019,8 @@
                 const sector = getHorizonSector(dx, dz);
 
                 // Check if chunk is below horizon
-                // Add small margin to avoid popping at exact horizon line
-                const margin = 0.02; // ~1 degree
+                // Add margin to avoid popping at exact horizon line
+                const margin = 0.08; // ~4.5 degrees (increased from 0.02)
                 const isOccluded = chunkElevation < horizonState.angles[sector] - margin;
 
                 // If not occluded, this chunk may raise the horizon for chunks behind it
