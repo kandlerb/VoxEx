@@ -10981,6 +10981,18 @@
             function compressChunkData(chunk) {
                 if (!chunk || chunk._compressed) return chunk;
 
+                // Handle legacy format (chunk IS the blocks array directly)
+                if (chunk instanceof Uint8Array || ArrayBuffer.isView(chunk)) {
+                    const compressed = {
+                        _compressed: true,
+                        _originalSizes: { blocks: chunk.length },
+                        _legacyFormat: true,
+                        blocks: rleEncode(chunk)
+                    };
+                    return compressed;
+                }
+
+                // Handle modern format (chunk has .blocks property)
                 const compressed = {
                     _compressed: true,
                     _originalSizes: {},
@@ -11015,6 +11027,12 @@
             function decompressChunkData(compressed) {
                 if (!compressed || !compressed._compressed) return compressed;
 
+                // Handle legacy format (return raw Uint8Array)
+                if (compressed._legacyFormat) {
+                    return rleDecode(compressed.blocks, compressed._originalSizes.blocks);
+                }
+
+                // Handle modern format
                 const chunk = {
                     sections: compressed.sections
                 };
@@ -12574,6 +12592,41 @@
                         roundTripMatch: match
                     });
                     return match;
+                },
+                /**
+                 * Inspect chunk structure for debugging compression issues.
+                 */
+                inspectChunks: () => {
+                    console.log('=== Chunk Structure Inspection ===');
+                    const firstChunk = chunks.values().next().value;
+                    if (!firstChunk) {
+                        console.log('No chunks loaded');
+                        return;
+                    }
+                    console.log('First chunk structure:', {
+                        isUint8Array: firstChunk instanceof Uint8Array,
+                        isArrayBufferView: ArrayBuffer.isView(firstChunk),
+                        hasBlocks: !!firstChunk?.blocks,
+                        hasSkyLight: !!firstChunk?.skyLight,
+                        hasBlockLight: !!firstChunk?.blockLight,
+                        isCompressed: !!firstChunk?._compressed,
+                        keys: firstChunk ? Object.keys(firstChunk) : 'null',
+                        type: typeof firstChunk
+                    });
+                    // Count metadata states
+                    let states = { total: 0, hasData: 0, isCompressed: 0, inactive: 0 };
+                    const now = performance.now();
+                    const inactiveTime = SETTINGS.compressionInactiveTime || 10000;
+                    for (const [, meta] of chunkDataPool.metadata) {
+                        states.total++;
+                        if (meta.hasData) states.hasData++;
+                        if (meta.isCompressed) states.isCompressed++;
+                        if (now - meta.lastAccessed > inactiveTime) states.inactive++;
+                    }
+                    console.log('Metadata states:', states);
+                    console.log('Chunks Map size:', chunks.size);
+                    console.log('SETTINGS.enableChunkCompression:', SETTINGS.enableChunkCompression);
+                    return states;
                 }
             };
             const chunkMeshes = new Map();
@@ -19158,11 +19211,12 @@
                 }
 
                 // Update all placed torch lights
+                // NOTE: Placed torch shadows are always disabled to prevent texture unit overflow
                 chunkTorches.forEach((torches) => {
                     for (const torch of torches) {
                         torch.traverse((node) => {
                             if (!node.isPointLight) return;
-                            node.castShadow = shadowsEnabled;
+                            node.castShadow = false; // CRITICAL: Always disabled for placed torches
                             // Shadow update handled centrally via markShadowsDirty()
                         });
                     }
@@ -19195,6 +19249,7 @@
                     if (torchActive) torchLight.intensity = torchIntensityValue;
                 }
                 // Update all placed torch lights
+                // NOTE: Placed torch shadows are always disabled to prevent texture unit overflow
                 chunkTorches.forEach((torches) => {
                     for (const torch of torches) {
                         torch.traverse((node) => {
@@ -19202,7 +19257,7 @@
                             node.color.setHex(SETTINGS.torchColor);
                             node.intensity = torchIntensityValue;
                             node.distance = SETTINGS.torchRange;
-                            node.castShadow = SETTINGS.shadows;
+                            node.castShadow = false; // CRITICAL: Always disabled for placed torches
                             if (node.shadow) {
                                 node.shadow.camera.far = SETTINGS.torchRange;
                                 if (node.shadow.mapSize?.width) {
@@ -29943,9 +29998,13 @@
                 glow.castShadow = false;
                 torchGroup.add(glow);
                 // Add PointLight for actual light emission - 2x brighter
+                // NOTE: castShadow is DISABLED for placed torches to prevent WebGL texture unit overflow.
+                // PointLight shadows require 6 texture units (cube shadow map) per light.
+                // With sun(1) + moon(1) + handheld torch(6) + materials(~4) = 12 units already.
+                // Adding shadow-casting placed torches quickly exceeds MAX_TEXTURE_IMAGE_UNITS (16).
                 const light = new THREE.PointLight(SETTINGS.torchColor, SETTINGS.torchIntensity * 2, SETTINGS.torchRange, 0.8);
                 light.position.set(0, 0.33, 0);
-                light.castShadow = SETTINGS.shadows;
+                light.castShadow = false; // CRITICAL: Disabled to prevent shader texture overflow
                 light.shadow.mapSize.set(512, 512); // Lower res for performance
                 light.shadow.camera.near = 0.5; // Increase near plane to reduce self-shadowing
                 light.shadow.camera.far = 32;
