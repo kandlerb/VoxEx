@@ -4934,6 +4934,11 @@
                 memoryCriticalThreshold: savedSettings.memoryCriticalThreshold ?? 0.95, // Take action at 95% usage
                 enableAutoMemoryScaling: savedSettings.enableAutoMemoryScaling !== undefined ? savedSettings.enableAutoMemoryScaling : true, // Automatically reduce quality when memory tight
                 minRenderDistanceForMemory: savedSettings.minRenderDistanceForMemory ?? 4, // Never reduce render distance below this
+                // RLE Compression settings
+                enableChunkCompression: savedSettings.enableChunkCompression !== undefined ? savedSettings.enableChunkCompression : true, // Enable RLE compression for inactive chunks
+                compressionInactiveTime: savedSettings.compressionInactiveTime ?? 10000,    // Compress chunks not accessed for 10 seconds
+                compressionMinDistance: savedSettings.compressionMinDistance ?? 8,          // Only compress chunks outside this radius (chunks)
+                compressionBatchSize: savedSettings.compressionBatchSize ?? 5,              // Max chunks to compress per frame
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5134,6 +5139,11 @@
                 memoryCriticalThreshold: 0.95,     // Take action at 95% usage
                 enableAutoMemoryScaling: true,     // Automatically reduce quality when memory tight
                 minRenderDistanceForMemory: 4,     // Never reduce render distance below this
+                // RLE Compression defaults
+                enableChunkCompression: true,      // Enable RLE compression for inactive chunks
+                compressionInactiveTime: 10000,    // Compress chunks not accessed for 10 seconds
+                compressionMinDistance: 8,         // Only compress chunks outside this radius (chunks)
+                compressionBatchSize: 5,           // Max chunks to compress per frame
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -7327,6 +7337,7 @@
 
                 /**
                  * Get chunk data, updating access time.
+                 * Auto-decompresses if the chunk is compressed.
                  * @param {string} key - Chunk key
                  * @returns {Object|undefined} Chunk data or undefined
                  */
@@ -7334,6 +7345,13 @@
                     if (isDebug) this._callCounts.get++;
                     const data = this.chunks.get(key);
                     if (data) {
+                        // Auto-decompress if compressed
+                        const meta = this.metadata.get(key);
+                        if (meta && meta.isCompressed && data._compressed) {
+                            this.decompressChunk(key);
+                            // Return the decompressed data
+                            return this.chunks.get(key);
+                        }
                         this.touch(key);
                     }
                     return data;
@@ -7542,6 +7560,170 @@
                     }
                 }
 
+                // =====================================================
+                // COMPRESSION METHODS
+                // =====================================================
+
+                /**
+                 * Compress a chunk's data in place.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if compression occurred
+                 */
+                compressChunk(key) {
+                    const chunk = this.chunks.get(key);
+                    const meta = this.metadata.get(key);
+
+                    if (!chunk || !meta || meta.isCompressed || chunk._compressed) {
+                        return false;
+                    }
+
+                    const startTime = performance.now();
+
+                    // Store original size
+                    const originalSize = this.estimateChunkSize(chunk);
+                    meta.uncompressedSize = originalSize;
+
+                    // Compress
+                    const compressed = compressChunkData(chunk);
+
+                    // Calculate new size
+                    const compressedSize = this.estimateChunkSize(compressed);
+                    meta.compressedSize = compressedSize;
+
+                    // Only keep compressed version if it's actually smaller
+                    if (compressedSize < originalSize * 0.9) { // At least 10% savings
+                        this.chunks.set(key, compressed);
+                        meta.isCompressed = true;
+
+                        // Update memory tracking
+                        this.totalDataSize -= originalSize;
+                        this.totalDataSize += compressedSize;
+                        meta.dataSize = compressedSize;
+
+                        // Update stats
+                        compressionStats.chunksCompressed++;
+                        compressionStats.totalOriginalBytes += originalSize;
+                        compressionStats.totalCompressedBytes += compressedSize;
+                        compressionStats.compressionTime += performance.now() - startTime;
+
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                /**
+                 * Decompress a chunk's data in place.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if decompression occurred
+                 */
+                decompressChunk(key) {
+                    const chunk = this.chunks.get(key);
+                    const meta = this.metadata.get(key);
+
+                    if (!chunk || !meta || !meta.isCompressed || !chunk._compressed) {
+                        return false;
+                    }
+
+                    const startTime = performance.now();
+
+                    // Decompress
+                    const decompressed = decompressChunkData(chunk);
+                    this.chunks.set(key, decompressed);
+                    meta.isCompressed = false;
+
+                    // Update memory tracking
+                    const oldSize = meta.compressedSize || meta.dataSize;
+                    const newSize = meta.uncompressedSize || this.estimateChunkSize(decompressed);
+                    this.totalDataSize -= oldSize;
+                    this.totalDataSize += newSize;
+                    meta.dataSize = newSize;
+
+                    // Update stats
+                    compressionStats.chunksDecompressed++;
+                    compressionStats.decompressionTime += performance.now() - startTime;
+
+                    return true;
+                }
+
+                /**
+                 * Compress inactive chunks to save memory.
+                 * @param {number} playerCX - Player chunk X
+                 * @param {number} playerCZ - Player chunk Z
+                 * @returns {number} Number of chunks compressed
+                 */
+                compressInactiveChunks(playerCX, playerCZ) {
+                    if (!this.settings.enableChunkCompression) return 0;
+
+                    const now = performance.now();
+                    const inactiveTime = this.settings.compressionInactiveTime || 10000;
+                    const minDistance = this.settings.compressionMinDistance || 8;
+                    const minDistSq = minDistance * minDistance;
+                    const batchSize = this.settings.compressionBatchSize || 5;
+
+                    let compressed = 0;
+
+                    for (const [key, meta] of this.metadata) {
+                        if (compressed >= batchSize) break;
+
+                        // Skip already compressed
+                        if (meta.isCompressed) continue;
+
+                        // Skip recently accessed
+                        if (now - meta.lastAccessed < inactiveTime) continue;
+
+                        // Skip chunks close to player
+                        const [cx, cz] = key.split(',').map(Number);
+                        const dx = cx - playerCX;
+                        const dz = cz - playerCZ;
+                        const distSq = dx * dx + dz * dz;
+                        if (distSq < minDistSq) continue;
+
+                        // Skip if no data
+                        if (!this.chunks.has(key)) continue;
+
+                        // Compress this chunk
+                        if (this.compressChunk(key)) {
+                            compressed++;
+                        }
+                    }
+
+                    return compressed;
+                }
+
+                /**
+                 * Get compression statistics.
+                 * @returns {Object} Compression stats
+                 */
+                getCompressionStats() {
+                    let compressedCount = 0;
+                    let uncompressedCount = 0;
+
+                    for (const [, meta] of this.metadata) {
+                        if (meta.hasData) {
+                            if (meta.isCompressed) compressedCount++;
+                            else uncompressedCount++;
+                        }
+                    }
+
+                    const ratio = compressionStats.totalOriginalBytes > 0
+                        ? compressionStats.totalCompressedBytes / compressionStats.totalOriginalBytes
+                        : 1;
+
+                    return {
+                        compressedChunks: compressedCount,
+                        uncompressedChunks: uncompressedCount,
+                        compressionRatio: (ratio * 100).toFixed(1) + '%',
+                        savedMB: ((compressionStats.totalOriginalBytes - compressionStats.totalCompressedBytes) / 1024 / 1024).toFixed(1),
+                        avgCompressTime: compressionStats.chunksCompressed > 0
+                            ? (compressionStats.compressionTime / compressionStats.chunksCompressed).toFixed(2) + 'ms'
+                            : 'N/A',
+                        avgDecompressTime: compressionStats.chunksDecompressed > 0
+                            ? (compressionStats.decompressionTime / compressionStats.chunksDecompressed).toFixed(2) + 'ms'
+                            : 'N/A'
+                    };
+                }
+
                 /**
                  * Create default metadata object with expanded fields.
                  * @private
@@ -7564,7 +7746,11 @@
                         // Block counts per section for isEmpty/isFullySolid detection
                         sectionBlockCounts: null, // Lazily allocated Int16Array[20]
                         // Section flags: packed as 2 bits per section (empty=0, mixed=1, solid=2)
-                        sectionFlags: 0
+                        sectionFlags: 0,
+                        // Compression state
+                        isCompressed: false,
+                        uncompressedSize: 0,
+                        compressedSize: 0
                     };
                 }
 
@@ -10720,6 +10906,171 @@
             }
 
             // --- OPTIMIZATION 11: Vector3 Object Pool ---
+            // =====================================================
+            // RLE COMPRESSION FOR CHUNK DATA
+            // Run-Length Encoding optimized for voxel data
+            // Format: [value, count, value, count, ...] where count is 1-255
+            // For runs > 255, multiple entries are used
+            // =====================================================
+
+            /**
+             * RLE encode a Uint8Array.
+             * @param {Uint8Array} data - Input data
+             * @returns {Uint8Array} Compressed data
+             */
+            function rleEncode(data) {
+                if (!data || data.length === 0) return new Uint8Array(0);
+
+                // Estimate output size (worst case: no compression = 2x size)
+                const tempOutput = new Uint8Array(data.length * 2);
+                let outIdx = 0;
+
+                let i = 0;
+                while (i < data.length) {
+                    const value = data[i];
+                    let runLength = 1;
+
+                    // Count consecutive identical values (max 255 per run)
+                    while (i + runLength < data.length &&
+                           data[i + runLength] === value &&
+                           runLength < 255) {
+                        runLength++;
+                    }
+
+                    // Write [value, count] pair
+                    tempOutput[outIdx++] = value;
+                    tempOutput[outIdx++] = runLength;
+
+                    i += runLength;
+                }
+
+                // Return trimmed result
+                return tempOutput.slice(0, outIdx);
+            }
+
+            /**
+             * RLE decode a compressed Uint8Array.
+             * @param {Uint8Array} compressed - Compressed data
+             * @param {number} originalLength - Original uncompressed length
+             * @returns {Uint8Array} Decompressed data
+             */
+            function rleDecode(compressed, originalLength) {
+                if (!compressed || compressed.length === 0) return new Uint8Array(0);
+
+                const output = new Uint8Array(originalLength);
+                let outIdx = 0;
+
+                for (let i = 0; i < compressed.length; i += 2) {
+                    const value = compressed[i];
+                    const count = compressed[i + 1];
+
+                    // Fill run
+                    for (let j = 0; j < count && outIdx < originalLength; j++) {
+                        output[outIdx++] = value;
+                    }
+                }
+
+                return output;
+            }
+
+            /**
+             * Compress all arrays in a chunk data object.
+             * @param {Object} chunk - Chunk data with blocks, skyLight, blockLight
+             * @returns {Object} Compressed chunk data
+             */
+            function compressChunkData(chunk) {
+                if (!chunk || chunk._compressed) return chunk;
+
+                const compressed = {
+                    _compressed: true,
+                    _originalSizes: {},
+                    sections: chunk.sections // Keep sections metadata uncompressed
+                };
+
+                // Compress block data
+                if (chunk.blocks) {
+                    compressed._originalSizes.blocks = chunk.blocks.length;
+                    compressed.blocks = rleEncode(chunk.blocks);
+                }
+
+                // Compress light data
+                if (chunk.skyLight) {
+                    compressed._originalSizes.skyLight = chunk.skyLight.length;
+                    compressed.skyLight = rleEncode(chunk.skyLight);
+                }
+
+                if (chunk.blockLight) {
+                    compressed._originalSizes.blockLight = chunk.blockLight.length;
+                    compressed.blockLight = rleEncode(chunk.blockLight);
+                }
+
+                return compressed;
+            }
+
+            /**
+             * Decompress a compressed chunk data object.
+             * @param {Object} compressed - Compressed chunk data
+             * @returns {Object} Decompressed chunk data
+             */
+            function decompressChunkData(compressed) {
+                if (!compressed || !compressed._compressed) return compressed;
+
+                const chunk = {
+                    sections: compressed.sections
+                };
+
+                // Decompress block data
+                if (compressed.blocks && compressed._originalSizes.blocks) {
+                    chunk.blocks = rleDecode(compressed.blocks, compressed._originalSizes.blocks);
+                }
+
+                // Decompress light data
+                if (compressed.skyLight && compressed._originalSizes.skyLight) {
+                    chunk.skyLight = rleDecode(compressed.skyLight, compressed._originalSizes.skyLight);
+                }
+
+                if (compressed.blockLight && compressed._originalSizes.blockLight) {
+                    chunk.blockLight = rleDecode(compressed.blockLight, compressed._originalSizes.blockLight);
+                }
+
+                return chunk;
+            }
+
+            /**
+             * Calculate compression ratio for a chunk.
+             * @param {Object} original - Original chunk data
+             * @param {Object} compressed - Compressed chunk data
+             * @returns {number} Compression ratio (0-1, lower is better)
+             */
+            function getCompressionRatio(original, compressed) {
+                if (!original || !compressed) return 1;
+
+                let originalSize = 0;
+                let compressedSize = 0;
+
+                if (original.blocks) originalSize += original.blocks.length;
+                if (original.skyLight) originalSize += original.skyLight.length;
+                if (original.blockLight) originalSize += original.blockLight.length;
+
+                if (compressed.blocks) compressedSize += compressed.blocks.length;
+                if (compressed.skyLight) compressedSize += compressed.skyLight.length;
+                if (compressed.blockLight) compressedSize += compressed.blockLight.length;
+
+                return originalSize > 0 ? compressedSize / originalSize : 1;
+            }
+
+            // Compression statistics
+            const compressionStats = {
+                chunksCompressed: 0,
+                chunksDecompressed: 0,
+                totalOriginalBytes: 0,
+                totalCompressedBytes: 0,
+                compressionTime: 0,
+                decompressionTime: 0
+            };
+            window.compressionStats = compressionStats;
+
+            // --- OPTIMIZATION 12: Vector3 Object Pool ---
             class Vector3Pool {
                 constructor(initialSize = 32) {
                     this.pool = [];
@@ -11889,6 +12240,12 @@
                     }
                 }
                 html += `Mesh: R:${meshStateCount.ready} Q:${meshStateCount.queued} B:${meshStateCount.building} S:${meshStateCount.stale}\n`;
+                // Compression Stats
+                if (SETTINGS.enableChunkCompression) {
+                    const compStats = chunkDataPool.getCompressionStats();
+                    html += `Compressed: ${compStats.compressedChunks}/${compStats.compressedChunks + compStats.uncompressedChunks} chunks\n`;
+                    html += `Ratio: ${compStats.compressionRatio} | Saved: ${compStats.savedMB}MB\n`;
+                }
                 // Geometry buffer pool stats
                 if (typeof geometryPool !== 'undefined') {
                     const geoStats = geometryPool.getStats();
@@ -12156,6 +12513,67 @@
                         memoryBudgetManager.setBudget(originalBudget);
                         console.log(`[MemoryDebug] Memory pressure simulation ended, budget restored to ${originalBudget}MB`);
                     }, durationMs);
+                },
+                /**
+                 * Display compression statistics.
+                 */
+                compression: () => {
+                    console.log('=== Compression Stats ===');
+                    if (typeof chunkDataPool !== 'undefined') {
+                        console.log(chunkDataPool.getCompressionStats());
+                    }
+                    console.log('Global stats:', compressionStats);
+                },
+                /**
+                 * Force compress all distant chunks.
+                 * @returns {Object} Compression stats after operation
+                 */
+                forceCompress: () => {
+                    if (typeof chunkDataPool === 'undefined') {
+                        console.warn('[MemoryDebug] chunkDataPool not initialized');
+                        return;
+                    }
+                    const playerPos = typeof getPlayerWorldPosition === 'function' ? getPlayerWorldPosition() : { x: 0, z: 0 };
+                    const playerCX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
+                    const playerCZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
+                    // Temporarily set aggressive compression settings
+                    const oldTime = SETTINGS.compressionInactiveTime;
+                    const oldDist = SETTINGS.compressionMinDistance;
+                    SETTINGS.compressionInactiveTime = 0;
+                    SETTINGS.compressionMinDistance = 0;
+                    let total = 0;
+                    for (let i = 0; i < 50; i++) {
+                        total += chunkDataPool.compressInactiveChunks(playerCX, playerCZ);
+                    }
+                    SETTINGS.compressionInactiveTime = oldTime;
+                    SETTINGS.compressionMinDistance = oldDist;
+                    console.log(`[MemoryDebug] Force compressed ${total} chunks`);
+                    return chunkDataPool.getCompressionStats();
+                },
+                /**
+                 * Test RLE encoding/decoding with sample data.
+                 * @returns {boolean} True if round-trip test passed
+                 */
+                testRLE: () => {
+                    // Test RLE on sample data
+                    const testData = new Uint8Array(1000);
+                    testData.fill(0, 0, 500);      // 500 zeros
+                    testData.fill(1, 500, 800);    // 300 ones
+                    testData.fill(2, 800, 1000);   // 200 twos
+
+                    const compressed = rleEncode(testData);
+                    const decompressed = rleDecode(compressed, testData.length);
+
+                    const ratio = compressed.length / testData.length;
+                    const match = testData.every((v, i) => v === decompressed[i]);
+
+                    console.log('RLE Test:', {
+                        originalSize: testData.length,
+                        compressedSize: compressed.length,
+                        ratio: (ratio * 100).toFixed(1) + '%',
+                        roundTripMatch: match
+                    });
+                    return match;
                 }
             };
             const chunkMeshes = new Map();
@@ -30427,6 +30845,13 @@
                 // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
                 // This replaces the old maxCachedChunks approach with memory-budget-based eviction
                 chunkDataPool.evictIfNeeded(chunkX, chunkZ, modifiedChunks, purgeChunkData);
+
+                // --- 8b. Chunk Data Compression ---
+                // Compress inactive chunks to save memory
+                if (SETTINGS.enableChunkCompression) {
+                    chunkDataPool.compressInactiveChunks(chunkX, chunkZ);
+                }
+
                 // --- BIOME CACHE CLEANUP ---
                 // Prevent memory leak by removing distant biome cells
                 if (biomeCellCache.size > 10000) {
