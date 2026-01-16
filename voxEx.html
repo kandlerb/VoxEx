@@ -6944,10 +6944,15 @@
                     const key = `${cx},${cz}`;  // Inline to avoid getChunkKey function call
                     // OPTIMIZATION: Chunk cache for sequential block access in same chunk
                     const isCacheHit = key === this._lastChunkKey;
-                    const chunk = isCacheHit ? this._lastChunk : this.chunks.get(key);
+                    let chunk = isCacheHit ? this._lastChunk : (typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key));
                     if (!chunk) return undefined;
+                    // Safety: If cached chunk is compressed, fetch fresh decompressed version
+                    if (chunk._compressed) {
+                        chunk = typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key);
+                        if (!chunk) return undefined;
+                    }
                     // Update LRU access time only on cache miss (new chunk access)
-                    if (!isCacheHit) {
+                    if (!isCacheHit || this._lastChunk !== chunk) {
                         this._lastChunkKey = key;
                         this._lastChunk = chunk;
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
@@ -6978,7 +6983,7 @@
                     const cx = x >> 4;
                     const cz = z >> 4;
                     const key = `${cx},${cz}`;  // Inline key generation
-                    let chunk = this.chunks.get(key);
+                    let chunk = typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(key) : this.chunks.get(key);
 
                     if (!chunk) {
                         if (!createIfMissing) return false;
@@ -7248,15 +7253,18 @@
                  * @returns {{north: ChunkData|undefined, south: ChunkData|undefined, east: ChunkData|undefined, west: ChunkData|undefined, northWest: ChunkData|undefined, northEast: ChunkData|undefined, southWest: ChunkData|undefined, southEast: ChunkData|undefined}} Neighbor chunks
                  */
                 getNeighborChunks(cx, cz) {
+                    const get = typeof chunkDataPool !== 'undefined'
+                        ? (k) => chunkDataPool.get(k)
+                        : (k) => this.chunks.get(k);
                     return {
-                        north: this.chunks.get(this.getChunkKey(cx, cz - 1)),
-                        south: this.chunks.get(this.getChunkKey(cx, cz + 1)),
-                        east: this.chunks.get(this.getChunkKey(cx + 1, cz)),
-                        west: this.chunks.get(this.getChunkKey(cx - 1, cz)),
-                        northWest: this.chunks.get(this.getChunkKey(cx - 1, cz - 1)),
-                        northEast: this.chunks.get(this.getChunkKey(cx + 1, cz - 1)),
-                        southWest: this.chunks.get(this.getChunkKey(cx - 1, cz + 1)),
-                        southEast: this.chunks.get(this.getChunkKey(cx + 1, cz + 1))
+                        north: get(this.getChunkKey(cx, cz - 1)),
+                        south: get(this.getChunkKey(cx, cz + 1)),
+                        east: get(this.getChunkKey(cx + 1, cz)),
+                        west: get(this.getChunkKey(cx - 1, cz)),
+                        northWest: get(this.getChunkKey(cx - 1, cz - 1)),
+                        northEast: get(this.getChunkKey(cx + 1, cz - 1)),
+                        southWest: get(this.getChunkKey(cx - 1, cz + 1)),
+                        southEast: get(this.getChunkKey(cx + 1, cz + 1))
                     };
                 }
 
@@ -11965,24 +11973,35 @@
                     };
                 }
 
-                getNeighbors(cx, cz, chunks) {
+                getNeighbors(cx, cz, chunks) {  // chunks param kept for backwards compat but not used
                     this._callCounts.getNeighbors++;
                     const key = `${cx},${cz}`;
                     if (this.cache.has(key)) {
                         this._callCounts.getNeighborsHit++;
-                        return this.cache.get(key);
+                        // Verify cached neighbors aren't compressed - if any are, refetch
+                        const cached = this.cache.get(key);
+                        if (cached.north?._compressed || cached.south?._compressed ||
+                            cached.east?._compressed || cached.west?._compressed ||
+                            cached.ne?._compressed || cached.nw?._compressed ||
+                            cached.se?._compressed || cached.sw?._compressed) {
+                            this.cache.delete(key);  // Invalidate stale cache
+                        } else {
+                            return cached;
+                        }
                     }
 
                     this._callCounts.getNeighborsMiss++;
+                    // Use chunkDataPool.get() for auto-decompression
+                    const get = typeof chunkDataPool !== 'undefined' ? (k) => chunkDataPool.get(k) : (k) => chunks.get(k);
                     const neighbors = {
-                        north: chunks.get(`${cx},${cz-1}`),
-                        south: chunks.get(`${cx},${cz+1}`),
-                        east: chunks.get(`${cx+1},${cz}`),
-                        west: chunks.get(`${cx-1},${cz}`),
-                        ne: chunks.get(`${cx+1},${cz-1}`),
-                        nw: chunks.get(`${cx-1},${cz-1}`),
-                        se: chunks.get(`${cx+1},${cz+1}`),
-                        sw: chunks.get(`${cx-1},${cz+1}`)
+                        north: get(`${cx},${cz-1}`),
+                        south: get(`${cx},${cz+1}`),
+                        east: get(`${cx+1},${cz}`),
+                        west: get(`${cx-1},${cz}`),
+                        ne: get(`${cx+1},${cz-1}`),
+                        nw: get(`${cx-1},${cz-1}`),
+                        se: get(`${cx+1},${cz+1}`),
+                        sw: get(`${cx-1},${cz+1}`)
                     };
 
                     if (this.cache.size >= this.maxSize) {
@@ -32205,7 +32224,7 @@
                     // Optimized block lookup with chunk caching
                     const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize));
                     // Only fetch chunk if we moved to a new chunk
-                    if (chunkKey !== lastChunkKey) { cachedChunk = chunks.get(chunkKey); lastChunkKey = chunkKey; }
+                    if (chunkKey !== lastChunkKey) { cachedChunk = chunkDataPool.get(chunkKey); lastChunkKey = chunkKey; }
                     if (!cachedChunk) return null;
                     const ly = y + WORLD_DIMS.yOffset;
                     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return null;
