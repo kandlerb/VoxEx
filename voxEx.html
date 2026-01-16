@@ -2143,6 +2143,14 @@
                         <input type="range" id="max-chunks-slider" min="100" max="1000" step="50" />
                     </div>
                     <div class="setting-item">
+                        <label for="memory-budget-slider">Memory Budget (MB): <span id="memory-budget-val">1024</span></label>
+                        <input type="range" id="memory-budget-slider" min="256" max="2048" step="128" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="auto-memory-toggle">Auto Memory Scaling</label>
+                        <input type="checkbox" id="auto-memory-toggle" />
+                    </div>
+                    <div class="setting-item">
                         <button id="clear-cache-btn" style="padding: 8px 16px; cursor: pointer">Clear World Cache</button>
                         <span id="cache-size" style="margin-left: 10px; font-size: 12px"></span>
                     </div>
@@ -4920,6 +4928,12 @@
                 dataKeepDistance: savedSettings.dataKeepDistance ?? 48,          // Keep chunk DATA within this radius (chunks, larger than renderDistance)
                 maxChunkDataMemoryMB: savedSettings.maxChunkDataMemoryMB ?? 1024, // Memory budget for chunk data in MB
                 chunkDataEvictionBatch: savedSettings.chunkDataEvictionBatch ?? 50, // How many chunks to evict per cleanup cycle
+                // Memory Budget System settings (unified memory tracking)
+                memoryBudgetMB: savedSettings.memoryBudgetMB ?? 1024,              // Total memory budget in MB
+                memoryWarningThreshold: savedSettings.memoryWarningThreshold ?? 0.8,  // Warn at 80% usage
+                memoryCriticalThreshold: savedSettings.memoryCriticalThreshold ?? 0.95, // Take action at 95% usage
+                enableAutoMemoryScaling: savedSettings.enableAutoMemoryScaling !== undefined ? savedSettings.enableAutoMemoryScaling : true, // Automatically reduce quality when memory tight
+                minRenderDistanceForMemory: savedSettings.minRenderDistanceForMemory ?? 4, // Never reduce render distance below this
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5114,6 +5128,12 @@
                 dataKeepDistance: 48,          // Keep chunk DATA within this radius (chunks)
                 maxChunkDataMemoryMB: 1024,    // Memory budget for chunk data in MB
                 chunkDataEvictionBatch: 50,    // How many chunks to evict per cleanup cycle
+                // Memory Budget System defaults (unified memory tracking)
+                memoryBudgetMB: 1024,              // Total memory budget in MB
+                memoryWarningThreshold: 0.8,       // Warn at 80% usage
+                memoryCriticalThreshold: 0.95,     // Take action at 95% usage
+                enableAutoMemoryScaling: true,     // Automatically reduce quality when memory tight
+                minRenderDistanceForMemory: 4,     // Never reduce render distance below this
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -11885,6 +11905,21 @@
                 }
                 const oldestAgeSeconds = ((performance.now() - oldestAccess) / 1000).toFixed(1);
                 html += `Raw Mem: ${chunkMemoryMB}MB | Oldest: ${oldestAgeSeconds}s\n`;
+                // Memory Budget Status
+                if (memoryBudgetManager) {
+                    const memStatus = memoryBudgetManager.getStatus();
+                    const memColor = memStatus.color || '';
+                    html += `<span class="perf-section">── Memory Budget ──</span>\n`;
+                    html += `<span class="${memColor}">Total: ${memStatus.totalMB}/${memStatus.budgetMB}MB (${(memStatus.percentage * 100).toFixed(0)}%)</span>\n`;
+                    if (memStatus.status !== 'OK') {
+                        html += `<span class="${memColor}">Status: ${memStatus.status}</span>\n`;
+                    }
+                    if (memStatus.scaledDown) {
+                        html += `<span class="perf-warn">Auto-scaled: RD reduced</span>\n`;
+                    }
+                    html += `  Chunks: ${memStatus.chunkDataMB}MB | Geo: ${memStatus.geometryPoolMB}MB\n`;
+                    html += `  GPU: ${memStatus.gpuGeometriesMB}MB geo, ${memStatus.gpuTexturesMB}MB tex\n`;
+                }
                 html += `<span class="perf-section">── Rendering ──</span>\n`;
                 html += `Faces: ${(totalFaces/1000).toFixed(1)}K\n`;
                 html += `Culled: ${culled} chunks\n`;
@@ -12047,6 +12082,85 @@
             window.chunks = chunks; // Expose chunks Map for console debugging
             // Create ChunkDataPool for Nvidium-style data persistence
             const chunkDataPool = new ChunkDataPool(chunks, SETTINGS);
+            // Initialize memory budget manager now that chunkDataPool exists
+            memoryBudgetManager = new MemoryBudgetManager();
+            window.memoryBudgetManager = memoryBudgetManager;
+            // Console commands for memory debugging
+            window.memoryDebug = {
+                /**
+                 * Display current memory status in console table.
+                 */
+                status: () => {
+                    if (!memoryBudgetManager) {
+                        console.warn('[MemoryDebug] MemoryBudgetManager not initialized');
+                        return;
+                    }
+                    console.table(memoryBudgetManager.getStatus());
+                },
+                /**
+                 * Set memory budget in MB.
+                 * @param {number} mb - Budget in MB.
+                 */
+                setBudget: (mb) => {
+                    if (!memoryBudgetManager) {
+                        console.warn('[MemoryDebug] MemoryBudgetManager not initialized');
+                        return;
+                    }
+                    memoryBudgetManager.setBudget(mb);
+                    console.log(`[MemoryDebug] Budget set to ${mb}MB`);
+                },
+                /**
+                 * Force chunk eviction.
+                 */
+                forceEvict: () => {
+                    if (typeof chunkDataPool === 'undefined') {
+                        console.warn('[MemoryDebug] chunkDataPool not initialized');
+                        return;
+                    }
+                    const playerPos = typeof getPlayerWorldPosition === 'function' ? getPlayerWorldPosition() : { x: 0, z: 0 };
+                    const playerCX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
+                    const playerCZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
+                    const evicted = chunkDataPool.evictIfNeeded(playerCX, playerCZ, modifiedChunks, purgeChunkData);
+                    console.log(`[MemoryDebug] Force evicted ${evicted} chunks`);
+                },
+                /**
+                 * Display detailed memory breakdown from all systems.
+                 */
+                breakdown: () => {
+                    console.log('=== Memory Breakdown ===');
+                    if (typeof chunkDataPool !== 'undefined') {
+                        console.log('Chunk Data:', chunkDataPool.getStats());
+                    }
+                    if (typeof geometryPool !== 'undefined') {
+                        console.log('Geometry Pool:', geometryPool.getStats());
+                    }
+                    if (typeof renderer !== 'undefined' && renderer.info) {
+                        console.log('GPU Memory:', renderer.info.memory);
+                        console.log('Render Info:', renderer.info.render);
+                    }
+                    if (memoryBudgetManager) {
+                        console.log('Total Budget Status:', memoryBudgetManager.getStatus());
+                    }
+                },
+                /**
+                 * Simulate memory pressure by setting a very low budget temporarily.
+                 * @param {number} [durationMs=5000] - Duration in ms before restoring.
+                 */
+                simulatePressure: (durationMs = 5000) => {
+                    if (!memoryBudgetManager) {
+                        console.warn('[MemoryDebug] MemoryBudgetManager not initialized');
+                        return;
+                    }
+                    const originalBudget = memoryBudgetManager.budgetMB;
+                    const lowBudget = 50; // Very low budget to trigger scaling
+                    console.log(`[MemoryDebug] Simulating memory pressure (${lowBudget}MB budget for ${durationMs}ms)`);
+                    memoryBudgetManager.setBudget(lowBudget);
+                    setTimeout(() => {
+                        memoryBudgetManager.setBudget(originalBudget);
+                        console.log(`[MemoryDebug] Memory pressure simulation ended, budget restored to ${originalBudget}MB`);
+                    }, durationMs);
+                }
+            };
             const chunkMeshes = new Map();
             window.chunkMeshes = chunkMeshes; // Expose for console debugging
             let terrainMeshCount = 0;
@@ -16096,6 +16210,257 @@
             const geometryPool = new GeometryBufferPool(256);
             window.geometryPool = geometryPool; // Expose for console debugging
 
+            /**
+             * MemoryBudgetManager - Tracks total memory usage across all systems
+             * and automatically adjusts quality settings when memory pressure is high.
+             */
+            class MemoryBudgetManager {
+                /**
+                 * Create a MemoryBudgetManager instance.
+                 */
+                constructor() {
+                    this.budgetMB = SETTINGS.memoryBudgetMB || 1024;
+                    this.warningThreshold = SETTINGS.memoryWarningThreshold || 0.8;
+                    this.criticalThreshold = SETTINGS.memoryCriticalThreshold || 0.95;
+
+                    // Memory tracking
+                    this.lastUpdate = 0;
+                    this.updateInterval = 1000; // Update every second
+
+                    // Cached values
+                    this._cachedUsage = {
+                        chunkDataMB: 0,
+                        geometryPoolMB: 0,
+                        gpuGeometriesMB: 0,
+                        gpuTexturesMB: 0,
+                        totalMB: 0,
+                        percentage: 0
+                    };
+
+                    // Auto-scaling state
+                    this._originalRenderDistance = null;
+                    this._scaledDown = false;
+
+                    // Stats
+                    this._stats = {
+                        warningCount: 0,
+                        criticalCount: 0,
+                        scaleDownCount: 0,
+                        scaleUpCount: 0
+                    };
+                }
+
+                /**
+                 * Estimate memory usage of geometry pool in MB.
+                 * @returns {number} Estimated geometry pool memory in MB.
+                 */
+                _estimateGeometryPoolMemory() {
+                    if (typeof geometryPool === 'undefined') return 0;
+
+                    const stats = geometryPool.getStats();
+                    // Each terrain geometry: ~3.6MB (24K faces * 150 bytes/face approx)
+                    // Each water geometry: ~0.9MB (6K faces * 150 bytes/face approx)
+                    const terrainMemory = (stats.terrainPoolSize + (stats.terrainCreated - stats.terrainReleased)) * 3.6;
+                    const waterMemory = (stats.waterPoolSize + (stats.waterCreated - stats.waterReleased)) * 0.9;
+                    return terrainMemory + waterMemory;
+                }
+
+                /**
+                 * Get GPU memory usage from Three.js renderer.
+                 * @returns {{geometries: number, textures: number}} GPU memory usage estimates.
+                 */
+                _getGPUMemory() {
+                    if (typeof renderer === 'undefined' || !renderer.info || !renderer.info.memory) {
+                        return { geometries: 0, textures: 0 };
+                    }
+
+                    const info = renderer.info.memory;
+                    // Rough estimates:
+                    // - Average geometry ~1MB
+                    // - Average texture ~4MB (assuming 1024x1024 RGBA)
+                    return {
+                        geometries: (info.geometries || 0) * 1,
+                        textures: (info.textures || 0) * 4
+                    };
+                }
+
+                /**
+                 * Update memory usage calculations.
+                 * @returns {Object} Current memory usage data.
+                 */
+                update() {
+                    const now = performance.now();
+                    if (now - this.lastUpdate < this.updateInterval) {
+                        return this._cachedUsage;
+                    }
+                    this.lastUpdate = now;
+
+                    // Chunk data memory
+                    const chunkDataMB = typeof chunkDataPool !== 'undefined'
+                        ? parseFloat(chunkDataPool.getStats().totalDataSizeMB) || 0
+                        : 0;
+
+                    // Geometry pool memory
+                    const geometryPoolMB = this._estimateGeometryPoolMemory();
+
+                    // GPU memory
+                    const gpuMem = this._getGPUMemory();
+
+                    // Calculate totals
+                    const totalMB = chunkDataMB + geometryPoolMB + gpuMem.geometries + gpuMem.textures;
+                    const percentage = totalMB / this.budgetMB;
+
+                    this._cachedUsage = {
+                        chunkDataMB: chunkDataMB.toFixed(1),
+                        geometryPoolMB: geometryPoolMB.toFixed(1),
+                        gpuGeometriesMB: gpuMem.geometries.toFixed(1),
+                        gpuTexturesMB: gpuMem.textures.toFixed(1),
+                        totalMB: totalMB.toFixed(1),
+                        percentage: percentage
+                    };
+
+                    // Check thresholds and take action
+                    this._checkMemoryPressure();
+
+                    return this._cachedUsage;
+                }
+
+                /**
+                 * Check memory pressure and take action if needed.
+                 */
+                _checkMemoryPressure() {
+                    const usage = this._cachedUsage;
+
+                    if (usage.percentage >= this.criticalThreshold) {
+                        this._stats.criticalCount++;
+                        this._handleCriticalMemory();
+                    } else if (usage.percentage >= this.warningThreshold) {
+                        this._stats.warningCount++;
+                        this._handleWarningMemory();
+                    } else if (this._scaledDown && usage.percentage < this.warningThreshold * 0.7) {
+                        // Memory recovered, restore quality
+                        this._restoreQuality();
+                    }
+                }
+
+                /**
+                 * Handle critical memory situation - aggressive reduction.
+                 */
+                _handleCriticalMemory() {
+                    if (!SETTINGS.enableAutoMemoryScaling) return;
+
+                    // Store original render distance if not already scaled
+                    if (this._originalRenderDistance === null) {
+                        this._originalRenderDistance = SETTINGS.renderDistance;
+                    }
+
+                    // Reduce render distance aggressively
+                    const minDist = SETTINGS.minRenderDistanceForMemory || 4;
+                    const currentDist = SETTINGS.renderDistance;
+                    const newDist = Math.max(minDist, currentDist - 2);
+
+                    if (newDist < currentDist) {
+                        SETTINGS.renderDistance = newDist;
+                        this._scaledDown = true;
+                        this._stats.scaleDownCount++;
+                        logDebug(`[MemoryBudget] CRITICAL: Reduced render distance ${currentDist} → ${newDist}`);
+                    }
+
+                    // Force eviction
+                    if (typeof chunkDataPool !== 'undefined') {
+                        const playerPos = typeof getPlayerWorldPosition === 'function' ? getPlayerWorldPosition() : { x: 0, z: 0 };
+                        const playerCX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
+                        const playerCZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
+                        chunkDataPool.evictIfNeeded(playerCX, playerCZ, modifiedChunks, purgeChunkData);
+                    }
+                }
+
+                /**
+                 * Handle warning memory situation - gentle reduction.
+                 */
+                _handleWarningMemory() {
+                    if (!SETTINGS.enableAutoMemoryScaling) return;
+
+                    // Store original render distance if not already scaled
+                    if (this._originalRenderDistance === null) {
+                        this._originalRenderDistance = SETTINGS.renderDistance;
+                    }
+
+                    // Reduce render distance by 1
+                    const minDist = SETTINGS.minRenderDistanceForMemory || 4;
+                    const currentDist = SETTINGS.renderDistance;
+                    const newDist = Math.max(minDist, currentDist - 1);
+
+                    if (newDist < currentDist && !this._scaledDown) {
+                        SETTINGS.renderDistance = newDist;
+                        this._scaledDown = true;
+                        this._stats.scaleDownCount++;
+                        logDebug(`[MemoryBudget] WARNING: Reduced render distance ${currentDist} → ${newDist}`);
+                    }
+                }
+
+                /**
+                 * Restore quality settings when memory pressure subsides.
+                 */
+                _restoreQuality() {
+                    if (this._originalRenderDistance !== null && this._scaledDown) {
+                        const currentDist = SETTINGS.renderDistance;
+                        // Restore gradually (1 chunk at a time)
+                        const targetDist = Math.min(currentDist + 1, this._originalRenderDistance);
+
+                        if (targetDist > currentDist) {
+                            SETTINGS.renderDistance = targetDist;
+                            this._stats.scaleUpCount++;
+                            logDebug(`[MemoryBudget] Memory recovered: Increased render distance ${currentDist} → ${targetDist}`);
+                        }
+
+                        if (targetDist >= this._originalRenderDistance) {
+                            this._scaledDown = false;
+                            this._originalRenderDistance = null;
+                        }
+                    }
+                }
+
+                /**
+                 * Get memory status for display.
+                 * @returns {Object} Memory status with usage breakdown and state.
+                 */
+                getStatus() {
+                    const usage = this._cachedUsage;
+                    let status = 'OK';
+                    let color = '';
+
+                    if (usage.percentage >= this.criticalThreshold) {
+                        status = 'CRITICAL';
+                        color = 'perf-bad';
+                    } else if (usage.percentage >= this.warningThreshold) {
+                        status = 'WARNING';
+                        color = 'perf-warn';
+                    }
+
+                    return {
+                        ...usage,
+                        budgetMB: this.budgetMB,
+                        status,
+                        color,
+                        scaledDown: this._scaledDown,
+                        stats: { ...this._stats }
+                    };
+                }
+
+                /**
+                 * Manually set memory budget.
+                 * @param {number} budgetMB - New memory budget in MB.
+                 */
+                setBudget(budgetMB) {
+                    this.budgetMB = budgetMB;
+                    SETTINGS.memoryBudgetMB = budgetMB;
+                }
+            }
+
+            // Create global memory budget manager (instantiated later after chunkDataPool exists)
+            let memoryBudgetManager = null;
+
             const perm = new Uint8Array(512);
             const p = new Uint8Array(256).map((_, i) => i);
             const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
@@ -19847,12 +20212,17 @@
                 const maxChunksVal = document.getElementById("max-chunks-val");
                 const pregenDistSlider = document.getElementById("pregen-dist-slider");
                 const pregenDistVal = document.getElementById("pregen-dist-val");
+                const memoryBudgetSlider = document.getElementById("memory-budget-slider");
+                const memoryBudgetVal = document.getElementById("memory-budget-val");
+                const autoMemoryToggle = document.getElementById("auto-memory-toggle");
                 if (frustumToggle) frustumToggle.checked = SETTINGS.enableFrustumCulling;
                 if (lowerFpsSlider && lowerFpsVal) { lowerFpsSlider.value = SETTINGS.lowerBoundFPS; lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; }
                 if (upperFpsSlider && upperFpsVal) { upperFpsSlider.value = SETTINGS.upperBoundFPS; upperFpsVal.textContent = SETTINGS.upperBoundFPS; }
                 if (buildQueueSlider && buildQueueVal) { buildQueueSlider.value = SETTINGS.buildQueueLimit; buildQueueVal.textContent = SETTINGS.buildQueueLimit; }
                 if (maxChunksSlider && maxChunksVal) { maxChunksSlider.value = SETTINGS.maxCachedChunks; maxChunksVal.textContent = SETTINGS.maxCachedChunks; }
                 if (pregenDistSlider && pregenDistVal) { pregenDistSlider.value = SETTINGS.preGenRenderDistance; pregenDistVal.textContent = SETTINGS.preGenRenderDistance; }
+                if (memoryBudgetSlider && memoryBudgetVal) { memoryBudgetSlider.value = SETTINGS.memoryBudgetMB; memoryBudgetVal.textContent = SETTINGS.memoryBudgetMB; }
+                if (autoMemoryToggle) { autoMemoryToggle.checked = SETTINGS.enableAutoMemoryScaling; }
                 // INITIALIZE UI VALUES - Graphics > Lighting
                 const sunColorInput = document.getElementById("sun-color");
                 const sunIntensityInput = document.getElementById("sun-intensity-input");
@@ -20317,6 +20687,18 @@
                 buildQueueSlider?.addEventListener("input", () => { SETTINGS.buildQueueLimit = parseInt(buildQueueSlider.value); buildQueueVal.textContent = SETTINGS.buildQueueLimit; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 maxChunksSlider?.addEventListener("input", () => { SETTINGS.maxCachedChunks = parseInt(maxChunksSlider.value); maxChunksVal.textContent = SETTINGS.maxCachedChunks; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
                 pregenDistSlider?.addEventListener("input", () => { SETTINGS.preGenRenderDistance = parseInt(pregenDistSlider.value); pregenDistVal.textContent = SETTINGS.preGenRenderDistance; localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS)); });
+                // EVENT HANDLERS - Memory Budget
+                memoryBudgetSlider?.addEventListener("input", () => {
+                    const val = parseInt(memoryBudgetSlider.value);
+                    SETTINGS.memoryBudgetMB = val;
+                    memoryBudgetVal.textContent = val;
+                    if (memoryBudgetManager) memoryBudgetManager.setBudget(val);
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                });
+                autoMemoryToggle?.addEventListener("change", () => {
+                    SETTINGS.enableAutoMemoryScaling = autoMemoryToggle.checked;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                });
                 // EVENT HANDLERS - Graphics > Lighting > Shadow
                 shadowBiasInput?.addEventListener("change", () => {
                     const val = parseFloat(shadowBiasInput.value);
@@ -20821,6 +21203,8 @@
                     if (buildQueueSlider && buildQueueVal) { buildQueueSlider.value = SETTINGS.buildQueueLimit; buildQueueVal.textContent = SETTINGS.buildQueueLimit; }
                     if (maxChunksSlider && maxChunksVal) { maxChunksSlider.value = SETTINGS.maxCachedChunks; maxChunksVal.textContent = SETTINGS.maxCachedChunks; }
                     if (pregenDistSlider && pregenDistVal) { pregenDistSlider.value = SETTINGS.preGenRenderDistance; pregenDistVal.textContent = SETTINGS.preGenRenderDistance; }
+                    if (memoryBudgetSlider && memoryBudgetVal) { memoryBudgetSlider.value = SETTINGS.memoryBudgetMB; memoryBudgetVal.textContent = SETTINGS.memoryBudgetMB; }
+                    if (autoMemoryToggle) { autoMemoryToggle.checked = SETTINGS.enableAutoMemoryScaling; }
                     if (dynamicDistToggle) dynamicDistToggle.checked = SETTINGS.dynamicRenderDistance;
                     if (renderDistSlider && renderDistVal) { renderDistSlider.value = SETTINGS.renderDistance; renderDistVal.textContent = SETTINGS.renderDistance; renderDistSlider.disabled = SETTINGS.dynamicRenderDistance; }
                     // Graphics - Basic
@@ -20936,6 +21320,9 @@
                     SETTINGS.buildQueueLimit = DEFAULTS.buildQueueLimit;
                     SETTINGS.maxCachedChunks = DEFAULTS.maxCachedChunks;
                     SETTINGS.preGenRenderDistance = DEFAULTS.preGenRenderDistance;
+                    SETTINGS.memoryBudgetMB = DEFAULTS.memoryBudgetMB;
+                    SETTINGS.enableAutoMemoryScaling = DEFAULTS.enableAutoMemoryScaling;
+                    if (memoryBudgetManager) memoryBudgetManager.setBudget(DEFAULTS.memoryBudgetMB);
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                 });
@@ -31608,6 +31995,8 @@
                         physicsAccumulator = 0;
                     }
                     prevTime = time;
+                    // Update memory budget manager (throttled internally)
+                    if (memoryBudgetManager) memoryBudgetManager.update();
                     // UI and visual updates
                     // OPTIMIZATION: Only update debug UI every N frames
                     if (isDebug && shouldUpdateDebugUI()) updateDebugInfo(fpsInstant, fpsAvg);
