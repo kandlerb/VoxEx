@@ -12627,6 +12627,83 @@
                     console.log('Chunks Map size:', chunks.size);
                     console.log('SETTINGS.enableChunkCompression:', SETTINGS.enableChunkCompression);
                     return states;
+                },
+
+                // === INDEXEDDB CACHE STATISTICS ===
+
+                /**
+                 * Display IndexedDB cache statistics.
+                 */
+                cacheStats: () => {
+                    console.log('=== IndexedDB Cache Stats ===');
+                    console.table(idbCacheStats.getStats());
+                },
+
+                /**
+                 * Reset IndexedDB cache statistics.
+                 */
+                resetCacheStats: () => {
+                    idbCacheStats.reset();
+                    console.log('[Cache] Statistics reset');
+                },
+
+                /**
+                 * Display auto-save statistics and pending chunks.
+                 */
+                autoSaveStats: () => {
+                    console.log('=== Auto-Save Stats ===');
+                    console.table(chunkAutoSave.getStats());
+                    if (chunkAutoSave.modifiedChunks.size > 0) {
+                        console.log('Pending chunks:', Array.from(chunkAutoSave.modifiedChunks));
+                    }
+                },
+
+                /**
+                 * Force immediate save of all modified chunks.
+                 * @returns {Promise<number>} Number of chunks saved
+                 */
+                forceSave: async () => {
+                    const count = await chunkAutoSave.forceSave();
+                    console.log(`[AutoSave] Force saved ${count} chunks`);
+                    return count;
+                },
+
+                /**
+                 * Toggle auto-save system.
+                 * @param {boolean} [enabled] - Enable or disable, toggles if not specified
+                 */
+                toggleAutoSave: (enabled) => {
+                    chunkAutoSave.enabled = enabled !== undefined ? enabled : !chunkAutoSave.enabled;
+                    console.log(`[AutoSave] ${chunkAutoSave.enabled ? 'Enabled' : 'Disabled'}`);
+                },
+
+                /**
+                 * Set auto-save interval in milliseconds.
+                 * @param {number} ms - Interval in milliseconds
+                 */
+                setAutoSaveInterval: (ms) => {
+                    chunkAutoSave.saveInterval = ms;
+                    console.log(`[AutoSave] Interval set to ${ms}ms`);
+                },
+
+                /**
+                 * Clear entire IndexedDB chunk cache.
+                 * @returns {Promise<void>}
+                 */
+                clearCache: async () => {
+                    await clearChunkCache();
+                    idbCacheStats.reset();
+                    console.log('[Cache] IndexedDB chunk cache cleared');
+                },
+
+                /**
+                 * Display combined persistence statistics.
+                 */
+                persistenceStats: () => {
+                    console.log('=== Persistence Statistics ===');
+                    console.log('Cache Stats:', idbCacheStats.getStats());
+                    console.log('Auto-Save Stats:', chunkAutoSave.getStats());
+                    console.log('Compressor Stats:', ChunkCompressor.stats());
                 }
             };
             const chunkMeshes = new Map();
@@ -19154,6 +19231,9 @@
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
                 const key = getChunkKey(cx, cz);
 
+                // Mark chunk as modified for auto-save to IndexedDB
+                chunkAutoSave.markModified(key);
+
                 // OPTIMIZATION: Invalidate caches for this chunk
                 chunkNeighborCache.invalidate(cx, cz);
                 invalidateCollisionGrid(cx, cz);
@@ -19440,6 +19520,192 @@
                     }
                 }
             };
+
+            // --- INDEXEDDB CACHE STATISTICS ---
+            const idbCacheStats = {
+                hits: 0,
+                misses: 0,
+                saves: 0,
+                bytesRead: 0,
+                bytesWritten: 0,
+                lastHitTime: 0,
+                lastMissTime: 0,
+                lastSaveTime: 0,
+                sessionStartTime: Date.now(),
+
+                /**
+                 * Records a cache hit
+                 * @param {number} [bytes=0] - Estimated bytes read from cache
+                 */
+                recordHit(bytes = 0) {
+                    this.hits++;
+                    this.bytesRead += bytes;
+                    this.lastHitTime = Date.now();
+                },
+
+                /**
+                 * Records a cache miss
+                 */
+                recordMiss() {
+                    this.misses++;
+                    this.lastMissTime = Date.now();
+                },
+
+                /**
+                 * Records a cache save operation
+                 * @param {number} [bytes=0] - Estimated bytes written to cache
+                 */
+                recordSave(bytes = 0) {
+                    this.saves++;
+                    this.bytesWritten += bytes;
+                    this.lastSaveTime = Date.now();
+                },
+
+                /**
+                 * Returns cache statistics for debugging
+                 * @returns {Object} Cache statistics
+                 */
+                getStats() {
+                    const total = this.hits + this.misses;
+                    const hitRate = total > 0 ? ((this.hits / total) * 100).toFixed(1) : '0.0';
+                    return {
+                        hits: this.hits,
+                        misses: this.misses,
+                        saves: this.saves,
+                        hitRate: `${hitRate}%`,
+                        bytesReadMB: (this.bytesRead / (1024 * 1024)).toFixed(2),
+                        bytesWrittenMB: (this.bytesWritten / (1024 * 1024)).toFixed(2),
+                        sessionDurationMin: ((Date.now() - this.sessionStartTime) / 60000).toFixed(1)
+                    };
+                },
+
+                /**
+                 * Resets all statistics
+                 */
+                reset() {
+                    this.hits = 0;
+                    this.misses = 0;
+                    this.saves = 0;
+                    this.bytesRead = 0;
+                    this.bytesWritten = 0;
+                    this.lastHitTime = 0;
+                    this.lastMissTime = 0;
+                    this.lastSaveTime = 0;
+                    this.sessionStartTime = Date.now();
+                }
+            };
+
+            // --- CHUNK MODIFICATION TRACKING & AUTO-SAVE ---
+            const chunkAutoSave = {
+                modifiedChunks: new Set(),
+                saveInterval: 30000, // 30 seconds default
+                lastSaveTime: 0,
+                isSaving: false,
+                enabled: true,
+
+                /**
+                 * Marks a chunk as modified (needs saving)
+                 * @param {ChunkKey} chunkKey - The chunk key to mark
+                 */
+                markModified(chunkKey) {
+                    if (this.enabled) {
+                        this.modifiedChunks.add(chunkKey);
+                    }
+                },
+
+                /**
+                 * Clears the modified flag for a chunk
+                 * @param {ChunkKey} chunkKey - The chunk key to clear
+                 */
+                clearModified(chunkKey) {
+                    this.modifiedChunks.delete(chunkKey);
+                },
+
+                /**
+                 * Gets the count of modified chunks pending save
+                 * @returns {number} Number of modified chunks
+                 */
+                getPendingCount() {
+                    return this.modifiedChunks.size;
+                },
+
+                /**
+                 * Auto-save modified chunks to IndexedDB
+                 * Called from main update loop
+                 * @returns {Promise<number>} Number of chunks saved
+                 */
+                async saveModifiedChunks() {
+                    if (this.isSaving || this.modifiedChunks.size === 0) return 0;
+                    if (!this.enabled) return 0;
+
+                    const now = Date.now();
+                    if (now - this.lastSaveTime < this.saveInterval) return 0;
+
+                    this.isSaving = true;
+                    const chunksToSave = new Map();
+
+                    // Collect modified chunks that still exist
+                    for (const key of this.modifiedChunks) {
+                        const chunkData = chunks.get(key);
+                        if (chunkData) {
+                            chunksToSave.set(key, chunkData);
+                        }
+                    }
+
+                    if (chunksToSave.size === 0) {
+                        this.modifiedChunks.clear();
+                        this.isSaving = false;
+                        return 0;
+                    }
+
+                    try {
+                        await batchSaveChunksToCache(chunksToSave);
+                        const savedCount = chunksToSave.size;
+                        logDebug(`[AutoSave] Saved ${savedCount} modified chunks to IndexedDB`);
+
+                        // Clear saved chunks from modified set
+                        for (const key of chunksToSave.keys()) {
+                            this.modifiedChunks.delete(key);
+                        }
+
+                        this.lastSaveTime = now;
+                        this.isSaving = false;
+                        return savedCount;
+                    } catch (error) {
+                        logDebug(`[AutoSave] Error saving chunks: ${error.message}`);
+                        this.isSaving = false;
+                        return 0;
+                    }
+                },
+
+                /**
+                 * Force immediate save of all modified chunks
+                 * @returns {Promise<number>} Number of chunks saved
+                 */
+                async forceSave() {
+                    const prevInterval = this.saveInterval;
+                    this.saveInterval = 0;
+                    this.lastSaveTime = 0;
+                    const result = await this.saveModifiedChunks();
+                    this.saveInterval = prevInterval;
+                    return result;
+                },
+
+                /**
+                 * Gets auto-save statistics
+                 * @returns {Object} Auto-save stats
+                 */
+                getStats() {
+                    return {
+                        pendingChunks: this.modifiedChunks.size,
+                        lastSaveTime: this.lastSaveTime > 0 ? new Date(this.lastSaveTime).toISOString() : 'Never',
+                        saveInterval: this.saveInterval,
+                        enabled: this.enabled,
+                        isSaving: this.isSaving
+                    };
+                }
+            };
+
             async function saveWorld() {
                 const nameInput = document.getElementById("save-name-input");
                 const name = nameInput.value.trim() || "AutoSave"; // Default name
@@ -19553,14 +19819,20 @@
                 return new Promise((resolve, reject) => { const transaction = db.transaction([STORE_NAME], "readwrite");
                     const store = transaction.objectStore(STORE_NAME);
                     // Store chunk data with metadata
+                    const compressed = ChunkCompressor.compress(chunkData);
                     const record = {
                         key: chunkKey,
-                        data: ChunkCompressor.compress(chunkData),
+                        data: compressed,
                         timestamp: Date.now(),
                         seed: finalSeedDisplay,
                     };
                     const request = store.put(record);
-                    request.onsuccess = () => resolve();
+                    request.onsuccess = () => {
+                        // Track save statistics (estimate bytes from original chunk size)
+                        const bytesWritten = chunkData.blocks ? chunkData.blocks.length * 3 : (chunkData.length || 0);
+                        idbCacheStats.recordSave(bytesWritten);
+                        resolve();
+                    };
                     request.onerror = () => reject(request.error);
                 });
             }
@@ -19593,13 +19865,20 @@
                                     blockLight: new Uint8Array(decompressed.length),
                                 };
                             }
+                            // Track cache hit statistics
+                            const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0; // blocks + skyLight + blockLight
+                            idbCacheStats.recordHit(bytesRead);
                             resolve(decompressed);
                         } else {
                             logDebug(`Cache MISS for ${chunkKey}`);
+                            idbCacheStats.recordMiss();
                             resolve(null);
                         }
                     };
-                    request.onerror = () => resolve(null);
+                    request.onerror = () => {
+                        idbCacheStats.recordMiss();
+                        resolve(null);
+                    };
                 });
             }
             async function clearChunkCache() {
@@ -19629,14 +19908,18 @@
                             if (record && seedsMatch(record.seed, finalSeedDisplay)) {
                                 const decompressed = ChunkCompressor.decompress(record.data);
                                 results.set(key, decompressed);
+                                // Track cache hit statistics
+                                const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0;
+                                idbCacheStats.recordHit(bytesRead);
                                 logDebug(`Batch Cache HIT for ${key}`);
                             } else {
+                                idbCacheStats.recordMiss();
                                 logDebug(`Batch Cache MISS for ${key}`);
                             }
                             pending--;
                             if (pending === 0 && !hasError) { resolve(results); }
                         };
-                        request.onerror = () => { hasError = true; pending--; if (pending === 0) { resolve(results); } };
+                        request.onerror = () => { idbCacheStats.recordMiss(); hasError = true; pending--; if (pending === 0) { resolve(results); } };
                     });
                     transaction.onerror = () => { if (!hasError) { hasError = true; resolve(results); }};
                 });
@@ -19648,6 +19931,7 @@
                     const store = transaction.objectStore(STORE_NAME);
                     let pending = chunkDataMap.size;
                     let hasError = false;
+                    let totalBytesWritten = 0;
                     if (pending === 0) { resolve(); return; }
                     for (const [chunkKey, chunkData] of chunkDataMap) {
                         const record = {
@@ -19656,8 +19940,15 @@
                             timestamp: Date.now(),
                             seed: finalSeedDisplay,
                         };
+                        // Track bytes for statistics
+                        const bytesWritten = chunkData.blocks ? chunkData.blocks.length * 3 : (chunkData.length || 0);
+                        totalBytesWritten += bytesWritten;
                         const request = store.put(record);
-                        request.onsuccess = () => { pending--; if (pending === 0 && !hasError) { logDebug(`Batch saved ${chunkDataMap.size} chunks`); resolve(); }};
+                        request.onsuccess = () => {
+                            idbCacheStats.recordSave(bytesWritten);
+                            pending--;
+                            if (pending === 0 && !hasError) { logDebug(`Batch saved ${chunkDataMap.size} chunks`); resolve(); }
+                        };
                         request.onerror = () => { hasError = true; pending--; if (pending === 0) { reject(request.error); }};
                     }
                     transaction.onerror = () => { if (!hasError) { hasError = true; reject(transaction.error); }};
@@ -22422,6 +22713,14 @@
                         "\nCam Dir: (" + camWorldDir.x.toFixed(2) + ", " + camWorldDir.y.toFixed(2) + ", " + camWorldDir.z.toFixed(2) + ")" +
                         "\nCam Rot: X=" + (camera.rotation.x * 180 / Math.PI).toFixed(0) + "° Y=" + (camera.rotation.y * 180 / Math.PI).toFixed(0) + "°";
                 }
+
+                // Add IndexedDB cache and auto-save stats
+                const cacheStats = idbCacheStats.getStats();
+                const pendingCount = chunkAutoSave.getPendingCount();
+                overlay.innerText += "\n--- CACHE ---" +
+                    "\nHits: " + cacheStats.hits + " | Misses: " + cacheStats.misses + " (" + cacheStats.hitRate + ")" +
+                    "\nSaves: " + cacheStats.saves + " | Read: " + cacheStats.bytesReadMB + "MB | Written: " + cacheStats.bytesWrittenMB + "MB" +
+                    (pendingCount > 0 ? "\nAuto-save pending: " + pendingCount + " chunks" : "");
             }
             function initTextures() {
                 const cvs = document.createElement("canvas");
@@ -32479,6 +32778,10 @@
                     prevTime = time;
                     // Update memory budget manager (throttled internally)
                     if (memoryBudgetManager) memoryBudgetManager.update();
+                    // Auto-save modified chunks to IndexedDB (throttled internally)
+                    if (chunkAutoSave.enabled && chunkAutoSave.modifiedChunks.size > 0) {
+                        chunkAutoSave.saveModifiedChunks(); // Fire-and-forget async
+                    }
                     // UI and visual updates
                     // OPTIMIZATION: Only update debug UI every N frames
                     if (isDebug && shouldUpdateDebugUI()) updateDebugInfo(fpsInstant, fpsAvg);
