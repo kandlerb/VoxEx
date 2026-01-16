@@ -12760,6 +12760,169 @@
                         torchLightPool.clear();
                         console.log('[Lights] Torch light pool cleared');
                     }
+                },
+
+                // === GEOMETRY LEAK DETECTION ===
+
+                /**
+                 * Display geometry statistics and detect potential leaks.
+                 * @returns {Object} Geometry stats with leak detection info.
+                 */
+                geometryStats: () => {
+                    console.log('=== Geometry Statistics ===');
+                    const geoCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+                    const texCount = typeof renderer !== 'undefined' ? renderer.info.memory.textures : 0;
+
+                    // Count active chunk geometries
+                    const terrainMeshCount = typeof chunkMeshes !== 'undefined' ?
+                        Array.from(chunkMeshes.keys()).filter(k => !k.includes('_WATER')).length : 0;
+                    const waterMeshCount = typeof chunkMeshes !== 'undefined' ?
+                        Array.from(chunkMeshes.keys()).filter(k => k.includes('_WATER')).length : 0;
+
+                    // Pool stats
+                    const poolStats = typeof geometryPool !== 'undefined' ? geometryPool.getStats() : {};
+
+                    // Count torch geometries (3 per torch)
+                    let torchCount = 0;
+                    if (typeof chunkTorches !== 'undefined') {
+                        for (const torches of chunkTorches.values()) {
+                            torchCount += torches.length;
+                        }
+                    }
+                    const torchGeoCount = torchCount * 3; // Each torch has 3 geometries
+
+                    // Expected geometry count (rough estimate)
+                    const expectedChunkGeos = terrainMeshCount + waterMeshCount;
+                    const pooledGeos = (poolStats.terrainPoolSize || 0) + (poolStats.waterPoolSize || 0);
+                    const staticGeos = 50; // Stars, clouds, sky, viewmodel, outline, etc.
+                    const expectedTotal = expectedChunkGeos + pooledGeos + torchGeoCount + staticGeos;
+
+                    const stats = {
+                        rendererGeometries: geoCount,
+                        rendererTextures: texCount,
+                        terrainMeshes: terrainMeshCount,
+                        waterMeshes: waterMeshCount,
+                        pooledTerrain: poolStats.terrainPoolSize || 0,
+                        pooledWater: poolStats.waterPoolSize || 0,
+                        worldTorches: torchCount,
+                        torchGeometries: torchGeoCount,
+                        expectedTotal: expectedTotal,
+                        possibleLeak: geoCount - expectedTotal
+                    };
+
+                    console.table(stats);
+
+                    if (stats.possibleLeak > 100) {
+                        console.warn(`[LEAK WARNING] ${stats.possibleLeak} geometries unaccounted for!`);
+                    }
+
+                    return stats;
+                },
+
+                /**
+                 * Emergency cleanup of leaked geometries.
+                 * Finds and disposes all geometries not actively in use.
+                 * @returns {Object} Cleanup results.
+                 */
+                fixLeaks: () => {
+                    console.log('=== Fixing Geometry Leaks ===');
+                    const beforeCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+
+                    // Collect geometries from active chunk meshes
+                    const activeGeos = new Set();
+                    if (typeof chunkMeshes !== 'undefined') {
+                        for (const mesh of chunkMeshes.values()) {
+                            if (mesh && mesh.geometry) activeGeos.add(mesh.geometry);
+                        }
+                    }
+
+                    // Collect geometries in pools
+                    if (typeof geometryPool !== 'undefined') {
+                        for (const geo of geometryPool.terrainPool || []) {
+                            activeGeos.add(geo);
+                        }
+                        for (const geo of geometryPool.waterPool || []) {
+                            activeGeos.add(geo);
+                        }
+                    }
+
+                    // Collect torch geometries
+                    if (typeof chunkTorches !== 'undefined') {
+                        for (const torches of chunkTorches.values()) {
+                            for (const torch of torches) {
+                                torch.traverse((node) => {
+                                    if (node.isMesh && node.geometry) {
+                                        activeGeos.add(node.geometry);
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    // Find and dispose orphaned geometries in scene
+                    let disposed = 0;
+                    const toRemove = [];
+
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isMesh && obj.geometry && !activeGeos.has(obj.geometry)) {
+                                // Skip known singleton geometries by checking parent chain
+                                let isKnownSingleton = false;
+                                let parent = obj.parent;
+                                while (parent) {
+                                    if (parent.name && (
+                                        parent.name.includes('torch') ||
+                                        parent.name.includes('viewmodel') ||
+                                        parent.name.includes('sky') ||
+                                        parent.name.includes('star') ||
+                                        parent.name.includes('cloud')
+                                    )) {
+                                        isKnownSingleton = true;
+                                        break;
+                                    }
+                                    parent = parent.parent;
+                                }
+
+                                if (!isKnownSingleton && !obj.name?.includes('CHUNK')) {
+                                    toRemove.push(obj);
+                                }
+                            }
+                        });
+
+                        for (const obj of toRemove) {
+                            if (obj.parent) obj.parent.remove(obj);
+                            if (obj.geometry) {
+                                obj.geometry.dispose();
+                                disposed++;
+                            }
+                            if (obj.material) {
+                                if (Array.isArray(obj.material)) {
+                                    obj.material.forEach(m => m.dispose && m.dispose());
+                                } else if (obj.material.dispose) {
+                                    obj.material.dispose();
+                                }
+                            }
+                        }
+                    }
+
+                    // Force garbage collection hint
+                    if (typeof renderer !== 'undefined') {
+                        renderer.renderLists.dispose();
+                    }
+
+                    const afterCount = typeof renderer !== 'undefined' ? renderer.info.memory.geometries : 0;
+
+                    const result = {
+                        disposedGeometries: disposed,
+                        beforeCount: beforeCount,
+                        afterCount: afterCount,
+                        reduction: beforeCount - afterCount
+                    };
+
+                    console.log(`Disposed ${disposed} orphaned objects`);
+                    console.log(`Geometries: ${beforeCount} → ${afterCount} (${result.reduction} freed)`);
+
+                    return result;
                 }
             };
             const chunkMeshes = new Map();
@@ -16977,6 +17140,61 @@
             // Geometry buffer pool for pre-allocated BufferGeometry objects
             const geometryPool = new GeometryBufferPool(256);
             window.geometryPool = geometryPool; // Expose for console debugging
+
+            // Geometry leak detection state
+            let lastGeometryLeakCheck = 0;
+            const GEOMETRY_LEAK_CHECK_INTERVAL = 5000; // Check every 5 seconds
+            const GEOMETRY_LEAK_WARNING_THRESHOLD = 500; // Warn if 500+ unexpected geometries
+            const GEOMETRY_LEAK_CRITICAL_THRESHOLD = 1500; // Auto-cleanup if 1500+ unexpected geometries
+
+            /**
+             * Periodic geometry leak detection.
+             * Compares actual geometry count to expected count and warns/cleans up if needed.
+             * @param {number} now - Current timestamp from performance.now().
+             */
+            function checkGeometryLeaks(now) {
+                if (now - lastGeometryLeakCheck < GEOMETRY_LEAK_CHECK_INTERVAL) return;
+                lastGeometryLeakCheck = now;
+
+                // Get actual geometry count from renderer
+                const geoCount = typeof renderer !== 'undefined' ? renderer.info?.memory?.geometries || 0 : 0;
+                if (geoCount === 0) return; // Renderer not ready
+
+                // Calculate expected geometry count
+                const terrainCount = typeof chunkMeshes !== 'undefined' ?
+                    Array.from(chunkMeshes.keys()).filter(k => !k.includes('_WATER')).length : 0;
+                const waterCount = typeof chunkMeshes !== 'undefined' ?
+                    Array.from(chunkMeshes.keys()).filter(k => k.includes('_WATER')).length : 0;
+                const pooledCount = (geometryPool.terrainPool?.length || 0) + (geometryPool.waterPool?.length || 0);
+
+                // Count torch geometries (3 per torch)
+                let torchCount = 0;
+                if (typeof chunkTorches !== 'undefined') {
+                    for (const torches of chunkTorches.values()) {
+                        torchCount += torches.length;
+                    }
+                }
+                const torchGeos = torchCount * 3;
+
+                // Static geometries: stars (3), clouds (1), sky (1), viewmodel torch (3), outline (1), particle (1), misc (~40)
+                const staticGeos = 50;
+
+                const expectedMax = terrainCount + waterCount + pooledCount + torchGeos + staticGeos;
+                const excess = geoCount - expectedMax;
+
+                // Log warning if significant leak detected
+                if (excess > GEOMETRY_LEAK_WARNING_THRESHOLD) {
+                    logDebug(`[GeoLeak] WARNING: ${geoCount} geometries (expected ~${expectedMax}, excess: ${excess})`);
+
+                    // Auto-cleanup for critical leaks
+                    if (excess > GEOMETRY_LEAK_CRITICAL_THRESHOLD) {
+                        logDebug(`[GeoLeak] CRITICAL: Auto-cleanup triggered`);
+                        if (typeof window.memoryDebug !== 'undefined' && typeof window.memoryDebug.fixLeaks === 'function') {
+                            window.memoryDebug.fixLeaks();
+                        }
+                    }
+                }
+            }
 
             /**
              * MemoryBudgetManager - Tracks total memory usage across all systems
@@ -31159,9 +31377,10 @@
                         meshLifecycleStats.mark("attach", { key: cKey + "_WATER", isWater: true, terrainMeshCount, waterMeshCount });
                     }
                     // --- CREATE TORCH MODELS ---
-                    // Clean up old torches first
-                    const oldTorches = chunkTorches.get(cKey);
-                    if (oldTorches) { for (const torch of oldTorches) { scene.remove(torch); }}
+                    // Clean up old torches first (CRITICAL: must dispose geometries to prevent leak)
+                    // This handles the edge case where torches exist but no mesh was created
+                    // (e.g., chunk with only torch blocks and no visible terrain faces)
+                    releaseChunkTorches(cKey);
                     // Create individual torch models with lighting
                     const torchArray = [];
                     for (let y = 0; y < height; y++) {
@@ -33007,6 +33226,8 @@
                     prevTime = time;
                     // Update memory budget manager (throttled internally)
                     if (memoryBudgetManager) memoryBudgetManager.update();
+                    // Periodic geometry leak detection (every 5 seconds)
+                    checkGeometryLeaks(time);
                     // Update torch light pool (throttled internally)
                     if (typeof torchLightPool !== 'undefined' && controls.isLocked) {
                         torchLightPool.update(getPlayerWorldPosition());
