@@ -12923,6 +12923,232 @@
                     console.log(`Geometries: ${beforeCount} → ${afterCount} (${result.reduction} freed)`);
 
                     return result;
+                },
+
+                // === TORCH DIAGNOSTICS ===
+
+                /**
+                 * Diagnose torch duplication issues.
+                 * Shows torch counts per chunk and identifies anomalies.
+                 * @returns {Object} Diagnostic info.
+                 */
+                torchDiagnostics: () => {
+                    console.log('=== Torch Diagnostics ===');
+
+                    if (typeof chunkTorches === 'undefined') {
+                        console.warn('chunkTorches not defined');
+                        return null;
+                    }
+
+                    let totalTorches = 0;
+                    let chunksWithTorches = 0;
+                    const torchesPerChunk = [];
+
+                    for (const [chunkKey, torches] of chunkTorches) {
+                        const count = torches ? torches.length : 0;
+                        totalTorches += count;
+                        if (count > 0) {
+                            chunksWithTorches++;
+                            torchesPerChunk.push({ chunkKey, count });
+                        }
+                    }
+
+                    // Sort by count to find anomalies
+                    torchesPerChunk.sort((a, b) => b.count - a.count);
+
+                    console.log(`Total torches: ${totalTorches}`);
+                    console.log(`Chunks with torches: ${chunksWithTorches}`);
+                    console.log(`ChunkTorches Map size: ${chunkTorches.size}`);
+
+                    // Show top 10 chunks by torch count
+                    if (torchesPerChunk.length > 0) {
+                        console.log('Top chunks by torch count:');
+                        console.table(torchesPerChunk.slice(0, 10));
+                    }
+
+                    // Check for anomalies (chunks with >10 torches are suspicious)
+                    const anomalies = torchesPerChunk.filter(c => c.count > 10);
+                    if (anomalies.length > 0) {
+                        console.warn(`ANOMALY: ${anomalies.length} chunks have >10 torches!`);
+                        console.table(anomalies);
+                    }
+
+                    // Count scene torch groups directly
+                    let sceneGroups = 0;
+                    let sceneTorchMeshes = 0;
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isGroup && obj.children.length === 3) {
+                                // Check if it looks like a torch (3 meshes: stick, flame, glow)
+                                const hasStick = obj.children[0]?.isMesh;
+                                const hasFlame = obj.children[1]?.isMesh;
+                                const hasGlow = obj.children[2]?.isMesh;
+                                if (hasStick && hasFlame && hasGlow) {
+                                    sceneGroups++;
+                                    sceneTorchMeshes += 3;
+                                }
+                            }
+                        });
+                    }
+                    console.log(`Scene torch-like groups: ${sceneGroups}`);
+                    console.log(`Scene torch meshes: ${sceneTorchMeshes}`);
+
+                    return {
+                        totalTorches,
+                        chunksWithTorches,
+                        mapSize: chunkTorches.size,
+                        sceneGroups,
+                        sceneTorchMeshes,
+                        topChunks: torchesPerChunk.slice(0, 10),
+                        anomalies
+                    };
+                },
+
+                /**
+                 * Clear all torches and rebuild from block data.
+                 * Use this to fix torch accumulation issues.
+                 * @returns {Object} Cleanup results.
+                 */
+                rebuildTorches: () => {
+                    console.log('=== Rebuilding All Torches ===');
+
+                    if (typeof chunkTorches === 'undefined') {
+                        console.warn('chunkTorches not defined');
+                        return null;
+                    }
+
+                    const beforeCount = chunkTorches.size;
+                    let torchesRemoved = 0;
+                    let geometriesDisposed = 0;
+
+                    // Clear all existing torches
+                    for (const [chunkKey, torches] of chunkTorches) {
+                        if (torches) {
+                            for (const torch of torches) {
+                                if (torch.parent) torch.parent.remove(torch);
+                                torch.traverse((node) => {
+                                    if (node.isMesh && node.geometry) {
+                                        node.geometry.dispose();
+                                        geometriesDisposed++;
+                                    }
+                                    if (node.isMesh && node.material) {
+                                        if (Array.isArray(node.material)) {
+                                            node.material.forEach(m => m.dispose && m.dispose());
+                                        } else if (node.material.dispose) {
+                                            node.material.dispose();
+                                        }
+                                    }
+                                });
+                                torchesRemoved++;
+                            }
+                        }
+                    }
+                    chunkTorches.clear();
+
+                    console.log(`Removed ${torchesRemoved} torches, disposed ${geometriesDisposed} geometries`);
+
+                    // Force re-render of all visible chunks to recreate torches
+                    if (typeof queuedChunkKeys !== 'undefined' && typeof chunks !== 'undefined') {
+                        let chunksQueued = 0;
+                        for (const chunkKey of chunks.keys()) {
+                            queuedChunkKeys.add(chunkKey);
+                            chunksQueued++;
+                        }
+                        console.log(`Queued ${chunksQueued} chunks for re-render`);
+                    }
+
+                    return {
+                        beforeCount,
+                        torchesRemoved,
+                        geometriesDisposed
+                    };
+                },
+
+                /**
+                 * Remove duplicate torch entries from scene.
+                 * Scans scene for torch groups at same position and removes duplicates.
+                 * @returns {Object} Cleanup results.
+                 */
+                deduplicateTorches: () => {
+                    console.log('=== Deduplicating Torches ===');
+
+                    const positionMap = new Map(); // position key -> first torch
+                    const duplicates = [];
+
+                    // First, scan scene for all torch-like groups
+                    if (typeof scene !== 'undefined') {
+                        scene.traverse((obj) => {
+                            if (obj.isGroup && obj.children.length === 3) {
+                                const hasStick = obj.children[0]?.isMesh;
+                                const hasFlame = obj.children[1]?.isMesh;
+                                const hasGlow = obj.children[2]?.isMesh;
+                                if (hasStick && hasFlame && hasGlow) {
+                                    const posKey = `${obj.position.x.toFixed(2)},${obj.position.y.toFixed(2)},${obj.position.z.toFixed(2)}`;
+                                    if (positionMap.has(posKey)) {
+                                        duplicates.push(obj);
+                                    } else {
+                                        positionMap.set(posKey, obj);
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    console.log(`Found ${positionMap.size} unique torch positions`);
+                    console.log(`Found ${duplicates.length} duplicate torches`);
+
+                    // Remove duplicates
+                    let removed = 0;
+                    let disposed = 0;
+                    for (const torch of duplicates) {
+                        if (torch.parent) torch.parent.remove(torch);
+                        torch.traverse((node) => {
+                            if (node.isMesh && node.geometry) {
+                                node.geometry.dispose();
+                                disposed++;
+                            }
+                            if (node.isMesh && node.material) {
+                                if (Array.isArray(node.material)) {
+                                    node.material.forEach(m => m.dispose && m.dispose());
+                                } else if (node.material.dispose) {
+                                    node.material.dispose();
+                                }
+                            }
+                        });
+                        removed++;
+                    }
+
+                    // Now rebuild chunkTorches Map from remaining scene torches
+                    if (typeof chunkTorches !== 'undefined') {
+                        // Clear the map
+                        const oldEntries = chunkTorches.size;
+                        chunkTorches.clear();
+
+                        // Rebuild from scene (remaining unique torches)
+                        for (const [posKey, torch] of positionMap) {
+                            // Calculate chunk key from torch position
+                            const cx = Math.floor(torch.position.x / 16);
+                            const cz = Math.floor(torch.position.z / 16);
+                            const chunkKey = `${cx},${cz}`;
+
+                            if (!chunkTorches.has(chunkKey)) {
+                                chunkTorches.set(chunkKey, []);
+                            }
+                            chunkTorches.get(chunkKey).push(torch);
+                        }
+
+                        console.log(`Rebuilt chunkTorches: ${oldEntries} entries → ${chunkTorches.size} entries`);
+                    }
+
+                    const result = {
+                        uniquePositions: positionMap.size,
+                        duplicatesFound: duplicates.length,
+                        removed,
+                        geometriesDisposed: disposed
+                    };
+
+                    console.log('Deduplication complete:', result);
+                    return result;
                 }
             };
             const chunkMeshes = new Map();
@@ -30840,13 +31066,27 @@
                 const torches = chunkTorches.get(baseKey);
                 if (!torches) return;
                 for (const torch of torches) {
-                    if (torch.parent) torch.parent.remove(torch);
-                    torch.traverse((node) => {     if (node.isMesh) {
+                    // Remove from scene hierarchy (prefer parent.remove, fallback to scene.remove)
+                    if (torch.parent) {
+                        torch.parent.remove(torch);
+                    } else if (typeof scene !== 'undefined') {
+                        scene.remove(torch); // Fallback if parent is null
+                    }
+                    // Dispose all geometries and materials
+                    torch.traverse((node) => {
+                        if (node.isMesh) {
                             if (node.geometry) node.geometry.dispose();
                             const mat = node.material;
-                            if (Array.isArray(mat)) { for (const m of mat) { if (m && typeof m.dispose === "function") m.dispose(); }
-                            } else if (mat && typeof mat.dispose === "function") { mat.dispose(); }
-                        } else if (node.isLight && typeof node.dispose === "function") { node.dispose(); }
+                            if (Array.isArray(mat)) {
+                                for (const m of mat) {
+                                    if (m && typeof m.dispose === "function") m.dispose();
+                                }
+                            } else if (mat && typeof mat.dispose === "function") {
+                                mat.dispose();
+                            }
+                        } else if (node.isLight && typeof node.dispose === "function") {
+                            node.dispose();
+                        }
                     });
                 }
                 chunkTorches.delete(baseKey);
@@ -31381,6 +31621,11 @@
                     // This handles the edge case where torches exist but no mesh was created
                     // (e.g., chunk with only torch blocks and no visible terrain faces)
                     releaseChunkTorches(cKey);
+                    // Safety: ensure chunkTorches entry is cleared (defensive programming)
+                    if (chunkTorches.has(cKey)) {
+                        logDebug(`[Torch] WARNING: chunkTorches entry for ${cKey} not cleared by releaseChunkTorches`);
+                        chunkTorches.delete(cKey);
+                    }
                     // Create individual torch models with lighting
                     const torchArray = [];
                     for (let y = 0; y < height; y++) {
@@ -31400,7 +31645,10 @@
                             }
                         }
                     }
-                    if (torchArray.length > 0) { chunkTorches.set(cKey, torchArray); }
+                    // Store torches for this chunk (overwrites any existing entry)
+                    if (torchArray.length > 0) {
+                        chunkTorches.set(cKey, torchArray);
+                    }
                     // Release all pools (including indexed geometry pools)
                     posPool.release(terrainPos);
                     normPool.release(terrainNorm);
