@@ -5552,6 +5552,15 @@
             const GEO_COL_SIZE = MAX_VERTICES_PER_CHUNK * 3;    // color: r,g,b
             const GEO_IDX_SIZE = MAX_INDICES_PER_CHUNK;         // indices
 
+            // =====================================================
+            // WEBGL LIGHT LIMITS
+            // =====================================================
+            // WebGL has limited uniform vectors (~1024 max).
+            // Each PointLight uses ~30 uniforms, shadows add more.
+            // Conservative limits to prevent shader overflow.
+            const MAX_POINT_LIGHTS = 8;   // Max simultaneous torch PointLights
+            const MAX_TOTAL_LIGHTS = 12;  // Including sun, moon, ambient
+
             /**
              * Create default section data array for a chunk.
              * Each section is a 16×16×16 vertical subdivision of the chunk.
@@ -12704,6 +12713,53 @@
                     console.log('Cache Stats:', idbCacheStats.getStats());
                     console.log('Auto-Save Stats:', chunkAutoSave.getStats());
                     console.log('Compressor Stats:', ChunkCompressor.stats());
+                },
+
+                // === LIGHT DEBUGGING ===
+
+                /**
+                 * Display current light counts and details.
+                 * @returns {{pointLights: number, totalLights: number}} Light counts.
+                 */
+                lights: () => {
+                    const count = getLightCount();
+                    console.log('=== Light Debug ===');
+                    console.log(`Point Lights: ${count.pointLights} / ${MAX_POINT_LIGHTS} max`);
+                    console.log(`Total Lights: ${count.totalLights} / ${MAX_TOTAL_LIGHTS} max`);
+
+                    // List all lights
+                    if (typeof scene !== 'undefined') {
+                        const lights = [];
+                        scene.traverse((obj) => {
+                            if (obj.isLight) {
+                                lights.push({
+                                    type: obj.type,
+                                    intensity: obj.intensity?.toFixed(2) || 'N/A',
+                                    castShadow: obj.castShadow,
+                                    visible: obj.visible,
+                                    position: obj.position ? `${obj.position.x.toFixed(1)}, ${obj.position.y.toFixed(1)}, ${obj.position.z.toFixed(1)}` : 'N/A'
+                                });
+                            }
+                        });
+                        console.table(lights);
+                    }
+
+                    // Torch light pool stats
+                    if (typeof torchLightPool !== 'undefined') {
+                        console.log('Torch Light Pool:', torchLightPool.getStats());
+                    }
+
+                    return count;
+                },
+
+                /**
+                 * Clear all torch lights and reset the pool.
+                 */
+                clearTorchLights: () => {
+                    if (typeof torchLightPool !== 'undefined') {
+                        torchLightPool.clear();
+                        console.log('[Lights] Torch light pool cleared');
+                    }
                 }
             };
             const chunkMeshes = new Map();
@@ -12711,6 +12767,173 @@
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
             const chunkTorches = new Map(); // Store torch 3D models per chunk
+
+            // =====================================================
+            // TORCH LIGHT POOL SYSTEM
+            // =====================================================
+            // Manages torch PointLights to prevent WebGL uniform overflow.
+            // Recycles lights to keep count under MAX_POINT_LIGHTS.
+
+            /**
+             * Get current light count in scene.
+             * @returns {{pointLights: number, totalLights: number}} Light counts.
+             */
+            function getLightCount() {
+                let pointLights = 0;
+                let totalLights = 0;
+                if (typeof scene === 'undefined' || !scene) return { pointLights: 0, totalLights: 0 };
+                scene.traverse((obj) => {
+                    if (obj.isLight) {
+                        totalLights++;
+                        if (obj.isPointLight) pointLights++;
+                    }
+                });
+                return { pointLights, totalLights };
+            }
+            window.getLightCount = getLightCount;
+
+            /**
+             * Torch light pool - limits total PointLights to prevent shader overflow.
+             * Dynamically assigns lights to closest torches to the player.
+             */
+            const torchLightPool = {
+                lights: [],             // Active torch lights in scene
+                maxLights: MAX_POINT_LIGHTS,
+                torchPositions: [],     // All torch world positions from chunkTorches
+                lastPlayerPos: null,    // Last update position
+                updateThreshold: 4,     // Minimum movement to trigger update (blocks)
+                _lastUpdate: 0,
+                _updateInterval: 500,   // ms between updates
+
+                /**
+                 * Register a torch position for light consideration.
+                 * @param {number} x - World X
+                 * @param {number} y - World Y
+                 * @param {number} z - World Z
+                 */
+                registerTorch(x, y, z) {
+                    this.torchPositions.push({ x, y, z });
+                },
+
+                /**
+                 * Clear all registered torch positions (called on chunk unload).
+                 */
+                clearTorchPositions() {
+                    this.torchPositions = [];
+                },
+
+                /**
+                 * Rebuild torch positions from chunkTorches map.
+                 */
+                rebuildTorchPositions() {
+                    this.torchPositions = [];
+                    for (const [chunkKey, torchArray] of chunkTorches) {
+                        for (const torch of torchArray) {
+                            // Extract position from torch group
+                            this.torchPositions.push({
+                                x: torch.position.x,
+                                y: torch.position.y,
+                                z: torch.position.z
+                            });
+                        }
+                    }
+                },
+
+                /**
+                 * Update torch lights based on player position.
+                 * Assigns lights to closest torches.
+                 * @param {Object} playerPos - Player position {x, y, z}
+                 */
+                update(playerPos) {
+                    if (!playerPos || typeof scene === 'undefined') return;
+
+                    const now = performance.now();
+                    if (now - this._lastUpdate < this._updateInterval) return;
+
+                    // Check movement threshold
+                    if (this.lastPlayerPos) {
+                        const dx = playerPos.x - this.lastPlayerPos.x;
+                        const dy = playerPos.y - this.lastPlayerPos.y;
+                        const dz = playerPos.z - this.lastPlayerPos.z;
+                        const distSq = dx*dx + dy*dy + dz*dz;
+                        if (distSq < this.updateThreshold * this.updateThreshold) return;
+                    }
+
+                    this._lastUpdate = now;
+                    this.lastPlayerPos = { x: playerPos.x, y: playerPos.y, z: playerPos.z };
+
+                    // Rebuild positions from chunkTorches
+                    this.rebuildTorchPositions();
+
+                    if (this.torchPositions.length === 0) {
+                        // Hide all lights if no torches
+                        for (const light of this.lights) {
+                            light.visible = false;
+                        }
+                        return;
+                    }
+
+                    // Sort torch positions by distance to player
+                    const sorted = this.torchPositions.map(pos => ({
+                        pos,
+                        distSq: (pos.x - playerPos.x)**2 + (pos.y - playerPos.y)**2 + (pos.z - playerPos.z)**2
+                    })).sort((a, b) => a.distSq - b.distSq);
+
+                    // Take closest N torches
+                    const closest = sorted.slice(0, this.maxLights);
+
+                    // Ensure we have enough lights in pool
+                    while (this.lights.length < closest.length && this.lights.length < this.maxLights) {
+                        const light = new THREE.PointLight(
+                            typeof SETTINGS !== 'undefined' ? SETTINGS.torchColor : 0xffaa44,
+                            typeof SETTINGS !== 'undefined' ? SETTINGS.torchIntensity * 2 : 2.0,
+                            typeof SETTINGS !== 'undefined' ? SETTINGS.torchRange : 12,
+                            0.8
+                        );
+                        light.castShadow = false; // CRITICAL: No shadows to prevent texture overflow
+                        scene.add(light);
+                        this.lights.push(light);
+                    }
+
+                    // Update light positions
+                    for (let i = 0; i < this.lights.length; i++) {
+                        if (i < closest.length) {
+                            const pos = closest[i].pos;
+                            this.lights[i].position.set(pos.x, pos.y + 0.33, pos.z);
+                            this.lights[i].visible = true;
+                        } else {
+                            this.lights[i].visible = false;
+                        }
+                    }
+                },
+
+                /**
+                 * Remove all torch lights from scene.
+                 */
+                clear() {
+                    for (const light of this.lights) {
+                        if (typeof scene !== 'undefined') scene.remove(light);
+                        if (light.dispose) light.dispose();
+                    }
+                    this.lights = [];
+                    this.torchPositions = [];
+                },
+
+                /**
+                 * Get pool statistics.
+                 * @returns {Object} Pool stats.
+                 */
+                getStats() {
+                    return {
+                        activeLights: this.lights.filter(l => l.visible).length,
+                        pooledLights: this.lights.length,
+                        maxLights: this.maxLights,
+                        registeredTorches: this.torchPositions.length
+                    };
+                }
+            };
+            window.torchLightPool = torchLightPool;
+
             const meshLifecycleStats = {
                 acquired: { terrain: 0, water: 0 },
                 released: { terrain: 0, water: 0 },
@@ -16803,11 +17026,23 @@
                     if (typeof geometryPool === 'undefined') return 0;
 
                     const stats = geometryPool.getStats();
-                    // Each terrain geometry: ~3.6MB (24K faces * 150 bytes/face approx)
-                    // Each water geometry: ~0.9MB (6K faces * 150 bytes/face approx)
-                    const terrainMemory = (stats.terrainPoolSize + (stats.terrainCreated - stats.terrainReleased)) * 3.6;
-                    const waterMemory = (stats.waterPoolSize + (stats.waterCreated - stats.waterReleased)) * 0.9;
-                    return terrainMemory + waterMemory;
+
+                    // Calculate active geometries (acquired - released, never negative)
+                    // Note: Use Acquired not Created, since geometries are reused from pool
+                    const activeTerrainGeo = Math.max(0, (stats.terrainAcquired || 0) - (stats.terrainReleased || 0));
+                    const activeWaterGeo = Math.max(0, (stats.waterAcquired || 0) - (stats.waterReleased || 0));
+
+                    // Include pool size (geometries ready for reuse)
+                    const pooledTerrain = stats.terrainPoolSize || 0;
+                    const pooledWater = stats.waterPoolSize || 0;
+
+                    // Estimate MB per geometry (conservative estimates based on actual buffer sizes)
+                    // Terrain: ~1MB average (varies by face count, pre-allocated at max ~3.6MB but typically uses less)
+                    // Water: ~0.25MB average (1/4 of terrain max allocation)
+                    const terrainMemory = (activeTerrainGeo + pooledTerrain) * 1.0;
+                    const waterMemory = (activeWaterGeo + pooledWater) * 0.25;
+
+                    return Math.max(0, terrainMemory + waterMemory); // Never return negative
                 }
 
                 /**
@@ -16840,26 +17075,30 @@
                     }
                     this.lastUpdate = now;
 
-                    // Chunk data memory
-                    const chunkDataMB = typeof chunkDataPool !== 'undefined'
+                    // Chunk data memory (with safety clamp)
+                    const rawChunkDataMB = typeof chunkDataPool !== 'undefined'
                         ? parseFloat(chunkDataPool.getStats().totalDataSizeMB) || 0
                         : 0;
+                    const chunkDataMB = Math.max(0, rawChunkDataMB);
 
-                    // Geometry pool memory
-                    const geometryPoolMB = this._estimateGeometryPoolMemory();
+                    // Geometry pool memory (already clamped in _estimateGeometryPoolMemory)
+                    const geometryPoolMB = Math.max(0, this._estimateGeometryPoolMemory());
 
-                    // GPU memory
+                    // GPU memory (with safety clamps)
                     const gpuMem = this._getGPUMemory();
+                    const gpuGeometriesMB = Math.max(0, gpuMem.geometries);
+                    const gpuTexturesMB = Math.max(0, gpuMem.textures);
 
-                    // Calculate totals
-                    const totalMB = chunkDataMB + geometryPoolMB + gpuMem.geometries + gpuMem.textures;
-                    const percentage = totalMB / this.budgetMB;
+                    // Calculate totals with safety clamp
+                    const totalMB = Math.max(0, chunkDataMB + geometryPoolMB + gpuGeometriesMB + gpuTexturesMB);
+                    // Clamp percentage to 0-200% range (allow showing over-budget, but not invalid values)
+                    const percentage = Math.max(0, Math.min(2, totalMB / this.budgetMB));
 
                     this._cachedUsage = {
                         chunkDataMB: chunkDataMB.toFixed(1),
                         geometryPoolMB: geometryPoolMB.toFixed(1),
-                        gpuGeometriesMB: gpuMem.geometries.toFixed(1),
-                        gpuTexturesMB: gpuMem.textures.toFixed(1),
+                        gpuGeometriesMB: gpuGeometriesMB.toFixed(1),
+                        gpuTexturesMB: gpuTexturesMB.toFixed(1),
                         totalMB: totalMB.toFixed(1),
                         percentage: percentage
                     };
@@ -30296,20 +30535,10 @@
                 glow.position.set(0, 0.33, 0);
                 glow.castShadow = false;
                 torchGroup.add(glow);
-                // Add PointLight for actual light emission - 2x brighter
-                // NOTE: castShadow is DISABLED for placed torches to prevent WebGL texture unit overflow.
-                // PointLight shadows require 6 texture units (cube shadow map) per light.
-                // With sun(1) + moon(1) + handheld torch(6) + materials(~4) = 12 units already.
-                // Adding shadow-casting placed torches quickly exceeds MAX_TEXTURE_IMAGE_UNITS (16).
-                const light = new THREE.PointLight(SETTINGS.torchColor, SETTINGS.torchIntensity * 2, SETTINGS.torchRange, 0.8);
-                light.position.set(0, 0.33, 0);
-                light.castShadow = false; // CRITICAL: Disabled to prevent shader texture overflow
-                light.shadow.mapSize.set(512, 512); // Lower res for performance
-                light.shadow.camera.near = 0.5; // Increase near plane to reduce self-shadowing
-                light.shadow.camera.far = 32;
-                light.shadow.bias = -0.003; // Reduce shadow acne/self-shadowing
-                light.shadow.normalBias = 0.15; // Push shadows away from surfaces
-                torchGroup.add(light);
+                // NOTE: PointLights are now managed by torchLightPool to prevent WebGL uniform overflow.
+                // The pool limits total PointLights to MAX_POINT_LIGHTS (8) and dynamically assigns
+                // them to the closest torches to the player. This prevents the shader from
+                // exceeding MAX_FRAGMENT_UNIFORM_VECTORS (1024).
                 // Position at block location (centered, on ground)
                 torchGroup.position.set(x + 0.5, y + 0.25, z + 0.5);
                 return torchGroup;
@@ -32778,6 +33007,10 @@
                     prevTime = time;
                     // Update memory budget manager (throttled internally)
                     if (memoryBudgetManager) memoryBudgetManager.update();
+                    // Update torch light pool (throttled internally)
+                    if (typeof torchLightPool !== 'undefined' && controls.isLocked) {
+                        torchLightPool.update(getPlayerWorldPosition());
+                    }
                     // Auto-save modified chunks to IndexedDB (throttled internally)
                     if (chunkAutoSave.enabled && chunkAutoSave.modifiedChunks.size > 0) {
                         chunkAutoSave.saveModifiedChunks(); // Fire-and-forget async
