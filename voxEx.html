@@ -20542,6 +20542,8 @@
                 if (!db) return;
                 return new Promise((resolve, reject) => { const transaction = db.transaction([STORE_NAME], "readwrite");
                     const store = transaction.objectStore(STORE_NAME);
+                    // Ensure chunk has current cache version for future compatibility checks
+                    chunkData._cacheVersion = 2;  // Current version with valid lighting
                     // Store chunk data with metadata
                     const compressed = ChunkCompressor.compress(chunkData);
                     const record = {
@@ -20658,6 +20660,8 @@
                     let totalBytesWritten = 0;
                     if (pending === 0) { resolve(); return; }
                     for (const [chunkKey, chunkData] of chunkDataMap) {
+                        // Ensure chunk has current cache version for future compatibility checks
+                        chunkData._cacheVersion = 2;  // Current version with valid lighting
                         const record = {
                             key: chunkKey,
                             data: ChunkCompressor.compress(chunkData),
@@ -30206,21 +30210,45 @@
                 if (chunk.skyLight.length !== expectedSize) return false;
                 if (chunk.blockLight.length !== expectedSize) return false;
 
-                // Quick sanity check: skyLight should have some variation (not all zeros or all 15s)
-                // Sample a few values to avoid O(n) scan
-                const samples = [0, 1000, 10000, expectedSize - 1];
+                // Sample multiple points to check for:
+                // 1. Variation (not all same value)
+                // 2. Valid range (0-15 for light values)
+                // 3. Reasonable distribution (not all max or all min)
+                const sampleIndices = [0, 1000, 5000, 10000, 50000, expectedSize - 1];
                 let hasVariation = false;
+                let hasShadows = false;  // At least some values < 15
                 let prevSky = chunk.skyLight[0];
-                for (const idx of samples) {
-                    if (idx < expectedSize && chunk.skyLight[idx] !== prevSky) {
+
+                for (const idx of sampleIndices) {
+                    if (idx >= expectedSize) continue;
+
+                    const skyVal = chunk.skyLight[idx];
+                    const blockVal = chunk.blockLight[idx];
+
+                    // CRITICAL: Check that values are in valid 0-15 range
+                    // Values > 15 indicate corrupt/garbage data from decompression bugs
+                    if (skyVal > 15 || blockVal > 15) {
+                        return false;  // Invalid light values - reject this cache
+                    }
+
+                    // Check for variation
+                    if (skyVal !== prevSky) {
                         hasVariation = true;
-                        break;
+                    }
+
+                    // Check for shadows (values less than max sunlight)
+                    if (skyVal < 15) {
+                        hasShadows = true;
                     }
                 }
 
                 // If skyLight is uniform 15 everywhere, it's likely uninitialized
-                // (real terrain should have shadows from blocks)
+                // (real terrain should have some shadows from blocks)
                 if (!hasVariation && prevSky === 15) return false;
+
+                // Additional check: terrain should have SOME shadowed areas
+                // If all sampled values are 15, lighting probably wasn't calculated properly
+                if (!hasShadows && prevSky === 15) return false;
 
                 return true;
             }
@@ -30254,13 +30282,27 @@
                             }
                         }
 
-                        // Only recalculate lighting if cached data is missing or invalid
+                        // Cache version check - older caches might have corrupt lighting
+                        // Force recalculation for caches without a version marker or with old version
+                        const CURRENT_CACHE_VERSION = 2;  // Increment when cache format changes
+                        const cacheVersion = cachedData._cacheVersion || 0;
+                        let forceLightingRecalc = false;
+                        if (cacheVersion < CURRENT_CACHE_VERSION) {
+                            // Old cache format - force lighting recalculation
+                            logDebug(`[Cache] Chunk ${key} has old cache version ${cacheVersion}, recalculating lighting`);
+                            forceLightingRecalc = true;
+                        }
+
+                        // Only recalculate lighting if cached data is missing, invalid, or old version
                         // This provides ~5x speedup for cached chunks with valid lighting
-                        const lightingValid = isLightingDataValid(cachedData, expectedSize);
+                        const lightingValid = !forceLightingRecalc && isLightingDataValid(cachedData, expectedSize);
                         const cacheLoadStart = performance.now();
                         if (!lightingValid) {
                             calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                             calculateBlockLight(cachedData, chunkSize, chunkHeight);
+                            // Update cache version and re-save with corrected lighting
+                            cachedData._cacheVersion = CURRENT_CACHE_VERSION;
+                            saveChunkToCache(key, cachedData);  // Non-blocking re-save
                         }
 
                         // Always analyze sections (fast operation, needed for rendering optimization)
@@ -31302,8 +31344,11 @@
             // This function is called thousands of times per chunk, so avoiding closure creation saves significant GC pressure
             function extractLightFromChunk(chunk, idx) {
                 if (!chunk || !chunk.skyLight) return 15;
-                const sky = chunk.skyLight[idx] || 1;
-                const block = chunk.blockLight ? chunk.blockLight[idx] : 0;
+                // Clamp to valid 0-15 range to handle any corrupt data that slipped through
+                const rawSky = chunk.skyLight[idx];
+                const rawBlock = chunk.blockLight ? chunk.blockLight[idx] : 0;
+                const sky = (rawSky > 15 ? 15 : rawSky) || 1;
+                const block = rawBlock > 15 ? 15 : rawBlock;
                 const maxLight = sky > block ? sky : block;
                 // Minimum light level 3 (20% brightness base, ~5% with full AO)
                 // Allows caves to feel dark while remaining visible
