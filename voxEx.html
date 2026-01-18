@@ -7361,11 +7361,13 @@
                     /** @type {ChunkDiskStorage|null} */
                     this.diskStorage = null;           // Reference to ChunkDiskStorage singleton
                     /** @type {Set<string>} */
-                    this.diskCachedKeys = new Set();   // Track which chunks are on disk
+                    this.diskCachedKeys = new Set();   // Track which chunks are on disk FOR CURRENT SEED
                     /** @type {Set<string>} */
                     this.diskDirtyKeys = new Set();    // Chunks modified since last OPFS write
                     /** @type {boolean} */
                     this.diskStorageReady = false;     // Is OPFS initialized?
+                    /** @type {string|null} */
+                    this.currentSeed = null;           // Current world seed for OPFS validation
 
                     // OPFS Statistics
                     this._opfsStats = {
@@ -7374,7 +7376,8 @@
                         writes: 0,
                         writeBytes: 0,
                         readBytes: 0,
-                        evictionWrites: 0
+                        evictionWrites: 0,
+                        seedMismatches: 0
                     };
                 }
 
@@ -7393,13 +7396,12 @@
                         if (this.diskStorage && this.diskStorage.isReady()) {
                             this.diskStorageReady = true;
 
-                            // Load list of existing cached chunks
-                            const existingKeys = await this.diskStorage.list();
-                            for (const key of existingKeys) {
-                                this.diskCachedKeys.add(key);
-                            }
-
-                            logDebug(`[OPFS] ChunkDataPool initialized with ${existingKeys.length} cached chunks`);
+                            // Note: We don't pre-load diskCachedKeys here because:
+                            // 1. Files may be from different seeds (we validate on load)
+                            // 2. diskCachedKeys is populated as chunks are successfully loaded
+                            // 3. This avoids false cache hits for wrong-seed chunks
+                            const stats = await this.diskStorage.getStats();
+                            logDebug(`[OPFS] ChunkDataPool initialized (${stats.count} files on disk, ${stats.totalMB}MB)`);
                             return true;
                         }
                     } catch (e) {
@@ -7437,13 +7439,24 @@
                             return null;
                         }
 
-                        // Convert ArrayBuffer to compressed format and decompress
-                        const compressedStr = new TextDecoder().decode(compressedBuffer);
-                        const compressed = JSON.parse(compressedStr);
-                        const chunk = ChunkCompressor.decompress(compressed);
+                        // Convert ArrayBuffer to stored format
+                        const storedStr = new TextDecoder().decode(compressedBuffer);
+                        const stored = JSON.parse(storedStr);
+
+                        // Validate seed matches current world (critical for multi-world support)
+                        if (!stored.seed || !seedsMatch(stored.seed, this.currentSeed)) {
+                            this._opfsStats.seedMismatches++;
+                            this.diskCachedKeys.delete(key); // Mark as invalid for this seed
+                            logDebug(`[OPFS] Seed mismatch for ${key}: stored=${stored.seed}, current=${this.currentSeed}`);
+                            return null;
+                        }
+
+                        // Decompress chunk data
+                        const chunk = ChunkCompressor.decompress(stored.data);
 
                         this._opfsStats.hits++;
                         this._opfsStats.readBytes += compressedBuffer.byteLength;
+                        this.diskCachedKeys.add(key); // Track successful loads for this seed
 
                         return chunk;
                     } catch (e) {
@@ -7466,10 +7479,20 @@
                         return false;
                     }
 
+                    // Don't write if we don't know the current seed
+                    if (!this.currentSeed) {
+                        logDebug(`[OPFS] Write skipped for ${key}: no current seed set`);
+                        return false;
+                    }
+
                     try {
-                        // Compress chunk data
+                        // Compress chunk data and store with seed for validation
                         const compressed = ChunkCompressor.compress(chunk);
-                        const jsonStr = JSON.stringify(compressed);
+                        const stored = {
+                            seed: this.currentSeed,
+                            data: compressed
+                        };
+                        const jsonStr = JSON.stringify(stored);
                         const buffer = new TextEncoder().encode(jsonStr);
 
                         await this.diskStorage.write(key, buffer);
@@ -7512,8 +7535,47 @@
                         dirtyCount: this.diskDirtyKeys.size,
                         hitRate: `${hitRate}%`,
                         readMB: (this._opfsStats.readBytes / (1024 * 1024)).toFixed(2),
-                        writeMB: (this._opfsStats.writeBytes / (1024 * 1024)).toFixed(2)
+                        writeMB: (this._opfsStats.writeBytes / (1024 * 1024)).toFixed(2),
+                        currentSeed: this.currentSeed
                     };
+                }
+
+                /**
+                 * Set the current world seed for OPFS validation.
+                 * Clears cached key tracking when seed changes (chunks will be re-validated on load).
+                 * @param {string} seed - Current world seed
+                 */
+                setCurrentSeed(seed) {
+                    const seedStr = seed?.toString() || null;
+                    if (this.currentSeed !== seedStr) {
+                        logDebug(`[OPFS] Seed changed: ${this.currentSeed} -> ${seedStr}`);
+                        this.currentSeed = seedStr;
+                        // Clear cached keys - they may not be valid for new seed
+                        // Actual files stay on disk; invalid ones rejected on load via seedsMatch()
+                        this.diskCachedKeys.clear();
+                        this.diskDirtyKeys.clear();
+                        // Reset stats for new session
+                        this._opfsStats.hits = 0;
+                        this._opfsStats.misses = 0;
+                        this._opfsStats.seedMismatches = 0;
+                    }
+                }
+
+                /**
+                 * Clear all OPFS cache files and reset state.
+                 * Call when starting a completely fresh world or to reclaim disk space.
+                 * @returns {Promise<number>} Number of files deleted
+                 */
+                async clearDiskCache() {
+                    if (!this.diskStorageReady || !this.diskStorage) {
+                        return 0;
+                    }
+
+                    const count = await this.diskStorage.clear();
+                    this.diskCachedKeys.clear();
+                    this.diskDirtyKeys.clear();
+                    logDebug(`[OPFS] Cleared ${count} cached chunk files`);
+                    return count;
                 }
 
                 /**
@@ -19286,6 +19348,7 @@
                     // Restore world state
                     worldConfig.seed = savePacket.seed;
                     finalSeedDisplay = savePacket.seed.toString(); // FIX: Update finalSeedDisplay!
+                    chunkDataPool.setCurrentSeed(finalSeedDisplay); // Sync OPFS cache with new seed
 
                     if (typeof SeededRandom !== 'undefined') {
                         rng = new SeededRandom(worldConfig.seed.toString());
@@ -19418,7 +19481,8 @@
 
             // Wrapper to hide menu and start engine
             async function initGameEngine(seedStr, loadedPlayerState) {
-                finalSeedDisplay = seedStr;                
+                finalSeedDisplay = seedStr;
+                chunkDataPool.setCurrentSeed(finalSeedDisplay); // Sync OPFS cache with seed
                 if (!db) await initDatabase(); // Initialize database first
                 // Determine spawn chunk coordinates
                 const spawnChunkX = 0;
@@ -21401,6 +21465,7 @@ self.onmessage = async (e) => {
                 // 2. Update finalSeedDisplay to match the loaded world
                 // Use the seed as string for consistency with chunk storage
                 finalSeedDisplay = savePacket.seed.toString();
+                chunkDataPool.setCurrentSeed(finalSeedDisplay); // Sync OPFS cache with loaded seed
 
                 // 3. Clear Scene
                 if (typeof scene !== "undefined") {
@@ -31242,7 +31307,8 @@ self.onmessage = async (e) => {
                     }
 
                     // 2. Try OPFS disk cache (faster than IndexedDB for binary data)
-                    if (chunkDataPool.diskStorageReady && chunkDataPool.hasDiskCache(key)) {
+                    // Always try loading - loadFromDisk returns null if not found or seed mismatch
+                    if (chunkDataPool.diskStorageReady) {
                         const opfsStart = performance.now();
                         const opfsData = await chunkDataPool.loadFromDisk(key);
                         if (opfsData && opfsData.blocks && opfsData.blocks.length === expectedSize) {
