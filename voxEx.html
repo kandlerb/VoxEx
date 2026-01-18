@@ -20336,6 +20336,659 @@
                 }
             };
 
+            // =====================================================
+            // OPFS (Origin Private File System) DISK STORAGE
+            // Provides true disk-based chunk storage via Web Worker
+            // for reduced RAM usage. Uses FileSystemSyncAccessHandle
+            // for fast synchronous I/O (~1-2ms read/write).
+            // =====================================================
+
+            /**
+             * Check if OPFS (Origin Private File System) is supported.
+             * Requires navigator.storage.getDirectory and FileSystemSyncAccessHandle.
+             * @returns {boolean} True if OPFS is supported
+             */
+            function supportsOPFS() {
+                try {
+                    // Check for storage.getDirectory (OPFS root access)
+                    if (!navigator?.storage?.getDirectory) {
+                        return false;
+                    }
+                    // Check for FileSystemSyncAccessHandle (sync I/O in workers)
+                    // This is only available in workers, so we check for the constructor
+                    if (typeof FileSystemSyncAccessHandle === 'undefined') {
+                        // FileSystemSyncAccessHandle may not be exposed on main thread
+                        // but still available in workers. Check for OPFS directory support as proxy.
+                        return true;
+                    }
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            }
+
+            // --- OPFS Web Worker Code (Inline for single-file architecture) ---
+            const OPFS_WORKER_CODE = `
+// OPFS Worker - Handles synchronous file I/O for chunk storage
+let chunksDir = null;
+let isInitialized = false;
+
+/**
+ * Initialize OPFS and create chunks directory.
+ * @returns {Promise<boolean>} True on success
+ */
+async function init() {
+    try {
+        const root = await navigator.storage.getDirectory();
+        chunksDir = await root.getDirectoryHandle('voxex-chunks', { create: true });
+        isInitialized = true;
+        return true;
+    } catch (e) {
+        console.error('[OPFS Worker] Init failed:', e);
+        return false;
+    }
+}
+
+/**
+ * Convert chunk key to valid filename.
+ * @param {string} key - Chunk key like "5,-3"
+ * @returns {string} Filename like "5_-3.bin"
+ */
+function keyToFilename(key) {
+    return key.replace(',', '_') + '.bin';
+}
+
+/**
+ * Write chunk data to OPFS.
+ * @param {string} key - Chunk key
+ * @param {ArrayBuffer} data - Compressed chunk data
+ * @returns {Promise<number>} Bytes written
+ */
+async function writeChunk(key, data) {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    const fileName = keyToFilename(key);
+    const fileHandle = await chunksDir.getFileHandle(fileName, { create: true });
+    const syncHandle = await fileHandle.createSyncAccessHandle();
+
+    try {
+        // Ensure data is ArrayBuffer
+        const buffer = data instanceof ArrayBuffer ? data :
+                       (data.buffer instanceof ArrayBuffer ? data.buffer : new Uint8Array(data).buffer);
+
+        syncHandle.truncate(0);
+        syncHandle.write(new Uint8Array(buffer), { at: 0 });
+        syncHandle.flush();
+        return buffer.byteLength;
+    } finally {
+        syncHandle.close();
+    }
+}
+
+/**
+ * Read chunk data from OPFS.
+ * @param {string} key - Chunk key
+ * @returns {Promise<ArrayBuffer|null>} Chunk data or null if not found
+ */
+async function readChunk(key) {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    const fileName = keyToFilename(key);
+    try {
+        const fileHandle = await chunksDir.getFileHandle(fileName);
+        const syncHandle = await fileHandle.createSyncAccessHandle();
+
+        try {
+            const size = syncHandle.getSize();
+            if (size === 0) return null;
+
+            const buffer = new ArrayBuffer(size);
+            syncHandle.read(new Uint8Array(buffer), { at: 0 });
+            return buffer;
+        } finally {
+            syncHandle.close();
+        }
+    } catch (e) {
+        if (e.name === 'NotFoundError') return null;
+        throw e;
+    }
+}
+
+/**
+ * Delete a chunk file from OPFS.
+ * @param {string} key - Chunk key
+ * @returns {Promise<boolean>} True if deleted, false if not found
+ */
+async function deleteChunk(key) {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    const fileName = keyToFilename(key);
+    try {
+        await chunksDir.removeEntry(fileName);
+        return true;
+    } catch (e) {
+        if (e.name === 'NotFoundError') return false;
+        throw e;
+    }
+}
+
+/**
+ * Clear all chunk files from OPFS.
+ * @returns {Promise<number>} Number of files deleted
+ */
+async function clearAllChunks() {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    let count = 0;
+    const entries = [];
+
+    // Collect all entries first (can't modify while iterating)
+    for await (const entry of chunksDir.values()) {
+        if (entry.kind === 'file' && entry.name.endsWith('.bin')) {
+            entries.push(entry.name);
+        }
+    }
+
+    // Delete all collected entries
+    for (const name of entries) {
+        try {
+            await chunksDir.removeEntry(name);
+            count++;
+        } catch (e) {
+            // Ignore individual deletion errors
+        }
+    }
+
+    return count;
+}
+
+/**
+ * List all stored chunk keys.
+ * @returns {Promise<string[]>} Array of chunk keys
+ */
+async function listChunks() {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    const keys = [];
+    for await (const entry of chunksDir.values()) {
+        if (entry.kind === 'file' && entry.name.endsWith('.bin')) {
+            // Convert filename back to key: "5_-3.bin" -> "5,-3"
+            const key = entry.name.slice(0, -4).replace('_', ',');
+            keys.push(key);
+        }
+    }
+    return keys;
+}
+
+/**
+ * Get storage statistics.
+ * @returns {Promise<{count: number, totalBytes: number}>}
+ */
+async function getStats() {
+    if (!chunksDir) throw new Error('OPFS not initialized');
+
+    let count = 0;
+    let totalBytes = 0;
+
+    for await (const entry of chunksDir.values()) {
+        if (entry.kind === 'file' && entry.name.endsWith('.bin')) {
+            count++;
+            try {
+                const fileHandle = await chunksDir.getFileHandle(entry.name);
+                const file = await fileHandle.getFile();
+                totalBytes += file.size;
+            } catch (e) {
+                // Skip files we can't access
+            }
+        }
+    }
+
+    return { count, totalBytes };
+}
+
+// Message handler
+self.onmessage = async (e) => {
+    const { type, key, data, id } = e.data;
+
+    try {
+        let result;
+
+        switch (type) {
+            case 'init':
+                result = await init();
+                break;
+            case 'write':
+                result = await writeChunk(key, data);
+                break;
+            case 'read':
+                result = await readChunk(key);
+                break;
+            case 'delete':
+                result = await deleteChunk(key);
+                break;
+            case 'clear':
+                result = await clearAllChunks();
+                break;
+            case 'list':
+                result = await listChunks();
+                break;
+            case 'stats':
+                result = await getStats();
+                break;
+            default:
+                throw new Error('Unknown message type: ' + type);
+        }
+
+        // Transfer ArrayBuffer if applicable
+        const transfer = result instanceof ArrayBuffer ? [result] : [];
+        self.postMessage({ id, success: true, result }, transfer);
+
+    } catch (error) {
+        self.postMessage({ id, success: false, error: error.message });
+    }
+};
+`;
+
+            /**
+             * ChunkDiskStorage - Manages chunk data persistence via OPFS.
+             * Uses a Web Worker for synchronous file I/O operations.
+             */
+            class ChunkDiskStorage {
+                constructor() {
+                    /** @type {Worker|null} */
+                    this.worker = null;
+                    /** @type {Map<number, {resolve: Function, reject: Function}>} */
+                    this.pending = new Map();
+                    /** @type {number} */
+                    this.nextId = 0;
+                    /** @type {boolean} */
+                    this.ready = false;
+                    /** @type {boolean} */
+                    this.supported = false;
+                    /** @type {boolean} */
+                    this.initFailed = false;
+
+                    // Statistics
+                    this._stats = {
+                        writes: 0,
+                        reads: 0,
+                        readHits: 0,
+                        readMisses: 0,
+                        deletes: 0,
+                        bytesWritten: 0,
+                        bytesRead: 0,
+                        errors: 0
+                    };
+                }
+
+                /**
+                 * Initialize the OPFS worker and storage.
+                 * @returns {Promise<boolean>} True if initialization successful
+                 */
+                async init() {
+                    if (this.ready) return true;
+                    if (this.initFailed) return false;
+
+                    // Check browser support
+                    if (!supportsOPFS()) {
+                        logDebug('[OPFS] Not supported in this browser');
+                        this.initFailed = true;
+                        return false;
+                    }
+
+                    try {
+                        // Create worker from inline code
+                        const blob = new Blob([OPFS_WORKER_CODE], { type: 'application/javascript' });
+                        const workerUrl = URL.createObjectURL(blob);
+                        this.worker = new Worker(workerUrl);
+
+                        // Set up message handler
+                        this.worker.onmessage = (e) => {
+                            const { id, success, result, error } = e.data;
+                            const pending = this.pending.get(id);
+                            if (pending) {
+                                this.pending.delete(id);
+                                if (success) {
+                                    pending.resolve(result);
+                                } else {
+                                    this._stats.errors++;
+                                    pending.reject(new Error(error));
+                                }
+                            }
+                        };
+
+                        this.worker.onerror = (e) => {
+                            logDebug('[OPFS] Worker error:', e.message);
+                            this._stats.errors++;
+                        };
+
+                        // Initialize OPFS in worker
+                        const initResult = await this._request('init');
+                        if (!initResult) {
+                            throw new Error('Worker init returned false');
+                        }
+
+                        this.ready = true;
+                        this.supported = true;
+                        logDebug('[OPFS] Initialized successfully');
+                        return true;
+
+                    } catch (e) {
+                        logDebug('[OPFS] Initialization failed:', e.message);
+                        this.initFailed = true;
+                        if (this.worker) {
+                            this.worker.terminate();
+                            this.worker = null;
+                        }
+                        return false;
+                    }
+                }
+
+                /**
+                 * Send a request to the worker and wait for response.
+                 * @param {string} type - Request type
+                 * @param {string|null} [key=null] - Chunk key
+                 * @param {ArrayBuffer|Uint8Array|null} [data=null] - Data for write operations
+                 * @returns {Promise<*>} Result from worker
+                 */
+                _request(type, key = null, data = null) {
+                    if (!this.worker && type !== 'init') {
+                        return Promise.reject(new Error('OPFS not initialized'));
+                    }
+
+                    return new Promise((resolve, reject) => {
+                        const id = this.nextId++;
+                        this.pending.set(id, { resolve, reject });
+
+                        // Transfer ArrayBuffer if provided (zero-copy)
+                        const transfer = [];
+                        if (data instanceof ArrayBuffer) {
+                            transfer.push(data);
+                        } else if (data && data.buffer instanceof ArrayBuffer) {
+                            transfer.push(data.buffer);
+                        }
+
+                        this.worker.postMessage({ type, key, data, id }, transfer);
+                    });
+                }
+
+                /**
+                 * Write compressed chunk data to disk.
+                 * @param {string} key - Chunk key (e.g., "5,-3")
+                 * @param {Uint8Array|ArrayBuffer} compressedData - RLE-compressed chunk data
+                 * @returns {Promise<number>} Bytes written
+                 */
+                async write(key, compressedData) {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) throw new Error('OPFS not available');
+                    }
+
+                    const bytes = await this._request('write', key, compressedData);
+                    this._stats.writes++;
+                    this._stats.bytesWritten += bytes;
+                    return bytes;
+                }
+
+                /**
+                 * Read compressed chunk data from disk.
+                 * @param {string} key - Chunk key (e.g., "5,-3")
+                 * @returns {Promise<ArrayBuffer|null>} Compressed data or null if not found
+                 */
+                async read(key) {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) return null;
+                    }
+
+                    const result = await this._request('read', key);
+                    this._stats.reads++;
+
+                    if (result) {
+                        this._stats.readHits++;
+                        this._stats.bytesRead += result.byteLength;
+                    } else {
+                        this._stats.readMisses++;
+                    }
+
+                    return result;
+                }
+
+                /**
+                 * Delete a chunk file from disk.
+                 * @param {string} key - Chunk key (e.g., "5,-3")
+                 * @returns {Promise<boolean>} True if deleted, false if not found
+                 */
+                async delete(key) {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) return false;
+                    }
+
+                    const deleted = await this._request('delete', key);
+                    if (deleted) this._stats.deletes++;
+                    return deleted;
+                }
+
+                /**
+                 * Clear all chunk files from disk.
+                 * @returns {Promise<number>} Number of files deleted
+                 */
+                async clear() {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) return 0;
+                    }
+
+                    const count = await this._request('clear');
+                    logDebug(`[OPFS] Cleared ${count} chunk files`);
+                    return count;
+                }
+
+                /**
+                 * List all stored chunk keys.
+                 * @returns {Promise<string[]>} Array of chunk keys
+                 */
+                async list() {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) return [];
+                    }
+
+                    return await this._request('list');
+                }
+
+                /**
+                 * Get storage statistics.
+                 * @returns {Promise<{count: number, totalBytes: number, totalMB: string}>}
+                 */
+                async getStats() {
+                    if (!this.ready) {
+                        const ok = await this.init();
+                        if (!ok) return { count: 0, totalBytes: 0, totalMB: '0.00' };
+                    }
+
+                    const stats = await this._request('stats');
+                    return {
+                        ...stats,
+                        totalMB: (stats.totalBytes / (1024 * 1024)).toFixed(2)
+                    };
+                }
+
+                /**
+                 * Get internal operation statistics.
+                 * @returns {Object} Operation statistics
+                 */
+                getOperationStats() {
+                    const hitRate = this._stats.reads > 0
+                        ? ((this._stats.readHits / this._stats.reads) * 100).toFixed(1)
+                        : '0.0';
+
+                    return {
+                        ...this._stats,
+                        hitRate: `${hitRate}%`,
+                        bytesWrittenMB: (this._stats.bytesWritten / (1024 * 1024)).toFixed(2),
+                        bytesReadMB: (this._stats.bytesRead / (1024 * 1024)).toFixed(2)
+                    };
+                }
+
+                /**
+                 * Check if OPFS is ready for use.
+                 * @returns {boolean}
+                 */
+                isReady() {
+                    return this.ready;
+                }
+
+                /**
+                 * Check if OPFS is supported.
+                 * @returns {boolean}
+                 */
+                isSupported() {
+                    return supportsOPFS();
+                }
+            }
+
+            // --- OPFS Singleton Instance ---
+            /** @type {ChunkDiskStorage|null} */
+            let chunkDiskStorage = null;
+
+            /**
+             * Get the ChunkDiskStorage singleton, initializing if needed.
+             * @returns {Promise<ChunkDiskStorage|null>} Storage instance or null if unsupported
+             */
+            async function getChunkDiskStorage() {
+                if (chunkDiskStorage) return chunkDiskStorage;
+
+                if (!supportsOPFS()) {
+                    logDebug('[OPFS] Browser does not support OPFS');
+                    return null;
+                }
+
+                chunkDiskStorage = new ChunkDiskStorage();
+                const ok = await chunkDiskStorage.init();
+
+                if (!ok) {
+                    chunkDiskStorage = null;
+                    return null;
+                }
+
+                return chunkDiskStorage;
+            }
+
+            /**
+             * Test OPFS functionality.
+             * Writes, reads, verifies, and deletes a test chunk.
+             * @returns {Promise<{success: boolean, message: string, timing?: Object}>}
+             */
+            async function testChunkDiskStorage() {
+                const result = {
+                    success: false,
+                    message: '',
+                    timing: {}
+                };
+
+                console.log('[OPFS Test] Starting...');
+
+                // Check support
+                if (!supportsOPFS()) {
+                    result.message = 'OPFS not supported in this browser';
+                    console.warn('[OPFS Test]', result.message);
+                    return result;
+                }
+
+                try {
+                    // Initialize
+                    let t0 = performance.now();
+                    const storage = await getChunkDiskStorage();
+                    result.timing.init = (performance.now() - t0).toFixed(2) + 'ms';
+
+                    if (!storage) {
+                        result.message = 'Failed to initialize OPFS storage';
+                        console.warn('[OPFS Test]', result.message);
+                        return result;
+                    }
+
+                    // Create test data (simulates compressed chunk)
+                    const testKey = 'test_0,0';
+                    const testData = new Uint8Array(1024);
+                    for (let i = 0; i < testData.length; i++) {
+                        testData[i] = i % 256;
+                    }
+
+                    // Write test
+                    t0 = performance.now();
+                    const bytesWritten = await storage.write(testKey, testData);
+                    result.timing.write = (performance.now() - t0).toFixed(2) + 'ms';
+                    console.log(`[OPFS Test] Write: ${bytesWritten} bytes in ${result.timing.write}`);
+
+                    // Read test
+                    t0 = performance.now();
+                    const readData = await storage.read(testKey);
+                    result.timing.read = (performance.now() - t0).toFixed(2) + 'ms';
+                    console.log(`[OPFS Test] Read: ${readData?.byteLength ?? 0} bytes in ${result.timing.read}`);
+
+                    // Verify data integrity
+                    if (!readData) {
+                        result.message = 'Read returned null';
+                        console.warn('[OPFS Test]', result.message);
+                        return result;
+                    }
+
+                    const readArray = new Uint8Array(readData);
+                    if (readArray.length !== testData.length) {
+                        result.message = `Size mismatch: expected ${testData.length}, got ${readArray.length}`;
+                        console.warn('[OPFS Test]', result.message);
+                        return result;
+                    }
+
+                    for (let i = 0; i < testData.length; i++) {
+                        if (readArray[i] !== testData[i]) {
+                            result.message = `Data mismatch at byte ${i}: expected ${testData[i]}, got ${readArray[i]}`;
+                            console.warn('[OPFS Test]', result.message);
+                            return result;
+                        }
+                    }
+
+                    // Delete test
+                    t0 = performance.now();
+                    const deleted = await storage.delete(testKey);
+                    result.timing.delete = (performance.now() - t0).toFixed(2) + 'ms';
+                    console.log(`[OPFS Test] Delete: ${deleted} in ${result.timing.delete}`);
+
+                    // Verify deletion
+                    const afterDelete = await storage.read(testKey);
+                    if (afterDelete !== null) {
+                        result.message = 'File not deleted properly';
+                        console.warn('[OPFS Test]', result.message);
+                        return result;
+                    }
+
+                    // Get stats
+                    const stats = await storage.getStats();
+                    console.log('[OPFS Test] Storage stats:', stats);
+
+                    result.success = true;
+                    result.message = 'OPFS test passed';
+                    console.log(`[OPFS Test] ✓ ${result.message}`, result.timing);
+
+                    return result;
+
+                } catch (e) {
+                    result.message = `Error: ${e.message}`;
+                    console.error('[OPFS Test]', result.message, e);
+                    return result;
+                }
+            }
+
+            // Expose OPFS test to window for console testing
+            window.testOPFS = testChunkDiskStorage;
+            window.getChunkDiskStorage = getChunkDiskStorage;
+            window.supportsOPFS = supportsOPFS;
+
+            // Log OPFS support status on init
+            logDebug(`[OPFS] Support check: ${supportsOPFS() ? 'Supported' : 'Not supported'}`);
+
             // --- CHUNK MODIFICATION TRACKING & AUTO-SAVE ---
             const chunkAutoSave = {
                 modifiedChunks: new Set(),
@@ -23466,6 +24119,18 @@
                     "\nHits: " + cacheStats.hits + " | Misses: " + cacheStats.misses + " (" + cacheStats.hitRate + ")" +
                     "\nSaves: " + cacheStats.saves + " | Read: " + cacheStats.bytesReadMB + "MB | Written: " + cacheStats.bytesWrittenMB + "MB" +
                     (pendingCount > 0 ? "\nAuto-save pending: " + pendingCount + " chunks" : "");
+
+                // Add OPFS (disk storage) status
+                const opfsSupported = supportsOPFS();
+                const opfsReady = chunkDiskStorage?.isReady() ?? false;
+                overlay.innerText += "\n--- OPFS ---" +
+                    "\nStatus: " + (opfsSupported ? (opfsReady ? "Ready" : "Supported") : "Not Supported");
+                if (opfsReady && chunkDiskStorage) {
+                    const opfsStats = chunkDiskStorage.getOperationStats();
+                    overlay.innerText += "\nOps: W:" + opfsStats.writes + " R:" + opfsStats.reads +
+                        " (Hit:" + opfsStats.hitRate + ")" +
+                        "\nDisk I/O: R:" + opfsStats.bytesReadMB + "MB W:" + opfsStats.bytesWrittenMB + "MB";
+                }
             }
             function initTextures() {
                 const cvs = document.createElement("canvas");
