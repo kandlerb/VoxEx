@@ -4939,6 +4939,9 @@
                 compressionInactiveTime: savedSettings.compressionInactiveTime ?? 10000,    // Compress chunks not accessed for 10 seconds
                 compressionMinDistance: savedSettings.compressionMinDistance ?? 8,          // Only compress chunks outside this radius (chunks)
                 compressionBatchSize: savedSettings.compressionBatchSize ?? 5,              // Max chunks to compress per frame
+                // OPFS Disk Storage
+                useOPFSCache: savedSettings.useOPFSCache !== undefined ? savedSettings.useOPFSCache : true, // Use OPFS for fast chunk disk caching
+                opfsCacheMaxMB: savedSettings.opfsCacheMaxMB ?? 500,                         // Max OPFS cache size in MB (auto-clear old if exceeded)
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5144,6 +5147,9 @@
                 compressionInactiveTime: 10000,    // Compress chunks not accessed for 10 seconds
                 compressionMinDistance: 8,         // Only compress chunks outside this radius (chunks)
                 compressionBatchSize: 5,           // Max chunks to compress per frame
+                // OPFS Disk Storage defaults
+                useOPFSCache: true,                // Use OPFS for fast chunk disk caching
+                opfsCacheMaxMB: 500,               // Max OPFS cache size in MB
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -7350,6 +7356,164 @@
                     this.metadata = new Map();         // ChunkKey -> { lastAccessed, dataSize, hasData }
                     this.totalDataSize = 0;            // Estimated total memory usage in bytes
                     this._callCounts = { get: 0, touch: 0, evict: 0, estimateSize: 0 };
+
+                    // OPFS Disk Storage Integration
+                    /** @type {ChunkDiskStorage|null} */
+                    this.diskStorage = null;           // Reference to ChunkDiskStorage singleton
+                    /** @type {Set<string>} */
+                    this.diskCachedKeys = new Set();   // Track which chunks are on disk
+                    /** @type {Set<string>} */
+                    this.diskDirtyKeys = new Set();    // Chunks modified since last OPFS write
+                    /** @type {boolean} */
+                    this.diskStorageReady = false;     // Is OPFS initialized?
+
+                    // OPFS Statistics
+                    this._opfsStats = {
+                        hits: 0,
+                        misses: 0,
+                        writes: 0,
+                        writeBytes: 0,
+                        readBytes: 0,
+                        evictionWrites: 0
+                    };
+                }
+
+                /**
+                 * Initialize OPFS disk storage for chunk caching.
+                 * Call this during game init after OPFS is available.
+                 * @returns {Promise<boolean>} True if OPFS initialized successfully
+                 */
+                async initDiskStorage() {
+                    if (this.diskStorageReady) return true;
+
+                    try {
+                        // Get singleton instance (lazy init)
+                        this.diskStorage = await getChunkDiskStorage();
+
+                        if (this.diskStorage && this.diskStorage.isReady()) {
+                            this.diskStorageReady = true;
+
+                            // Load list of existing cached chunks
+                            const existingKeys = await this.diskStorage.list();
+                            for (const key of existingKeys) {
+                                this.diskCachedKeys.add(key);
+                            }
+
+                            logDebug(`[OPFS] ChunkDataPool initialized with ${existingKeys.length} cached chunks`);
+                            return true;
+                        }
+                    } catch (e) {
+                        logDebug(`[OPFS] ChunkDataPool init failed: ${e.message}`);
+                    }
+
+                    this.diskStorageReady = false;
+                    return false;
+                }
+
+                /**
+                 * Check if a chunk exists in OPFS disk cache.
+                 * @param {string} key - Chunk key
+                 * @returns {boolean} True if chunk is cached on disk
+                 */
+                hasDiskCache(key) {
+                    return this.diskCachedKeys.has(key);
+                }
+
+                /**
+                 * Load a chunk from OPFS disk cache.
+                 * @param {string} key - Chunk key
+                 * @returns {Promise<Object|null>} Decompressed chunk data or null
+                 */
+                async loadFromDisk(key) {
+                    if (!this.diskStorageReady || !this.diskStorage) {
+                        return null;
+                    }
+
+                    try {
+                        const compressedBuffer = await this.diskStorage.read(key);
+                        if (!compressedBuffer) {
+                            this._opfsStats.misses++;
+                            this.diskCachedKeys.delete(key); // Sync cache state
+                            return null;
+                        }
+
+                        // Convert ArrayBuffer to compressed format and decompress
+                        const compressedStr = new TextDecoder().decode(compressedBuffer);
+                        const compressed = JSON.parse(compressedStr);
+                        const chunk = ChunkCompressor.decompress(compressed);
+
+                        this._opfsStats.hits++;
+                        this._opfsStats.readBytes += compressedBuffer.byteLength;
+
+                        return chunk;
+                    } catch (e) {
+                        logDebug(`[OPFS] Load failed for ${key}: ${e.message}`);
+                        this._opfsStats.misses++;
+                        this.diskCachedKeys.delete(key);
+                        return null;
+                    }
+                }
+
+                /**
+                 * Write a chunk to OPFS disk cache (async, non-blocking).
+                 * @param {string} key - Chunk key
+                 * @param {Object} chunk - Chunk data to cache
+                 * @param {boolean} [isEviction=false] - True if writing during eviction
+                 * @returns {Promise<boolean>} True if write succeeded
+                 */
+                async writeToDisk(key, chunk, isEviction = false) {
+                    if (!this.diskStorageReady || !this.diskStorage) {
+                        return false;
+                    }
+
+                    try {
+                        // Compress chunk data
+                        const compressed = ChunkCompressor.compress(chunk);
+                        const jsonStr = JSON.stringify(compressed);
+                        const buffer = new TextEncoder().encode(jsonStr);
+
+                        await this.diskStorage.write(key, buffer);
+
+                        this.diskCachedKeys.add(key);
+                        this.diskDirtyKeys.delete(key);
+                        this._opfsStats.writes++;
+                        this._opfsStats.writeBytes += buffer.byteLength;
+                        if (isEviction) this._opfsStats.evictionWrites++;
+
+                        return true;
+                    } catch (e) {
+                        logDebug(`[OPFS] Write failed for ${key}: ${e.message}`);
+                        return false;
+                    }
+                }
+
+                /**
+                 * Mark a chunk as dirty (needs OPFS update on eviction).
+                 * @param {string} key - Chunk key
+                 */
+                markDirtyForDisk(key) {
+                    if (this.diskStorageReady) {
+                        this.diskDirtyKeys.add(key);
+                    }
+                }
+
+                /**
+                 * Get OPFS cache statistics.
+                 * @returns {Object} OPFS stats
+                 */
+                getOPFSStats() {
+                    const hitRate = (this._opfsStats.hits + this._opfsStats.misses) > 0
+                        ? ((this._opfsStats.hits / (this._opfsStats.hits + this._opfsStats.misses)) * 100).toFixed(1)
+                        : '0.0';
+
+                    return {
+                        ...this._opfsStats,
+                        cachedCount: this.diskCachedKeys.size,
+                        dirtyCount: this.diskDirtyKeys.size,
+                        hitRate: `${hitRate}%`,
+                        readMB: (this._opfsStats.readBytes / (1024 * 1024)).toFixed(2),
+                        writeMB: (this._opfsStats.writeBytes / (1024 * 1024)).toFixed(2)
+                    };
                 }
 
                 /**
@@ -7535,21 +7699,40 @@
                     const batchSize = this.settings.chunkDataEvictionBatch || 50;
                     let evicted = 0;
                     let freedBytes = 0;
+                    let opfsWrites = 0;
                     const targetFree = this.totalDataSize - maxBytes + (maxBytes * 0.1); // Free 10% extra
 
                     for (const candidate of candidates) {
                         if (evicted >= batchSize) break;
                         if (freedBytes >= targetFree) break;
 
+                        const key = candidate.key;
+
+                        // Write to OPFS before evicting (fire-and-forget for performance)
+                        // Dirty chunks MUST be written to preserve modifications
+                        // Pristine chunks can be written for faster reload (optional)
+                        if (this.diskStorageReady) {
+                            const chunk = this.chunks.get(key);
+                            const isDirty = this.diskDirtyKeys.has(key);
+                            const notOnDisk = !this.diskCachedKeys.has(key);
+
+                            // Write dirty chunks or pristine chunks not yet on disk
+                            if (chunk && (isDirty || notOnDisk)) {
+                                this.writeToDisk(key, chunk, true).catch(() => {});
+                                opfsWrites++;
+                            }
+                        }
+
                         if (isDebug) this._callCounts.evict++;
-                        purgeCallback(candidate.key);
-                        this.unregister(candidate.key);
+                        purgeCallback(key);
+                        this.unregister(key);
                         freedBytes += candidate.size;
                         evicted++;
                     }
 
                     if (evicted > 0 && isDebug) {
-                        logDebug(`[ChunkDataPool] Evicted ${evicted} chunks, freed ~${(freedBytes / 1024 / 1024).toFixed(1)}MB`);
+                        logDebug(`[ChunkDataPool] Evicted ${evicted} chunks, freed ~${(freedBytes / 1024 / 1024).toFixed(1)}MB` +
+                            (opfsWrites > 0 ? `, ${opfsWrites} OPFS writes` : ''));
                     }
 
                     return evicted;
@@ -19967,6 +20150,9 @@
                 // Mark chunk as modified for auto-save to IndexedDB
                 chunkAutoSave.markModified(key);
 
+                // Mark chunk as dirty for OPFS disk cache (will be written on eviction)
+                chunkDataPool.markDirtyForDisk(key);
+
                 // OPTIMIZATION: Invalidate caches for this chunk
                 chunkNeighborCache.invalidate(cx, cz);
                 invalidateCollisionGrid(cx, cz);
@@ -21498,6 +21684,15 @@ self.onmessage = async (e) => {
             async function init() {
                 try { await initDatabase();
                 } catch (err) { logError("DATABASE", "Failed to initialize IndexedDB", err); }
+
+                // Initialize OPFS disk storage for chunk caching (if supported and enabled)
+                if (SETTINGS.useOPFSCache && supportsOPFS()) {
+                    try {
+                        await chunkDataPool.initDiskStorage();
+                    } catch (err) {
+                        logDebug('[OPFS] Failed to initialize disk storage:', err.message);
+                    }
+                }
 
                 // --- OPTIMIZATION SYSTEM INITIALIZATION (Phase 1: Pre-texture) ---
                 initBlockLookupTables();  // Initialize block type lookup tables
@@ -24202,7 +24397,15 @@ self.onmessage = async (e) => {
 
                 overlay.innerText += "\n--- OPFS ---" +
                     "\nStatus: " + opfsStatus;
-                if (opfsReady && chunkDiskStorage) {
+                if (chunkDataPool.diskStorageReady) {
+                    const poolStats = chunkDataPool.getOPFSStats();
+                    overlay.innerText += "\nCached: " + poolStats.cachedCount + " chunks" +
+                        (poolStats.dirtyCount > 0 ? " (" + poolStats.dirtyCount + " dirty)" : "") +
+                        "\nHits: " + poolStats.hits + " | Misses: " + poolStats.misses + " (" + poolStats.hitRate + ")" +
+                        "\nDisk I/O: R:" + poolStats.readMB + "MB W:" + poolStats.writeMB + "MB" +
+                        "\nEvict writes: " + poolStats.evictionWrites;
+                } else if (opfsReady && chunkDiskStorage) {
+                    // Fallback to direct storage stats if pool not initialized
                     const opfsStats = chunkDiskStorage.getOperationStats();
                     overlay.innerText += "\nOps: W:" + opfsStats.writes + " R:" + opfsStats.reads +
                         " (Hit:" + opfsStats.hitRate + ")" +
@@ -31019,9 +31222,71 @@ self.onmessage = async (e) => {
                     const chunkHeight = WORLD_DIMS.chunkHeight;
                     const startX = cx * chunkSize;
                     const startZ = cz * chunkSize;
-                    // Try to load from cache first
-                    const cachedData = await loadChunkFromCache(key);
                     const expectedSize = chunkSize * chunkSize * chunkHeight;
+
+                    // === LOADING PRIORITY ===
+                    // 1. RAM (already loaded) - instant
+                    // 2. OPFS disk cache - fast (~5-15ms)
+                    // 3. IndexedDB - medium (~20-50ms)
+                    // 4. Generate new - slow (~50-100ms)
+
+                    // 1. Already in RAM? Return immediately
+                    if (chunks.has(key)) {
+                        const existingChunk = chunks.get(key);
+                        chunkDataPool.touch(key);
+                        return existingChunk;
+                    }
+
+                    // 2. Try OPFS disk cache (faster than IndexedDB for binary data)
+                    if (chunkDataPool.diskStorageReady && chunkDataPool.hasDiskCache(key)) {
+                        const opfsStart = performance.now();
+                        const opfsData = await chunkDataPool.loadFromDisk(key);
+                        if (opfsData && opfsData.blocks && opfsData.blocks.length === expectedSize) {
+                            opfsData.cx = cx;
+                            opfsData.cz = cz;
+                            opfsData.startX = startX;
+                            opfsData.startZ = startZ;
+
+                            // Ensure backward compatibility
+                            if (typeof opfsData.genState === 'undefined') {
+                                opfsData.genState = GEN_PASS.ALL;
+                            }
+                            if (!opfsData.sections) {
+                                opfsData.sections = createSectionData();
+                                for (let i = 0; i < opfsData.sections.length; i++) {
+                                    opfsData.sections[i].analyzed = false;
+                                }
+                            }
+
+                            // Validate and recalculate lighting if needed
+                            const lightingValid = isLightingDataValid(opfsData, expectedSize);
+                            if (!lightingValid) {
+                                calculateChunkSunlight(opfsData, chunkSize, chunkHeight);
+                                calculateBlockLight(opfsData, chunkSize, chunkHeight);
+                            }
+
+                            // Analyze sections if needed
+                            const needsAnalysis = !opfsData.sections || opfsData.sections.some(s => !s.analyzed);
+                            if (needsAnalysis) {
+                                analyzeChunkSections(opfsData);
+                            }
+
+                            const opfsTime = performance.now() - opfsStart;
+                            if (isDebug) {
+                                logDebug(`[OPFS] Chunk ${key} loaded in ${opfsTime.toFixed(2)}ms`);
+                            }
+
+                            chunks.set(key, opfsData);
+                            chunkDataPool.register(key, opfsData);
+                            if (!lightingValid) {
+                                queueAdjacentChunksForUpdate(cx, cz, key);
+                            }
+                            return opfsData;
+                        }
+                    }
+
+                    // 3. Try IndexedDB cache
+                    const cachedData = await loadChunkFromCache(key);
                     // Only use cached data if it has the correct size (handles world height changes)
                     if (cachedData && cachedData.blocks && cachedData.blocks.length === expectedSize) {
                         cachedData.cx = cx;
@@ -31153,7 +31418,14 @@ self.onmessage = async (e) => {
                     // Queue adjacent chunks for update (cross-chunk features like trees, lighting)
                     queueAdjacentChunksForUpdate(cx, cz, key);
 
+                    // Save to IndexedDB (long-term persistence)
                     await saveChunkToCache(key, chunk);
+
+                    // Also write to OPFS disk cache (faster reload, fire-and-forget)
+                    if (chunkDataPool.diskStorageReady) {
+                        chunkDataPool.writeToDisk(key, chunk).catch(() => {});
+                    }
+
                     return chunk;
                 } catch (error) {
                     logError("GENERATE_CHUNK", `Error generating chunk data (${cx}, ${cz})`, error);
