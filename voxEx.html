@@ -20345,27 +20345,42 @@
 
             /**
              * Check if OPFS (Origin Private File System) is supported.
-             * Requires navigator.storage.getDirectory and FileSystemSyncAccessHandle.
+             * Requires HTTP/HTTPS protocol, navigator.storage.getDirectory, and FileSystemSyncAccessHandle.
+             * Sets supportsOPFS.reason to explain why OPFS is/isn't available.
              * @returns {boolean} True if OPFS is supported
              */
             function supportsOPFS() {
                 try {
-                    // Check for storage.getDirectory (OPFS root access)
-                    if (!navigator?.storage?.getDirectory) {
+                    // Check for file:// protocol - OPFS requires HTTP/HTTPS
+                    if (location.protocol === 'file:') {
+                        supportsOPFS.reason = 'file-protocol';
                         return false;
                     }
+
+                    // Check for storage.getDirectory (OPFS root access)
+                    if (!navigator?.storage?.getDirectory) {
+                        supportsOPFS.reason = 'no-storage-api';
+                        return false;
+                    }
+
                     // Check for FileSystemSyncAccessHandle (sync I/O in workers)
                     // This is only available in workers, so we check for the constructor
                     if (typeof FileSystemSyncAccessHandle === 'undefined') {
                         // FileSystemSyncAccessHandle may not be exposed on main thread
                         // but still available in workers. Check for OPFS directory support as proxy.
+                        supportsOPFS.reason = 'supported';
                         return true;
                     }
+
+                    supportsOPFS.reason = 'supported';
                     return true;
                 } catch (e) {
+                    supportsOPFS.reason = 'error';
                     return false;
                 }
             }
+            // Initialize reason
+            supportsOPFS.reason = 'unchecked';
 
             // --- OPFS Web Worker Code (Inline for single-file architecture) ---
             const OPFS_WORKER_CODE = `
@@ -20879,21 +20894,41 @@ self.onmessage = async (e) => {
             /**
              * Test OPFS functionality.
              * Writes, reads, verifies, and deletes a test chunk.
-             * @returns {Promise<{success: boolean, message: string, timing?: Object}>}
+             * @returns {Promise<{success: boolean, message: string, reason?: string, suggestion?: string, timing?: Object}>}
              */
             async function testChunkDiskStorage() {
                 const result = {
                     success: false,
                     message: '',
+                    reason: null,
+                    suggestion: null,
                     timing: {}
                 };
 
                 console.log('[OPFS Test] Starting...');
 
-                // Check support
+                // Check support with detailed reason
                 if (!supportsOPFS()) {
-                    result.message = 'OPFS not supported in this browser';
-                    console.warn('[OPFS Test]', result.message);
+                    const reason = supportsOPFS.reason;
+                    result.reason = reason;
+
+                    // Provide specific messages and suggestions based on reason
+                    if (reason === 'file-protocol') {
+                        result.message = 'OPFS disabled: file:// protocol not supported';
+                        result.suggestion = 'Run a local server: python -m http.server 8080, then open http://localhost:8080/voxEx.html';
+                        console.warn('[OPFS Test] %cfile:// protocol detected', 'color: #ff9800; font-weight: bold');
+                        console.info('[OPFS Test] To test OPFS, serve the file over HTTP/HTTPS');
+                        console.info('[OPFS Test] Try: python -m http.server 8080');
+                    } else if (reason === 'no-storage-api') {
+                        result.message = 'OPFS not supported: Storage API unavailable';
+                        result.suggestion = 'Try a modern browser (Chrome 102+, Firefox 111+, Edge 102+)';
+                        console.warn('[OPFS Test]', result.message);
+                    } else {
+                        result.message = `OPFS not supported: ${reason}`;
+                        result.suggestion = 'Check browser compatibility at https://caniuse.com/native-filesystem-api';
+                        console.warn('[OPFS Test]', result.message);
+                    }
+
                     return result;
                 }
 
@@ -20987,7 +21022,31 @@ self.onmessage = async (e) => {
             window.supportsOPFS = supportsOPFS;
 
             // Log OPFS support status on init
-            logDebug(`[OPFS] Support check: ${supportsOPFS() ? 'Supported' : 'Not supported'}`);
+            (function logOPFSStatus() {
+                const supported = supportsOPFS();
+                const reason = supportsOPFS.reason;
+
+                if (supported) {
+                    logDebug('[OPFS] Support check: Supported');
+                } else if (reason === 'file-protocol') {
+                    // Friendly message for file:// protocol users
+                    console.warn(
+                        '%c[VoxEx] OPFS disk storage disabled (file:// protocol)',
+                        'color: #ff9800; font-weight: bold'
+                    );
+                    console.info(
+                        '%c[VoxEx] OPFS requires HTTP/HTTPS. To enable disk-based chunk storage:\n' +
+                        '  1. Open a terminal in the VoxEx folder\n' +
+                        '  2. Run: python -m http.server 8080\n' +
+                        '  3. Open: http://localhost:8080/voxEx.html\n\n' +
+                        'The game works fine without OPFS, but will use more RAM for chunk data.',
+                        'color: #2196f3'
+                    );
+                    logDebug('[OPFS] Disabled: file:// protocol detected');
+                } else {
+                    logDebug(`[OPFS] Support check: Not supported (${reason})`);
+                }
+            })();
 
             // --- CHUNK MODIFICATION TRACKING & AUTO-SAVE ---
             const chunkAutoSave = {
@@ -24122,9 +24181,27 @@ self.onmessage = async (e) => {
 
                 // Add OPFS (disk storage) status
                 const opfsSupported = supportsOPFS();
+                const opfsReason = supportsOPFS.reason;
                 const opfsReady = chunkDiskStorage?.isReady() ?? false;
+
+                // Build status string with reason for unsupported cases
+                let opfsStatus;
+                if (opfsSupported) {
+                    opfsStatus = opfsReady ? "Ready" : "Supported";
+                } else {
+                    // Show user-friendly reason
+                    const reasonLabels = {
+                        'file-protocol': 'file:// protocol',
+                        'no-storage-api': 'No Storage API',
+                        'no-sync-handle': 'No SyncHandle',
+                        'error': 'Error',
+                        'unchecked': 'Unchecked'
+                    };
+                    opfsStatus = reasonLabels[opfsReason] || opfsReason;
+                }
+
                 overlay.innerText += "\n--- OPFS ---" +
-                    "\nStatus: " + (opfsSupported ? (opfsReady ? "Ready" : "Supported") : "Not Supported");
+                    "\nStatus: " + opfsStatus;
                 if (opfsReady && chunkDiskStorage) {
                     const opfsStats = chunkDiskStorage.getOperationStats();
                     overlay.innerText += "\nOps: W:" + opfsStats.writes + " R:" + opfsStats.reads +
