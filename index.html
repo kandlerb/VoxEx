@@ -178,8 +178,8 @@
             position: absolute;
             top: -9999px;
             left: -9999px;
-            width: 256px;
-            height: 256px;
+            width: 512px;
+            height: 512px;
         }
         noscript .container {
             text-align: center;
@@ -384,6 +384,9 @@
         async function runBenchmark() {
             return new Promise((resolve) => {
                 const canvas = document.getElementById('benchmark-canvas');
+                // Use larger canvas for meaningful fill rate testing
+                canvas.width = 512;
+                canvas.height = 512;
                 const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
 
                 if (!gl) {
@@ -391,22 +394,72 @@
                     return;
                 }
 
-                // Simple triangle benchmark
-                const vertices = new Float32Array([
-                    -1, -1, 0,  1, -1, 0,  0, 1, 0
-                ]);
+                // Create a more representative workload: textured quads with vertex colors (like voxel faces)
+                // 100 quads = 200 triangles, similar to a small chunk
+                const quadCount = 100;
+                const vertices = [];
+                const colors = [];
 
-                const buffer = gl.createBuffer();
-                gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-                gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+                for (let i = 0; i < quadCount; i++) {
+                    // Random positions across the canvas
+                    const x = (Math.random() - 0.5) * 1.8;
+                    const y = (Math.random() - 0.5) * 1.8;
+                    const size = 0.1 + Math.random() * 0.1;
 
+                    // Two triangles per quad
+                    vertices.push(
+                        x, y, 0,
+                        x + size, y, 0,
+                        x + size, y + size, 0,
+                        x, y, 0,
+                        x + size, y + size, 0,
+                        x, y + size, 0
+                    );
+
+                    // Vertex colors simulating AO (like voxel faces)
+                    const ao1 = 0.5 + Math.random() * 0.5;
+                    const ao2 = 0.5 + Math.random() * 0.5;
+                    const ao3 = 0.5 + Math.random() * 0.5;
+                    const ao4 = 0.5 + Math.random() * 0.5;
+                    colors.push(
+                        ao1, ao1, ao1,
+                        ao2, ao2, ao2,
+                        ao3, ao3, ao3,
+                        ao1, ao1, ao1,
+                        ao3, ao3, ao3,
+                        ao4, ao4, ao4
+                    );
+                }
+
+                const vertexData = new Float32Array(vertices);
+                const colorData = new Float32Array(colors);
+
+                const posBuffer = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, vertexData, gl.STATIC_DRAW);
+
+                const colorBuffer = gl.createBuffer();
+                gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+                gl.bufferData(gl.ARRAY_BUFFER, colorData, gl.STATIC_DRAW);
+
+                // Shader with vertex colors (simulates voxel AO rendering)
                 const vsSource = `
                     attribute vec3 position;
-                    void main() { gl_Position = vec4(position, 1.0); }
+                    attribute vec3 color;
+                    varying vec3 vColor;
+                    void main() {
+                        vColor = color;
+                        gl_Position = vec4(position, 1.0);
+                    }
                 `;
                 const fsSource = `
                     precision mediump float;
-                    void main() { gl_FragColor = vec4(0.5, 0.7, 1.0, 1.0); }
+                    varying vec3 vColor;
+                    void main() {
+                        // Simulate texture lookup cost with some math
+                        float light = vColor.r * 0.8 + 0.2;
+                        gl_FragColor = vec4(vec3(0.4, 0.6, 0.3) * light, 1.0);
+                    }
                 `;
 
                 function createShader(type, source) {
@@ -423,39 +476,59 @@
                 gl.useProgram(program);
 
                 const posLoc = gl.getAttribLocation(program, 'position');
-                gl.enableVertexAttribArray(posLoc);
-                gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+                const colorLoc = gl.getAttribLocation(program, 'color');
 
-                // Warm up
-                for (let i = 0; i < 10; i++) {
-                    gl.clear(gl.COLOR_BUFFER_BIT);
-                    for (let j = 0; j < 1000; j++) {
-                        gl.drawArrays(gl.TRIANGLES, 0, 3);
+                // Function to run a single benchmark sample
+                function runSample() {
+                    const drawCalls = 500;  // Draw the scene 500 times per sample
+                    const vertexCount = quadCount * 6;
+
+                    // Ensure GPU is ready
+                    gl.finish();
+
+                    const start = performance.now();
+
+                    for (let i = 0; i < drawCalls; i++) {
+                        gl.clear(gl.COLOR_BUFFER_BIT);
+
+                        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+                        gl.enableVertexAttribArray(posLoc);
+                        gl.vertexAttribPointer(posLoc, 3, gl.FLOAT, false, 0, 0);
+
+                        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+                        gl.enableVertexAttribArray(colorLoc);
+                        gl.vertexAttribPointer(colorLoc, 3, gl.FLOAT, false, 0, 0);
+
+                        gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
                     }
+
+                    gl.finish();  // Wait for GPU to complete
+                    const elapsed = performance.now() - start;
+
+                    // Score = draw calls completed per second (higher = better)
+                    return Math.round((drawCalls / elapsed) * 1000);
                 }
-                gl.finish();
 
-                // Benchmark
-                const iterations = 50;
-                const drawsPerIteration = 5000;
-                const start = performance.now();
+                // Warmup run (discard result)
+                runSample();
 
-                for (let i = 0; i < iterations; i++) {
-                    gl.clear(gl.COLOR_BUFFER_BIT);
-                    for (let j = 0; j < drawsPerIteration; j++) {
-                        gl.drawArrays(gl.TRIANGLES, 0, 3);
-                    }
+                // Run 3 samples and take median for stability
+                const samples = [];
+                for (let i = 0; i < 3; i++) {
+                    samples.push(runSample());
                 }
-                gl.finish();
-
-                const elapsed = performance.now() - start;
-                const fps = Math.round((iterations / elapsed) * 1000);
+                samples.sort((a, b) => a - b);
+                const medianScore = samples[1];  // Middle value
 
                 // Cleanup
-                gl.deleteBuffer(buffer);
+                gl.deleteBuffer(posBuffer);
+                gl.deleteBuffer(colorBuffer);
                 gl.deleteProgram(program);
 
-                resolve(fps);
+                // Store raw samples for debugging (optional: display in UI)
+                console.log('[Benchmark] Samples:', samples, 'Median:', medianScore);
+
+                resolve(medianScore);
             });
         }
 
@@ -479,11 +552,33 @@
             errorContainer.appendChild(div);
         }
 
-        function getPerformanceTier(fps) {
-            if (fps >= 800) return { tier: 'High', color: '#10b981', suggestion: 'Max settings recommended: Render Distance 16+, Shadows On, All Effects' };
-            if (fps >= 400) return { tier: 'Medium', color: '#f59e0b', suggestion: 'Balanced settings recommended: Render Distance 10-12, Shadows On, Volumetrics Off' };
-            if (fps >= 150) return { tier: 'Low', color: '#f97316', suggestion: 'Performance settings recommended: Render Distance 6-8, Shadows Off, Minimal Effects' };
-            return { tier: 'Very Low', color: '#ef4444', suggestion: 'Minimum settings recommended: Render Distance 4-6, All Effects Off. Expect reduced FPS.' };
+        function getPerformanceTier(score) {
+            // Thresholds calibrated for new benchmark (draw calls per second with 100 quads)
+            // High-end GPU: 4000+ | Mid-range: 2000-4000 | Low-end: 800-2000 | Very low: <800
+            if (score >= 4000) return {
+                tier: 'High',
+                color: '#4caf50',
+                suggestion: 'Max settings recommended: Render Distance 16+, Shadows On, All Effects',
+                score: score
+            };
+            if (score >= 2000) return {
+                tier: 'Medium',
+                color: '#ff9800',
+                suggestion: 'Balanced settings recommended: Render Distance 10-12, Shadows On, Volumetrics Off',
+                score: score
+            };
+            if (score >= 800) return {
+                tier: 'Low',
+                color: '#ff5722',
+                suggestion: 'Performance settings recommended: Render Distance 6-8, Shadows Off, Minimal Effects',
+                score: score
+            };
+            return {
+                tier: 'Very Low',
+                color: '#f44336',
+                suggestion: 'Minimum settings recommended: Render Distance 4-6, All Effects Off. Expect reduced FPS.',
+                score: score
+            };
         }
 
         // ==== Main Test Runner ====
@@ -530,7 +625,7 @@
                     const perf = getPerformanceTier(benchmarkFPS);
                     benchmarkResultEl.textContent = perf.tier;
                     benchmarkResultEl.style.color = perf.color;
-                    benchmarkSuggestionEl.textContent = perf.suggestion;
+                    benchmarkSuggestionEl.textContent = `${perf.suggestion} (Score: ${perf.score})`;
                     benchmarkEl.classList.remove('hidden');
                 }
             } else {
