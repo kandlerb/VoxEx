@@ -127,7 +127,7 @@
                 top: 10px;
                 right: 10px;
                 padding: 8px 10px;
-                background: rgba(0, 0, 0, 0.7);
+                background: rgba(0, 0, 0, 0.8);
                 color: #0f0;
                 font-family: monospace;
                 font-size: 11px;
@@ -136,11 +136,25 @@
                 display: none;
                 border-radius: 6px;
                 pointer-events: none;
-                min-width: 200px;
+                min-width: 220px;
+                max-width: 280px;
             }
             #perf-overlay .perf-warn { color: #ff0; }
             #perf-overlay .perf-bad { color: #f44; }
-            #perf-overlay .perf-section { color: #8cf; margin-top: 4px; }
+            #perf-overlay .perf-good { color: #4f4; }
+            #perf-overlay .perf-section { color: #8cf; margin-top: 4px; display: block; }
+            #perf-overlay .perf-graph-container {
+                margin: 4px 0;
+                padding: 2px;
+                background: rgba(0, 0, 0, 0.5);
+                border-radius: 3px;
+            }
+            #perf-overlay #fps-graph {
+                width: 200px;
+                height: 40px;
+                display: block;
+            }
+            #perf-overlay .perf-spike { color: #f80; }
 
             /* Clickable Debug Overlay */
             #debug-overlay .debug-line {
@@ -1803,7 +1817,7 @@
         <div id="crosshair" style="display: none"></div>
         <div id="torch-overlay"></div>
         <div id="debug-overlay">Debug Mode Active</div>
-        <div id="perf-overlay">Performance Monitor</div>
+        <div id="perf-overlay"><div class="perf-graph-container"><canvas id="fps-graph" width="200" height="40"></canvas></div><div id="perf-text">Performance Monitor</div></div>
         <div id="pose-debug-panel">
             <button class="close-btn" onclick="togglePoseDebug()">✕</button>
             <h3>Pose Debug Mode</h3>
@@ -12375,6 +12389,7 @@
                 chunkBuildTime: 0,
                 chunkUpdateTime: 0,
                 lightingTime: 0,
+                entityTime: 0, // Entity system (zombies, player body) timing
                 // Effect timing (for verifying disabled settings skip work)
                 shadowUpdateTime: 0,
                 shadowUpdatesThisSecond: 0,
@@ -12447,6 +12462,7 @@
                     this.chunkBuildTime = 0;
                     this.chunkUpdateTime = 0;
                     this.lightingTime = 0;
+                    this.entityTime = 0;
                     // Reset effect timing
                     this.shadowUpdateTime = 0;
                     // Note: shadowUpdatesThisSecond, shadowUpdateCount, lastShadowSecond are NOT reset per frame
@@ -12463,6 +12479,83 @@
             // --- Performance Overlay Update Function ---
             let perfOverlayUpdateCounter = 0;
             const PERF_OVERLAY_UPDATE_INTERVAL = 10; // Update every 10 frames
+            let _fpsGraphCtx = null; // Cached canvas context
+
+            /**
+             * Draw FPS history graph on canvas.
+             * @param {CanvasRenderingContext2D} ctx - Canvas 2D context.
+             * @param {number} width - Canvas width.
+             * @param {number} height - Canvas height.
+             */
+            function drawFPSGraph(ctx, width, height) {
+                // Clear canvas
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+                ctx.fillRect(0, 0, width, height);
+
+                // Get FPS history from PerformanceMonitor
+                const history = perfMonitor.getHistory('fps');
+                if (history.length < 2) return;
+
+                // Draw thresholds
+                const maxFPS = 70;
+                const minFPS = 0;
+                const range = maxFPS - minFPS;
+
+                // 60fps line (green)
+                const y60 = height - ((60 - minFPS) / range) * height;
+                ctx.strokeStyle = 'rgba(0, 255, 0, 0.3)';
+                ctx.setLineDash([2, 2]);
+                ctx.beginPath();
+                ctx.moveTo(0, y60);
+                ctx.lineTo(width, y60);
+                ctx.stroke();
+
+                // 30fps line (yellow warning)
+                const y30 = height - ((30 - minFPS) / range) * height;
+                ctx.strokeStyle = 'rgba(255, 255, 0, 0.3)';
+                ctx.beginPath();
+                ctx.moveTo(0, y30);
+                ctx.lineTo(width, y30);
+                ctx.stroke();
+
+                ctx.setLineDash([]);
+
+                // Draw FPS line
+                const step = width / (history.length - 1);
+                ctx.beginPath();
+                ctx.moveTo(0, height - ((Math.min(history[0], maxFPS) - minFPS) / range) * height);
+
+                for (let i = 1; i < history.length; i++) {
+                    const fps = Math.min(Math.max(history[i], minFPS), maxFPS);
+                    const x = i * step;
+                    const y = height - ((fps - minFPS) / range) * height;
+                    ctx.lineTo(x, y);
+                }
+
+                // Color based on average FPS
+                const avgFPS = perfMonitor.averages.fps;
+                if (avgFPS >= 55) {
+                    ctx.strokeStyle = '#4f4';
+                } else if (avgFPS >= 30) {
+                    ctx.strokeStyle = '#ff0';
+                } else {
+                    ctx.strokeStyle = '#f44';
+                }
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+
+                // Draw current FPS value
+                ctx.fillStyle = ctx.strokeStyle;
+                ctx.font = '10px monospace';
+                ctx.fillText(`${avgFPS.toFixed(0)} FPS`, 3, 10);
+
+                // Draw worst frame indicator
+                const worstMs = perfMonitor.getWorstFrameTime(300);
+                if (worstMs > 33) {
+                    ctx.fillStyle = '#f80';
+                    ctx.fillText(`worst: ${worstMs.toFixed(0)}ms`, width - 60, 10);
+                }
+            }
 
             function updatePerfOverlay() {
                 perfOverlayUpdateCounter++;
@@ -12472,8 +12565,19 @@
                 const overlay = document.getElementById("perf-overlay");
                 if (!overlay || !isDebug) return;
 
+                // Draw FPS graph
+                const canvas = document.getElementById("fps-graph");
+                if (canvas) {
+                    if (!_fpsGraphCtx) {
+                        _fpsGraphCtx = canvas.getContext('2d');
+                    }
+                    if (_fpsGraphCtx) {
+                        drawFPSGraph(_fpsGraphCtx, canvas.width, canvas.height);
+                    }
+                }
+
                 const fps = perfMetrics.frameTimeAvg > 0 ? (1000 / perfMetrics.frameTimeAvg).toFixed(0) : '--';
-                const fpsColor = perfMetrics.frameTimeAvg < 16.67 ? '' : perfMetrics.frameTimeAvg < 33 ? 'perf-warn' : 'perf-bad';
+                const fpsColor = perfMetrics.frameTimeAvg < 16.67 ? 'perf-good' : perfMetrics.frameTimeAvg < 33 ? 'perf-warn' : 'perf-bad';
 
                 // Collect stats
                 const chunkDataCount = chunks.size;
@@ -12607,7 +12711,38 @@
                     }
                 }
 
-                overlay.innerHTML = html;
+                // Performance Monitor advanced metrics
+                html += `<span class="perf-section">── Profiler ──</span>\n`;
+                // JS heap memory (Chrome only)
+                if (perfMonitor.memory.jsHeapMB > 0) {
+                    const heapPercent = (perfMonitor.memory.jsHeapMB / perfMonitor.memory.jsHeapLimitMB * 100).toFixed(0);
+                    const heapColor = heapPercent > 80 ? 'perf-bad' : heapPercent > 60 ? 'perf-warn' : '';
+                    html += `<span class="${heapColor}">JS Heap: ${perfMonitor.memory.jsHeapMB.toFixed(1)}MB (${heapPercent}%)</span>\n`;
+                }
+                // Spike detection
+                const spikeCount = perfMonitor.spikes.totalCount;
+                const recentSpikes = perfMonitor.spikes.recentSpikes.length;
+                if (spikeCount > 0) {
+                    const spikeColor = recentSpikes > 3 ? 'perf-bad' : recentSpikes > 0 ? 'perf-spike' : '';
+                    html += `<span class="${spikeColor}">Spikes: ${spikeCount} total (${recentSpikes} recent)</span>\n`;
+                }
+                // GC detection
+                if (perfMonitor.memory.gcPauseDetected) {
+                    html += `<span class="perf-spike">⚠ GC pause detected</span>\n`;
+                }
+                // Entity timing
+                if (perfMetrics.entityTime > 0) {
+                    const entityColor = perfMetrics.entityTime > 4 ? 'perf-warn' : '';
+                    html += `<span class="${entityColor}">Entities: ${perfMetrics.entityTime.toFixed(2)}ms</span>\n`;
+                }
+
+                // Update the text content (graph is rendered separately)
+                const perfText = document.getElementById("perf-text");
+                if (perfText) {
+                    perfText.innerHTML = html;
+                } else {
+                    overlay.innerHTML = html;
+                }
             }
 
             let camera, scene, renderer, controls, raycaster;
@@ -12698,30 +12833,257 @@
             }
             function logDebug(message, ...args) { if (isDebug) { console.log(`[VoxEx Debug]:`, message, ...args); }}
             function logWarn(message, ...args) { if (isDebug) { console.warn(`[VoxEx Warning]:`, message, ...args); }}
-            const perfMonitor = { // Performance profiling system
-                enabled: false, // Enable with window.perfMonitor.enabled = true
-                samples: new Map(),
-                thresholds: {
-                    animate: 16, // 16ms = 60fps
-                    physics: 5,
-                    chunkBuild: 8,
-                    chunkUpdate: 10,
-                    rendering: 8,
-                    mousedown: 50,
-                },
-                start(label) { if (!this.enabled) return null; return performance.now(); },
+            /**
+             * PerformanceMonitor - Comprehensive performance profiling system.
+             * Tracks frame timing, section timing, memory usage, and provides historical data.
+             * @class
+             */
+            class PerformanceMonitor {
+                /**
+                 * Create a new PerformanceMonitor.
+                 */
+                constructor() {
+                    this.enabled = true; // Enabled by default for metrics collection
+                    this.logEnabled = false; // Verbose logging disabled by default
+
+                    // Historical ring buffers (5 seconds at 60fps = 300 samples)
+                    this.historySize = 300;
+                    this.history = {
+                        fps: new Float32Array(this.historySize),
+                        frameTime: new Float32Array(this.historySize),
+                        renderTime: new Float32Array(this.historySize),
+                        physicsTime: new Float32Array(this.historySize),
+                        chunkTime: new Float32Array(this.historySize),
+                        entityTime: new Float32Array(this.historySize),
+                        memoryMB: new Float32Array(this.historySize),
+                        index: 0,
+                        count: 0
+                    };
+
+                    // Section timing (active timers)
+                    this.sectionTimers = new Map();
+
+                    // Current frame metrics
+                    this.currentFrame = {
+                        startTime: 0,
+                        sections: new Map()
+                    };
+
+                    // Spike detection
+                    this.spikes = {
+                        threshold: 33, // ms (below 30fps)
+                        recentSpikes: [], // Last 10 spikes
+                        maxSpikes: 10,
+                        totalCount: 0,
+                        lastSpikeTime: 0
+                    };
+
+                    // Rolling averages (computed from history)
+                    this.averages = {
+                        fps: 60,
+                        frameTime: 16.67,
+                        renderTime: 0,
+                        physicsTime: 0,
+                        chunkTime: 0,
+                        entityTime: 0
+                    };
+
+                    // Memory tracking
+                    this.memory = {
+                        jsHeapMB: 0,
+                        jsHeapLimitMB: 0,
+                        geometries: 0,
+                        textures: 0,
+                        lastGcTime: 0,
+                        gcPauseDetected: false,
+                        gcPauseThreshold: 5 // ms - if frame takes 5ms longer than expected, might be GC
+                    };
+
+                    // Chunk metrics
+                    this.chunks = {
+                        cacheHits: 0,
+                        cacheMisses: 0,
+                        meshGenTimes: new Float32Array(100),
+                        meshGenIndex: 0,
+                        meshGenCount: 0,
+                        buildQueueDepth: 0,
+                        chunksBuiltTotal: 0,
+                        chunksBuiltThisSecond: 0,
+                        lastSecondTimestamp: 0
+                    };
+
+                    // Thresholds for warnings (legacy compatibility)
+                    this.thresholds = {
+                        animate: 16, // 16ms = 60fps
+                        physics: 5,
+                        chunkBuild: 8,
+                        chunkUpdate: 10,
+                        rendering: 8,
+                        mousedown: 50
+                    };
+
+                    // Legacy samples map for backward compatibility
+                    this.samples = new Map();
+
+                    // Frame budget tracking
+                    this._expectedFrameTime = 16.67;
+                    this._lastFrameEnd = 0;
+                }
+
+                /**
+                 * Start timing a frame.
+                 */
+                beginFrame() {
+                    if (!this.enabled) return;
+                    this.currentFrame.startTime = performance.now();
+                    this.currentFrame.sections.clear();
+                }
+
+                /**
+                 * End timing a frame and record metrics.
+                 */
+                endFrame() {
+                    if (!this.enabled || this.currentFrame.startTime === 0) return;
+
+                    const now = performance.now();
+                    const frameTime = now - this.currentFrame.startTime;
+                    const fps = frameTime > 0 ? 1000 / frameTime : 60;
+
+                    // Detect GC pauses (frame took much longer than expected)
+                    if (this._lastFrameEnd > 0) {
+                        const timeSinceLastFrame = now - this._lastFrameEnd;
+                        const actualWork = frameTime;
+                        // If time since last frame is much greater than our work time, something blocked
+                        if (timeSinceLastFrame > actualWork + this.memory.gcPauseThreshold + 5) {
+                            this.memory.gcPauseDetected = true;
+                            this.memory.lastGcTime = now;
+                            if (this.logEnabled) {
+                                logDebug(`[Perf] Possible GC pause detected: expected ${actualWork.toFixed(1)}ms, got ${timeSinceLastFrame.toFixed(1)}ms`);
+                            }
+                        } else {
+                            this.memory.gcPauseDetected = false;
+                        }
+                    }
+                    this._lastFrameEnd = now;
+
+                    // Detect spikes
+                    if (frameTime > this.spikes.threshold) {
+                        this.spikes.totalCount++;
+                        this.spikes.lastSpikeTime = now;
+                        this.spikes.recentSpikes.push({
+                            time: now,
+                            frameTime: frameTime,
+                            sections: Object.fromEntries(this.currentFrame.sections)
+                        });
+                        if (this.spikes.recentSpikes.length > this.spikes.maxSpikes) {
+                            this.spikes.recentSpikes.shift();
+                        }
+                        if (this.logEnabled) {
+                            logDebug(`[Perf] Spike detected: ${frameTime.toFixed(2)}ms`);
+                        }
+                    }
+
+                    // Get section times from current frame
+                    const renderTime = this.currentFrame.sections.get('render') || 0;
+                    const physicsTime = this.currentFrame.sections.get('physics') || 0;
+                    const chunkTime = this.currentFrame.sections.get('chunks') || 0;
+                    const entityTime = this.currentFrame.sections.get('entities') || 0;
+
+                    // Record to history ring buffer
+                    const idx = this.history.index;
+                    this.history.fps[idx] = fps;
+                    this.history.frameTime[idx] = frameTime;
+                    this.history.renderTime[idx] = renderTime;
+                    this.history.physicsTime[idx] = physicsTime;
+                    this.history.chunkTime[idx] = chunkTime;
+                    this.history.entityTime[idx] = entityTime;
+                    this.history.memoryMB[idx] = this.memory.jsHeapMB;
+
+                    this.history.index = (idx + 1) % this.historySize;
+                    if (this.history.count < this.historySize) {
+                        this.history.count++;
+                    }
+
+                    // Update rolling averages (last 60 frames)
+                    this._updateAverages();
+
+                    // Update memory from Chrome API if available
+                    this._updateMemory();
+                }
+
+                /**
+                 * Start timing a named section.
+                 * @param {string} name - Section name.
+                 * @returns {number|null} Start timestamp or null if disabled.
+                 */
+                beginSection(name) {
+                    if (!this.enabled) return null;
+                    const start = performance.now();
+                    this.sectionTimers.set(name, start);
+                    return start;
+                }
+
+                /**
+                 * End timing a named section.
+                 * @param {string} name - Section name.
+                 * @returns {number} Duration in milliseconds.
+                 */
+                endSection(name) {
+                    if (!this.enabled) return 0;
+                    const start = this.sectionTimers.get(name);
+                    if (start === undefined) return 0;
+
+                    const duration = performance.now() - start;
+                    this.sectionTimers.delete(name);
+                    this.currentFrame.sections.set(name, duration);
+
+                    // Legacy threshold warning
+                    if (this.logEnabled) {
+                        const threshold = this.thresholds[name] || 10;
+                        if (duration > threshold) {
+                            logWarn(`[Perf] ${name} took ${duration.toFixed(2)}ms (threshold: ${threshold}ms)`);
+                        }
+                    }
+
+                    return duration;
+                }
+
+                /**
+                 * Legacy start method for backward compatibility.
+                 * @param {string} label - Section label.
+                 * @returns {number|null} Start timestamp.
+                 */
+                start(label) {
+                    if (!this.enabled) return null;
+                    return performance.now();
+                }
+
+                /**
+                 * Legacy end method for backward compatibility.
+                 * @param {string} label - Section label.
+                 * @param {number|null} startTime - Start timestamp from start().
+                 */
                 end(label, startTime) {
                     if (!this.enabled || startTime === null) return;
                     const duration = performance.now() - startTime;
                     const threshold = this.thresholds[label] || 10;
-                    if (duration > threshold) { logWarn(`[Performance] ${label} took ${duration.toFixed(2)}ms (threshold: ${threshold}ms)`); }
-                    // Track samples for averaging
-                    if (!this.samples.has(label)) { this.samples.set(label, []); }
+                    if (this.logEnabled && duration > threshold) {
+                        logWarn(`[Perf] ${label} took ${duration.toFixed(2)}ms (threshold: ${threshold}ms)`);
+                    }
+                    // Track samples for legacy compatibility
+                    if (!this.samples.has(label)) {
+                        this.samples.set(label, []);
+                    }
                     const samples = this.samples.get(label);
                     samples.push({ time: performance.now(), duration });
-                    // Keep only last 100 samples
                     if (samples.length > 100) samples.shift();
-                },
+                }
+
+                /**
+                 * Legacy getStats method for backward compatibility.
+                 * @param {string} label - Section label.
+                 * @returns {Object|null} Stats object or null.
+                 */
                 getStats(label) {
                     const samples = this.samples.get(label);
                     if (!samples || samples.length === 0) return null;
@@ -12730,9 +13092,477 @@
                     const max = Math.max(...durations);
                     const min = Math.min(...durations);
                     return { avg: avg.toFixed(2), max: max.toFixed(2), min: min.toFixed(2), count: samples.length };
-                },
-            };
+                }
+
+                /**
+                 * Update rolling averages from history buffer.
+                 * @private
+                 */
+                _updateAverages() {
+                    const windowSize = Math.min(60, this.history.count);
+                    if (windowSize === 0) return;
+
+                    let fpsSum = 0, frameSum = 0, renderSum = 0, physicsSum = 0, chunkSum = 0, entitySum = 0;
+
+                    for (let i = 0; i < windowSize; i++) {
+                        const idx = (this.history.index - 1 - i + this.historySize) % this.historySize;
+                        fpsSum += this.history.fps[idx];
+                        frameSum += this.history.frameTime[idx];
+                        renderSum += this.history.renderTime[idx];
+                        physicsSum += this.history.physicsTime[idx];
+                        chunkSum += this.history.chunkTime[idx];
+                        entitySum += this.history.entityTime[idx];
+                    }
+
+                    this.averages.fps = fpsSum / windowSize;
+                    this.averages.frameTime = frameSum / windowSize;
+                    this.averages.renderTime = renderSum / windowSize;
+                    this.averages.physicsTime = physicsSum / windowSize;
+                    this.averages.chunkTime = chunkSum / windowSize;
+                    this.averages.entityTime = entitySum / windowSize;
+                }
+
+                /**
+                 * Update memory metrics from browser APIs.
+                 * @private
+                 */
+                _updateMemory() {
+                    // Chrome-only memory API
+                    if (performance.memory) {
+                        this.memory.jsHeapMB = performance.memory.usedJSHeapSize / (1024 * 1024);
+                        this.memory.jsHeapLimitMB = performance.memory.jsHeapSizeLimit / (1024 * 1024);
+                    }
+
+                    // Three.js renderer info
+                    if (typeof renderer !== 'undefined' && renderer && renderer.info) {
+                        this.memory.geometries = renderer.info.memory.geometries;
+                        this.memory.textures = renderer.info.memory.textures;
+                    }
+                }
+
+                /**
+                 * Record a chunk cache hit.
+                 */
+                recordCacheHit() {
+                    this.chunks.cacheHits++;
+                }
+
+                /**
+                 * Record a chunk cache miss.
+                 */
+                recordCacheMiss() {
+                    this.chunks.cacheMisses++;
+                }
+
+                /**
+                 * Record chunk mesh generation time.
+                 * @param {number} timeMs - Generation time in ms.
+                 */
+                recordMeshGenTime(timeMs) {
+                    this.chunks.meshGenTimes[this.chunks.meshGenIndex] = timeMs;
+                    this.chunks.meshGenIndex = (this.chunks.meshGenIndex + 1) % 100;
+                    if (this.chunks.meshGenCount < 100) this.chunks.meshGenCount++;
+                }
+
+                /**
+                 * Record that a chunk was built.
+                 */
+                recordChunkBuilt() {
+                    this.chunks.chunksBuiltTotal++;
+                    const now = performance.now();
+                    if (now - this.chunks.lastSecondTimestamp > 1000) {
+                        this.chunks.chunksBuiltThisSecond = 1;
+                        this.chunks.lastSecondTimestamp = now;
+                    } else {
+                        this.chunks.chunksBuiltThisSecond++;
+                    }
+                }
+
+                /**
+                 * Update build queue depth.
+                 * @param {number} depth - Current queue depth.
+                 */
+                updateBuildQueueDepth(depth) {
+                    this.chunks.buildQueueDepth = depth;
+                }
+
+                /**
+                 * Get average mesh generation time.
+                 * @returns {number} Average time in ms.
+                 */
+                getAvgMeshGenTime() {
+                    if (this.chunks.meshGenCount === 0) return 0;
+                    let sum = 0;
+                    for (let i = 0; i < this.chunks.meshGenCount; i++) {
+                        sum += this.chunks.meshGenTimes[i];
+                    }
+                    return sum / this.chunks.meshGenCount;
+                }
+
+                /**
+                 * Get chunk throughput (chunks built per second).
+                 * @returns {number} Chunks per second.
+                 */
+                getChunkThroughput() {
+                    return this.chunks.chunksBuiltThisSecond;
+                }
+
+                /**
+                 * Get cache hit rate.
+                 * @returns {number} Hit rate (0-1).
+                 */
+                getCacheHitRate() {
+                    const total = this.chunks.cacheHits + this.chunks.cacheMisses;
+                    return total > 0 ? this.chunks.cacheHits / total : 0;
+                }
+
+                /**
+                 * Get historical data for a metric.
+                 * @param {string} metric - Metric name ('fps', 'frameTime', etc.).
+                 * @returns {Float32Array} Historical data array.
+                 */
+                getHistory(metric) {
+                    const data = this.history[metric];
+                    if (!data) return new Float32Array(0);
+
+                    // Return data in chronological order
+                    const result = new Float32Array(this.history.count);
+                    for (let i = 0; i < this.history.count; i++) {
+                        const idx = (this.history.index - this.history.count + i + this.historySize) % this.historySize;
+                        result[i] = data[idx];
+                    }
+                    return result;
+                }
+
+                /**
+                 * Get worst frame time in last N samples.
+                 * @param {number} [windowSize=300] - Number of samples to check.
+                 * @returns {number} Worst frame time in ms.
+                 */
+                getWorstFrameTime(windowSize = 300) {
+                    const samples = Math.min(windowSize, this.history.count);
+                    if (samples === 0) return 0;
+
+                    let worst = 0;
+                    for (let i = 0; i < samples; i++) {
+                        const idx = (this.history.index - 1 - i + this.historySize) % this.historySize;
+                        if (this.history.frameTime[idx] > worst) {
+                            worst = this.history.frameTime[idx];
+                        }
+                    }
+                    return worst;
+                }
+
+                /**
+                 * Get comprehensive metrics object.
+                 * @returns {Object} Current metrics.
+                 */
+                getMetrics() {
+                    return {
+                        // Frame timing
+                        fps: this.averages.fps,
+                        frameTime: this.averages.frameTime,
+                        frameTimeWorst: this.getWorstFrameTime(),
+
+                        // Section timing
+                        renderTime: this.averages.renderTime,
+                        physicsTime: this.averages.physicsTime,
+                        chunkTime: this.averages.chunkTime,
+                        entityTime: this.averages.entityTime,
+
+                        // Memory
+                        jsHeapMB: this.memory.jsHeapMB,
+                        jsHeapLimitMB: this.memory.jsHeapLimitMB,
+                        geometries: this.memory.geometries,
+                        textures: this.memory.textures,
+                        gcPauseDetected: this.memory.gcPauseDetected,
+
+                        // Chunks
+                        cacheHitRate: this.getCacheHitRate(),
+                        cacheHits: this.chunks.cacheHits,
+                        cacheMisses: this.chunks.cacheMisses,
+                        avgMeshGenTime: this.getAvgMeshGenTime(),
+                        buildQueueDepth: this.chunks.buildQueueDepth,
+                        chunksPerSecond: this.getChunkThroughput(),
+
+                        // Spikes
+                        spikeCount: this.spikes.totalCount,
+                        recentSpikes: this.spikes.recentSpikes.length
+                    };
+                }
+
+                /**
+                 * Export metrics as JSON for analysis.
+                 * @returns {Object} Exportable metrics object.
+                 */
+                exportMetrics() {
+                    return {
+                        timestamp: new Date().toISOString(),
+                        summary: this.getMetrics(),
+                        history: {
+                            fps: Array.from(this.getHistory('fps')),
+                            frameTime: Array.from(this.getHistory('frameTime')),
+                            renderTime: Array.from(this.getHistory('renderTime')),
+                            physicsTime: Array.from(this.getHistory('physicsTime')),
+                            chunkTime: Array.from(this.getHistory('chunkTime')),
+                            memoryMB: Array.from(this.getHistory('memoryMB'))
+                        },
+                        spikes: this.spikes.recentSpikes,
+                        chunks: {
+                            cacheHits: this.chunks.cacheHits,
+                            cacheMisses: this.chunks.cacheMisses,
+                            totalBuilt: this.chunks.chunksBuiltTotal
+                        }
+                    };
+                }
+
+                /**
+                 * Export metrics as CSV string.
+                 * @returns {string} CSV formatted data.
+                 */
+                exportCSV() {
+                    const history = this.exportMetrics().history;
+                    const lines = ['timestamp,fps,frameTime,renderTime,physicsTime,chunkTime,memoryMB'];
+                    const count = history.fps.length;
+
+                    for (let i = 0; i < count; i++) {
+                        lines.push([
+                            i,
+                            history.fps[i].toFixed(2),
+                            history.frameTime[i].toFixed(2),
+                            history.renderTime[i].toFixed(2),
+                            history.physicsTime[i].toFixed(2),
+                            history.chunkTime[i].toFixed(2),
+                            history.memoryMB[i].toFixed(2)
+                        ].join(','));
+                    }
+
+                    return lines.join('\n');
+                }
+
+                /**
+                 * Print metrics summary to console.
+                 */
+                printSummary() {
+                    const m = this.getMetrics();
+                    console.log('%c[Performance Summary]', 'color: #0af; font-weight: bold;');
+                    console.log(`FPS: ${m.fps.toFixed(1)} (worst: ${m.frameTimeWorst.toFixed(1)}ms)`);
+                    console.log(`Frame: ${m.frameTime.toFixed(2)}ms avg`);
+                    console.log(`  Render: ${m.renderTime.toFixed(2)}ms`);
+                    console.log(`  Physics: ${m.physicsTime.toFixed(2)}ms`);
+                    console.log(`  Chunks: ${m.chunkTime.toFixed(2)}ms`);
+                    console.log(`  Entities: ${m.entityTime.toFixed(2)}ms`);
+                    if (m.jsHeapMB > 0) {
+                        console.log(`Memory: ${m.jsHeapMB.toFixed(1)}MB / ${m.jsHeapLimitMB.toFixed(1)}MB`);
+                    }
+                    console.log(`GPU: ${m.geometries} geometries, ${m.textures} textures`);
+                    console.log(`Cache: ${(m.cacheHitRate * 100).toFixed(1)}% hit rate (${m.cacheHits}/${m.cacheHits + m.cacheMisses})`);
+                    console.log(`Spikes: ${m.spikeCount} total (${m.recentSpikes} recent)`);
+                }
+
+                /**
+                 * Reset all metrics.
+                 */
+                reset() {
+                    this.history.index = 0;
+                    this.history.count = 0;
+                    this.history.fps.fill(0);
+                    this.history.frameTime.fill(0);
+                    this.history.renderTime.fill(0);
+                    this.history.physicsTime.fill(0);
+                    this.history.chunkTime.fill(0);
+                    this.history.entityTime.fill(0);
+                    this.history.memoryMB.fill(0);
+
+                    this.spikes.totalCount = 0;
+                    this.spikes.recentSpikes = [];
+
+                    this.chunks.cacheHits = 0;
+                    this.chunks.cacheMisses = 0;
+                    this.chunks.meshGenIndex = 0;
+                    this.chunks.meshGenCount = 0;
+                    this.chunks.chunksBuiltTotal = 0;
+
+                    this.samples.clear();
+                }
+            }
+
+            // Create global instance
+            const perfMonitor = new PerformanceMonitor();
             window.perfMonitor = perfMonitor; // Expose to window for console access
+
+            // Console commands for performance debugging
+            window.perfDebug = {
+                /** Print performance summary to console */
+                summary: () => perfMonitor.printSummary(),
+                /** Export metrics as JSON */
+                exportJSON: () => {
+                    const data = perfMonitor.exportMetrics();
+                    console.log(JSON.stringify(data, null, 2));
+                    return data;
+                },
+                /** Export metrics as CSV and copy to clipboard */
+                exportCSV: () => {
+                    const csv = perfMonitor.exportCSV();
+                    if (navigator.clipboard) {
+                        navigator.clipboard.writeText(csv).then(() => {
+                            console.log('[Perf] CSV copied to clipboard');
+                        });
+                    }
+                    console.log(csv);
+                    return csv;
+                },
+                /** Download metrics as JSON file */
+                download: () => {
+                    const data = perfMonitor.exportMetrics();
+                    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `voxex-perf-${Date.now()}.json`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                },
+                /** Get current metrics object */
+                metrics: () => perfMonitor.getMetrics(),
+                /** Enable verbose logging */
+                enableLogging: () => { perfMonitor.logEnabled = true; console.log('[Perf] Verbose logging enabled'); },
+                /** Disable verbose logging */
+                disableLogging: () => { perfMonitor.logEnabled = false; console.log('[Perf] Verbose logging disabled'); },
+                /** Reset all metrics */
+                reset: () => { perfMonitor.reset(); console.log('[Perf] Metrics reset'); },
+
+                /**
+                 * Save current performance as baseline for regression detection.
+                 */
+                saveBaseline: () => {
+                    const baseline = {
+                        timestamp: new Date().toISOString(),
+                        fps: perfMonitor.averages.fps,
+                        frameTime: perfMonitor.averages.frameTime,
+                        renderTime: perfMonitor.averages.renderTime,
+                        physicsTime: perfMonitor.averages.physicsTime,
+                        chunkTime: perfMonitor.averages.chunkTime,
+                        spikeRate: perfMonitor.spikes.totalCount / Math.max(1, perfMonitor.history.count),
+                        memoryMB: perfMonitor.memory.jsHeapMB,
+                        settings: {
+                            renderDistance: SETTINGS.renderDistance,
+                            shadows: SETTINGS.shadows,
+                            AO: SETTINGS.AO,
+                            volumetricLightingEnabled: SETTINGS.volumetricLightingEnabled
+                        }
+                    };
+                    localStorage.setItem('voxex_perf_baseline', JSON.stringify(baseline));
+                    console.log('%c[Perf] Baseline saved', 'color: #0af;', baseline);
+                    return baseline;
+                },
+
+                /**
+                 * Compare current performance to saved baseline.
+                 * @returns {Object|null} Comparison results or null if no baseline.
+                 */
+                compareBaseline: () => {
+                    const baselineStr = localStorage.getItem('voxex_perf_baseline');
+                    if (!baselineStr) {
+                        console.warn('[Perf] No baseline saved. Run perfDebug.saveBaseline() first.');
+                        return null;
+                    }
+                    const baseline = JSON.parse(baselineStr);
+                    const current = {
+                        fps: perfMonitor.averages.fps,
+                        frameTime: perfMonitor.averages.frameTime,
+                        renderTime: perfMonitor.averages.renderTime,
+                        physicsTime: perfMonitor.averages.physicsTime,
+                        chunkTime: perfMonitor.averages.chunkTime,
+                        spikeRate: perfMonitor.spikes.totalCount / Math.max(1, perfMonitor.history.count),
+                        memoryMB: perfMonitor.memory.jsHeapMB
+                    };
+
+                    const comparison = {
+                        baseline: baseline,
+                        current: current,
+                        changes: {
+                            fps: ((current.fps - baseline.fps) / baseline.fps * 100).toFixed(1) + '%',
+                            frameTime: ((current.frameTime - baseline.frameTime) / baseline.frameTime * 100).toFixed(1) + '%',
+                            renderTime: ((current.renderTime - baseline.renderTime) / Math.max(0.1, baseline.renderTime) * 100).toFixed(1) + '%',
+                            physicsTime: ((current.physicsTime - baseline.physicsTime) / Math.max(0.1, baseline.physicsTime) * 100).toFixed(1) + '%',
+                            chunkTime: ((current.chunkTime - baseline.chunkTime) / Math.max(0.1, baseline.chunkTime) * 100).toFixed(1) + '%'
+                        },
+                        regressionDetected: current.fps < baseline.fps * 0.9 || current.frameTime > baseline.frameTime * 1.2
+                    };
+
+                    console.log('%c[Perf] Baseline Comparison', 'color: #0af; font-weight: bold;');
+                    console.log(`Baseline from: ${baseline.timestamp}`);
+                    console.log(`FPS: ${baseline.fps.toFixed(1)} → ${current.fps.toFixed(1)} (${comparison.changes.fps})`);
+                    console.log(`Frame: ${baseline.frameTime.toFixed(2)}ms → ${current.frameTime.toFixed(2)}ms (${comparison.changes.frameTime})`);
+                    if (comparison.regressionDetected) {
+                        console.warn('%c⚠ Performance regression detected!', 'color: #f44;');
+                    } else {
+                        console.log('%c✓ Performance within baseline', 'color: #4f4;');
+                    }
+                    return comparison;
+                },
+
+                /**
+                 * Suggest a performance profile based on current metrics.
+                 * @returns {string} Suggested profile name.
+                 */
+                suggestProfile: () => {
+                    const avgFPS = perfMonitor.averages.fps;
+                    const spikeRate = perfMonitor.spikes.totalCount / Math.max(1, perfMonitor.history.count);
+                    let suggestion;
+
+                    if (avgFPS >= 55 && spikeRate < 0.05) {
+                        suggestion = 'quality';
+                        console.log('%c[Perf] Suggestion: QUALITY profile', 'color: #4f4;');
+                        console.log('Your hardware handles the current load well. Try higher quality settings.');
+                    } else if (avgFPS >= 40 && spikeRate < 0.1) {
+                        suggestion = 'balanced';
+                        console.log('%c[Perf] Suggestion: BALANCED profile', 'color: #ff0;');
+                        console.log('Good performance with occasional dips. Balanced settings recommended.');
+                    } else {
+                        suggestion = 'performance';
+                        console.log('%c[Perf] Suggestion: PERFORMANCE profile', 'color: #f80;');
+                        console.log('Consider lowering settings for smoother gameplay.');
+                    }
+
+                    console.log(`Current FPS: ${avgFPS.toFixed(1)}, Spike rate: ${(spikeRate * 100).toFixed(1)}%`);
+                    console.log(`To apply: Click Settings > Graphics > "${suggestion.charAt(0).toUpperCase() + suggestion.slice(1)}" preset`);
+                    return suggestion;
+                },
+
+                /**
+                 * Run a quick benchmark (10 seconds) and report results.
+                 * @returns {Promise<Object>} Benchmark results.
+                 */
+                benchmark: async () => {
+                    console.log('%c[Perf] Starting 10-second benchmark...', 'color: #0af;');
+                    console.log('Move around and look at different areas for accurate results.');
+
+                    // Reset metrics
+                    perfMonitor.reset();
+
+                    // Wait 10 seconds
+                    await new Promise(resolve => setTimeout(resolve, 10000));
+
+                    const results = {
+                        duration: '10s',
+                        samples: perfMonitor.history.count,
+                        avgFPS: perfMonitor.averages.fps.toFixed(1),
+                        minFPS: (1000 / perfMonitor.getWorstFrameTime()).toFixed(1),
+                        avgFrameTime: perfMonitor.averages.frameTime.toFixed(2) + 'ms',
+                        worstFrameTime: perfMonitor.getWorstFrameTime().toFixed(2) + 'ms',
+                        spikeCount: perfMonitor.spikes.totalCount,
+                        memoryMB: perfMonitor.memory.jsHeapMB.toFixed(1),
+                        suggestedProfile: window.perfDebug.suggestProfile()
+                    };
+
+                    console.log('%c[Perf] Benchmark Complete', 'color: #0af; font-weight: bold;');
+                    console.table(results);
+
+                    return results;
+                }
+            };
             let prevTime = performance.now();
             let physicsAccumulator = 0;
             const FIXED_TIME_STEP = 1 / 60;
@@ -34915,7 +35745,8 @@ self.onmessage = async (e) => {
             // Main animation loop (simplified orchestrator)
             async function animate() {
                 const frameStartMs = performance.now();
-                const frameStart = perfMonitor.start("animate");
+                perfMonitor.beginFrame(); // INSTRUMENTATION: Start frame timing
+                const frameStart = perfMonitor.start("animate"); // Legacy timing
                 startFrameBudget(); // OPTIMIZATION: Track frame time budget
                 invalidateCameraDir(); // OPTIMIZATION: Invalidate camera direction cache each frame
                 matricesUpdatedThisFrame = false; // OPTIMIZATION: Reset matrix update flag for volumetric lighting
@@ -34925,10 +35756,17 @@ self.onmessage = async (e) => {
                     const rawDt = (time - prevTime) / 1000;
                     const clampedDt = Math.min(rawDt, 0.1);
                     physicsAccumulator = Math.min(physicsAccumulator + clampedDt, FIXED_TIME_STEP * MAX_PHYSICS_STEPS);
+
                     // Update chunk system with timing
+                    perfMonitor.beginSection('chunks');
                     const chunkStartMs = performance.now();
                     updateChunkSystem(time, prevTime);
                     perfMetrics.chunkUpdateTime = performance.now() - chunkStartMs;
+                    perfMonitor.endSection('chunks');
+
+                    // Update build queue depth for PerformanceMonitor
+                    perfMonitor.updateBuildQueueDepth(chunkBuildQueue.length);
+
                     // Block breaking logic
                     if (breakingBlock && controls.isLocked) {
                         breakProgress += clampedDt / BREAK_TIME;
@@ -34945,6 +35783,7 @@ self.onmessage = async (e) => {
                         }
                     }
                     frameCount++;
+
                     // Game active updates
                     if (controls.isLocked) {
                         updateDayNight(clampedDt);
@@ -34953,15 +35792,19 @@ self.onmessage = async (e) => {
                         updateUnderwaterState(); // Update underwater state and shader uniforms
                         perfMetrics.underwaterTime = performance.now() - underwaterStartMs;
                         updateFPSTracking(time, rawDt, clampedDt);
+
                         // Track physics timing
+                        perfMonitor.beginSection('physics');
                         const physicsStartMs = performance.now();
                         updatePhysicsAndMovement();
                         perfMetrics.physicsTime = performance.now() - physicsStartMs;
+                        perfMonitor.endSection('physics');
                     } else {
                         prevTime = performance.now();
                         physicsAccumulator = 0;
                     }
                     prevTime = time;
+
                     // Update memory budget manager (throttled internally)
                     if (memoryBudgetManager) memoryBudgetManager.update();
                     // Periodic geometry leak detection (every 5 seconds)
@@ -34974,25 +35817,36 @@ self.onmessage = async (e) => {
                     if (chunkAutoSave.enabled && chunkAutoSave.modifiedChunks.size > 0) {
                         chunkAutoSave.saveModifiedChunks(); // Fire-and-forget async
                     }
+
                     // UI and visual updates
                     // OPTIMIZATION: Only update debug UI every N frames
                     if (isDebug && shouldUpdateDebugUI()) updateDebugInfo(fpsInstant, fpsAvg);
                     if (isDebug) updatePerfOverlay(); // Update performance overlay
                     updateMovementIndicators();
                     updateVisualEffects(time, clampedDt);
-                    // Entity and material updates
+
+                    // Entity and material updates with timing
+                    perfMonitor.beginSection('entities');
+                    const entityStartMs = performance.now();
                     updateZombies(clampedDt);
                     updatePlayerBody(clampedDt);
+                    perfMetrics.entityTime = performance.now() - entityStartMs;
+                    perfMonitor.endSection('entities');
+
                     flushMaterialUpdates();
                     // OPTIMIZATION: Process scheduled and incremental updates
                     scheduledUpdates.process();
                     processIncrementalUpdates();
                     flushGeometryUpdates();
                     // updateTorchInstances(); // Disabled - using individual torch models instead
+
                     // Render with timing
+                    perfMonitor.beginSection('render');
                     const renderStartMs = performance.now();
                     renderFrame();
                     perfMetrics.renderTime = performance.now() - renderStartMs;
+                    perfMonitor.endSection('render');
+
                     // Update loading spinner (throttled internally)
                     if (typeof updateLoadingSpinner === "function") updateLoadingSpinner();
                 } catch (error) {
@@ -35001,6 +35855,7 @@ self.onmessage = async (e) => {
                     // Record total frame time
                     perfMetrics.recordFrameTime(performance.now() - frameStartMs);
                     perfMonitor.end("animate", frameStart);
+                    perfMonitor.endFrame(); // INSTRUMENTATION: End frame timing
                     requestAnimationFrame(animate);
                 }
             }
@@ -35041,6 +35896,22 @@ self.onmessage = async (e) => {
                 if (event.code === "F9") {
                     event.preventDefault();
                     if (typeof quickLoad === "function") quickLoad();
+                    return;
+                }
+                // O key - Toggle Performance Overlay (alternative to ~ which shows both)
+                if (event.code === "KeyO" && !event.repeat) {
+                    if (isTypingInInput()) return;
+                    const perfOverlay = document.getElementById("perf-overlay");
+                    if (perfOverlay) {
+                        const isVisible = perfOverlay.style.display !== "none";
+                        perfOverlay.style.display = isVisible ? "none" : "block";
+                        // Enable debug mode if showing perf overlay (for proper updates)
+                        if (!isVisible && !isDebug) {
+                            isDebug = true;
+                            const debugOverlay = document.getElementById("debug-overlay");
+                            if (debugOverlay) debugOverlay.style.display = "none"; // Keep debug hidden, just perf
+                        }
+                    }
                     return;
                 }
                 if (event.code === "Escape") {
