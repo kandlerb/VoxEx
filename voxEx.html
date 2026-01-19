@@ -5561,10 +5561,16 @@
             // =====================================================
             // Maximum faces per chunk (based on actual usage: ~2-3K typical, 5K common max)
             // 16×16×320 chunk = ~150K max exposed faces, but typical is ~2-3K
-            // Reduced from 24K (4.69MB) to 8K (1.56MB) per geometry to fix memory leak
-            const MAX_FACES_PER_CHUNK = 8192;   // 8K faces = ~1.56MB per geometry (66% reduction)
+            // Increased from 8K to 16K to handle complex terrain (mountains, caves)
+            // 16K faces = ~3.1MB per geometry - balance between memory and rendering all chunks
+            const MAX_FACES_PER_CHUNK = 16384;  // 16K faces = ~3.1MB per geometry
             const MAX_VERTICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 4;  // 4 vertices per face (quads)
             const MAX_INDICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 6;   // 6 indices per face (2 triangles)
+
+            // DIAGNOSTIC: Track chunks skipped due to face limit
+            let chunksSkippedDueToFaceLimit = 0;
+            window.getSkippedChunkCount = () => chunksSkippedDueToFaceLimit;
+            window.resetSkippedChunkCount = () => { chunksSkippedDueToFaceLimit = 0; };
 
             // Buffer sizes (floats/uints)
             const GEO_POS_SIZE = MAX_VERTICES_PER_CHUNK * 3;    // position: x,y,z
@@ -18424,24 +18430,34 @@
 
                 /**
                  * Acquire a terrain geometry from pool or create new.
+                 * Resets drawRange to Infinity for debugging visibility.
                  * @returns {THREE.BufferGeometry}
                  */
                 acquireTerrain() {
                     this._stats.terrainAcquired++;
                     if (this.terrainPool.length > 0) {
-                        return this.terrainPool.pop();
+                        const geo = this.terrainPool.pop();
+                        // Reset drawRange to Infinity - will be set properly in renderChunk
+                        // This ensures any rendering shows something (even if wrong) for debugging
+                        geo.setDrawRange(0, Infinity);
+                        return geo;
                     }
                     return this._createTerrainGeometry();
                 }
 
                 /**
                  * Acquire a water geometry from pool or create new.
+                 * Resets drawRange to Infinity for debugging visibility.
                  * @returns {THREE.BufferGeometry}
                  */
                 acquireWater() {
                     this._stats.waterAcquired++;
                     if (this.waterPool.length > 0) {
-                        return this.waterPool.pop();
+                        const geo = this.waterPool.pop();
+                        // Reset drawRange to Infinity - will be set properly in renderChunk
+                        // This ensures any rendering shows something (even if wrong) for debugging
+                        geo.setDrawRange(0, Infinity);
+                        return geo;
                     }
                     return this._createWaterGeometry();
                 }
@@ -33309,6 +33325,8 @@ self.onmessage = async (e) => {
                 mesh.castShadow = type === "water" ? false : SETTINGS.shadows;
                 mesh.receiveShadow = type === "water" ? false : SETTINGS.shadows;
                 mesh.renderOrder = type === "water" ? 1 : 0;
+                mesh.visible = true; // Ensure visibility when reusing pooled mesh
+                mesh.layers.set(0);  // Ensure mesh is on world layer (not viewmodel layer)
                 mesh.userData.chunkType = type;
                 mesh.userData.chunkKey = null;
                 meshLifecycleStats.acquired[type]++;
@@ -33788,9 +33806,17 @@ self.onmessage = async (e) => {
                     // --- CREATE TERRAIN MESH (INDEXED GEOMETRY WITH POOLED BUFFERS) ---
                     if (tFaceCount > 0) {
                         // Face count histogram for memory optimization analysis
-                        if (!window._faceCountHistogram) window._faceCountHistogram = {};
-                        const bucket = Math.floor(tFaceCount / 1000) * 1000;
-                        window._faceCountHistogram[bucket] = (window._faceCountHistogram[bucket] || 0) + 1;
+                        // Buckets: 0-2k, 2k-4k, 4k-8k, 8k-12k, 12k-16k, 16k+
+                        if (!window._faceCountHistogram) {
+                            window._faceCountHistogram = { '0-2k': 0, '2k-4k': 0, '4k-8k': 0, '8k-12k': 0, '12k-16k': 0, '16k+': 0 };
+                            window.printFaceHistogram = () => console.table(window._faceCountHistogram);
+                        }
+                        if (tFaceCount < 2000) window._faceCountHistogram['0-2k']++;
+                        else if (tFaceCount < 4000) window._faceCountHistogram['2k-4k']++;
+                        else if (tFaceCount < 8000) window._faceCountHistogram['4k-8k']++;
+                        else if (tFaceCount < 12000) window._faceCountHistogram['8k-12k']++;
+                        else if (tFaceCount < 16000) window._faceCountHistogram['12k-16k']++;
+                        else window._faceCountHistogram['16k+']++;
 
                         // Soft warning when approaching buffer limit (90% threshold)
                         if (tFaceCount > MAX_FACES_PER_CHUNK * 0.9) {
@@ -33799,7 +33825,8 @@ self.onmessage = async (e) => {
 
                         // Safety check: ensure we don't exceed buffer capacity
                         if (tFaceCount > MAX_FACES_PER_CHUNK) {
-                            console.warn(`[renderChunk] ${cKey}: ${tFaceCount} faces exceeds max ${MAX_FACES_PER_CHUNK}, skipping`);
+                            chunksSkippedDueToFaceLimit++;
+                            console.warn(`[renderChunk] ${cKey}: ${tFaceCount} faces exceeds max ${MAX_FACES_PER_CHUNK}, skipping (total skipped: ${chunksSkippedDueToFaceLimit})`);
                             queuedChunkKeys.delete(cKey);
                             chunkDataPool.setMeshState(cKey, MESH_STATE.STALE);
                             return;
@@ -33845,6 +33872,11 @@ self.onmessage = async (e) => {
 
                         // Set draw range to only render valid portion
                         terrainGeo.setDrawRange(0, tIIdx);
+
+                        // DIAGNOSTIC: Verify drawRange was set correctly
+                        if (terrainGeo.drawRange.count !== tIIdx) {
+                            console.error(`[renderChunk] ${cKey}: drawRange mismatch! Expected ${tIIdx}, got ${terrainGeo.drawRange.count}`);
+                        }
 
                         // Update bounds using pre-computed tight bounds from section data
                         applyTightChunkBounds(terrainGeo, tightBounds);
@@ -33916,6 +33948,11 @@ self.onmessage = async (e) => {
 
                         // Set draw range to only render valid portion
                         waterGeo.setDrawRange(0, wIIdx);
+
+                        // DIAGNOSTIC: Verify drawRange was set correctly
+                        if (waterGeo.drawRange.count !== wIIdx) {
+                            console.error(`[renderChunk] ${cKey}_WATER: drawRange mismatch! Expected ${wIIdx}, got ${waterGeo.drawRange.count}`);
+                        }
 
                         // Update bounds using pre-computed tight bounds from section data
                         applyTightChunkBounds(waterGeo, tightBounds);
@@ -35616,6 +35653,31 @@ self.onmessage = async (e) => {
 
                 // Always use composer - bypassing causes color/lighting changes
                 const useComposer = true;
+
+                // DIAGNOSTIC: Render mesh analysis (logs every ~5 seconds)
+                // Tracks how many scene meshes have geometry and valid drawRange
+                if (!window._lastRenderDiagTime) window._lastRenderDiagTime = 0;
+                const diagNow = performance.now();
+                if (diagNow - window._lastRenderDiagTime > 5000) {
+                    window._lastRenderDiagTime = diagNow;
+                    let meshesWithGeometry = 0, meshesWithDrawRange = 0, totalDrawCount = 0;
+                    let meshesWithZeroDrawRange = 0;
+                    scene.traverse(obj => {
+                        if (obj.isMesh && obj.geometry) {
+                            meshesWithGeometry++;
+                            const dr = obj.geometry.drawRange;
+                            if (dr && dr.count > 0 && dr.count !== Infinity) {
+                                meshesWithDrawRange++;
+                                totalDrawCount += dr.count;
+                            } else if (dr && dr.count === 0) {
+                                meshesWithZeroDrawRange++;
+                            }
+                        }
+                    });
+                    if (meshesWithZeroDrawRange > 0 || meshesWithDrawRange < meshesWithGeometry / 2) {
+                        console.warn(`[RenderDiag] Scene meshes: ${meshesWithGeometry} with geo, ${meshesWithDrawRange} with drawRange>0, ${meshesWithZeroDrawRange} with drawRange=0, total indices: ${totalDrawCount}`);
+                    }
+                }
 
                 // Two-pass rendering for torch/arms viewmodel
                 if ((torchActive && window.torchModel) || (playerArmsModel && !isThirdPerson)) {
