@@ -5559,9 +5559,10 @@
             // =====================================================
             // GEOMETRY BUFFER POOL CONSTANTS
             // =====================================================
-            // Maximum faces per chunk (based on actual usage: ~2-3K typical, 20K worst case)
+            // Maximum faces per chunk (based on actual usage: ~2-3K typical, 5K common max)
             // 16×16×320 chunk = ~150K max exposed faces, but typical is ~2-3K
-            const MAX_FACES_PER_CHUNK = 24576;  // 24K faces = ~3.6MB per geometry (was 10MB)
+            // Reduced from 24K (4.69MB) to 8K (1.56MB) per geometry to fix memory leak
+            const MAX_FACES_PER_CHUNK = 8192;   // 8K faces = ~1.56MB per geometry (66% reduction)
             const MAX_VERTICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 4;  // 4 vertices per face (quads)
             const MAX_INDICES_PER_CHUNK = MAX_FACES_PER_CHUNK * 6;   // 6 indices per face (2 triangles)
 
@@ -18490,7 +18491,8 @@
             }
 
             // Geometry buffer pool for pre-allocated BufferGeometry objects
-            const geometryPool = new GeometryBufferPool(256);
+            // Reduced from 256 to 64 since we have smaller geometries now (less caching needed)
+            const geometryPool = new GeometryBufferPool(64);
             window.geometryPool = geometryPool; // Expose for console debugging
 
             // Geometry leak detection state
@@ -18606,11 +18608,13 @@
                     const pooledTerrain = stats.terrainPoolSize || 0;
                     const pooledWater = stats.waterPoolSize || 0;
 
-                    // Estimate MB per geometry (conservative estimates based on actual buffer sizes)
-                    // Terrain: ~1MB average (varies by face count, pre-allocated at max ~3.6MB but typically uses less)
-                    // Water: ~0.25MB average (1/4 of terrain max allocation)
-                    const terrainMemory = (activeTerrainGeo + pooledTerrain) * 1.0;
-                    const waterMemory = (activeWaterGeo + pooledWater) * 0.25;
+                    // Calculate actual MB per geometry based on buffer sizes
+                    // Terrain: MAX_VERTICES (8192*4=32768) * (pos:3 + norm:3 + uv:2 + col:3) * 4 bytes + indices
+                    // = 32768 * 11 * 4 + 49152 * 4 = ~1.56 MB per terrain geometry
+                    const TERRAIN_GEO_MB = (MAX_FACES_PER_CHUNK * 4 * 11 * 4 + MAX_FACES_PER_CHUNK * 6 * 4) / (1024 * 1024);
+                    const WATER_GEO_MB = TERRAIN_GEO_MB; // Water uses same buffer size
+                    const terrainMemory = (activeTerrainGeo + pooledTerrain) * TERRAIN_GEO_MB;
+                    const waterMemory = (activeWaterGeo + pooledWater) * WATER_GEO_MB;
 
                     return Math.max(0, terrainMemory + waterMemory); // Never return negative
                 }
@@ -18625,11 +18629,12 @@
                     }
 
                     const info = renderer.info.memory;
-                    // Rough estimates:
-                    // - Average geometry ~1MB
-                    // - Average texture ~4MB (assuming 1024x1024 RGBA)
+                    // Calculate actual geometry size based on MAX_FACES_PER_CHUNK
+                    // Most geometries are terrain/water with pre-allocated buffers
+                    const geoSizeMB = (MAX_FACES_PER_CHUNK * 4 * 11 * 4 + MAX_FACES_PER_CHUNK * 6 * 4) / (1024 * 1024);
+                    // Texture estimate: ~4MB (assuming 1024x1024 RGBA)
                     return {
-                        geometries: (info.geometries || 0) * 1,
+                        geometries: (info.geometries || 0) * geoSizeMB,
                         textures: (info.textures || 0) * 4
                     };
                 }
@@ -33782,6 +33787,16 @@ self.onmessage = async (e) => {
 
                     // --- CREATE TERRAIN MESH (INDEXED GEOMETRY WITH POOLED BUFFERS) ---
                     if (tFaceCount > 0) {
+                        // Face count histogram for memory optimization analysis
+                        if (!window._faceCountHistogram) window._faceCountHistogram = {};
+                        const bucket = Math.floor(tFaceCount / 1000) * 1000;
+                        window._faceCountHistogram[bucket] = (window._faceCountHistogram[bucket] || 0) + 1;
+
+                        // Soft warning when approaching buffer limit (90% threshold)
+                        if (tFaceCount > MAX_FACES_PER_CHUNK * 0.9) {
+                            logDebug(`[Chunks] WARNING: ${cKey} has ${tFaceCount} faces (${((tFaceCount / MAX_FACES_PER_CHUNK) * 100).toFixed(0)}% of max)`);
+                        }
+
                         // Safety check: ensure we don't exceed buffer capacity
                         if (tFaceCount > MAX_FACES_PER_CHUNK) {
                             console.warn(`[renderChunk] ${cKey}: ${tFaceCount} faces exceeds max ${MAX_FACES_PER_CHUNK}, skipping`);
