@@ -4956,6 +4956,8 @@
                 // OPFS Disk Storage
                 useOPFSCache: savedSettings.useOPFSCache !== undefined ? savedSettings.useOPFSCache : true, // Use OPFS for fast chunk disk caching
                 opfsCacheMaxMB: savedSettings.opfsCacheMaxMB ?? 500,                         // Max OPFS cache size in MB (auto-clear old if exceeded)
+                // Web Workers
+                useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5164,6 +5166,8 @@
                 // OPFS Disk Storage defaults
                 useOPFSCache: true,                // Use OPFS for fast chunk disk caching
                 opfsCacheMaxMB: 500,               // Max OPFS cache size in MB
+                // Web Worker defaults
+                useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -18423,6 +18427,345 @@
             const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
             const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
 
+            // ============================================================
+            // WEB WORKER: Chunk Generation & Meshing (runs in background thread)
+            // ============================================================
+            const CHUNK_WORKER_CODE = `
+    // Worker-side constants (duplicated from main thread - workers can't share scope)
+    const CHUNK_SIZE = 16;
+    const CHUNK_HEIGHT = 320;
+    const AIR = 0;
+    const WATER = 9;
+
+    // Block transparency lookup (must match main thread BLOCK_CONFIG)
+    const TRANSPARENT_BLOCKS = new Set([0, 6, 9, 10, 14, 255]);
+
+    // Noise functions (simplified for worker - import pyfastnoiselite pattern)
+    // TODO: Copy the noise generation code here or use a seedable PRNG
+
+    /**
+     * Generate terrain data for a chunk.
+     * @param {number} cx - Chunk X coordinate
+     * @param {number} cz - Chunk Z coordinate
+     * @param {number} seed - World seed
+     * @returns {Uint8Array} Block data array
+     */
+    function generateTerrain(cx, cz, seed) {
+        const blocks = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+
+        // TODO: Port terrain generation logic here
+        // This includes: noise sampling, biome selection, cave carving, tree placement
+
+        // Placeholder: flat grass world
+        for (let x = 0; x < CHUNK_SIZE; x++) {
+            for (let z = 0; z < CHUNK_SIZE; z++) {
+                const height = 64;
+                for (let y = 0; y < height; y++) {
+                    const idx = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
+                    blocks[idx] = y === height - 1 ? 1 : (y < height - 3 ? 3 : 2); // grass/dirt/stone
+                }
+            }
+        }
+
+        return blocks;
+    }
+
+    /**
+     * Generate mesh vertices for a chunk.
+     * @param {Uint8Array} blocks - Block data
+     * @param {Object} neighborBlocks - Neighboring chunk block arrays {north, south, east, west}
+     * @returns {Object} Mesh data with positions, normals, uvs, colors, indices
+     */
+    function generateMesh(blocks, neighborBlocks) {
+        // Pre-allocate for worst case (will trim later)
+        const maxFaces = 16 * 16 * 320 * 6; // Absolute max
+        const positions = new Float32Array(maxFaces * 4 * 3);
+        const normals = new Float32Array(maxFaces * 4 * 3);
+        const uvs = new Float32Array(maxFaces * 4 * 2);
+        const colors = new Float32Array(maxFaces * 4 * 3);
+        const indices = new Uint32Array(maxFaces * 6);
+
+        let vertexCount = 0;
+        let indexCount = 0;
+        let faceCount = 0;
+
+        // TODO: Port face culling and mesh generation logic here
+        // This includes: neighbor checks, UV calculation, AO calculation
+
+        // Return trimmed arrays
+        return {
+            positions: positions.slice(0, vertexCount * 3),
+            normals: normals.slice(0, vertexCount * 3),
+            uvs: uvs.slice(0, vertexCount * 2),
+            colors: colors.slice(0, vertexCount * 3),
+            indices: indices.slice(0, indexCount),
+            faceCount: faceCount
+        };
+    }
+
+    // Message handler
+    self.onmessage = function(e) {
+        const { type, jobId, cx, cz, seed, blocks, neighborBlocks } = e.data;
+
+        try {
+            if (type === 'generate') {
+                // Generate terrain
+                const blockData = generateTerrain(cx, cz, seed);
+
+                // Transfer the buffer (zero-copy)
+                self.postMessage({
+                    type: 'terrain',
+                    jobId: jobId,
+                    cx: cx,
+                    cz: cz,
+                    blocks: blockData
+                }, [blockData.buffer]);
+
+            } else if (type === 'mesh') {
+                // Generate mesh from provided blocks
+                const mesh = generateMesh(blocks, neighborBlocks);
+
+                // Transfer all buffers (zero-copy)
+                self.postMessage({
+                    type: 'mesh',
+                    jobId: jobId,
+                    cx: cx,
+                    cz: cz,
+                    positions: mesh.positions,
+                    normals: mesh.normals,
+                    uvs: mesh.uvs,
+                    colors: mesh.colors,
+                    indices: mesh.indices,
+                    faceCount: mesh.faceCount
+                }, [
+                    mesh.positions.buffer,
+                    mesh.normals.buffer,
+                    mesh.uvs.buffer,
+                    mesh.colors.buffer,
+                    mesh.indices.buffer
+                ]);
+            }
+        } catch (error) {
+            self.postMessage({
+                type: 'error',
+                jobId: jobId,
+                error: error.message
+            });
+        }
+    };
+`;
+
+            /**
+             * Pool of Web Workers for parallel chunk generation and meshing.
+             * Uses Transferable objects for zero-copy data transfer.
+             */
+            class ChunkWorkerPool {
+                /**
+                 * Create a worker pool.
+                 * @param {number} [poolSize] - Number of workers (default: CPU cores - 1, min 1, max 4)
+                 */
+                constructor(poolSize) {
+                    const cores = navigator.hardwareConcurrency || 4;
+                    this.poolSize = poolSize || Math.min(4, Math.max(1, cores - 1));
+                    this.workers = [];
+                    this.jobQueue = [];
+                    this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz}
+                    this.nextJobId = 0;
+                    this.workerBusy = []; // Track which workers are busy
+
+                    this._initWorkers();
+                    logDebug(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+                }
+
+                /**
+                 * Initialize worker instances from embedded code.
+                 * @private
+                 */
+                _initWorkers() {
+                    const blob = new Blob([CHUNK_WORKER_CODE], { type: 'application/javascript' });
+                    const workerUrl = URL.createObjectURL(blob);
+
+                    for (let i = 0; i < this.poolSize; i++) {
+                        const worker = new Worker(workerUrl);
+                        worker.onmessage = (e) => this._handleWorkerMessage(i, e);
+                        worker.onerror = (e) => this._handleWorkerError(i, e);
+                        this.workers.push(worker);
+                        this.workerBusy.push(false);
+                    }
+
+                    // Clean up blob URL after workers are created
+                    URL.revokeObjectURL(workerUrl);
+                }
+
+                /**
+                 * Handle message from worker.
+                 * @private
+                 * @param {number} workerIndex - Index of the worker that sent the message.
+                 * @param {MessageEvent} event - The message event from the worker.
+                 */
+                _handleWorkerMessage(workerIndex, event) {
+                    const { type, jobId, error, ...data } = event.data;
+
+                    this.workerBusy[workerIndex] = false;
+
+                    const job = this.pendingJobs.get(jobId);
+                    if (!job) {
+                        console.warn(`[WorkerPool] Received result for unknown job ${jobId}`);
+                        return;
+                    }
+
+                    this.pendingJobs.delete(jobId);
+
+                    if (type === 'error') {
+                        job.reject(new Error(error));
+                    } else {
+                        job.resolve({ type, ...data });
+                    }
+
+                    // Process next job in queue
+                    this._processQueue();
+                }
+
+                /**
+                 * Handle worker error.
+                 * @private
+                 * @param {number} workerIndex - Index of the worker that errored.
+                 * @param {ErrorEvent} event - The error event.
+                 */
+                _handleWorkerError(workerIndex, event) {
+                    console.error(`[WorkerPool] Worker ${workerIndex} error:`, event.message);
+                    this.workerBusy[workerIndex] = false;
+                    this._processQueue();
+                }
+
+                /**
+                 * Find an idle worker.
+                 * @private
+                 * @returns {number} Worker index or -1 if all busy.
+                 */
+                _getIdleWorker() {
+                    for (let i = 0; i < this.poolSize; i++) {
+                        if (!this.workerBusy[i]) return i;
+                    }
+                    return -1;
+                }
+
+                /**
+                 * Process queued jobs.
+                 * @private
+                 */
+                _processQueue() {
+                    while (this.jobQueue.length > 0) {
+                        const workerIndex = this._getIdleWorker();
+                        if (workerIndex === -1) break; // All workers busy
+
+                        const job = this.jobQueue.shift();
+                        this.workerBusy[workerIndex] = true;
+                        this.workers[workerIndex].postMessage(job.message, job.transfer || []);
+                    }
+                }
+
+                /**
+                 * Queue a terrain generation job.
+                 * @param {number} cx - Chunk X coordinate.
+                 * @param {number} cz - Chunk Z coordinate.
+                 * @param {number} seed - World seed.
+                 * @returns {Promise<{blocks: Uint8Array}>} Promise resolving to block data.
+                 */
+                generateTerrain(cx, cz, seed) {
+                    return new Promise((resolve, reject) => {
+                        const jobId = this.nextJobId++;
+
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+
+                        this.jobQueue.push({
+                            message: { type: 'generate', jobId, cx, cz, seed },
+                            transfer: []
+                        });
+
+                        this._processQueue();
+                    });
+                }
+
+                /**
+                 * Queue a mesh generation job.
+                 * @param {number} cx - Chunk X coordinate.
+                 * @param {number} cz - Chunk Z coordinate.
+                 * @param {Uint8Array} blocks - Block data (will be transferred, becomes unusable!).
+                 * @param {Object} neighborBlocks - Neighboring chunk data.
+                 * @returns {Promise<{positions: Float32Array, normals: Float32Array, uvs: Float32Array, colors: Float32Array, indices: Uint32Array, faceCount: number}>} Promise resolving to mesh data.
+                 */
+                generateMesh(cx, cz, blocks, neighborBlocks) {
+                    return new Promise((resolve, reject) => {
+                        const jobId = this.nextJobId++;
+
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+
+                        // Collect all transferable buffers
+                        const transfer = [blocks.buffer];
+                        // Note: neighborBlocks would need copies since we can't transfer chunks still in use
+
+                        this.jobQueue.push({
+                            message: { type: 'mesh', jobId, cx, cz, blocks, neighborBlocks },
+                            transfer: transfer
+                        });
+
+                        this._processQueue();
+                    });
+                }
+
+                /**
+                 * Get pool statistics.
+                 * @returns {{poolSize: number, busyWorkers: number, queueLength: number, pendingJobs: number}} Pool stats.
+                 */
+                getStats() {
+                    return {
+                        poolSize: this.poolSize,
+                        busyWorkers: this.workerBusy.filter(b => b).length,
+                        queueLength: this.jobQueue.length,
+                        pendingJobs: this.pendingJobs.size
+                    };
+                }
+
+                /**
+                 * Terminate all workers.
+                 */
+                terminate() {
+                    for (const worker of this.workers) {
+                        worker.terminate();
+                    }
+                    this.workers = [];
+                    this.jobQueue = [];
+                    this.pendingJobs.clear();
+                    logDebug('[WorkerPool] Terminated all workers');
+                }
+            }
+
+            // Global worker pool instance (initialized after game starts)
+            let chunkWorkerPool = null;
+
+            /**
+             * Generate chunk using worker pool (async).
+             * Falls back to main thread if workers unavailable.
+             * NOTE: This is a future integration point - not wired up yet.
+             * @param {number} cx - Chunk X coordinate.
+             * @param {number} cz - Chunk Z coordinate.
+             * @returns {Promise<Uint8Array>} Block data.
+             */
+            async function generateChunkAsync(cx, cz) {
+                if (chunkWorkerPool && SETTINGS.useWorkers) {
+                    try {
+                        const result = await chunkWorkerPool.generateTerrain(cx, cz, finalSeedDisplay);
+                        return result.blocks;
+                    } catch (e) {
+                        logDebug(`[Worker] Terrain gen failed, falling back to main thread: ${e.message}`);
+                    }
+                }
+                // Fallback to synchronous main-thread generation
+                const chunkData = await generateChunkData(cx, cz);
+                return chunkData.blocks;
+            }
+
             // =====================================================
             // GEOMETRY BUFFER POOL (TIERED)
             // =====================================================
@@ -20648,6 +20991,10 @@
                     for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
                 }
                 await init(); // Initialize Three.js FIRST (creates scene, materials, controls)
+                // Initialize worker pool for chunk generation
+                if (!chunkWorkerPool && SETTINGS.useWorkers) {
+                    chunkWorkerPool = new ChunkWorkerPool();
+                }
                 const isNewWorld = !(await isWorldPreGenerated(seedStr)); // NOW check if this is a new world (after scene exists)
                 if (isNewWorld) { logDebug("New world detected - pre-generating spawn chunks..."); await preGenerateSpawnChunks(spawnChunkX, spawnChunkZ, SETTINGS.preGenRenderDistance);
                 } else { logDebug("Existing world detected - skipping pre-generation"); }
@@ -25770,6 +26117,14 @@ self.onmessage = async (e) => {
                     overlay.innerText += "\nOps: W:" + opfsStats.writes + " R:" + opfsStats.reads +
                         " (Hit:" + opfsStats.hitRate + ")" +
                         "\nDisk I/O: R:" + opfsStats.bytesReadMB + "MB W:" + opfsStats.bytesWrittenMB + "MB";
+                }
+
+                // Worker pool stats
+                if (chunkWorkerPool) {
+                    const workerStats = chunkWorkerPool.getStats();
+                    overlay.innerText += "\n--- WORKERS ---" +
+                        "\nWorkers: " + workerStats.busyWorkers + "/" + workerStats.poolSize + " busy | Q: " + workerStats.queueLength +
+                        (workerStats.pendingJobs > 0 ? " | Pending: " + workerStats.pendingJobs : "");
                 }
             }
             function initTextures() {
