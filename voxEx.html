@@ -19166,8 +19166,9 @@
     }
 
     // ============================================================
-    // HEIGHT FUNCTIONS - MUST MATCH MAIN THREAD EXACTLY!
+    // HEIGHT FUNCTIONS - INJECTED FROM MAIN THREAD
     // ============================================================
+    /* __TERRAIN_FUNCS_START__ */
 
     // Continental height (-1 to 1) - affects ocean vs inland scaling
     function continentalHeight(gx, gz, seed) {
@@ -19424,6 +19425,7 @@
         const centerFactor = 1.0 - oceanFactor;
         return baseOceanDepth + depthVariation * centerFactor;
     }
+    /* __TERRAIN_FUNCS_END__ */
 
     // ============================================================
     // TERRAIN CACHE GENERATION
@@ -19776,6 +19778,74 @@
 `;
 
             /**
+             * Build worker code with dynamically injected terrain functions.
+             * Uses Function.toString() to extract exact source code from main thread,
+             * ensuring identical behavior between worker and main thread terrain generation.
+             * @returns {string} Complete worker code with injected terrain functions
+             */
+            function buildChunkWorkerCode() {
+                // Get terrain function sources from main thread (defined later in file, but hoisted)
+                const terrainFuncs = [
+                    continentalHeight,
+                    defaultHeightFunc,
+                    hillsHeightFunc,
+                    plainsHeightFunc,
+                    mountainsHeightFunc,
+                    getBiomeHeightAtCell,
+                    blendedHeight,
+                    getRiverFactor,
+                    getOceanFactor,
+                    getRiverDepth,
+                    getOceanDepth
+                ];
+
+                // Build injected code string with proper indentation for worker
+                let injectedCode = '    // ============================================================\n';
+                injectedCode += '    // HEIGHT FUNCTIONS - DYNAMICALLY INJECTED FROM MAIN THREAD\n';
+                injectedCode += '    // Using Function.toString() guarantees identical behavior\n';
+                injectedCode += '    // ============================================================\n\n';
+
+                // Inject lerpValue helper (needed by several functions)
+                injectedCode += '    const lerpValue = (a, b, t) => a + t * (b - a);\n\n';
+
+                // Inject each function's source code
+                for (const fn of terrainFuncs) {
+                    // Get function source and add proper indentation
+                    const source = fn.toString();
+                    // Add 4-space indent for worker context
+                    const indentedSource = source.split('\n').map(line => '    ' + line).join('\n');
+                    injectedCode += indentedSource + '\n\n';
+                }
+
+                // Add HEIGHT_FUNCS lookup table
+                injectedCode += '    // Height function lookup by biome name\n';
+                injectedCode += '    const HEIGHT_FUNCS = {\n';
+                injectedCode += '        plains: plainsHeightFunc,\n';
+                injectedCode += '        hills: hillsHeightFunc,\n';
+                injectedCode += '        forests: defaultHeightFunc,\n';
+                injectedCode += '        mountains: mountainsHeightFunc,\n';
+                injectedCode += '        swamp: defaultHeightFunc,\n';
+                injectedCode += '        longwoods: defaultHeightFunc\n';
+                injectedCode += '    };\n';
+
+                // Find and replace the terrain functions section
+                const startMarker = '/* __TERRAIN_FUNCS_START__ */';
+                const endMarker = '/* __TERRAIN_FUNCS_END__ */';
+                const startIdx = CHUNK_WORKER_CODE.indexOf(startMarker);
+                const endIdx = CHUNK_WORKER_CODE.indexOf(endMarker);
+
+                if (startIdx === -1 || endIdx === -1) {
+                    console.warn('[WorkerPool] Terrain function markers not found, using static code');
+                    return CHUNK_WORKER_CODE;
+                }
+
+                // Replace content between markers with injected functions
+                const before = CHUNK_WORKER_CODE.substring(0, startIdx + startMarker.length);
+                const after = CHUNK_WORKER_CODE.substring(endIdx);
+                return before + '\n' + injectedCode + '\n    ' + after;
+            }
+
+            /**
              * Pool of Web Workers for parallel chunk generation and meshing.
              * Uses Transferable objects for zero-copy data transfer.
              */
@@ -19800,10 +19870,13 @@
 
                 /**
                  * Initialize worker instances from embedded code.
+                 * Uses buildChunkWorkerCode() for dynamic function injection.
                  * @private
                  */
                 _initWorkers() {
-                    const blob = new Blob([CHUNK_WORKER_CODE], { type: 'application/javascript' });
+                    // Build worker code with injected terrain functions from main thread
+                    const workerCode = buildChunkWorkerCode();
+                    const blob = new Blob([workerCode], { type: 'application/javascript' });
                     const workerUrl = URL.createObjectURL(blob);
 
                     for (let i = 0; i < this.poolSize; i++) {
