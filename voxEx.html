@@ -20584,9 +20584,11 @@
             function applyWorkerMeshData(cKey, cx, cz, meshData) {
                 const { terrain, water } = meshData;
 
-                // Release existing meshes
-                if (chunkMeshes.has(cKey)) releaseMeshForKey(cKey);
-                if (chunkMeshes.has(cKey + "_WATER")) releaseMeshForKey(cKey + "_WATER");
+                // DEFERRED RELEASE: Store old mesh references instead of releasing immediately
+                // This prevents the "flash" artifact where chunk disappears during mesh swap.
+                // Old meshes stay visible until new meshes are added to scene.
+                const oldTerrainMesh = chunkMeshes.get(cKey) || null;
+                const oldWaterMesh = chunkMeshes.get(cKey + "_WATER") || null;
 
                 // Create terrain mesh if has faces
                 if (terrain && terrain.faceCount > 0) {
@@ -20705,6 +20707,19 @@
                     wMesh.renderOrder = 1;
                     scene.add(wMesh);
                     chunkMeshes.set(cKey + "_WATER", wMesh);
+                }
+
+                // DEFERRED RELEASE: Now that new meshes are in scene, release old ones
+                // This atomic swap prevents the "flash" artifact where chunk disappears during rebuild.
+                if (oldTerrainMesh) {
+                    releaseChunkMesh(oldTerrainMesh, "terrain");
+                    if (terrainMeshCount > 0) terrainMeshCount--;
+                    meshLifecycleStats.mark("deferred-detach", { key: cKey, isWater: false, source: "worker" });
+                }
+                if (oldWaterMesh) {
+                    releaseChunkMesh(oldWaterMesh, "water");
+                    if (waterMeshCount > 0) waterMeshCount--;
+                    meshLifecycleStats.mark("deferred-detach", { key: cKey + "_WATER", isWater: true, source: "worker" });
                 }
 
                 // Mark as meshed
@@ -36310,15 +36325,11 @@ self.onmessage = async (e) => {
                     // Mark chunk as being built
                     chunkDataPool.setMeshState(cKey, MESH_STATE.BUILDING);
 
-                    // CRITICAL: Release any existing meshes before creating new ones
-                    // This prevents duplicate meshes from accumulating in the scene
-                    // (which causes visual artifacts like darker water from z-fighting)
-                    if (chunkMeshes.has(cKey)) {
-                        releaseMeshForKey(cKey);
-                    }
-                    if (chunkMeshes.has(cKey + "_WATER")) {
-                        releaseMeshForKey(cKey + "_WATER");
-                    }
+                    // DEFERRED RELEASE: Store references to old meshes instead of releasing immediately
+                    // This prevents the "flash" artifact where chunk disappears during mesh rebuild.
+                    // Old meshes stay visible until new meshes are ready, then we swap atomically.
+                    const oldTerrainMesh = chunkMeshes.get(cKey) || null;
+                    const oldWaterMesh = chunkMeshes.get(cKey + "_WATER") || null;
 
                     const firstMeshForChunk = !meshedChunkKeys.has(cKey);
                     let missingNeighbor = false; // Tracks whether we treated any neighbor as solid due to being unloaded
@@ -36807,6 +36818,22 @@ self.onmessage = async (e) => {
                         waterMeshCount++;
                         meshLifecycleStats.mark("attach", { key: cKey + "_WATER", isWater: true, terrainMeshCount, waterMeshCount });
                     }
+
+                    // --- DEFERRED RELEASE: Now that new meshes are in scene, release old ones ---
+                    // This atomic swap prevents the "flash" artifact where chunk disappears during rebuild.
+                    // Use releaseChunkMesh directly since we have stored references (not releaseMeshForKey
+                    // which would look up from chunkMeshes where new meshes now exist).
+                    if (oldTerrainMesh) {
+                        releaseChunkMesh(oldTerrainMesh, "terrain");
+                        if (terrainMeshCount > 0) terrainMeshCount--;
+                        meshLifecycleStats.mark("deferred-detach", { key: cKey, isWater: false });
+                    }
+                    if (oldWaterMesh) {
+                        releaseChunkMesh(oldWaterMesh, "water");
+                        if (waterMeshCount > 0) waterMeshCount--;
+                        meshLifecycleStats.mark("deferred-detach", { key: cKey + "_WATER", isWater: true });
+                    }
+
                     // --- CREATE TORCH MODELS ---
                     // Clean up old torches first (CRITICAL: must dispose geometries to prevent leak)
                     // This handles the edge case where torches exist but no mesh was created
@@ -37245,8 +37272,10 @@ self.onmessage = async (e) => {
                     queuedChunkKeys.delete(job.key); // Allow re-queueing later if needed
                     // Make chunk generation await if data doesn't exist
                     if (!chunks.has(job.key)) { await generateChunkData(jobCx, jobCz); }
-                    // Release old meshes only when the chunk was explicitly marked dirty
-                    if (isDirty) { releaseMeshForKey(job.key); releaseMeshForKey(job.key + "_WATER"); dirtyChunks.delete(job.key); }
+                    // DEFERRED RELEASE: Don't release old meshes here - let renderChunk/renderChunkAsync
+                    // handle the swap atomically to prevent the "flash" artifact where chunk disappears
+                    // momentarily during mesh rebuild. Old mesh stays visible until new mesh is ready.
+                    if (isDirty) { dirtyChunks.delete(job.key); }
                     // OPTIMIZATION: Pass distance for LOD calculation
                     const jobDistSq = job.dist || 0;
                     // Use worker mesh generation if enabled, otherwise fall back to sync
@@ -37279,9 +37308,8 @@ self.onmessage = async (e) => {
                         if (chunkOrNeighborsPending(cx, cz)) { chunkNeighborUpdateQueue.add(key); chunkUpdateDiagnostics.neighborStats.requeued++; continue; }
                         chunkUpdateDiagnostics.neighborStats.processed++;
                         chunkUpdateDiagnostics.neighborStats.lastRun = performance.now();
-                        // Remove old meshes
-                        releaseMeshForKey(key);
-                        releaseMeshForKey(key + "_WATER");
+                        // DEFERRED RELEASE: Don't remove old meshes here - renderChunk handles
+                        // the swap atomically to prevent flash artifacts
                         // Rebuild chunk - calculate distance for LOD
                         const playerWorldPos = getPlayerWorldPosition();
                         const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
