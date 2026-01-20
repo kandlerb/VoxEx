@@ -1,91 +1,114 @@
 # VoxEx
 
-**The Modular Voxel Explorer** - A browser-based voxel game engine inspired by Minecraft.
+**The Browser-Based Voxel Explorer** - A fully-featured voxel game engine inspired by Minecraft, running entirely in your browser.
 
 ## Play
 
-- **Modular Version**: https://kandlerb.github.io/VoxEx/
-- **Standalone Version**: Download `voxEx.html` for offline play
+- **Online**: https://kandlerb.github.io/VoxEx/
+- **Offline**: Download `voxEx.html` and open in any modern browser
+
+The launcher page runs browser compatibility tests (WebGL, GPU benchmarks) before starting the game.
 
 ## Architecture
 
-VoxEx now supports two modes:
-1. **Modular ES Modules** (`index.html`) - For development, served via GitHub Pages
-2. **Single-File Standalone** (`voxEx.html`) - ~23K lines, works offline
+VoxEx is a **single-file application** - the entire game (~39K lines) runs from one HTML file with embedded CSS and JavaScript. No build tools, no bundlers, no external dependencies beyond Three.js from CDN.
 
-### Project Structure
+### Repository Structure
 
 ```
 VoxEx/
-├── index.html          # Modular entry point (ES modules)
-├── voxEx.html          # Standalone offline version (~23K lines)
-├── src/
-│   ├── main.js         # Game initialization
-│   ├── core/           # Constants and type definitions
-│   │   ├── index.js
-│   │   ├── constants.js    # Block IDs (AIR, GRASS, STONE, etc.)
-│   │   └── types.js        # JSDoc type definitions
-│   ├── config/         # All configuration objects
-│   │   ├── index.js
-│   │   ├── BlockConfig.js  # Block properties, textures, inventory
-│   │   ├── WorldConfig.js  # World dimensions, chunk settings
-│   │   ├── BiomeConfig.js  # Biome definitions (6 biomes)
-│   │   ├── TreeConfig.js   # Tree generation parameters
-│   │   ├── Settings.js     # Game settings and profiles
-│   │   ├── ZombieConfig.js # Zombie behavior parameters
-│   │   ├── PlayerConfig.js # Player physics and proportions
-│   │   └── PosePresets.js  # Animation pose definitions
-│   └── math/           # Math utilities
-│       ├── index.js
-│       ├── noise.js        # Perlin noise (2D, 3D, fBm)
-│       ├── SeededRandom.js # Deterministic PRNG
-│       └── animation.js    # Spring dampers, interpolation
-├── styles/
-│   └── main.css        # Extracted CSS styles
-└── CLAUDE.md           # AI assistant guidelines
+├── index.html               # System check & launcher
+├── voxEx.html               # Complete game (single file, ~39K lines)
+├── voxex-sound-formula.html # Sound synthesis demo
+├── CLAUDE.md                # AI assistant guidelines
+├── futureFeatures.md        # Feature roadmap
+└── chunkRenderingPlan.md    # Technical planning doc
 ```
 
-### Phase 1 Complete ✓
+### Design Philosophy
 
-Core configuration modules extracted:
-- **15 block types** with full texture and UI configuration
-- **6 biomes** (plains, hills, forests, mountains, swamp, longwoods)
-- **Noise functions** (Perlin 2D/3D, fBm, domain warp)
-- **Seeded random** for deterministic world generation
-- **Animation math** (spring dampers, pose interpolation)
-
-### Future Phases
-
-- **Phase 2**: World system (chunks, terrain, lighting)
-- **Phase 3**: Rendering system (Three.js, materials, shaders)
-- **Phase 4**: Entity system (player, zombies, AI)
-- **Phase 5**: UI system (menus, HUD, inventory)
-- **Phase 6**: Audio system (sound synthesis)
+1. **One File to Rule Them All** - All game code in a single HTML file
+2. **No Circles, Only Voxels** - Pure cube-based geometry (BoxGeometry only)
+3. **Runs Anywhere** - Targets 60fps on mid-range hardware
+4. **Zero Build Steps** - Three.js loaded from CDN, no npm/webpack needed
 
 ## Key Features
 
-1. **Voxel Engine**
-   - Infinite procedural world generation
-   - Chunk size: 16×16×320
-   - Streaming chunk system with configurable pre-generation
-   - Optimized rendering with face culling and frustum culling
-   - Hostile zombie mobs with AI
+### Voxel Engine
+- Infinite procedural world generation with 6 biomes
+- Chunk size: 16x16x320 blocks
+- Optimized rendering with face culling, frustum culling, and ambient occlusion
+- RLE compression for chunk storage
+- Configurable render distance (4-32 chunks)
+- Web Worker-based mesh generation
 
-2. **Biome System**
-   - 6 Biomes: Plains, Hills, Forests, Mountains, Swamps, Longwoods
-   - Dynamic tree generation per-biome
-   - Heightmap blending using noise and domain warping
+### Biome System
 
-3. **Advanced Lighting**
-   - Sunlight propagation system
-   - Ambient Occlusion baked into vertex colors
-   - Dynamic day/night cycle
-   - 3D Voxel Torch with point lighting
+| Biome | Description |
+|-------|-------------|
+| Plains | Flat terrain, sparse oak trees |
+| Hills | Rolling terrain, moderate tree density |
+| Forests | Dense oak trees |
+| Mountains | High peaks with conical pines, snow above treeline |
+| Swamp | Low wetlands with droopy trees and water pools |
+| Longwoods | Giant trees (2x2 and 3x3 trunks), heights 12-24 blocks |
 
-4. **Persistence**
-   - IndexedDB for chunk storage
-   - RLE compression for efficient saves
-   - LocalStorage for settings
+### 15 Block Types
+
+Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water, Torch, Snow, Gravel, Longwood Log, Longwood Leaves
+
+### Lighting System
+- 15-level sunlight propagation
+- Ambient occlusion baked into vertex colors
+- Dynamic day/night cycle
+- Torch point lighting with 3D voxel model
+
+### Hostile Mobs
+- Zombie AI with detection, tracking, and pathfinding
+- Proximity-based scare effects (red vignette, desaturation)
+- Procedural growl and hurt audio
+- Object pooling for performance (max 10 zombies)
+
+### Post-Processing Effects
+- Volumetric lighting (god rays)
+- Configurable fog with cylindrical shader
+- Zombie proximity visual effects
+
+### Persistence
+- IndexedDB for chunk storage with RLE compression
+- Multiple save slots with unique seeds
+- LocalStorage for settings
+- Quick save (F5) and quick load (F9)
+
+## Controls
+
+| Key | Action |
+|-----|--------|
+| W, A, S, D | Move |
+| SPACE | Jump / Fly Up (double-tap toggles flight) |
+| C | Crouch / Fly Down |
+| SHIFT | Sprint |
+| F | Toggle Torch |
+| E | Inventory |
+| 1-9 / Scroll | Hotbar |
+| Left Click | Break Block |
+| Right Click | Place Block |
+| F5 | Quick Save |
+| F9 | Quick Load |
+| ~ (Tilde) | Debug Overlay |
+| ESC | Pause |
+
+## Tech Stack
+
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| Three.js | r160 | 3D rendering (loaded from CDN) |
+| PointerLockControls | Three.js addon | First-person camera controls |
+| IndexedDB | Browser API | Chunk persistence with RLE compression |
+| LocalStorage | Browser API | Settings and save slots |
+| Canvas API | Browser API | Procedural 16x16 textures (17-tile atlas) |
+| Web Audio API | Browser API | Procedural sound synthesis |
+| Web Workers | Browser API | Off-thread mesh generation |
 
 ## For Developers
 
@@ -93,14 +116,12 @@ Core configuration modules extracted:
 
 1. Clone this repo
 2. Serve with any local server:
-   - **VS Code**: Install "Live Server" → Right-click `index.html` → Open with Live Server
-   - **Python**: `python -m http.server 8080` → http://localhost:8080
-   - **Node**: `npx serve` → http://localhost:3000
-3. Push changes to deploy to GitHub Pages
+   - **VS Code**: Live Server extension
+   - **Python**: `python -m http.server 8080`
+   - **Node**: `npx serve`
+3. Navigate to the served URL
 
 ### No Build Tools Required
-
-This project uses native ES modules. No npm, webpack, or bundlers needed.
 
 Three.js is loaded from CDN via import map:
 ```html
@@ -114,49 +135,15 @@ Three.js is loaded from CDN via import map:
 </script>
 ```
 
-### Console Debugging
+### Contributing
 
-The `window.VoxEx` object is available:
-```javascript
-VoxEx.Core.GRASS        // Block ID: 1
-VoxEx.Config.BIOME_CONFIG.mountains
-VoxEx.MathUtils.noise2D(0.5, 0.5)
-```
+All code must remain in `voxEx.html` - this is the core design principle. See `CLAUDE.md` for detailed coding guidelines, JSDoc standards, and performance patterns.
 
-## Controls
-
-| Key | Action |
-|-----|--------|
-| W, A, S, D | Move |
-| SPACE | Jump / Fly Up |
-| C | Crouch / Fly Down |
-| SHIFT | Sprint |
-| F | Toggle Torch |
-| E | Inventory |
-| 1-9 / Scroll | Hotbar |
-| Left Click | Break Block |
-| Right Click | Place Block |
-| ~ (Tilde) | Debug Overlay |
-| ESC | Pause |
-
-## Tech Stack
-
-- **Three.js r160** - 3D rendering
-- **Native ES Modules** - No bundler required
-- **IndexedDB** - Chunk persistence
-- **LocalStorage** - Settings and saves
-- **Canvas API** - Procedural textures (17-tile atlas)
-
-## Contributing
-
-For the modular version (`src/`):
-- Follow JSDoc documentation standards
-- Use ES modules with explicit exports
-- No external dependencies beyond Three.js CDN
-
-For the standalone version (`voxEx.html`):
-- All code must remain in the single file
-- No external CSS or JS files
+Key guidelines:
+- Use JSDoc for all public functions
+- Prefer typed arrays (`Uint8Array`, `Float32Array`) for performance
+- Use strict equality (`===`) everywhere
+- Avoid allocations in hot paths (render loop, meshing)
 
 ## License
 
