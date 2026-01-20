@@ -20738,6 +20738,8 @@
             const p = new Uint8Array(256).map((_, i) => i);
             const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
             const lerp = (t, a, b) => a + t * (b - a);
+            // lerpValue: same as THREE.MathUtils.lerp(a, b, t) - for terrain functions that can be injected into workers
+            const lerpValue = (a, b, t) => a + t * (b - a);
             const grad = (h, x, y) => {
                 const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : 0;
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
@@ -33153,9 +33155,9 @@ self.onmessage = async (e) => {
                 const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
                 const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
                 const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
-                const h0 = THREE.MathUtils.lerp(h00, h10, sx);
-                const h1 = THREE.MathUtils.lerp(h01, h11, sx);
-                let finalHeight = THREE.MathUtils.lerp(h0, h1, sz);
+                const h0 = lerpValue(h00, h10, sx);
+                const h1 = lerpValue(h01, h11, sx);
+                let finalHeight = lerpValue(h0, h1, sz);
 
                 // 4. Apply oceans first (larger scale feature)
                 const oceanFactor = getOceanFactor(gx, gz, seed);
@@ -33163,20 +33165,18 @@ self.onmessage = async (e) => {
                     const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
                     const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
                     const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
-                    finalHeight = THREE.MathUtils.lerp(oceanFloor, finalHeight, bank);
+                    finalHeight = lerpValue(oceanFloor, finalHeight, bank);
                 }
 
-                // 5. Apply rivers (can carve through ocean edges too) - only if enabled
-                if (window.worldGenSettings?.enableRivers !== false) {
-                    const r = getRiverFactor(gx, gz, seed);
-                    if (r < 1.0) {
-                        const riverDepth = getRiverDepth(r, gx, gz, seed);
-                        const riverBed = WORLD_DIMS.seaLevel - riverDepth;
-                        const bank = r * r * (3 - 2 * r);
-                        // Rivers carve down from current height (whether land or ocean edge)
-                        const carvedHeight = Math.min(finalHeight, riverBed);
-                        finalHeight = THREE.MathUtils.lerp(carvedHeight, finalHeight, bank);
-                    }
+                // 5. Apply rivers (always enabled in terrain generation - rivers are deterministic)
+                const r = getRiverFactor(gx, gz, seed);
+                if (r < 1.0) {
+                    const riverDepth = getRiverDepth(r, gx, gz, seed);
+                    const riverBed = WORLD_DIMS.seaLevel - riverDepth;
+                    const bank = r * r * (3 - 2 * r);
+                    // Rivers carve down from current height (whether land or ocean edge)
+                    const carvedHeight = Math.min(finalHeight, riverBed);
+                    finalHeight = lerpValue(carvedHeight, finalHeight, bank);
                 }
 
                 return Math.floor(finalHeight);
@@ -33186,7 +33186,8 @@ self.onmessage = async (e) => {
                 const centerX = cx * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const centerZ = cz * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const biome = getBiomeParams(centerX, centerZ);
-                const hf = biome.heightFunc || defaultHeightFunc;
+                // Use HEIGHT_FUNCS lookup instead of biome.heightFunc for consistent behavior with workers
+                const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc;
                 let h = hf(gx, gz, biome, seed);
                 // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
                 const t = (continentFactor + 1) * 0.5; // -1..1 → 0..1
@@ -33363,6 +33364,15 @@ self.onmessage = async (e) => {
                 const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
                 return Math.floor(Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285));
             }
+            // Height function lookup table - used by getBiomeHeightAtCell for consistent behavior with workers
+            const HEIGHT_FUNCS = {
+                plains: plainsHeightFunc,
+                hills: hillsHeightFunc,
+                forests: defaultHeightFunc,
+                mountains: mountainsHeightFunc,
+                swamp: defaultHeightFunc,
+                longwoods: defaultHeightFunc
+            };
             function getRiverFactor(gx, gz, seed) {
                 // Reduce warp frequency and strength by 50%
                 const warpScale = 0.004; // Was 0.008
