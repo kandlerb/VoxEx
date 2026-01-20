@@ -17227,6 +17227,92 @@
             let lastChunkX = -Infinity;
             let lastChunkZ = -Infinity;
             let lastRenderRadius = -1;
+
+            // Chunk system dirty tracking - only update when something changes
+            const chunkSystemState = {
+                lastPlayerChunkX: null,
+                lastPlayerChunkZ: null,
+                lastCameraYaw: null,          // For frustum dirty detection
+                lastRenderDistance: null,
+                lastMemoryCheckTime: 0,
+                streamingDirty: true,         // Force initial run
+                frustumDirty: true,
+                memoryCheckInterval: 1000,    // Check memory every 1s, not every 200ms
+                compressionInterval: 5000,    // Compress chunks every 5s
+                lastCompressionTime: 0,
+                lastUpdateSkipped: false      // Track if last update was skipped for debug
+            };
+
+            /**
+             * Mark chunk system as dirty, forcing an update on next tick.
+             * @param {string} reason - Debug reason for marking dirty.
+             */
+            function markChunkSystemDirty(reason) {
+                chunkSystemState.streamingDirty = true;
+                chunkSystemState.frustumDirty = true;
+                if (isDebug) logDebug(`[ChunkSystem] Marked dirty: ${reason}`);
+            }
+
+            /**
+             * Check if chunk streaming needs to update.
+             * @returns {boolean} True if player moved to new chunk or render distance changed.
+             */
+            function shouldUpdateChunkStreaming() {
+                const pPos = getPlayerWorldPosition();
+                const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
+                const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
+
+                // Check if player changed chunks
+                if (chunkX !== chunkSystemState.lastPlayerChunkX ||
+                    chunkZ !== chunkSystemState.lastPlayerChunkZ) {
+                    chunkSystemState.lastPlayerChunkX = chunkX;
+                    chunkSystemState.lastPlayerChunkZ = chunkZ;
+                    return true;
+                }
+
+                // Check if render distance changed
+                const currentRD = SETTINGS.dynamicRenderDistance ? currentRenderRadius : SETTINGS.renderDistance;
+                if (currentRD !== chunkSystemState.lastRenderDistance) {
+                    chunkSystemState.lastRenderDistance = currentRD;
+                    return true;
+                }
+
+                // Check if explicitly marked dirty (block changes, etc.)
+                if (chunkSystemState.streamingDirty) {
+                    chunkSystemState.streamingDirty = false;
+                    return true;
+                }
+
+                return false;
+            }
+
+            /**
+             * Check if frustum culling needs recalculation.
+             * Uses camera yaw to detect significant direction changes.
+             * @returns {boolean} True if camera direction changed significantly.
+             */
+            function shouldUpdateFrustum() {
+                if (!controls || !controls.getObject) return false;
+
+                // Get camera yaw (horizontal rotation)
+                controls.getDirection(cameraDirTmp);
+                const yaw = Math.atan2(cameraDirTmp.x, cameraDirTmp.z);
+
+                // Check if yaw changed by more than 5 degrees
+                const YAW_THRESHOLD = 0.087; // ~5 degrees in radians
+                if (chunkSystemState.lastCameraYaw === null ||
+                    Math.abs(yaw - chunkSystemState.lastCameraYaw) > YAW_THRESHOLD) {
+                    chunkSystemState.lastCameraYaw = yaw;
+                    return true;
+                }
+
+                if (chunkSystemState.frustumDirty) {
+                    chunkSystemState.frustumDirty = false;
+                    return true;
+                }
+
+                return false;
+            }
             const BIOME_CELL_SIZE = 64;
             const biomeCellCache = new Map();
             const treeMaskCache = new Map();
@@ -17273,7 +17359,11 @@
                 dirty: true,
             };
 
-            function invalidateFrustumCache() { frustumCacheState.dirty = true; }
+            function invalidateFrustumCache() {
+                frustumCacheState.dirty = true;
+                // Also mark chunk system dirty so early exit checks run streaming update
+                chunkSystemState.frustumDirty = true;
+            }
             function markPendingLight(chunkKey) {
                 if (!chunkKey) return;
                 const now = performance.now();
@@ -21269,6 +21359,9 @@
                 // OPTIMIZATION: Mark shadows dirty for update (block changed = shadow geometry changed)
                 markShadowsDirty();
 
+                // Mark chunk system dirty for streaming update
+                markChunkSystemDirty('block modified');
+
                 // Schedule localized relight so sunlight/torches react to edits
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
@@ -23851,6 +23944,8 @@ self.onmessage = async (e) => {
                             // Fog ends 1 chunk before edge for full occlusion
                             const fogFarActual = fogFar - WORLD_DIMS.chunkSize;
                             if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogFarActual * 0.5; }
+                            // Mark chunk system dirty for streaming update
+                            markChunkSystemDirty('render distance slider changed');
                         }
                         localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     });
@@ -24988,6 +25083,8 @@ self.onmessage = async (e) => {
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                     if (renderer) { renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio); }
+                    // Mark chunk system dirty for streaming update
+                    markChunkSystemDirty('performance rendering reset');
                 });
                 // Reset Performance - Streaming
                 document.getElementById("btn-reset-performance-streaming")?.addEventListener("click", () => {
@@ -25591,6 +25688,9 @@ self.onmessage = async (e) => {
                     "\n" +
                     "Frustum Culling: " +
                     (culled ? `${culled} chunks hidden` : "OFF") +
+                    "\n" +
+                    "Streaming: " +
+                    (chunkSystemState.lastUpdateSkipped ? "idle" : "active") +
                     "\n" +
                     (tightBoundsStats.totalChunks > 0 ?
                         "Bounds: " + (tightBoundsStats.avgHeightReduction * 100).toFixed(0) + "% height, " +
@@ -34303,7 +34403,8 @@ self.onmessage = async (e) => {
             async function updateChunks() {
                 const currentTime = typeof time !== "undefined" ? time : performance.now();
                 let renderDistanceChanged = false;
-                // --- 1. Dynamic Render Distance Logic ---
+
+                // --- 1. Dynamic Render Distance Logic (runs every 2s, unchanged) ---
                 if (SETTINGS.dynamicRenderDistance) {
                     if (currentTime - renderDistanceChangeTimer > 2000) {
                         // 2s cooldown
@@ -34321,16 +34422,39 @@ self.onmessage = async (e) => {
                             currentRenderRadius = newRadius;
                             renderDistanceChangeTimer = currentTime;
                             renderDistanceChanged = true;
+                            markChunkSystemDirty('render distance changed');
                             logDebug(`Render Distance Updated: ${currentRenderRadius} (FPS: ${avgFPS.toFixed(0)})`);
                         }
                     }
                     // Force static setting if dynamic is off
-                } else { if (currentRenderRadius !== SETTINGS.renderDistance) { currentRenderRadius = SETTINGS.renderDistance; renderDistanceChanged = true; }}
+                } else {
+                    if (currentRenderRadius !== SETTINGS.renderDistance) {
+                        currentRenderRadius = SETTINGS.renderDistance;
+                        renderDistanceChanged = true;
+                        markChunkSystemDirty('render distance changed');
+                    }
+                }
+
+                // --- 2. Early exit checks - skip expensive work when nothing changed ---
+                const needsStreaming = shouldUpdateChunkStreaming();
+                const needsFrustum = shouldUpdateFrustum();
+                const needsMemoryCheck = (currentTime - chunkSystemState.lastMemoryCheckTime) > chunkSystemState.memoryCheckInterval;
+                const needsCompression = SETTINGS.enableChunkCompression &&
+                    (currentTime - chunkSystemState.lastCompressionTime) > chunkSystemState.compressionInterval;
+
+                // If nothing needs doing, skip the expensive work
+                if (!needsStreaming && !needsFrustum && !needsMemoryCheck && !needsCompression && !renderDistanceChanged) {
+                    chunkSystemState.lastUpdateSkipped = true;
+                    return; // Early exit - nothing to do!
+                }
+                chunkSystemState.lastUpdateSkipped = false;
+
                 // --- 1b. Update shadow frustum when render distance changes ---
                 if (renderDistanceChanged || currentRenderRadius !== lastShadowRenderRadius) {
                     updateShadowFrustumSize(currentRenderRadius);
                 }
-                // --- 2. Calculate Player Position ---
+
+                // --- 3. Calculate Player Position ---
                 const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
@@ -34338,6 +34462,7 @@ self.onmessage = async (e) => {
                 lastChunkX = chunkX;
                 lastChunkZ = chunkZ;
                 lastRenderRadius = currentRenderRadius;
+
                 // --- 4. Efficient Fog Update ---
                 // Don't create 'new Fog' every frame. Update properties instead.
                 // Skip fog distance updates when underwater (underwater fog handles its own distances)
@@ -34508,20 +34633,30 @@ self.onmessage = async (e) => {
                 // Optional: Clean queue set occasionally to prevent memory leaks
                 // (if chunks are cancelled but remain in set)
                 if (queuedChunkKeys.size > chunkBuildQueue.length * 2) { queuedChunkKeys.clear(); chunkBuildQueue.forEach((j) => queuedChunkKeys.add(j.key)); }
-                // --- 7B. Smart Memory Management: Discard Pristine Chunk Data ---
-                // Pristine (unmodified) chunks can be regenerated from seed or loaded from IndexedDB,
-                // so we can aggressively free their memory. Modified chunks must be kept.
-                // Aggressively discard pristine chunks that aren't currently needed
-                // No need to check if mesh exists - IndexedDB will cache the data
-                if (pristineChunks.size > 0) { for (const key of pristineChunks) { if (!chunksInRange.has(key) && canEvictChunk(key)) { purgeChunkData(key); }}}
-                // --- 8. Chunk Data Pool Eviction ---
-                // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
-                // This replaces the old maxCachedChunks approach with memory-budget-based eviction
-                chunkDataPool.evictIfNeeded(chunkX, chunkZ, modifiedChunks, purgeChunkData);
+                // --- 7B. Smart Memory Management (throttled to 1s interval) ---
+                // Only run memory checks periodically to reduce CPU usage when idle
+                if (needsMemoryCheck) {
+                    chunkSystemState.lastMemoryCheckTime = currentTime;
 
-                // --- 8b. Chunk Data Compression ---
+                    // Pristine (unmodified) chunks can be regenerated from seed or loaded from IndexedDB,
+                    // so we can aggressively free their memory. Modified chunks must be kept.
+                    if (pristineChunks.size > 0) {
+                        for (const key of pristineChunks) {
+                            if (!chunksInRange.has(key) && canEvictChunk(key)) {
+                                purgeChunkData(key);
+                            }
+                        }
+                    }
+
+                    // --- 8. Chunk Data Pool Eviction ---
+                    // Use ChunkDataPool for smarter LRU-based eviction with dataKeepDistance
+                    chunkDataPool.evictIfNeeded(chunkX, chunkZ, modifiedChunks, purgeChunkData);
+                }
+
+                // --- 8b. Chunk Data Compression (throttled to 5s interval) ---
                 // Compress inactive chunks to save memory
-                if (SETTINGS.enableChunkCompression) {
+                if (needsCompression) {
+                    chunkSystemState.lastCompressionTime = currentTime;
                     chunkDataPool.compressInactiveChunks(chunkX, chunkZ);
                 }
 
@@ -34945,13 +35080,14 @@ self.onmessage = async (e) => {
                     processChunkQueue();
                     perfMonitor.end("chunkBuild", chunkBuildStart);
                 }
-                // Run chunk updates every 200ms
-                if (time - lastChunkUpdate > 200) {
-                    const chunkUpdateStart = perfMonitor.start("chunkUpdate");
-                    updateChunks();
-                    perfMonitor.end("chunkUpdate", chunkUpdateStart);
-                    lastChunkUpdate = time;
-                }
+                // Run chunk streaming updates - now internally event-driven
+                // Changed from fixed 200ms interval to smart dirty checking
+                // updateChunks() returns early if nothing changed, so calling every frame is safe
+                const chunkUpdateStart = perfMonitor.start("chunkUpdate");
+                updateChunks();
+                perfMonitor.end("chunkUpdate", chunkUpdateStart);
+                lastChunkUpdate = time;
+
                 runNeighborReconciliationSweep(time);
             }
             // Update FPS tracking and statistics
