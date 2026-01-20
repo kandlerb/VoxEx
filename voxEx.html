@@ -18442,11 +18442,20 @@
     const GRASS = 1;
     const DIRT = 2;
     const STONE = 3;
+    const LOG = 5;
+    const LEAVES = 6;
     const BEDROCK = 7;
     const SAND = 8;
     const WATER = 9;
     const SNOW = 11;
     const GRAVEL = 12;
+    const LONGWOOD_LOG = 13;
+    const LONGWOOD_LEAVES = 14;
+
+    // Block type sets for tree generation
+    const LOG_BLOCK_IDS = new Set([LOG, LONGWOOD_LOG]);
+    const LEAF_BLOCK_IDS = new Set([LEAVES, LONGWOOD_LEAVES]);
+    const DEFAULT_TREE_GROUND_BLOCKS = new Set([GRASS, DIRT]);
 
     // World dimensions
     const WORLD_DIMS = {
@@ -18456,14 +18465,87 @@
         yOffset: 64
     };
 
-    // Simplified biome config for terrain generation (no rendering properties)
+    // Default tree configuration - matches main thread TREE_CONFIG exactly
+    const TREE_CONFIG = {
+        trunk: {
+            w: 1, d: 1,
+            minHeight: 5, maxHeight: 11,
+            branchStart: 0.5, branchChance: 0.0, branchLength: 2, taperTop: false,
+        },
+        canopy: {
+            radius: 2, topExtension: 2, overlapDown: 2, leafChance: 1.0,
+            shape: "round", taperFactor: 0.7, noiseStrength: 0.2,
+            holeChance: 0.05, branchChance: 0.08, layerGap: 0, layers: null,
+        },
+        blocks: { log: null, leaves: null },
+        spacing: 4,
+        allowedGroundBlocks: null,
+    };
+
+    // Biome config WITH tree configurations - must match main thread
     const BIOME_CONFIG = {
-        plains: { weight: 2, roughness: 0.006, amplitude: 8, baseHeight: 62, tags: [] },
-        hills: { weight: 2, roughness: 0.010, amplitude: 40, baseHeight: 65, tags: [] },
-        forests: { weight: 2, roughness: 0.015, amplitude: 12, baseHeight: 64, tags: [] },
-        mountains: { weight: 1, roughness: 0.003, amplitude: 180, baseHeight: 70, tags: ["mountain"] },
-        swamp: { weight: 1, roughness: 0.025, amplitude: 5, baseHeight: 58, tags: [] },
-        longwoods: { weight: 2, roughness: 0.008, amplitude: 25, baseHeight: 68, tags: ["forested", "giant_trees"] }
+        plains: {
+            weight: 2, roughness: 0.006, amplitude: 8, baseHeight: 62, tags: [],
+            trees: {
+                density: 0.002,
+                canopy: { shape: "spherical", noiseStrength: 0.3, branchChance: 0.1 },
+            },
+        },
+        hills: {
+            weight: 2, roughness: 0.010, amplitude: 40, baseHeight: 65, tags: [],
+            trees: {
+                density: 0.005,
+                canopy: { shape: "spherical", noiseStrength: 0.25, branchChance: 0.08 },
+            },
+        },
+        forests: {
+            weight: 2, roughness: 0.015, amplitude: 12, baseHeight: 64, tags: [],
+            trees: {
+                density: 0.15, spacing: 5,
+                canopy: {
+                    shape: "spherical", radius: 3, topExtension: 2, overlapDown: 2,
+                    noiseStrength: 0.35, holeChance: 0.03, branchChance: 0.12,
+                },
+            },
+        },
+        mountains: {
+            weight: 1, roughness: 0.003, amplitude: 180, baseHeight: 70, tags: ["mountain"],
+            trees: {
+                density: 0.005,
+                canopy: {
+                    shape: "conical", radius: 2, topExtension: 3, overlapDown: 1,
+                    taperFactor: 0.5, noiseStrength: 0.15, branchChance: 0.05,
+                },
+            },
+        },
+        swamp: {
+            weight: 1, roughness: 0.025, amplitude: 5, baseHeight: 58, tags: [],
+            trees: {
+                density: 0.15,
+                canopy: {
+                    shape: "round", radius: 3, topExtension: 1, overlapDown: 3,
+                    noiseStrength: 0.4, holeChance: 0.08, branchChance: 0.15, leafChance: 0.85,
+                },
+            },
+        },
+        longwoods: {
+            weight: 2, roughness: 0.008, amplitude: 25, baseHeight: 68, tags: ["forested", "giant_trees"],
+            trees: {
+                density: 0.18, spacing: 6,
+                trunk: {
+                    minHeight: 12, maxHeight: 24,
+                    sizes: [
+                        { w: 2, d: 2, weight: 0.75 },
+                        { w: 3, d: 3, weight: 0.25 },
+                    ],
+                },
+                canopy: {
+                    shape: "round", radius: 6, topExtension: 1, overlapDown: 1,
+                    leafChance: 0.65, noiseStrength: 0.5, holeChance: 0.1, branchChance: 0.18,
+                },
+                blocks: { log: LONGWOOD_LOG, leaves: LONGWOOD_LEAVES },
+            },
+        },
     };
     const BIOME_NAMES = Object.keys(BIOME_CONFIG);
     const BIOME_WEIGHTS = BIOME_NAMES.map(name => BIOME_CONFIG[name].weight);
@@ -18641,6 +18723,446 @@
         const cellX = Math.floor(gx / BIOME_CELL_SIZE);
         const cellZ = Math.floor(gz / BIOME_CELL_SIZE);
         return getBiomeCellValue(cellX, cellZ);
+    }
+
+    // ============================================================
+    // TREE GENERATION SYSTEM - MUST MATCH MAIN THREAD EXACTLY!
+    // ============================================================
+    const treeMaskCache = new Map();
+    // Empty Map for chunks - worker doesn't have access to main thread chunks
+    // This causes neighbor validation to always trust the deterministic generator
+    const chunks = new Map();
+
+    function getChunkKey(cx, cz) {
+        return cx + ',' + cz;
+    }
+
+    function seededRandom(seed, gx, gz, x, y, z) {
+        let h = seed;
+        h = ((h << 5) - h + gx) | 0;
+        h = ((h << 5) - h + gz) | 0;
+        h = ((h << 5) - h + x) | 0;
+        h = ((h << 5) - h + y) | 0;
+        h = ((h << 5) - h + z) | 0;
+        h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+        h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+        h ^= h >>> 16;
+        return (h >>> 0) / 4294967296;
+    }
+
+    function treePlacementValue(gx, gz, seed) {
+        const h = Math.sin(gx * 12.9898 + gz * 78.233 + seed * 0.12345);
+        const base = h - Math.floor(h);
+        const warp = noise2D(gx * 0.05 + seed * 7.31, gz * 0.05 - seed * 3.17) * 0.3;
+        const combined = base + warp;
+        return combined - Math.floor(combined);
+    }
+
+    function isLeafBlock(blockId) {
+        return LEAF_BLOCK_IDS.has(blockId);
+    }
+
+    function isLogBlock(blockId) {
+        return LOG_BLOCK_IDS.has(blockId);
+    }
+
+    function isValidTreeGround(blockId, allowedGroundBlocks) {
+        return allowedGroundBlocks.has(blockId);
+    }
+
+    function getTreeDensityForBiome(biomeName) {
+        const config = BIOME_CONFIG[biomeName];
+        if (!config) return 0.0;
+        return config.trees?.density ?? 0.0;
+    }
+
+    function getTreeMaskKey(cx, cz) {
+        return cx + ',' + cz;
+    }
+
+    function generateTreeMaskForChunk(cx, cz, seed) {
+        const w = WORLD_DIMS.chunkSize, h = WORLD_DIMS.chunkSize;
+        const mask = new Uint8Array(w * h);
+        const startX = cx * WORLD_DIMS.chunkSize, startZ = cz * WORLD_DIMS.chunkSize;
+        for (let lx = 0; lx < w; lx++) {
+            for (let lz = 0; lz < h; lz++) {
+                const gx = startX + lx, gz = startZ + lz;
+                const biome = getBiomeParams(gx, gz);
+                if (!biome) continue;
+                const density = getTreeDensityForBiome(biome.name);
+                if (density <= 0) continue;
+                const p = treePlacementValue(gx, gz, seed);
+                if (p < density * 1.4) mask[lx + lz * w] = 1;
+            }
+        }
+        const steps = 3, tmp = new Uint8Array(w * h);
+        for (let s = 0; s < steps; s++) {
+            for (let lx = 0; lx < w; lx++) {
+                for (let lz = 0; lz < h; lz++) {
+                    const idx = lx + lz * w, cur = mask[idx];
+                    let neighbors = 0;
+                    for (let ox = -1; ox <= 1; ox++) {
+                        for (let oz = -1; oz <= 1; oz++) {
+                            if (ox === 0 && oz === 0) continue;
+                            const nx = lx + ox, nz = lz + oz;
+                            if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
+                            neighbors += mask[nx + nz * w];
+                        }
+                    }
+                    tmp[idx] = cur ? (neighbors >= 2 && neighbors <= 6 ? 1 : 0) : neighbors >= 4 ? 1 : 0;
+                }
+            }
+            mask.set(tmp);
+        }
+        return mask;
+    }
+
+    function getTreeMaskForChunk(cx, cz, seed) {
+        const key = getTreeMaskKey(cx, cz);
+        let mask = treeMaskCache.get(key);
+        if (!mask) {
+            mask = generateTreeMaskForChunk(cx, cz, seed);
+            treeMaskCache.set(key, mask);
+        }
+        return mask;
+    }
+
+    function getTreeMaskValueGlobal(gx, gz, seed) {
+        const cs = WORLD_DIMS.chunkSize;
+        const cx = Math.floor(gx / cs), cz = Math.floor(gz / cs);
+        const lx = ((gx % cs) + cs) % cs, lz = ((gz % cs) + cs) % cs;
+        const mask = getTreeMaskForChunk(cx, cz, seed);
+        return mask[lx + lz * cs] === 1;
+    }
+
+    function resolveTreeProfile(biome) {
+        const trees = biome.trees || {};
+        const trunk = {
+            ...TREE_CONFIG.trunk,
+            branchStart: TREE_CONFIG.trunk.branchStart,
+            branchChance: TREE_CONFIG.trunk.branchChance,
+            branchLength: TREE_CONFIG.trunk.branchLength,
+            taperTop: TREE_CONFIG.trunk.taperTop,
+            ...trees.trunk,
+        };
+        if (trees.trunk?.sizes) trunk.sizes = trees.trunk.sizes;
+        const canopy = {
+            radius: TREE_CONFIG.canopy.radius,
+            topExtension: TREE_CONFIG.canopy.topExtension,
+            overlapDown: TREE_CONFIG.canopy.overlapDown,
+            leafChance: TREE_CONFIG.canopy.leafChance,
+            shape: TREE_CONFIG.canopy.shape,
+            taperFactor: TREE_CONFIG.canopy.taperFactor,
+            noiseStrength: TREE_CONFIG.canopy.noiseStrength,
+            holeChance: TREE_CONFIG.canopy.holeChance,
+            branchChance: TREE_CONFIG.canopy.branchChance,
+            layerGap: TREE_CONFIG.canopy.layerGap,
+            layers: TREE_CONFIG.canopy.layers,
+            ...trees.canopy,
+        };
+        if (trees.canopy?.layers) canopy.layers = trees.canopy.layers;
+        const blocks = { ...TREE_CONFIG.blocks, ...trees.blocks };
+        let allowedGround = trees.allowedGroundBlocks ?? TREE_CONFIG.allowedGroundBlocks;
+        if (allowedGround === null) {
+            allowedGround = DEFAULT_TREE_GROUND_BLOCKS;
+        } else if (Array.isArray(allowedGround)) {
+            allowedGround = new Set(allowedGround);
+        }
+        return {
+            density: trees.density ?? 0,
+            spacing: trees.spacing ?? TREE_CONFIG.spacing,
+            trunk, canopy,
+            blocks: { log: blocks.log ?? LOG, leaves: blocks.leaves ?? LEAVES },
+            allowedGroundBlocks: allowedGround,
+        };
+    }
+
+    function pickTrunkSize(profile, seed, gx, gz) {
+        const trunk = profile.trunk;
+        let w = trunk.w, d = trunk.d, maxW = trunk.w, maxD = trunk.d;
+        if (trunk.sizes && trunk.sizes.length > 0) {
+            for (const s of trunk.sizes) {
+                if (s.w > maxW) maxW = s.w;
+                if (s.d > maxD) maxD = s.d;
+            }
+            const totalWeight = trunk.sizes.reduce((sum, s) => sum + (s.weight || 1), 0);
+            const r = seededRandom(seed, gx, gz, 0, 0, 12345) * totalWeight;
+            let cumulative = 0;
+            for (const s of trunk.sizes) {
+                cumulative += (s.weight || 1);
+                if (r < cumulative) { w = s.w; d = s.d; break; }
+            }
+        }
+        return { w, d, maxW, maxD };
+    }
+
+    function wouldHaveValidTree(gx, gz, worldSeed) {
+        const biome = getBiomeParams(gx, gz);
+        if (!biome || !biome.trees || biome.trees.density <= 0) return false;
+        if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) return false;
+        const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+        if (groundY < WORLD_DIMS.seaLevel) return false;
+        const riverFactor = getRiverFactor(gx, gz, worldSeed);
+        if (riverFactor < 0.8) return false;
+        return true;
+    }
+
+    function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
+        const startX = cx * chunkSize, startZ = cz * chunkSize;
+        const trees = [];
+        for (let lx = 0; lx < chunkSize; lx++) {
+            for (let lz = 0; lz < chunkSize; lz++) {
+                const gx = startX + lx, gz = startZ + lz;
+                const biome = getBiomeParams(gx, gz);
+                if (!biome || !biome.trees || biome.trees.density <= 0) continue;
+                if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) continue;
+                const profile = resolveTreeProfile(biome);
+                const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = profile;
+                const density = profile.density;
+                const p = treePlacementValue(gx, gz, worldSeed);
+                if (p > density) continue;
+                const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+                if (groundY < WORLD_DIMS.seaLevel) continue;
+                const riverFactor = getRiverFactor(gx, gz, worldSeed);
+                if (riverFactor < 0.8) continue;
+                let tooClose = false;
+                for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
+                    for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
+                        if (ddx === 0 && ddz === 0) continue;
+                        const dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                        if (dist >= spacing) continue;
+                        const neighborGx = gx + ddx, neighborGz = gz + ddz;
+                        const np = treePlacementValue(neighborGx, neighborGz, worldSeed);
+                        if (np <= density && np < p && wouldHaveValidTree(neighborGx, neighborGz, worldSeed)) {
+                            tooClose = true;
+                        }
+                    }
+                }
+                if (tooClose) continue;
+                const { w: trunkW, d: trunkD, maxW, maxD } = pickTrunkSize(profile, worldSeed, gx, gz);
+                const halfW = Math.floor(trunkW / 2), halfD = Math.floor(trunkD / 2);
+                const minTx = -halfW, maxTx = trunkW - halfW - 1;
+                const minTz = -halfD, maxTz = trunkD - halfD - 1;
+                if (lx + minTx < 0 || lx + maxTx >= chunkSize || lz + minTz < 0 || lz + maxTz >= chunkSize) continue;
+                const n = noise2D(gx * 0.01 + worldSeed, gz * 0.01 - worldSeed);
+                const val01 = (n + 1) * 0.5;
+                const heightRange = trunk.maxHeight - trunk.minHeight;
+                const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
+                trees.push({
+                    gx, gz, lx, lz, groundY, trunkHeight, trunkW, trunkD,
+                    halfW, halfD, minTx, maxTx, minTz, maxTz,
+                    profile, biome, canopyRadius: canopy.radius,
+                    density, placementValue: p, spacing, riverFactor,
+                });
+            }
+        }
+        return trees;
+    }
+
+    function getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap) {
+        const canopyHeight = canopyTop - canopyBottom + 1;
+        const layerIndex = y - canopyBottom;
+        const normalizedY = layerIndex / Math.max(1, canopyHeight - 1);
+        switch (shape) {
+            case "conical":
+                return Math.max(1, Math.round(baseRadius * (1 - normalizedY * (1 - taperFactor))));
+            case "spherical": {
+                const centerY = (canopyBottom + canopyTop) / 2;
+                const distFromCenter = Math.abs(y - centerY);
+                const maxDist = (canopyTop - canopyBottom) / 2;
+                const sphereFactor = Math.sqrt(1 - Math.pow(distFromCenter / Math.max(1, maxDist), 2));
+                return Math.max(1, Math.round(baseRadius * sphereFactor));
+            }
+            case "layered": {
+                if (layerGap > 0 && layerIndex % (layerGap + 1) !== 0) return 0;
+                const isWideLayer = Math.floor(layerIndex / Math.max(1, layerGap + 1)) % 2 === 0;
+                const baseTaper = 1 - normalizedY * (1 - taperFactor);
+                const layerMultiplier = isWideLayer ? 1.0 : 0.6;
+                return Math.max(1, Math.round(baseRadius * baseTaper * layerMultiplier));
+            }
+            case "umbrella":
+                if (normalizedY < 0.7) return Math.max(0, Math.round(baseRadius * 0.3 * normalizedY));
+                return baseRadius;
+            case "round":
+            default:
+                return baseRadius;
+        }
+    }
+
+    function forEachCanopyVoxel(profile, seed, gxCenter, gzCenter, trunkTopY, trunkW, trunkD, fn) {
+        const { radius: baseRadius, topExtension, overlapDown, leafChance: defaultLeafChance,
+                shape, taperFactor, noiseStrength, holeChance, branchChance, layerGap, layers } = profile.canopy;
+        const canopyBottom = trunkTopY - overlapDown;
+        const canopyTop = trunkTopY + topExtension;
+        const halfW = Math.floor(trunkW / 2), halfD = Math.floor(trunkD / 2);
+        const trunkMinX = -halfW, trunkMaxX = trunkW - halfW - 1;
+        const trunkMinZ = -halfD, trunkMaxZ = trunkD - halfD - 1;
+        const candidates = new Map();
+        function isInTrunk(dx, dz) {
+            return dx >= trunkMinX && dx <= trunkMaxX && dz >= trunkMinZ && dz <= trunkMaxZ;
+        }
+        function collectCandidatesForLayer(y, layerRadius, leafChance) {
+            const noiseValue = seededRandom(seed, gxCenter, gzCenter, 0, y, 7777);
+            const radiusNoise = Math.round((noiseValue - 0.5) * 2 * noiseStrength);
+            const effectiveRadius = Math.max(1, layerRadius + radiusNoise);
+            const scanRadius = baseRadius + 2;
+            for (let dx = -scanRadius; dx <= scanRadius; dx++) {
+                for (let dz = -scanRadius; dz <= scanRadius; dz++) {
+                    const dist = Math.sqrt(dx * dx + dz * dz);
+                    if (dist > effectiveRadius + 2) continue;
+                    if (y <= trunkTopY && isInTrunk(dx, dz)) continue;
+                    let shouldPlace = false;
+                    if (dist <= effectiveRadius) {
+                        shouldPlace = true;
+                        if (dist > effectiveRadius - 1) {
+                            const edgeFade = 1 - (dist - (effectiveRadius - 1));
+                            const edgeRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz);
+                            if (edgeRand > edgeFade * 0.7 + 0.3) shouldPlace = false;
+                        }
+                        if (Math.abs(dx) >= effectiveRadius - 0.5 && Math.abs(dz) >= effectiveRadius - 0.5) {
+                            if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 1111) > 0.4) shouldPlace = false;
+                        }
+                        if (shouldPlace && holeChance > 0 && dist < effectiveRadius - 1) {
+                            const holeRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 5555);
+                            if (holeRand < holeChance) shouldPlace = false;
+                        }
+                    } else if (dist <= effectiveRadius + 2 && branchChance > 0) {
+                        const branchRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 3333);
+                        const layerNorm = (y - canopyBottom) / Math.max(1, canopyTop - canopyBottom);
+                        const middleBias = 1 - Math.abs(layerNorm - 0.5) * 2;
+                        if (branchRand < branchChance * middleBias) {
+                            let hasNeighbor = false;
+                            for (let nx = -1; nx <= 1 && !hasNeighbor; nx++) {
+                                for (let nz = -1; nz <= 1 && !hasNeighbor; nz++) {
+                                    if (nx === 0 && nz === 0) continue;
+                                    const nDist = Math.sqrt((dx + nx) * (dx + nx) + (dz + nz) * (dz + nz));
+                                    if (nDist <= effectiveRadius) hasNeighbor = true;
+                                }
+                            }
+                            if (hasNeighbor) shouldPlace = true;
+                        }
+                    }
+                    if (shouldPlace && leafChance < 1.0) {
+                        const lcRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999);
+                        if (lcRand > leafChance) shouldPlace = false;
+                    }
+                    if (shouldPlace) candidates.set(dx + ',' + y + ',' + dz, true);
+                }
+            }
+        }
+        if (layers && layers.length > 0) {
+            for (const layer of layers) {
+                const y = trunkTopY + layer.yOffset;
+                if (y < 0) continue;
+                collectCandidatesForLayer(y, layer.radius, layer.leafChance ?? defaultLeafChance);
+            }
+        } else {
+            for (let y = canopyBottom; y <= canopyTop; y++) {
+                const layerRadius = getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap);
+                if (layerRadius <= 0) continue;
+                collectCandidatesForLayer(y, layerRadius, defaultLeafChance);
+            }
+        }
+        // Pass 2: Filter for face adjacency
+        const filtered = new Map();
+        for (const key of candidates.keys()) {
+            const [dxs, ys, dzs] = key.split(',');
+            const dx = parseInt(dxs), y = parseInt(ys), dz = parseInt(dzs);
+            let hasFaceNeighbor = false;
+            const checks = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+            for (const [ox, oy, oz] of checks) {
+                const nKey = (dx + ox) + ',' + (y + oy) + ',' + (dz + oz);
+                if (candidates.has(nKey)) { hasFaceNeighbor = true; break; }
+            }
+            if (hasFaceNeighbor) filtered.set(key, true);
+            else if (isInTrunk(dx, dz) && y === trunkTopY + 1) filtered.set(key, true);
+        }
+        for (const key of filtered.keys()) {
+            const [dxs, ys, dzs] = key.split(',');
+            fn(parseInt(dxs), parseInt(dzs), parseInt(ys));
+        }
+    }
+
+    function generateTreesForChunk(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, get, set, caches) {
+        const { heightCache, riverCache } = caches;
+        const allTrees = [];
+        const MAX_CANOPY_RADIUS = 8;
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+                const ncx = cx + dx, ncz = cz + dz;
+                const chunkTrees = getChunkTreePositions(ncx, ncz, seed, chunkSize);
+                for (const tree of chunkTrees) {
+                    const canopyMinX = tree.gx - tree.canopyRadius;
+                    const canopyMaxX = tree.gx + tree.canopyRadius;
+                    const canopyMinZ = tree.gz - tree.canopyRadius;
+                    const canopyMaxZ = tree.gz + tree.canopyRadius;
+                    const chunkMinX = startX, chunkMaxX = startX + chunkSize;
+                    const chunkMinZ = startZ, chunkMaxZ = startZ + chunkSize;
+                    if (canopyMaxX < chunkMinX || canopyMinX >= chunkMaxX ||
+                        canopyMaxZ < chunkMinZ || canopyMinZ >= chunkMaxZ) continue;
+                    allTrees.push({
+                        ...tree, isOwnChunk: (dx === 0 && dz === 0),
+                        sourceCx: ncx, sourceCz: ncz,
+                    });
+                }
+            }
+        }
+        for (const tree of allTrees) {
+            const { gx, gz, lx, lz, trunkHeight, trunkW, trunkD, profile, isOwnChunk,
+                    halfW, halfD, minTx, maxTx, minTz, maxTz, groundY } = tree;
+            const { canopy, blocks, allowedGroundBlocks } = profile;
+            const localX = gx - startX, localZ = gz - startZ;
+            let finalGroundY = groundY;
+            if (isOwnChunk) finalGroundY = heightCache[lx + lz * chunkSize];
+            const trunkBaseY = finalGroundY + 1;
+            const trunkTopY = trunkBaseY + trunkHeight;
+            if (isOwnChunk) {
+                const groundId = get(lx, finalGroundY, lz);
+                if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
+                let hasSpace = true;
+                for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
+                    const block = get(lx, y, lz);
+                    if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                }
+                if (!hasSpace) continue;
+                if (trunkTopY + canopy.topExtension >= chunkHeight) continue;
+                for (let y = trunkBaseY; y <= trunkTopY; y++) {
+                    for (let tx = minTx; tx <= maxTx; tx++) {
+                        for (let tz = minTz; tz <= maxTz; tz++) {
+                            const bx = lx + tx, bz = lz + tz;
+                            if (bx >= 0 && bx < chunkSize && bz >= 0 && bz < chunkSize) {
+                                set(bx, y, bz, blocks.log);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // NEIGHBOR TREE VALIDATION - In worker, chunks is empty so we trust deterministic generator
+                const sourceKey = getChunkKey(tree.sourceCx, tree.sourceCz);
+                const sourceChunk = chunks.get(sourceKey);
+                if (sourceChunk) {
+                    const sourceBlocks = sourceChunk.blocks || sourceChunk;
+                    const sourceStartX = tree.sourceCx * chunkSize;
+                    const sourceStartZ = tree.sourceCz * chunkSize;
+                    const trunkLocalX = gx - sourceStartX;
+                    const trunkLocalZ = gz - sourceStartZ;
+                    const checkY = Math.min(trunkTopY, chunkHeight - 1);
+                    const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
+                    if (!isLogBlock(sourceBlocks[trunkIdx])) continue;
+                }
+            }
+            const actualGroundY = isOwnChunk ? finalGroundY : groundY;
+            const minCanopyY = actualGroundY + 2;
+            forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
+                if (y < minCanopyY) return;
+                const globalX = gx + cdx, globalZ = gz + cdz;
+                const leafLocalX = globalX - startX, leafLocalZ = globalZ - startZ;
+                if (leafLocalX < 0 || leafLocalX >= chunkSize || leafLocalZ < 0 || leafLocalZ >= chunkSize) return;
+                if (y < 0 || y >= chunkHeight) return;
+                const existing = get(leafLocalX, y, leafLocalZ);
+                if (existing === AIR) set(leafLocalX, y, leafLocalZ, blocks.leaves);
+            });
+        }
     }
 
     // ============================================================
@@ -19218,7 +19740,19 @@
                 generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches);
                 fillWaterPass(blocks, chunkSize, chunkHeight, caches.heightCache);
 
-                // Note: Tree generation skipped for now (Phase 3)
+                // --- Phase 3: Tree generation ---
+                // Helper functions for tree generation
+                const get = (x, y, z) => {
+                    if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
+                    return blocks[x + z * chunkSize + y * chunkSize * chunkSize];
+                };
+                const set = (x, y, z, id) => {
+                    if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
+                    blocks[x + z * chunkSize + y * chunkSize * chunkSize] = id;
+                };
+                // Clear tree mask cache for this generation (ensures fresh calculation)
+                treeMaskCache.clear();
+                generateTreesForChunk(cx, cz, blocks, chunkSize, chunkHeight, startX, startZ, workerNumericSeed, get, set, caches);
 
                 // Transfer the buffer (zero-copy)
                 self.postMessage({
@@ -33813,7 +34347,7 @@ self.onmessage = async (e) => {
                     }
 
                     if (workerBlocks) {
-                        // Worker generated terrain + water - still need decorations, lighting on main thread
+                        // Worker generated terrain + water + trees (Phase 3) - only need lighting on main thread
                         const size = chunkSize * chunkSize * chunkHeight;
                         const chunk = {
                             blocks: workerBlocks,
@@ -33823,26 +34357,11 @@ self.onmessage = async (e) => {
                             cz,
                             startX,
                             startZ,
-                            genState: GEN_PASS.TERRAIN | GEN_PASS.WATER, // Worker did terrain + water
+                            genState: GEN_PASS.TERRAIN | GEN_PASS.WATER | GEN_PASS.DECORATIONS, // Worker did all generation
                             sections: createSectionData(),
                         };
 
-                        // Pre-calculate caches for decorations (still needed for trees)
-                        const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seed);
-
-                        // Helper functions for decorations
-                        const set = (x, y, z, id) => {
-                            if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
-                            chunk.blocks[x + z * chunkSize + y * chunkSize * chunkSize] = id;
-                        };
-                        const get = (x, y, z) => {
-                            if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
-                            return chunk.blocks[x + z * chunkSize + y * chunkSize * chunkSize];
-                        };
-
-                        // --- PASS 3: Generate decorations (trees, etc.) - still on main thread ---
-                        generateDecorationsPass(cx, cz, chunk.blocks, chunkSize, chunkHeight, startX, startZ, seed, caches, set, get);
-                        chunk.genState |= GEN_PASS.DECORATIONS;
+                        // Trees already generated in worker - skip decorations pass
 
                         // --- PASS 4: Calculate sunlight ---
                         calculateChunkSunlight(chunk, chunkSize, chunkHeight);
