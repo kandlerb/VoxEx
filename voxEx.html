@@ -4956,6 +4956,8 @@
                 // OPFS Disk Storage
                 useOPFSCache: savedSettings.useOPFSCache !== undefined ? savedSettings.useOPFSCache : true, // Use OPFS for fast chunk disk caching
                 opfsCacheMaxMB: savedSettings.opfsCacheMaxMB ?? 500,                         // Max OPFS cache size in MB (auto-clear old if exceeded)
+                // Web Workers
+                useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5164,6 +5166,8 @@
                 // OPFS Disk Storage defaults
                 useOPFSCache: true,                // Use OPFS for fast chunk disk caching
                 opfsCacheMaxMB: 500,               // Max OPFS cache size in MB
+                // Web Worker defaults
+                useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -18423,6 +18427,1671 @@
             const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
             const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
 
+            // ============================================================
+            // WEB WORKER: Chunk Generation & Meshing (runs in background thread)
+            // ============================================================
+            const CHUNK_WORKER_CODE = `
+    // ============================================================
+    // WORKER CONSTANTS (duplicated from main thread - workers can't share scope)
+    // ============================================================
+    const CHUNK_SIZE = 16;
+    const CHUNK_HEIGHT = 320;
+
+    // Block type constants
+    const AIR = 0;
+    const GRASS = 1;
+    const DIRT = 2;
+    const STONE = 3;
+    const LOG = 5;
+    const LEAVES = 6;
+    const BEDROCK = 7;
+    const SAND = 8;
+    const WATER = 9;
+    const SNOW = 11;
+    const GRAVEL = 12;
+    const LONGWOOD_LOG = 13;
+    const LONGWOOD_LEAVES = 14;
+
+    // Block type sets for tree generation
+    const LOG_BLOCK_IDS = new Set([LOG, LONGWOOD_LOG]);
+    const LEAF_BLOCK_IDS = new Set([LEAVES, LONGWOOD_LEAVES]);
+    const DEFAULT_TREE_GROUND_BLOCKS = new Set([GRASS, DIRT]);
+
+    // World dimensions
+    const WORLD_DIMS = {
+        chunkSize: 16,
+        chunkHeight: 320,
+        seaLevel: 60,
+        yOffset: 64
+    };
+
+    // Default tree configuration - matches main thread TREE_CONFIG exactly
+    const TREE_CONFIG = {
+        trunk: {
+            w: 1, d: 1,
+            minHeight: 5, maxHeight: 11,
+            branchStart: 0.5, branchChance: 0.0, branchLength: 2, taperTop: false,
+        },
+        canopy: {
+            radius: 2, topExtension: 2, overlapDown: 2, leafChance: 1.0,
+            shape: "round", taperFactor: 0.7, noiseStrength: 0.2,
+            holeChance: 0.05, branchChance: 0.08, layerGap: 0, layers: null,
+        },
+        blocks: { log: null, leaves: null },
+        spacing: 4,
+        allowedGroundBlocks: null,
+    };
+
+    // Biome config WITH tree configurations - must match main thread
+    const BIOME_CONFIG = {
+        plains: {
+            weight: 2, roughness: 0.006, amplitude: 8, baseHeight: 62, tags: [],
+            trees: {
+                density: 0.002,
+                canopy: { shape: "spherical", noiseStrength: 0.3, branchChance: 0.1 },
+            },
+        },
+        hills: {
+            weight: 2, roughness: 0.010, amplitude: 40, baseHeight: 65, tags: [],
+            trees: {
+                density: 0.005,
+                canopy: { shape: "spherical", noiseStrength: 0.25, branchChance: 0.08 },
+            },
+        },
+        forests: {
+            weight: 2, roughness: 0.015, amplitude: 12, baseHeight: 64, tags: [],
+            trees: {
+                density: 0.15, spacing: 5,
+                canopy: {
+                    shape: "spherical", radius: 3, topExtension: 2, overlapDown: 2,
+                    noiseStrength: 0.35, holeChance: 0.03, branchChance: 0.12,
+                },
+            },
+        },
+        mountains: {
+            weight: 1, roughness: 0.003, amplitude: 180, baseHeight: 70, tags: ["mountain"],
+            trees: {
+                density: 0.005,
+                canopy: {
+                    shape: "conical", radius: 2, topExtension: 3, overlapDown: 1,
+                    taperFactor: 0.5, noiseStrength: 0.15, branchChance: 0.05,
+                },
+            },
+        },
+        swamp: {
+            weight: 1, roughness: 0.025, amplitude: 5, baseHeight: 58, tags: [],
+            trees: {
+                density: 0.15,
+                canopy: {
+                    shape: "round", radius: 3, topExtension: 1, overlapDown: 3,
+                    noiseStrength: 0.4, holeChance: 0.08, branchChance: 0.15, leafChance: 0.85,
+                },
+            },
+        },
+        longwoods: {
+            weight: 2, roughness: 0.008, amplitude: 25, baseHeight: 68, tags: ["forested", "giant_trees"],
+            trees: {
+                density: 0.18, spacing: 6,
+                trunk: {
+                    minHeight: 12, maxHeight: 24,
+                    sizes: [
+                        { w: 2, d: 2, weight: 0.75 },
+                        { w: 3, d: 3, weight: 0.25 },
+                    ],
+                },
+                canopy: {
+                    shape: "round", radius: 6, topExtension: 1, overlapDown: 1,
+                    leafChance: 0.65, noiseStrength: 0.5, holeChance: 0.1, branchChance: 0.18,
+                },
+                blocks: { log: LONGWOOD_LOG, leaves: LONGWOOD_LEAVES },
+            },
+        },
+    };
+    const BIOME_NAMES = Object.keys(BIOME_CONFIG);
+    const BIOME_WEIGHTS = BIOME_NAMES.map(name => BIOME_CONFIG[name].weight);
+    const TOTAL_BIOME_WEIGHT = BIOME_WEIGHTS.reduce((a, b) => a + b, 0);
+
+    // ============================================================
+    // NOISE SYSTEM
+    // ============================================================
+    let perm = null;
+    let workerSeedStr = null;
+    let workerNumericSeed = null; // The numeric seed (first rng.next() value) - used in height functions
+
+    // Fade lookup table for performance
+    const FADE_LUT = new Float32Array(256);
+    for (let i = 0; i < 256; i++) {
+        const t = i / 255;
+        FADE_LUT[i] = t * t * t * (t * (t * 6 - 15) + 10);
+    }
+
+    function fadeFast(t) {
+        const idx = (t * 255) | 0;
+        return FADE_LUT[Math.min(255, Math.max(0, idx))];
+    }
+
+    /**
+     * SeededRandom - MUST match main thread exactly!
+     * Ported from main thread SeededRandom class.
+     */
+    class SeededRandom {
+        constructor(seed) {
+            if (typeof seed === "string") {
+                let h = 0xdeadbeef;
+                for (let i = 0; i < seed.length; i++) {
+                    h = Math.imul(h ^ seed.charCodeAt(i), 2654435761);
+                    h = (h ^ (h >>> 16)) >>> 0;
+                }
+                this.seed = h;
+            } else {
+                this.seed = seed >>> 0;
+            }
+        }
+
+        next() {
+            let t = (this.seed += 0x6d2b79f5);
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+    }
+
+    /**
+     * Initialize noise with seed string (called once when worker receives seed).
+     * MUST match main thread initialization exactly!
+     * @param {string} seedStr - World seed string
+     */
+    function initNoise(seedStr) {
+        workerSeedStr = seedStr;
+        perm = new Uint8Array(512);
+        const p = new Uint8Array(256);
+
+        // Initialize p with 0-255
+        for (let i = 0; i < 256; i++) p[i] = i;
+
+        // Create RNG from seed string - same as main thread
+        const rng = new SeededRandom(seedStr);
+
+        // Store first call value - this is worldConfig.seed in main thread (NUMERIC seed for height functions!)
+        workerNumericSeed = rng.next();
+
+        // Fisher-Yates shuffle - MUST match main thread exactly!
+        // Main thread: for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
+        for (let i = 0; i < 256; i++) {
+            const r = Math.floor(rng.next() * (256 - i)) + i;
+            [p[i], p[r]] = [p[r], p[i]];
+            perm[i] = perm[i + 256] = p[i];
+        }
+    }
+
+    const lerp = (t, a, b) => a + t * (b - a);
+
+    const grad = (h, x, y) => {
+        const u = h < 8 ? x : y;
+        const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
+        return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+    };
+
+    const grad3D = (hash, x, y, z) => {
+        const h = hash & 15;
+        const u = h < 8 ? x : y;
+        const v = h < 4 ? y : (h === 12 || h === 14 ? x : z);
+        return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+    };
+
+    function noise2D(x, y) {
+        const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+        x -= Math.floor(x);
+        y -= Math.floor(y);
+        const u = fadeFast(x), v = fadeFast(y);
+        const A = perm[X] + Y, B = perm[X + 1] + Y;
+        return lerp(v,
+            lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)),
+            lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1))
+        );
+    }
+
+    function noise3D(x, y, z) {
+        const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+        x -= Math.floor(x);
+        y -= Math.floor(y);
+        z -= Math.floor(z);
+        const u = fadeFast(x), v = fadeFast(y), w = fadeFast(z);
+        const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z;
+        const B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z;
+        return lerp(w,
+            lerp(v,
+                lerp(u, grad3D(perm[AA], x, y, z), grad3D(perm[BA], x - 1, y, z)),
+                lerp(u, grad3D(perm[AB], x, y - 1, z), grad3D(perm[BB], x - 1, y - 1, z))
+            ),
+            lerp(v,
+                lerp(u, grad3D(perm[AA + 1], x, y, z - 1), grad3D(perm[BA + 1], x - 1, y, z - 1)),
+                lerp(u, grad3D(perm[AB + 1], x, y - 1, z - 1), grad3D(perm[BB + 1], x - 1, y - 1, z - 1))
+            )
+        );
+    }
+
+    function fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
+        let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
+        for (let i = 0; i < octaves; i++) {
+            total += noise2D(x * frequency, z * frequency) * amplitude;
+            maxValue += amplitude;
+            amplitude *= persistence;
+            frequency *= lacunarity;
+        }
+        return total / maxValue;
+    }
+
+    function fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
+        const warpScale = 0.03;
+        const offsetX = fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
+        const offsetZ = fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
+        return fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
+    }
+
+    // ============================================================
+    // BIOME SYSTEM
+    // ============================================================
+    const BIOME_CELL_SIZE = 64;
+    const biomeCellCache = new Map();
+
+    function getBiomeCellValue(cellX, cellZ) {
+        const key = cellX + ',' + cellZ;
+        if (biomeCellCache.has(key)) return biomeCellCache.get(key);
+
+        // Deterministic biome selection based on cell position
+        const cellNoise = noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
+        const normalizedNoise = (cellNoise + 1) * 0.5;
+
+        let accumulated = 0;
+        let selectedBiome = BIOME_NAMES[0];
+        for (let i = 0; i < BIOME_NAMES.length; i++) {
+            accumulated += BIOME_WEIGHTS[i] / TOTAL_BIOME_WEIGHT;
+            if (normalizedNoise <= accumulated) {
+                selectedBiome = BIOME_NAMES[i];
+                break;
+            }
+        }
+
+        const config = BIOME_CONFIG[selectedBiome];
+        const result = { name: selectedBiome, ...config };
+        biomeCellCache.set(key, result);
+        return result;
+    }
+
+    function getBiomeParams(gx, gz) {
+        const cellX = Math.floor(gx / BIOME_CELL_SIZE);
+        const cellZ = Math.floor(gz / BIOME_CELL_SIZE);
+        return getBiomeCellValue(cellX, cellZ);
+    }
+
+    // ============================================================
+    // TREE GENERATION SYSTEM - MUST MATCH MAIN THREAD EXACTLY!
+    // ============================================================
+    const treeMaskCache = new Map();
+    // Empty Map for chunks - worker doesn't have access to main thread chunks
+    // This causes neighbor validation to always trust the deterministic generator
+    const chunks = new Map();
+
+    function getChunkKey(cx, cz) {
+        return cx + ',' + cz;
+    }
+
+    function seededRandom(seed, gx, gz, x, y, z) {
+        let h = seed;
+        h = ((h << 5) - h + gx) | 0;
+        h = ((h << 5) - h + gz) | 0;
+        h = ((h << 5) - h + x) | 0;
+        h = ((h << 5) - h + y) | 0;
+        h = ((h << 5) - h + z) | 0;
+        h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+        h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+        h ^= h >>> 16;
+        return (h >>> 0) / 4294967296;
+    }
+
+    function treePlacementValue(gx, gz, seed) {
+        const h = Math.sin(gx * 12.9898 + gz * 78.233 + seed * 0.12345);
+        const base = h - Math.floor(h);
+        const warp = noise2D(gx * 0.05 + seed * 7.31, gz * 0.05 - seed * 3.17) * 0.3;
+        const combined = base + warp;
+        return combined - Math.floor(combined);
+    }
+
+    function isLeafBlock(blockId) {
+        return LEAF_BLOCK_IDS.has(blockId);
+    }
+
+    function isLogBlock(blockId) {
+        return LOG_BLOCK_IDS.has(blockId);
+    }
+
+    function isValidTreeGround(blockId, allowedGroundBlocks) {
+        return allowedGroundBlocks.has(blockId);
+    }
+
+    function getTreeDensityForBiome(biomeName) {
+        const config = BIOME_CONFIG[biomeName];
+        if (!config) return 0.0;
+        return config.trees?.density ?? 0.0;
+    }
+
+    function getTreeMaskKey(cx, cz) {
+        return cx + ',' + cz;
+    }
+
+    function generateTreeMaskForChunk(cx, cz, seed) {
+        const w = WORLD_DIMS.chunkSize, h = WORLD_DIMS.chunkSize;
+        const mask = new Uint8Array(w * h);
+        const startX = cx * WORLD_DIMS.chunkSize, startZ = cz * WORLD_DIMS.chunkSize;
+        for (let lx = 0; lx < w; lx++) {
+            for (let lz = 0; lz < h; lz++) {
+                const gx = startX + lx, gz = startZ + lz;
+                const biome = getBiomeParams(gx, gz);
+                if (!biome) continue;
+                const density = getTreeDensityForBiome(biome.name);
+                if (density <= 0) continue;
+                const p = treePlacementValue(gx, gz, seed);
+                if (p < density * 1.4) mask[lx + lz * w] = 1;
+            }
+        }
+        const steps = 3, tmp = new Uint8Array(w * h);
+        for (let s = 0; s < steps; s++) {
+            for (let lx = 0; lx < w; lx++) {
+                for (let lz = 0; lz < h; lz++) {
+                    const idx = lx + lz * w, cur = mask[idx];
+                    let neighbors = 0;
+                    for (let ox = -1; ox <= 1; ox++) {
+                        for (let oz = -1; oz <= 1; oz++) {
+                            if (ox === 0 && oz === 0) continue;
+                            const nx = lx + ox, nz = lz + oz;
+                            if (nx < 0 || nx >= w || nz < 0 || nz >= h) continue;
+                            neighbors += mask[nx + nz * w];
+                        }
+                    }
+                    tmp[idx] = cur ? (neighbors >= 2 && neighbors <= 6 ? 1 : 0) : neighbors >= 4 ? 1 : 0;
+                }
+            }
+            mask.set(tmp);
+        }
+        return mask;
+    }
+
+    function getTreeMaskForChunk(cx, cz, seed) {
+        const key = getTreeMaskKey(cx, cz);
+        let mask = treeMaskCache.get(key);
+        if (!mask) {
+            mask = generateTreeMaskForChunk(cx, cz, seed);
+            treeMaskCache.set(key, mask);
+        }
+        return mask;
+    }
+
+    function getTreeMaskValueGlobal(gx, gz, seed) {
+        const cs = WORLD_DIMS.chunkSize;
+        const cx = Math.floor(gx / cs), cz = Math.floor(gz / cs);
+        const lx = ((gx % cs) + cs) % cs, lz = ((gz % cs) + cs) % cs;
+        const mask = getTreeMaskForChunk(cx, cz, seed);
+        return mask[lx + lz * cs] === 1;
+    }
+
+    function resolveTreeProfile(biome) {
+        const trees = biome.trees || {};
+        const trunk = {
+            ...TREE_CONFIG.trunk,
+            branchStart: TREE_CONFIG.trunk.branchStart,
+            branchChance: TREE_CONFIG.trunk.branchChance,
+            branchLength: TREE_CONFIG.trunk.branchLength,
+            taperTop: TREE_CONFIG.trunk.taperTop,
+            ...trees.trunk,
+        };
+        if (trees.trunk?.sizes) trunk.sizes = trees.trunk.sizes;
+        const canopy = {
+            radius: TREE_CONFIG.canopy.radius,
+            topExtension: TREE_CONFIG.canopy.topExtension,
+            overlapDown: TREE_CONFIG.canopy.overlapDown,
+            leafChance: TREE_CONFIG.canopy.leafChance,
+            shape: TREE_CONFIG.canopy.shape,
+            taperFactor: TREE_CONFIG.canopy.taperFactor,
+            noiseStrength: TREE_CONFIG.canopy.noiseStrength,
+            holeChance: TREE_CONFIG.canopy.holeChance,
+            branchChance: TREE_CONFIG.canopy.branchChance,
+            layerGap: TREE_CONFIG.canopy.layerGap,
+            layers: TREE_CONFIG.canopy.layers,
+            ...trees.canopy,
+        };
+        if (trees.canopy?.layers) canopy.layers = trees.canopy.layers;
+        const blocks = { ...TREE_CONFIG.blocks, ...trees.blocks };
+        let allowedGround = trees.allowedGroundBlocks ?? TREE_CONFIG.allowedGroundBlocks;
+        if (allowedGround === null) {
+            allowedGround = DEFAULT_TREE_GROUND_BLOCKS;
+        } else if (Array.isArray(allowedGround)) {
+            allowedGround = new Set(allowedGround);
+        }
+        return {
+            density: trees.density ?? 0,
+            spacing: trees.spacing ?? TREE_CONFIG.spacing,
+            trunk, canopy,
+            blocks: { log: blocks.log ?? LOG, leaves: blocks.leaves ?? LEAVES },
+            allowedGroundBlocks: allowedGround,
+        };
+    }
+
+    function pickTrunkSize(profile, seed, gx, gz) {
+        const trunk = profile.trunk;
+        let w = trunk.w, d = trunk.d, maxW = trunk.w, maxD = trunk.d;
+        if (trunk.sizes && trunk.sizes.length > 0) {
+            for (const s of trunk.sizes) {
+                if (s.w > maxW) maxW = s.w;
+                if (s.d > maxD) maxD = s.d;
+            }
+            const totalWeight = trunk.sizes.reduce((sum, s) => sum + (s.weight || 1), 0);
+            const r = seededRandom(seed, gx, gz, 0, 0, 12345) * totalWeight;
+            let cumulative = 0;
+            for (const s of trunk.sizes) {
+                cumulative += (s.weight || 1);
+                if (r < cumulative) { w = s.w; d = s.d; break; }
+            }
+        }
+        return { w, d, maxW, maxD };
+    }
+
+    function wouldHaveValidTree(gx, gz, worldSeed) {
+        const biome = getBiomeParams(gx, gz);
+        if (!biome || !biome.trees || biome.trees.density <= 0) return false;
+        if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) return false;
+        const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+        if (groundY < WORLD_DIMS.seaLevel) return false;
+        const riverFactor = getRiverFactor(gx, gz, worldSeed);
+        if (riverFactor < 0.8) return false;
+        return true;
+    }
+
+    function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
+        const startX = cx * chunkSize, startZ = cz * chunkSize;
+        const trees = [];
+        for (let lx = 0; lx < chunkSize; lx++) {
+            for (let lz = 0; lz < chunkSize; lz++) {
+                const gx = startX + lx, gz = startZ + lz;
+                const biome = getBiomeParams(gx, gz);
+                if (!biome || !biome.trees || biome.trees.density <= 0) continue;
+                if (!getTreeMaskValueGlobal(gx, gz, worldSeed)) continue;
+                const profile = resolveTreeProfile(biome);
+                const { trunk, canopy, blocks, spacing, allowedGroundBlocks } = profile;
+                const density = profile.density;
+                const p = treePlacementValue(gx, gz, worldSeed);
+                if (p > density) continue;
+                const groundY = Math.floor(blendedHeight(gx, gz, worldSeed));
+                if (groundY < WORLD_DIMS.seaLevel) continue;
+                const riverFactor = getRiverFactor(gx, gz, worldSeed);
+                if (riverFactor < 0.8) continue;
+                let tooClose = false;
+                for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
+                    for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
+                        if (ddx === 0 && ddz === 0) continue;
+                        const dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                        if (dist >= spacing) continue;
+                        const neighborGx = gx + ddx, neighborGz = gz + ddz;
+                        const np = treePlacementValue(neighborGx, neighborGz, worldSeed);
+                        if (np <= density && np < p && wouldHaveValidTree(neighborGx, neighborGz, worldSeed)) {
+                            tooClose = true;
+                        }
+                    }
+                }
+                if (tooClose) continue;
+                const { w: trunkW, d: trunkD, maxW, maxD } = pickTrunkSize(profile, worldSeed, gx, gz);
+                const halfW = Math.floor(trunkW / 2), halfD = Math.floor(trunkD / 2);
+                const minTx = -halfW, maxTx = trunkW - halfW - 1;
+                const minTz = -halfD, maxTz = trunkD - halfD - 1;
+                if (lx + minTx < 0 || lx + maxTx >= chunkSize || lz + minTz < 0 || lz + maxTz >= chunkSize) continue;
+                const n = noise2D(gx * 0.01 + worldSeed, gz * 0.01 - worldSeed);
+                const val01 = (n + 1) * 0.5;
+                const heightRange = trunk.maxHeight - trunk.minHeight;
+                const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
+                trees.push({
+                    gx, gz, lx, lz, groundY, trunkHeight, trunkW, trunkD,
+                    halfW, halfD, minTx, maxTx, minTz, maxTz,
+                    profile, biome, canopyRadius: canopy.radius,
+                    density, placementValue: p, spacing, riverFactor,
+                });
+            }
+        }
+        return trees;
+    }
+
+    function getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap) {
+        const canopyHeight = canopyTop - canopyBottom + 1;
+        const layerIndex = y - canopyBottom;
+        const normalizedY = layerIndex / Math.max(1, canopyHeight - 1);
+        switch (shape) {
+            case "conical":
+                return Math.max(1, Math.round(baseRadius * (1 - normalizedY * (1 - taperFactor))));
+            case "spherical": {
+                const centerY = (canopyBottom + canopyTop) / 2;
+                const distFromCenter = Math.abs(y - centerY);
+                const maxDist = (canopyTop - canopyBottom) / 2;
+                const sphereFactor = Math.sqrt(1 - Math.pow(distFromCenter / Math.max(1, maxDist), 2));
+                return Math.max(1, Math.round(baseRadius * sphereFactor));
+            }
+            case "layered": {
+                if (layerGap > 0 && layerIndex % (layerGap + 1) !== 0) return 0;
+                const isWideLayer = Math.floor(layerIndex / Math.max(1, layerGap + 1)) % 2 === 0;
+                const baseTaper = 1 - normalizedY * (1 - taperFactor);
+                const layerMultiplier = isWideLayer ? 1.0 : 0.6;
+                return Math.max(1, Math.round(baseRadius * baseTaper * layerMultiplier));
+            }
+            case "umbrella":
+                if (normalizedY < 0.7) return Math.max(0, Math.round(baseRadius * 0.3 * normalizedY));
+                return baseRadius;
+            case "round":
+            default:
+                return baseRadius;
+        }
+    }
+
+    function forEachCanopyVoxel(profile, seed, gxCenter, gzCenter, trunkTopY, trunkW, trunkD, fn) {
+        const { radius: baseRadius, topExtension, overlapDown, leafChance: defaultLeafChance,
+                shape, taperFactor, noiseStrength, holeChance, branchChance, layerGap, layers } = profile.canopy;
+        const canopyBottom = trunkTopY - overlapDown;
+        const canopyTop = trunkTopY + topExtension;
+        const halfW = Math.floor(trunkW / 2), halfD = Math.floor(trunkD / 2);
+        const trunkMinX = -halfW, trunkMaxX = trunkW - halfW - 1;
+        const trunkMinZ = -halfD, trunkMaxZ = trunkD - halfD - 1;
+        const candidates = new Map();
+        function isInTrunk(dx, dz) {
+            return dx >= trunkMinX && dx <= trunkMaxX && dz >= trunkMinZ && dz <= trunkMaxZ;
+        }
+        function collectCandidatesForLayer(y, layerRadius, leafChance) {
+            const noiseValue = seededRandom(seed, gxCenter, gzCenter, 0, y, 7777);
+            const radiusNoise = Math.round((noiseValue - 0.5) * 2 * noiseStrength);
+            const effectiveRadius = Math.max(1, layerRadius + radiusNoise);
+            const scanRadius = baseRadius + 2;
+            for (let dx = -scanRadius; dx <= scanRadius; dx++) {
+                for (let dz = -scanRadius; dz <= scanRadius; dz++) {
+                    const dist = Math.sqrt(dx * dx + dz * dz);
+                    if (dist > effectiveRadius + 2) continue;
+                    if (y <= trunkTopY && isInTrunk(dx, dz)) continue;
+                    let shouldPlace = false;
+                    if (dist <= effectiveRadius) {
+                        shouldPlace = true;
+                        if (dist > effectiveRadius - 1) {
+                            const edgeFade = 1 - (dist - (effectiveRadius - 1));
+                            const edgeRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz);
+                            if (edgeRand > edgeFade * 0.7 + 0.3) shouldPlace = false;
+                        }
+                        if (Math.abs(dx) >= effectiveRadius - 0.5 && Math.abs(dz) >= effectiveRadius - 0.5) {
+                            if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 1111) > 0.4) shouldPlace = false;
+                        }
+                        if (shouldPlace && holeChance > 0 && dist < effectiveRadius - 1) {
+                            const holeRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 5555);
+                            if (holeRand < holeChance) shouldPlace = false;
+                        }
+                    } else if (dist <= effectiveRadius + 2 && branchChance > 0) {
+                        const branchRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 3333);
+                        const layerNorm = (y - canopyBottom) / Math.max(1, canopyTop - canopyBottom);
+                        const middleBias = 1 - Math.abs(layerNorm - 0.5) * 2;
+                        if (branchRand < branchChance * middleBias) {
+                            let hasNeighbor = false;
+                            for (let nx = -1; nx <= 1 && !hasNeighbor; nx++) {
+                                for (let nz = -1; nz <= 1 && !hasNeighbor; nz++) {
+                                    if (nx === 0 && nz === 0) continue;
+                                    const nDist = Math.sqrt((dx + nx) * (dx + nx) + (dz + nz) * (dz + nz));
+                                    if (nDist <= effectiveRadius) hasNeighbor = true;
+                                }
+                            }
+                            if (hasNeighbor) shouldPlace = true;
+                        }
+                    }
+                    if (shouldPlace && leafChance < 1.0) {
+                        const lcRand = seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999);
+                        if (lcRand > leafChance) shouldPlace = false;
+                    }
+                    if (shouldPlace) candidates.set(dx + ',' + y + ',' + dz, true);
+                }
+            }
+        }
+        if (layers && layers.length > 0) {
+            for (const layer of layers) {
+                const y = trunkTopY + layer.yOffset;
+                if (y < 0) continue;
+                collectCandidatesForLayer(y, layer.radius, layer.leafChance ?? defaultLeafChance);
+            }
+        } else {
+            for (let y = canopyBottom; y <= canopyTop; y++) {
+                const layerRadius = getCanopyLayerRadius(shape, baseRadius, y, canopyBottom, canopyTop, trunkTopY, taperFactor, layerGap);
+                if (layerRadius <= 0) continue;
+                collectCandidatesForLayer(y, layerRadius, defaultLeafChance);
+            }
+        }
+        // Pass 2: Filter for face adjacency
+        const filtered = new Map();
+        for (const key of candidates.keys()) {
+            const [dxs, ys, dzs] = key.split(',');
+            const dx = parseInt(dxs), y = parseInt(ys), dz = parseInt(dzs);
+            let hasFaceNeighbor = false;
+            const checks = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+            for (const [ox, oy, oz] of checks) {
+                const nKey = (dx + ox) + ',' + (y + oy) + ',' + (dz + oz);
+                if (candidates.has(nKey)) { hasFaceNeighbor = true; break; }
+            }
+            if (hasFaceNeighbor) filtered.set(key, true);
+            else if (isInTrunk(dx, dz) && y === trunkTopY + 1) filtered.set(key, true);
+        }
+        for (const key of filtered.keys()) {
+            const [dxs, ys, dzs] = key.split(',');
+            fn(parseInt(dxs), parseInt(dzs), parseInt(ys));
+        }
+    }
+
+    function generateTreesForChunk(cx, cz, data, chunkSize, chunkHeight, startX, startZ, seed, get, set, caches) {
+        const { heightCache, riverCache } = caches;
+        const allTrees = [];
+        const MAX_CANOPY_RADIUS = 8;
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dz = -1; dz <= 1; dz++) {
+                const ncx = cx + dx, ncz = cz + dz;
+                const chunkTrees = getChunkTreePositions(ncx, ncz, seed, chunkSize);
+                for (const tree of chunkTrees) {
+                    const canopyMinX = tree.gx - tree.canopyRadius;
+                    const canopyMaxX = tree.gx + tree.canopyRadius;
+                    const canopyMinZ = tree.gz - tree.canopyRadius;
+                    const canopyMaxZ = tree.gz + tree.canopyRadius;
+                    const chunkMinX = startX, chunkMaxX = startX + chunkSize;
+                    const chunkMinZ = startZ, chunkMaxZ = startZ + chunkSize;
+                    if (canopyMaxX < chunkMinX || canopyMinX >= chunkMaxX ||
+                        canopyMaxZ < chunkMinZ || canopyMinZ >= chunkMaxZ) continue;
+                    allTrees.push({
+                        ...tree, isOwnChunk: (dx === 0 && dz === 0),
+                        sourceCx: ncx, sourceCz: ncz,
+                    });
+                }
+            }
+        }
+        for (const tree of allTrees) {
+            const { gx, gz, lx, lz, trunkHeight, trunkW, trunkD, profile, isOwnChunk,
+                    halfW, halfD, minTx, maxTx, minTz, maxTz, groundY } = tree;
+            const { canopy, blocks, allowedGroundBlocks } = profile;
+            const localX = gx - startX, localZ = gz - startZ;
+            let finalGroundY = groundY;
+            if (isOwnChunk) finalGroundY = heightCache[lx + lz * chunkSize];
+            const trunkBaseY = finalGroundY + 1;
+            const trunkTopY = trunkBaseY + trunkHeight;
+            if (isOwnChunk) {
+                const groundId = get(lx, finalGroundY, lz);
+                if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
+                let hasSpace = true;
+                for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
+                    const block = get(lx, y, lz);
+                    if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                }
+                if (!hasSpace) continue;
+                if (trunkTopY + canopy.topExtension >= chunkHeight) continue;
+                for (let y = trunkBaseY; y <= trunkTopY; y++) {
+                    for (let tx = minTx; tx <= maxTx; tx++) {
+                        for (let tz = minTz; tz <= maxTz; tz++) {
+                            const bx = lx + tx, bz = lz + tz;
+                            if (bx >= 0 && bx < chunkSize && bz >= 0 && bz < chunkSize) {
+                                set(bx, y, bz, blocks.log);
+                            }
+                        }
+                    }
+                }
+            } else {
+                // NEIGHBOR TREE VALIDATION - In worker, chunks is empty so we trust deterministic generator
+                const sourceKey = getChunkKey(tree.sourceCx, tree.sourceCz);
+                const sourceChunk = chunks.get(sourceKey);
+                if (sourceChunk) {
+                    const sourceBlocks = sourceChunk.blocks || sourceChunk;
+                    const sourceStartX = tree.sourceCx * chunkSize;
+                    const sourceStartZ = tree.sourceCz * chunkSize;
+                    const trunkLocalX = gx - sourceStartX;
+                    const trunkLocalZ = gz - sourceStartZ;
+                    const checkY = Math.min(trunkTopY, chunkHeight - 1);
+                    const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
+                    if (!isLogBlock(sourceBlocks[trunkIdx])) continue;
+                }
+            }
+            const actualGroundY = isOwnChunk ? finalGroundY : groundY;
+            const minCanopyY = actualGroundY + 2;
+            forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
+                if (y < minCanopyY) return;
+                const globalX = gx + cdx, globalZ = gz + cdz;
+                const leafLocalX = globalX - startX, leafLocalZ = globalZ - startZ;
+                if (leafLocalX < 0 || leafLocalX >= chunkSize || leafLocalZ < 0 || leafLocalZ >= chunkSize) return;
+                if (y < 0 || y >= chunkHeight) return;
+                const existing = get(leafLocalX, y, leafLocalZ);
+                if (existing === AIR) set(leafLocalX, y, leafLocalZ, blocks.leaves);
+            });
+        }
+    }
+
+    // ============================================================
+    // HEIGHT FUNCTIONS - INJECTED FROM MAIN THREAD
+    // ============================================================
+    /* __TERRAIN_FUNCS_START__ */
+
+    // Continental height (-1 to 1) - affects ocean vs inland scaling
+    function continentalHeight(gx, gz, seed) {
+        const base = fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
+        const erosion = fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8);
+        let c = base * 0.7 + erosion * 0.3;
+        c += 0.3;
+        return Math.max(-1, Math.min(1, c));
+    }
+
+    // Standard rolling noise (Forests, Swamp, Longwoods)
+    function defaultHeightFunc(gx, gz, biome, seed) {
+        const n = fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
+        return Math.floor(biome.baseHeight + n * biome.amplitude);
+    }
+
+    // "Billowy" Hills (Rounded tops)
+    function hillsHeightFunc(gx, gz, biome, seed) {
+        let n = Math.abs(noise2D(gx * biome.roughness, gz * biome.roughness));
+        n = n * n;
+        return Math.floor(biome.baseHeight + n * biome.amplitude);
+    }
+
+    // Smooth, gentle rolling plains
+    function plainsHeightFunc(gx, gz, biome, seed) {
+        const base = noise2D(gx * 0.003, gz * 0.003);
+        const detail = noise2D(gx * 0.05, gz * 0.05) * 0.1;
+        return Math.floor(biome.baseHeight + (base + detail) * biome.amplitude);
+    }
+
+    // Comprehensive mountain generation with ridges, valleys, erosion
+    function mountainsHeightFunc(gx, gz, biome, seed) {
+        // Domain warping for winding ridge lines
+        const warpScale = 0.0015;
+        const warpStrength = 80;
+        const warpX = gx + noise2D(gx * warpScale + seed, gz * warpScale) * warpStrength;
+        const warpZ = gz + noise2D(gx * warpScale + 100, gz * warpScale + seed) * warpStrength;
+
+        // Regional variation (foothills vs major peaks)
+        const regionNoise = noise2D(gx * 0.0006 + seed * 0.3, gz * 0.0006 - seed * 0.3);
+        const regionNoise2 = noise2D(gx * 0.001 + seed * 0.7, gz * 0.001 + seed * 0.2);
+        const regionScale = 0.15 + Math.pow((regionNoise + 1) * 0.5, 0.8) * 0.55 +
+                           Math.pow((regionNoise2 + 1) * 0.5, 1.2) * 0.30;
+
+        // Main ridge system
+        const rx = warpX * biome.roughness;
+        const rz = warpZ * biome.roughness;
+        let ridgeSum = 0;
+        let amp = 1.0;
+        let freq = 1.0;
+        for (let i = 0; i < 6; i++) {
+            let n = 1.0 - Math.abs(noise2D(rx * freq + seed * 10, rz * freq + seed * 10));
+            const sharpness = i < 2 ? 1.5 : 1.2;
+            n = Math.pow(n, sharpness);
+            ridgeSum += n * amp;
+            freq *= 2.0;
+            amp *= 0.52;
+        }
+        ridgeSum = ridgeSum / 2.2;
+
+        // Valley carving
+        const valleyNoise = noise2D(gx * 0.003 + seed * 5, gz * 0.003 - seed * 5);
+        const valleyNoise2 = noise2D(gx * 0.006 - seed * 2, gz * 0.006 + seed * 2);
+        const valleyFactor = Math.max(0, -valleyNoise * 0.5 - valleyNoise2 * 0.3);
+        const valleyCarve = valleyFactor * 0.35;
+
+        // Saddles and passes
+        const saddleNoise = noise2D(gx * 0.008 + seed * 8, gz * 0.008 - seed * 8);
+        const saddleFactor = saddleNoise > 0.6 ? (saddleNoise - 0.6) * 0.5 : 0;
+
+        // Peak variation
+        const peakTypeNoise = noise2D(gx * 0.004 + seed * 12, gz * 0.004 - seed * 12);
+        let peakBonus = 0;
+        if (peakTypeNoise > 0.5 && ridgeSum > 0.6) {
+            const spireNoise = noise2D(gx * 0.02 + seed * 15, gz * 0.02 - seed * 15);
+            if (spireNoise > 0.6) {
+                peakBonus = Math.pow((spireNoise - 0.6) * 2.5, 2) * 0.25;
+            }
+        } else if (peakTypeNoise < -0.3 && ridgeSum > 0.5) {
+            peakBonus = ridgeSum * 0.1;
+        }
+
+        // Cliff bands
+        const preHeight = ridgeSum - valleyCarve - saddleFactor + peakBonus;
+        const cliffBandNoise = noise2D(gx * 0.05 + seed * 20, gz * 0.05);
+        let cliffBonus = 0;
+        if (preHeight > 0.35 && preHeight < 0.45 && cliffBandNoise > 0.3) {
+            cliffBonus = (cliffBandNoise - 0.3) * 0.08;
+        } else if (preHeight > 0.65 && preHeight < 0.75 && cliffBandNoise > 0.2) {
+            cliffBonus = (cliffBandNoise - 0.2) * 0.1;
+        }
+
+        // Erosion detail
+        const erosionNoise = noise2D(gx * 0.08 + seed * 3, gz * 0.08 - seed * 3);
+        const erosionNoise2 = noise2D(gx * 0.15 - seed * 4, gz * 0.15 + seed * 4);
+        const erosionAmount = (Math.abs(erosionNoise) * 0.04 + Math.abs(erosionNoise2) * 0.02) *
+                             (0.5 + ridgeSum * 0.5);
+
+        // Gullies
+        const gullyNoise = 1.0 - Math.abs(noise2D(gx * 0.025 + seed * 25, gz * 0.025 - seed * 25));
+        const gullyCarve = gullyNoise > 0.85 ? (gullyNoise - 0.85) * 0.15 : 0;
+
+        // Combine all factors
+        let totalHeight = ridgeSum - valleyCarve - saddleFactor + peakBonus + cliffBonus +
+                         erosionAmount - gullyCarve;
+        totalHeight *= regionScale;
+
+        // Foothill transition
+        const baseNoise = noise2D(gx * 0.002, gz * 0.002);
+        const foothillBase = (baseNoise + 1) * 0.5 * 0.15;
+        totalHeight = foothillBase + totalHeight * 0.85;
+
+        const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
+        return Math.floor(Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285));
+    }
+
+    // Height function lookup by biome name
+    const HEIGHT_FUNCS = {
+        plains: plainsHeightFunc,
+        hills: hillsHeightFunc,
+        forests: defaultHeightFunc,
+        mountains: mountainsHeightFunc,
+        swamp: defaultHeightFunc,
+        longwoods: defaultHeightFunc
+    };
+
+    // Get biome height at a cell center with continental scaling
+    function getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
+        const centerX = cx * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
+        const centerZ = cz * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
+        const biome = getBiomeParams(centerX, centerZ);
+        const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc;
+        let h = hf(gx, gz, biome, seed);
+        // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
+        const t = (continentFactor + 1) * 0.5; // -1..1 → 0..1
+        const factor = 0.3 + t * 0.7;
+        h = biome.baseHeight + (h - biome.baseHeight) * factor;
+        // Add height boost for inland areas (mountains)
+        h += Math.max(0, continentFactor - 0.15) * 10;
+        return h;
+    }
+
+    // Lerp helper (since we don't have THREE.MathUtils in worker)
+    const lerpValue = (a, b, t) => a + t * (b - a);
+
+    // Full blendedHeight with 4-cell biome interpolation - MUST MATCH MAIN THREAD!
+    function blendedHeight(gx, gz, seed) {
+        // 1. Get continentalness (-1 to 1)
+        const c = continentalHeight(gx, gz, seed);
+
+        // 2. Biome grid interpolation (4-cell smoothstep)
+        const gridScale = BIOME_CELL_SIZE;
+        const u = gx / gridScale - 0.5;
+        const v = gz / gridScale - 0.5;
+        const x0 = Math.floor(u);
+        const z0 = Math.floor(v);
+        const x1 = x0 + 1;
+        const z1 = z0 + 1;
+        const wx = u - x0;
+        const wz = v - z0;
+        const sx = wx * wx * (3 - 2 * wx); // smoothstep
+        const sz = wz * wz * (3 - 2 * wz);
+
+        // 3. Sample 4 biomes and calculate heights
+        const h00 = getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+        const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+        const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+        const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+        const h0 = lerpValue(h00, h10, sx);
+        const h1 = lerpValue(h01, h11, sx);
+        let finalHeight = lerpValue(h0, h1, sz);
+
+        // 4. Apply oceans first (larger scale feature)
+        const oceanFactor = getOceanFactor(gx, gz, seed);
+        if (oceanFactor < 1.0) {
+            const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
+            const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+            const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+            finalHeight = lerpValue(oceanFloor, finalHeight, bank);
+        }
+
+        // 5. Apply rivers (can carve through ocean edges too)
+        const r = getRiverFactor(gx, gz, seed);
+        if (r < 1.0) {
+            const riverDepth = getRiverDepth(r, gx, gz, seed);
+            const riverBed = WORLD_DIMS.seaLevel - riverDepth;
+            const bank = r * r * (3 - 2 * r);
+            const carvedHeight = Math.min(finalHeight, riverBed);
+            finalHeight = lerpValue(carvedHeight, finalHeight, bank);
+        }
+
+        return Math.floor(finalHeight);
+    }
+
+    // River factor - determines river presence and bank transition
+    function getRiverFactor(gx, gz, seed) {
+        const warpScale = 0.004;
+        const warpStrength = 20.0;
+        const wx = gx + noise2D(gx * warpScale, gz * warpScale) * warpStrength;
+        const wz = gz + noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
+        const scale = 0.001;
+        const n = Math.abs(noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
+
+        const coastNoiseScale = 0.05;
+        const coastNoise = noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
+        const coastVariation = coastNoise * 0.02;
+        const width = 0.055 + coastVariation;
+
+        if (n < width) {
+            let t = n / width;
+            return t * t * (3 - 2 * t);
+        }
+        return 1.0;
+    }
+
+    // Ocean factor - determines ocean presence (0 = deep ocean, 1 = land)
+    function getOceanFactor(gx, gz, seed) {
+        const oceanScale = 0.0008;
+        const oceanNoise = noise2D(gx * oceanScale + seed * 1.5, gz * oceanScale - seed * 0.8);
+
+        const coastScale = 0.004;
+        const coastNoise = noise2D(gx * coastScale + seed * 2.1, gz * coastScale + seed * 1.3);
+
+        const detailScale = 0.02;
+        const detailNoise = noise2D(gx * detailScale - seed * 0.5, gz * detailScale + seed * 0.9) * 0.1;
+
+        const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
+        const oceanThreshold = -0.3;
+        const shallowThreshold = -0.1;
+
+        if (combined < oceanThreshold) {
+            return 0.0; // Deep ocean
+        } else if (combined < shallowThreshold) {
+            let t = (combined - oceanThreshold) / (shallowThreshold - oceanThreshold);
+            return t * t * (3 - 2 * t);
+        }
+        return 1.0; // Land
+    }
+
+    // River depth (deeper in center)
+    function getRiverDepth(riverFactor, gx, gz, seed) {
+        const baseRiverDepth = 6;
+        const depthNoise = noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
+        const depthVariation = (depthNoise + 1) * 0.5 * 3;
+        const centerFactor = 1.0 - riverFactor;
+        return baseRiverDepth + depthVariation * centerFactor;
+    }
+
+    // Ocean depth (much deeper than rivers)
+    function getOceanDepth(oceanFactor, gx, gz, seed) {
+        const baseOceanDepth = 20;
+        const depthNoise = noise2D(gx * 0.008 + seed * 0.9, gz * 0.008 - seed * 0.6);
+        const depthVariation = (depthNoise + 1) * 0.5 * 15;
+        const centerFactor = 1.0 - oceanFactor;
+        return baseOceanDepth + depthVariation * centerFactor;
+    }
+    /* __TERRAIN_FUNCS_END__ */
+
+    // ============================================================
+    // TERRAIN CACHE GENERATION
+    // ============================================================
+    function precalculateTerrainCaches(chunkSize, startX, startZ, seed) {
+        const heightCache = new Int16Array(chunkSize * chunkSize);
+        const riverCache = new Float32Array(chunkSize * chunkSize);
+        const biomeCache = new Array(chunkSize * chunkSize);
+        const widthNoiseCache = new Float32Array(chunkSize * chunkSize);
+
+        for (let lx = 0; lx < chunkSize; lx++) {
+            for (let lz = 0; lz < chunkSize; lz++) {
+                const idx = lx + lz * chunkSize;
+                const gx = startX + lx;
+                const gz = startZ + lz;
+                heightCache[idx] = blendedHeight(gx, gz, seed);
+                riverCache[idx] = getRiverFactor(gx, gz, seed);
+                biomeCache[idx] = getBiomeParams(gx, gz);
+                widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
+            }
+        }
+        return { heightCache, riverCache, biomeCache, widthNoiseCache };
+    }
+
+    function precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ) {
+        const CAVE_STEP = 4;
+        const cxDim = Math.ceil(chunkSize / CAVE_STEP) + 1;
+        const cyDim = Math.ceil(chunkHeight / CAVE_STEP) + 1;
+        const czDim = Math.ceil(chunkSize / CAVE_STEP) + 1;
+        const caveCache1 = new Float32Array(cxDim * cyDim * czDim);
+        const caveCache2 = new Float32Array(cxDim * cyDim * czDim);
+
+        for (let sx = 0; sx <= chunkSize; sx += CAVE_STEP) {
+            for (let sz = 0; sz <= chunkSize; sz += CAVE_STEP) {
+                for (let sy = 0; sy <= chunkHeight; sy += CAVE_STEP) {
+                    const gx = startX + sx;
+                    const gy = sy - WORLD_DIMS.yOffset;
+                    const gz = startZ + sz;
+                    const caveScale = 0.02;
+                    const caveYScale = 0.03;
+                    const cx = gx * caveScale;
+                    const cy = gy * caveYScale;
+                    const cz = gz * caveScale;
+                    const idx = sx / CAVE_STEP + (sz / CAVE_STEP) * cxDim + (sy / CAVE_STEP) * cxDim * czDim;
+                    caveCache1[idx] = noise3D(cx, cy, cz);
+                    caveCache2[idx] = noise3D(cx + 123.45, cy + 456.78, cz + 789.01);
+                }
+            }
+        }
+        return { caveCache1, caveCache2, cxDim, cxzStride: cxDim * czDim };
+    }
+
+    function interpolateCaveNoise(lx, ly, lz, caveCache, cxDim, cxzStride) {
+        const CAVE_STEP = 4;
+        const fx = lx / CAVE_STEP;
+        const fy = ly / CAVE_STEP;
+        const fz = lz / CAVE_STEP;
+
+        const ix = Math.floor(fx);
+        const iy = Math.floor(fy);
+        const iz = Math.floor(fz);
+
+        const tx = fx - ix;
+        const ty = fy - iy;
+        const tz = fz - iz;
+
+        const getVal = (x, y, z) => {
+            const idx = x + z * cxDim + y * cxzStride;
+            return caveCache[idx] || 0;
+        };
+
+        // Trilinear interpolation
+        const c000 = getVal(ix, iy, iz);
+        const c100 = getVal(ix + 1, iy, iz);
+        const c010 = getVal(ix, iy + 1, iz);
+        const c110 = getVal(ix + 1, iy + 1, iz);
+        const c001 = getVal(ix, iy, iz + 1);
+        const c101 = getVal(ix + 1, iy, iz + 1);
+        const c011 = getVal(ix, iy + 1, iz + 1);
+        const c111 = getVal(ix + 1, iy + 1, iz + 1);
+
+        const c00 = c000 * (1 - tx) + c100 * tx;
+        const c10 = c010 * (1 - tx) + c110 * tx;
+        const c01 = c001 * (1 - tx) + c101 * tx;
+        const c11 = c011 * (1 - tx) + c111 * tx;
+
+        const c0 = c00 * (1 - ty) + c10 * ty;
+        const c1 = c01 * (1 - ty) + c11 * ty;
+
+        return c0 * (1 - tz) + c1 * tz;
+    }
+
+    // ============================================================
+    // TERRAIN GENERATION PASS
+    // ============================================================
+    function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches) {
+        const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
+        const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
+
+        // Elevation thresholds
+        const SNOW_LINE = 190;
+        const SNOW_PATCHES_LINE = 160;
+        const HIGH_ROCK_LINE = 140;
+        const ROCK_LINE = 110;
+        const ALPINE_LINE = 85;
+        const RIVER_MAX_ELEVATION = 75;
+
+        // Slope thresholds
+        const CLIFF_SLOPE = 8;
+        const STEEP_SLOPE = 5;
+        const MODERATE_SLOPE = 3;
+
+        for (let lx = 0; lx < chunkSize; lx++) {
+            for (let lz = 0; lz < chunkSize; lz++) {
+                const idx = lx + lz * chunkSize;
+                const worldTopY = heightCache[idx];
+                const riverFactor = riverCache[idx];
+                const biome = biomeCache[idx];
+                const isMountain = biome && biome.tags && biome.tags.includes("mountain");
+                const gx = startX + lx;
+                const gz = startZ + lz;
+
+                // Slope analysis
+                let maxSlope = 0;
+                let slopeNorth = 0, slopeSouth = 0;
+                const neighborOffsets = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]];
+                for (const [dx, dz] of neighborOffsets) {
+                    const nx = lx + dx;
+                    const nz = lz + dz;
+                    if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
+                        const nIdx = nx + nz * chunkSize;
+                        const neighborY = heightCache[nIdx];
+                        const slope = worldTopY - neighborY;
+                        const absSlope = Math.abs(slope);
+                        if (absSlope > maxSlope) maxSlope = absSlope;
+                        if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
+                        if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
+                    }
+                }
+
+                const isCliff = maxSlope >= CLIFF_SLOPE;
+                const isSteep = maxSlope >= STEEP_SLOPE;
+                const isModerate = maxSlope >= MODERATE_SLOPE;
+                const northFacing = slopeNorth > slopeSouth + 1;
+                const isExposedRidge = slopeNorth > 2 && slopeSouth > 2;
+
+                // Noise for surface variation
+                const surfaceNoise = noise2D(gx * 0.1, gz * 0.1);
+                const patchNoise = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
+                const detailNoise = noise2D(gx * 0.2 + 200, gz * 0.2 + 200);
+                const screeNoise = noise2D(gx * 0.08 + 300, gz * 0.08 + 300);
+
+                for (let ly = 0; ly < chunkHeight; ly++) {
+                    const worldY = ly - WORLD_DIMS.yOffset;
+                    const idx3D = lx + lz * chunkSize + ly * chunkSize * chunkSize;
+                    let id = AIR;
+
+                    if (worldY <= 0) {
+                        id = BEDROCK;
+                    } else if (worldY <= worldTopY) {
+                        const depth = worldTopY - worldY;
+
+                        if (depth === 0) {
+                            // Surface block logic
+                            if (riverFactor < 0.8 && worldTopY <= RIVER_MAX_ELEVATION) {
+                                id = SAND;
+                            } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) {
+                                id = SAND;
+                            } else if (isMountain || worldTopY >= ALPINE_LINE) {
+                                // Mountain terrain
+                                if (worldTopY >= SNOW_LINE) {
+                                    if (isCliff) id = STONE;
+                                    else if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL;
+                                    else if (isExposedRidge && detailNoise > 0.4) id = STONE;
+                                    else id = SNOW;
+                                } else if (worldTopY >= SNOW_PATCHES_LINE) {
+                                    if (isCliff) id = STONE;
+                                    else if (northFacing && !isSteep && patchNoise > 0.2) id = SNOW;
+                                    else if (!isModerate && patchNoise > 0.5) id = SNOW;
+                                    else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL;
+                                    else id = surfaceNoise > 0.3 ? STONE : GRAVEL;
+                                } else if (worldTopY >= HIGH_ROCK_LINE) {
+                                    if (isCliff) id = STONE;
+                                    else if (isModerate && screeNoise > 0) id = GRAVEL;
+                                    else if (northFacing && !isSteep && patchNoise > 0.6) id = SNOW;
+                                    else id = surfaceNoise > 0.2 ? STONE : GRAVEL;
+                                } else if (worldTopY >= ROCK_LINE || isCliff) {
+                                    if (isCliff) id = STONE;
+                                    else if (!isModerate && detailNoise > 0.6) id = STONE;
+                                    else if (isModerate) id = screeNoise > 0 ? GRAVEL : STONE;
+                                    else {
+                                        const r = surfaceNoise + detailNoise * 0.5;
+                                        if (r > 0.4) id = STONE;
+                                        else if (r > -0.2) id = GRAVEL;
+                                        else id = STONE;
+                                    }
+                                } else if (worldTopY >= ALPINE_LINE) {
+                                    if (isCliff) id = STONE;
+                                    else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL;
+                                    else if (!isModerate) {
+                                        if (patchNoise > 0.3) id = GRASS;
+                                        else if (patchNoise > -0.2) id = DIRT;
+                                        else id = surfaceNoise > 0 ? STONE : GRAVEL;
+                                    } else {
+                                        if (patchNoise > 0.5) id = GRASS;
+                                        else if (patchNoise > 0) id = DIRT;
+                                        else id = GRAVEL;
+                                    }
+                                } else {
+                                    if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL;
+                                    else if (isModerate) id = patchNoise > -0.3 ? GRASS : DIRT;
+                                    else {
+                                        if (detailNoise > 0.7) id = STONE;
+                                        else if (patchNoise > -0.4) id = GRASS;
+                                        else id = DIRT;
+                                    }
+                                }
+                            } else {
+                                // Non-mountain low elevation
+                                if (isSteep) id = surfaceNoise > 0.5 ? STONE : DIRT;
+                                else if (detailNoise > 0.8) id = STONE;
+                                else id = GRASS;
+                            }
+
+                            if (id === GRASS && worldTopY < WORLD_DIMS.seaLevel) {
+                                id = DIRT;
+                            }
+                        } else if (depth < 4) {
+                            // Subsurface
+                            if (worldTopY >= HIGH_ROCK_LINE) id = STONE;
+                            else if (worldTopY >= ROCK_LINE) id = depth < 2 ? GRAVEL : STONE;
+                            else if (worldTopY >= ALPINE_LINE) id = depth < 2 ? DIRT : STONE;
+                            else if (isSteep) id = depth < 2 ? DIRT : STONE;
+                            else id = DIRT;
+                        } else {
+                            id = STONE;
+                        }
+                    }
+
+                    // Cave carving
+                    if (id !== AIR && id !== BEDROCK && id !== WATER) {
+                        const fadeStart = 30;
+                        const fadeEnd = 50;
+                        if (worldY < fadeEnd) {
+                            const n1 = interpolateCaveNoise(lx, ly, lz, caveCache1, cxDim, cxzStride);
+                            const n2 = interpolateCaveNoise(lx, ly, lz, caveCache2, cxDim, cxzStride);
+                            const widthNoise = widthNoiseCache[idx];
+                            let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
+                            if (worldY > fadeStart) {
+                                const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart);
+                                threshold *= fade;
+                            }
+                            if (n1 * n1 + n2 * n2 < threshold) {
+                                id = AIR;
+                            }
+                        }
+                    }
+
+                    data[idx3D] = id;
+                }
+            }
+        }
+    }
+
+    function fillWaterPass(data, chunkSize, chunkHeight, heightCache) {
+        const seaLevel = WORLD_DIMS.seaLevel;
+        for (let wx = 0; wx < chunkSize; wx++) {
+            for (let wz = 0; wz < chunkSize; wz++) {
+                const worldTopY = heightCache[wx + wz * chunkSize];
+                if (worldTopY >= seaLevel) continue;
+                const waterStart = worldTopY + 1 + WORLD_DIMS.yOffset;
+                const waterEnd = Math.min(seaLevel + WORLD_DIMS.yOffset, chunkHeight - 1);
+                for (let wy = waterStart; wy <= waterEnd; wy++) {
+                    const waterIdx = wx + wz * chunkSize + wy * chunkSize * chunkSize;
+                    if (data[waterIdx] === AIR) data[waterIdx] = WATER;
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // MESSAGE HANDLER
+    // ============================================================
+    self.onmessage = function(e) {
+        const { type, jobId, cx, cz, seedStr } = e.data;
+
+        try {
+            if (type === 'init') {
+                // Initialize noise with seed string
+                initNoise(seedStr);
+                biomeCellCache.clear(); // Clear biome cache for new seed
+                self.postMessage({ type: 'ready', jobId });
+                return;
+            }
+
+            if (type === 'generate') {
+                // Ensure noise is initialized
+                if (!perm || workerSeedStr !== seedStr) {
+                    initNoise(seedStr);
+                    biomeCellCache.clear();
+                }
+
+                const chunkSize = CHUNK_SIZE;
+                const chunkHeight = CHUNK_HEIGHT;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+
+                // Generate terrain - use NUMERIC seed for height functions (matches main thread worldConfig.seed)
+                const blocks = new Uint8Array(chunkSize * chunkSize * chunkHeight);
+
+                const caches = precalculateTerrainCaches(chunkSize, startX, startZ, workerNumericSeed);
+                const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
+
+                generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches);
+                fillWaterPass(blocks, chunkSize, chunkHeight, caches.heightCache);
+
+                // --- Phase 3: Tree generation ---
+                // Helper functions for tree generation
+                const get = (x, y, z) => {
+                    if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
+                    return blocks[x + z * chunkSize + y * chunkSize * chunkSize];
+                };
+                const set = (x, y, z, id) => {
+                    if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
+                    blocks[x + z * chunkSize + y * chunkSize * chunkSize] = id;
+                };
+                // Clear tree mask cache for this generation (ensures fresh calculation)
+                treeMaskCache.clear();
+                generateTreesForChunk(cx, cz, blocks, chunkSize, chunkHeight, startX, startZ, workerNumericSeed, get, set, caches);
+
+                // Transfer the buffer (zero-copy)
+                self.postMessage({
+                    type: 'terrain',
+                    jobId: jobId,
+                    cx: cx,
+                    cz: cz,
+                    blocks: blocks
+                }, [blocks.buffer]);
+            }
+        } catch (error) {
+            self.postMessage({
+                type: 'error',
+                jobId: jobId,
+                cx: cx,
+                cz: cz,
+                error: error.message + '\\n' + (error.stack || '')
+            });
+        }
+    };
+`;
+
+            /**
+             * Build worker code with dynamically injected terrain functions.
+             * Uses Function.toString() to extract exact source code from main thread,
+             * ensuring identical behavior between worker and main thread terrain generation.
+             * @returns {string} Complete worker code with injected terrain functions
+             */
+            function buildChunkWorkerCode() {
+                // Get terrain function sources from main thread (defined later in file, but hoisted)
+                const terrainFuncs = [
+                    continentalHeight,
+                    defaultHeightFunc,
+                    hillsHeightFunc,
+                    plainsHeightFunc,
+                    mountainsHeightFunc,
+                    getBiomeHeightAtCell,
+                    blendedHeight,
+                    getRiverFactor,
+                    getOceanFactor,
+                    getRiverDepth,
+                    getOceanDepth
+                ];
+
+                // Build injected code string with proper indentation for worker
+                let injectedCode = '    // ============================================================\n';
+                injectedCode += '    // HEIGHT FUNCTIONS - DYNAMICALLY INJECTED FROM MAIN THREAD\n';
+                injectedCode += '    // Using Function.toString() guarantees identical behavior\n';
+                injectedCode += '    // ============================================================\n\n';
+
+                // Inject lerpValue helper (needed by several functions)
+                injectedCode += '    const lerpValue = (a, b, t) => a + t * (b - a);\n\n';
+
+                // Inject each function's source code
+                for (const fn of terrainFuncs) {
+                    // Get function source and add proper indentation
+                    const source = fn.toString();
+                    // Add 4-space indent for worker context
+                    const indentedSource = source.split('\n').map(line => '    ' + line).join('\n');
+                    injectedCode += indentedSource + '\n\n';
+                }
+
+                // Add HEIGHT_FUNCS lookup table
+                injectedCode += '    // Height function lookup by biome name\n';
+                injectedCode += '    const HEIGHT_FUNCS = {\n';
+                injectedCode += '        plains: plainsHeightFunc,\n';
+                injectedCode += '        hills: hillsHeightFunc,\n';
+                injectedCode += '        forests: defaultHeightFunc,\n';
+                injectedCode += '        mountains: mountainsHeightFunc,\n';
+                injectedCode += '        swamp: defaultHeightFunc,\n';
+                injectedCode += '        longwoods: defaultHeightFunc\n';
+                injectedCode += '    };\n';
+
+                // Find and replace the terrain functions section
+                const startMarker = '/* __TERRAIN_FUNCS_START__ */';
+                const endMarker = '/* __TERRAIN_FUNCS_END__ */';
+                const startIdx = CHUNK_WORKER_CODE.indexOf(startMarker);
+                const endIdx = CHUNK_WORKER_CODE.indexOf(endMarker);
+
+                if (startIdx === -1 || endIdx === -1) {
+                    console.warn('[WorkerPool] Terrain function markers not found, using static code');
+                    return CHUNK_WORKER_CODE;
+                }
+
+                // Replace content between markers with injected functions
+                const before = CHUNK_WORKER_CODE.substring(0, startIdx + startMarker.length);
+                const after = CHUNK_WORKER_CODE.substring(endIdx);
+                return before + '\n' + injectedCode + '\n    ' + after;
+            }
+
+            /**
+             * Pool of Web Workers for parallel chunk generation and meshing.
+             * Uses Transferable objects for zero-copy data transfer.
+             */
+            class ChunkWorkerPool {
+                /**
+                 * Create a worker pool.
+                 * @param {number} [poolSize] - Number of workers (default: CPU cores - 1, min 1, max 4)
+                 */
+                constructor(poolSize) {
+                    const cores = navigator.hardwareConcurrency || 4;
+                    this.poolSize = poolSize || Math.min(4, Math.max(1, cores - 1));
+                    this.workers = [];
+                    this.jobQueue = [];
+                    this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz}
+                    this.nextJobId = 0;
+                    this.workerBusy = []; // Track which workers are busy
+                    this.currentSeed = null; // Track current world seed for worker init
+
+                    this._initWorkers();
+                    console.log(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+                }
+
+                /**
+                 * Initialize worker instances from embedded code.
+                 * Uses buildChunkWorkerCode() for dynamic function injection.
+                 * @private
+                 */
+                _initWorkers() {
+                    // Build worker code with injected terrain functions from main thread
+                    const workerCode = buildChunkWorkerCode();
+                    const blob = new Blob([workerCode], { type: 'application/javascript' });
+                    const workerUrl = URL.createObjectURL(blob);
+
+                    for (let i = 0; i < this.poolSize; i++) {
+                        const worker = new Worker(workerUrl);
+                        worker.onmessage = (e) => this._handleWorkerMessage(i, e);
+                        worker.onerror = (e) => this._handleWorkerError(i, e);
+                        this.workers.push(worker);
+                        this.workerBusy.push(false);
+                    }
+
+                    // Clean up blob URL after workers are created
+                    URL.revokeObjectURL(workerUrl);
+                }
+
+                /**
+                 * Handle message from worker.
+                 * @private
+                 * @param {number} workerIndex - Index of the worker that sent the message.
+                 * @param {MessageEvent} event - The message event from the worker.
+                 */
+                _handleWorkerMessage(workerIndex, event) {
+                    const { type, jobId, error, ...data } = event.data;
+
+                    this.workerBusy[workerIndex] = false;
+
+                    const job = this.pendingJobs.get(jobId);
+                    if (!job) {
+                        console.warn(`[WorkerPool] Received result for unknown job ${jobId}`);
+                        return;
+                    }
+
+                    this.pendingJobs.delete(jobId);
+
+                    if (type === 'error') {
+                        job.reject(new Error(error));
+                    } else {
+                        job.resolve({ type, ...data });
+                    }
+
+                    // Process next job in queue
+                    this._processQueue();
+                }
+
+                /**
+                 * Handle worker error.
+                 * @private
+                 * @param {number} workerIndex - Index of the worker that errored.
+                 * @param {ErrorEvent} event - The error event.
+                 */
+                _handleWorkerError(workerIndex, event) {
+                    console.error(`[WorkerPool] Worker ${workerIndex} error:`, event.message);
+                    this.workerBusy[workerIndex] = false;
+                    this._processQueue();
+                }
+
+                /**
+                 * Find an idle worker.
+                 * @private
+                 * @returns {number} Worker index or -1 if all busy.
+                 */
+                _getIdleWorker() {
+                    for (let i = 0; i < this.poolSize; i++) {
+                        if (!this.workerBusy[i]) return i;
+                    }
+                    return -1;
+                }
+
+                /**
+                 * Process queued jobs.
+                 * @private
+                 */
+                _processQueue() {
+                    while (this.jobQueue.length > 0) {
+                        const workerIndex = this._getIdleWorker();
+                        if (workerIndex === -1) break; // All workers busy
+
+                        const job = this.jobQueue.shift();
+                        this.workerBusy[workerIndex] = true;
+                        this.workers[workerIndex].postMessage(job.message, job.transfer || []);
+                    }
+                }
+
+                /**
+                 * Initialize all workers with the world seed string.
+                 * Must be called before generating terrain.
+                 * @param {string} seedStr - World seed string.
+                 * @returns {Promise<void>} Resolves when all workers are initialized.
+                 */
+                async initWithSeed(seedStr) {
+                    this.currentSeed = seedStr;
+                    const initPromises = [];
+
+                    for (let i = 0; i < this.poolSize; i++) {
+                        initPromises.push(new Promise((resolve, reject) => {
+                            const jobId = this.nextJobId++;
+                            this.pendingJobs.set(jobId, { resolve, reject });
+                            this.workers[i].postMessage({ type: 'init', jobId, seedStr });
+                        }));
+                    }
+
+                    await Promise.all(initPromises);
+                    console.log(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}`);
+                }
+
+                /**
+                 * Queue a terrain generation job.
+                 * @param {number} cx - Chunk X coordinate.
+                 * @param {number} cz - Chunk Z coordinate.
+                 * @param {string} seedStr - World seed string.
+                 * @returns {Promise<{blocks: Uint8Array}>} Promise resolving to block data.
+                 */
+                generateTerrain(cx, cz, seedStr) {
+                    return new Promise((resolve, reject) => {
+                        const jobId = this.nextJobId++;
+
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+
+                        this.jobQueue.push({
+                            message: { type: 'generate', jobId, cx, cz, seedStr },
+                            transfer: []
+                        });
+
+                        this._processQueue();
+                    });
+                }
+
+                /**
+                 * Queue a mesh generation job.
+                 * @param {number} cx - Chunk X coordinate.
+                 * @param {number} cz - Chunk Z coordinate.
+                 * @param {Uint8Array} blocks - Block data (will be transferred, becomes unusable!).
+                 * @param {Object} neighborBlocks - Neighboring chunk data.
+                 * @returns {Promise<{positions: Float32Array, normals: Float32Array, uvs: Float32Array, colors: Float32Array, indices: Uint32Array, faceCount: number}>} Promise resolving to mesh data.
+                 */
+                generateMesh(cx, cz, blocks, neighborBlocks) {
+                    return new Promise((resolve, reject) => {
+                        const jobId = this.nextJobId++;
+
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+
+                        // Collect all transferable buffers
+                        const transfer = [blocks.buffer];
+                        // Note: neighborBlocks would need copies since we can't transfer chunks still in use
+
+                        this.jobQueue.push({
+                            message: { type: 'mesh', jobId, cx, cz, blocks, neighborBlocks },
+                            transfer: transfer
+                        });
+
+                        this._processQueue();
+                    });
+                }
+
+                /**
+                 * Get pool statistics.
+                 * @returns {{poolSize: number, busyWorkers: number, queueLength: number, pendingJobs: number}} Pool stats.
+                 */
+                getStats() {
+                    return {
+                        poolSize: this.poolSize,
+                        busyWorkers: this.workerBusy.filter(b => b).length,
+                        queueLength: this.jobQueue.length,
+                        pendingJobs: this.pendingJobs.size
+                    };
+                }
+
+                /**
+                 * Terminate all workers.
+                 */
+                terminate() {
+                    for (const worker of this.workers) {
+                        worker.terminate();
+                    }
+                    this.workers = [];
+                    this.jobQueue = [];
+                    this.pendingJobs.clear();
+                    logDebug('[WorkerPool] Terminated all workers');
+                }
+            }
+
+            // Global worker pool instance (initialized after game starts)
+            let chunkWorkerPool = null;
+
+            /**
+             * Generate chunk terrain using worker pool.
+             * Falls back to main thread if workers unavailable or disabled.
+             * @param {number} cx - Chunk X coordinate.
+             * @param {number} cz - Chunk Z coordinate.
+             * @returns {Promise<Uint8Array|null>} Block data, or null if workers unavailable.
+             */
+            async function generateTerrainViaWorker(cx, cz) {
+                // Check if workers are available and enabled
+                if (!chunkWorkerPool || !SETTINGS.useWorkers) {
+                    return null; // Signal to use main thread
+                }
+
+                // Ensure workers are initialized with current seed string
+                if (chunkWorkerPool.currentSeed !== finalSeedDisplay) {
+                    try {
+                        await chunkWorkerPool.initWithSeed(finalSeedDisplay);
+                    } catch (e) {
+                        logDebug(`[WorkerPool] Init failed: ${e.message}`);
+                        return null;
+                    }
+                }
+
+                try {
+                    const result = await chunkWorkerPool.generateTerrain(cx, cz, finalSeedDisplay);
+                    return result.blocks;
+                } catch (e) {
+                    logDebug(`[Worker] Terrain gen failed for ${cx},${cz}: ${e.message}`);
+                    return null; // Signal to use main thread fallback
+                }
+            }
+
             // =====================================================
             // GEOMETRY BUFFER POOL (TIERED)
             // =====================================================
@@ -19142,6 +20811,8 @@
             const p = new Uint8Array(256).map((_, i) => i);
             const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
             const lerp = (t, a, b) => a + t * (b - a);
+            // lerpValue: same as THREE.MathUtils.lerp(a, b, t) - for terrain functions that can be injected into workers
+            const lerpValue = (a, b, t) => a + t * (b - a);
             const grad = (h, x, y) => {
                 const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : 0;
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
@@ -20648,6 +22319,16 @@
                     for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
                 }
                 await init(); // Initialize Three.js FIRST (creates scene, materials, controls)
+                // Initialize worker pool for chunk generation
+                if (!chunkWorkerPool && SETTINGS.useWorkers) {
+                    chunkWorkerPool = new ChunkWorkerPool();
+                    // Initialize workers with seed string immediately for faster first-chunk generation
+                    if (finalSeedDisplay) {
+                        chunkWorkerPool.initWithSeed(finalSeedDisplay).catch(e => {
+                            logDebug(`[WorkerPool] Seed init failed: ${e.message}`);
+                        });
+                    }
+                }
                 const isNewWorld = !(await isWorldPreGenerated(seedStr)); // NOW check if this is a new world (after scene exists)
                 if (isNewWorld) { logDebug("New world detected - pre-generating spawn chunks..."); await preGenerateSpawnChunks(spawnChunkX, spawnChunkZ, SETTINGS.preGenRenderDistance);
                 } else { logDebug("Existing world detected - skipping pre-generation"); }
@@ -25770,6 +27451,18 @@ self.onmessage = async (e) => {
                     overlay.innerText += "\nOps: W:" + opfsStats.writes + " R:" + opfsStats.reads +
                         " (Hit:" + opfsStats.hitRate + ")" +
                         "\nDisk I/O: R:" + opfsStats.bytesReadMB + "MB W:" + opfsStats.bytesWrittenMB + "MB";
+                }
+
+                // Worker pool stats
+                if (chunkWorkerPool) {
+                    const workerStats = chunkWorkerPool.getStats();
+                    const seedReady = chunkWorkerPool.currentSeed !== null;
+                    overlay.innerText += "\n--- WORKERS ---" +
+                        "\nWorkers: " + workerStats.busyWorkers + "/" + workerStats.poolSize + " busy | Q: " + workerStats.queueLength +
+                        (workerStats.pendingJobs > 0 ? " | Pending: " + workerStats.pendingJobs : "") +
+                        "\nSeed: " + (seedReady ? "ready" : "not initialized");
+                } else if (SETTINGS.useWorkers) {
+                    overlay.innerText += "\n--- WORKERS ---\nPool: not created";
                 }
             }
             function initTextures() {
@@ -31535,9 +33228,9 @@ self.onmessage = async (e) => {
                 const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
                 const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
                 const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
-                const h0 = THREE.MathUtils.lerp(h00, h10, sx);
-                const h1 = THREE.MathUtils.lerp(h01, h11, sx);
-                let finalHeight = THREE.MathUtils.lerp(h0, h1, sz);
+                const h0 = lerpValue(h00, h10, sx);
+                const h1 = lerpValue(h01, h11, sx);
+                let finalHeight = lerpValue(h0, h1, sz);
 
                 // 4. Apply oceans first (larger scale feature)
                 const oceanFactor = getOceanFactor(gx, gz, seed);
@@ -31545,20 +33238,18 @@ self.onmessage = async (e) => {
                     const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
                     const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
                     const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
-                    finalHeight = THREE.MathUtils.lerp(oceanFloor, finalHeight, bank);
+                    finalHeight = lerpValue(oceanFloor, finalHeight, bank);
                 }
 
-                // 5. Apply rivers (can carve through ocean edges too) - only if enabled
-                if (window.worldGenSettings?.enableRivers !== false) {
-                    const r = getRiverFactor(gx, gz, seed);
-                    if (r < 1.0) {
-                        const riverDepth = getRiverDepth(r, gx, gz, seed);
-                        const riverBed = WORLD_DIMS.seaLevel - riverDepth;
-                        const bank = r * r * (3 - 2 * r);
-                        // Rivers carve down from current height (whether land or ocean edge)
-                        const carvedHeight = Math.min(finalHeight, riverBed);
-                        finalHeight = THREE.MathUtils.lerp(carvedHeight, finalHeight, bank);
-                    }
+                // 5. Apply rivers (always enabled in terrain generation - rivers are deterministic)
+                const r = getRiverFactor(gx, gz, seed);
+                if (r < 1.0) {
+                    const riverDepth = getRiverDepth(r, gx, gz, seed);
+                    const riverBed = WORLD_DIMS.seaLevel - riverDepth;
+                    const bank = r * r * (3 - 2 * r);
+                    // Rivers carve down from current height (whether land or ocean edge)
+                    const carvedHeight = Math.min(finalHeight, riverBed);
+                    finalHeight = lerpValue(carvedHeight, finalHeight, bank);
                 }
 
                 return Math.floor(finalHeight);
@@ -31568,7 +33259,8 @@ self.onmessage = async (e) => {
                 const centerX = cx * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const centerZ = cz * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const biome = getBiomeParams(centerX, centerZ);
-                const hf = biome.heightFunc || defaultHeightFunc;
+                // Use HEIGHT_FUNCS lookup instead of biome.heightFunc for consistent behavior with workers
+                const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc;
                 let h = hf(gx, gz, biome, seed);
                 // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
                 const t = (continentFactor + 1) * 0.5; // -1..1 → 0..1
@@ -31745,6 +33437,15 @@ self.onmessage = async (e) => {
                 const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
                 return Math.floor(Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285));
             }
+            // Height function lookup table - used by getBiomeHeightAtCell for consistent behavior with workers
+            const HEIGHT_FUNCS = {
+                plains: plainsHeightFunc,
+                hills: hillsHeightFunc,
+                forests: defaultHeightFunc,
+                mountains: mountainsHeightFunc,
+                swamp: defaultHeightFunc,
+                longwoods: defaultHeightFunc
+            };
             function getRiverFactor(gx, gz, seed) {
                 // Reduce warp frequency and strength by 50%
                 const warpScale = 0.004; // Was 0.008
@@ -32711,9 +34412,74 @@ self.onmessage = async (e) => {
                         }
                         return cachedData;
                     }
+
+                    // ============================================================
+                    // 4. Try worker-based terrain generation (if enabled)
+                    // ============================================================
+                    const seed = worldConfig.seed;
+                    let workerBlocks = null;
+                    if (SETTINGS.useWorkers && chunkWorkerPool) {
+                        try {
+                            workerBlocks = await generateTerrainViaWorker(cx, cz);
+                            if (workerBlocks) {
+                                console.log(`[Worker] Chunk ${key} terrain generated via worker`);
+                            }
+                        } catch (e) {
+                            logDebug(`[Worker] Failed, falling back to main thread: ${e.message}`);
+                        }
+                    }
+
+                    if (workerBlocks) {
+                        // Worker generated terrain + water + trees (Phase 3) - only need lighting on main thread
+                        const size = chunkSize * chunkSize * chunkHeight;
+                        const chunk = {
+                            blocks: workerBlocks,
+                            skyLight: new Uint8Array(size),
+                            blockLight: new Uint8Array(size),
+                            cx,
+                            cz,
+                            startX,
+                            startZ,
+                            genState: GEN_PASS.TERRAIN | GEN_PASS.WATER | GEN_PASS.DECORATIONS, // Worker did all generation
+                            sections: createSectionData(),
+                        };
+
+                        // Trees already generated in worker - skip decorations pass
+
+                        // --- PASS 4: Calculate sunlight ---
+                        calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                        chunk.genState |= GEN_PASS.SUNLIGHT;
+
+                        // --- PASS 5: Calculate block light ---
+                        calculateBlockLight(chunk, chunkSize, chunkHeight);
+                        chunk.genState |= GEN_PASS.BLOCKLIGHT;
+
+                        // --- PASS 6: Analyze sections for visibility optimization ---
+                        analyzeChunkSections(chunk);
+
+                        chunks.set(key, chunk);
+                        chunkDataPool.register(key, chunk);
+                        pristineChunks.add(key);
+
+                        // Queue adjacent chunks for update
+                        queueAdjacentChunksForUpdate(cx, cz, key);
+
+                        // Save to IndexedDB
+                        await saveChunkToCache(key, chunk);
+
+                        // Also write to OPFS disk cache
+                        if (chunkDataPool.diskStorageReady) {
+                            chunkDataPool.writeToDisk(key, chunk).catch(() => {});
+                        }
+
+                        return chunk;
+                    }
+
+                    // ============================================================
+                    // 5. Main-thread terrain generation (fallback or workers disabled)
+                    // ============================================================
                     // Initialize chunk data and parameters
                     const data = new Uint8Array(chunkSize * chunkSize * chunkHeight);
-                    const seed = worldConfig.seed;
                     // Helper: Set block in current chunk
                     const set = (x, y, z, id) => {
                         if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
