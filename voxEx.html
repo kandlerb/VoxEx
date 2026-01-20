@@ -18473,7 +18473,7 @@
     // NOISE SYSTEM
     // ============================================================
     let perm = null;
-    let workerSeed = 0;
+    let workerSeedStr = null;
 
     // Fade lookup table for performance
     const FADE_LUT = new Float32Array(256);
@@ -18488,34 +18488,56 @@
     }
 
     /**
-     * Initialize noise with seed (called once when worker receives seed).
-     * @param {number} seed - World seed
+     * SeededRandom - MUST match main thread exactly!
+     * Ported from main thread SeededRandom class.
      */
-    function initNoise(seed) {
-        workerSeed = seed;
+    class SeededRandom {
+        constructor(seed) {
+            if (typeof seed === "string") {
+                let h = 0xdeadbeef;
+                for (let i = 0; i < seed.length; i++) {
+                    h = Math.imul(h ^ seed.charCodeAt(i), 2654435761);
+                    h = (h ^ (h >>> 16)) >>> 0;
+                }
+                this.seed = h;
+            } else {
+                this.seed = seed >>> 0;
+            }
+        }
+
+        next() {
+            let t = (this.seed += 0x6d2b79f5);
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+    }
+
+    /**
+     * Initialize noise with seed string (called once when worker receives seed).
+     * MUST match main thread initialization exactly!
+     * @param {string} seedStr - World seed string
+     */
+    function initNoise(seedStr) {
+        workerSeedStr = seedStr;
         perm = new Uint8Array(512);
         const p = new Uint8Array(256);
 
         // Initialize p with 0-255
         for (let i = 0; i < 256; i++) p[i] = i;
 
-        // Seeded shuffle using mulberry32-style PRNG
-        let state = seed >>> 0;
-        const rng = () => {
-            state = Math.imul(state ^ (state >>> 16), 2246822507);
-            state = Math.imul(state ^ (state >>> 13), 3266489909);
-            return ((state ^= state >>> 16) >>> 0) / 4294967296;
-        };
+        // Create RNG from seed string - same as main thread
+        const rng = new SeededRandom(seedStr);
 
-        // Fisher-Yates shuffle
-        for (let i = 255; i > 0; i--) {
-            const j = Math.floor(rng() * (i + 1));
-            [p[i], p[j]] = [p[j], p[i]];
-        }
+        // Skip first call (main thread stores this as worldConfig.seed)
+        rng.next();
 
-        // Duplicate for wrapping
-        for (let i = 0; i < 512; i++) {
-            perm[i] = p[i & 255];
+        // Fisher-Yates shuffle - MUST match main thread exactly!
+        // Main thread: for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
+        for (let i = 0; i < 256; i++) {
+            const r = Math.floor(rng.next() * (256 - i)) + i;
+            [p[i], p[r]] = [p[r], p[i]];
+            perm[i] = perm[i + 256] = p[i];
         }
     }
 
@@ -18955,12 +18977,12 @@
     // MESSAGE HANDLER
     // ============================================================
     self.onmessage = function(e) {
-        const { type, jobId, cx, cz, seed } = e.data;
+        const { type, jobId, cx, cz, seedStr } = e.data;
 
         try {
             if (type === 'init') {
-                // Initialize noise with seed
-                initNoise(seed);
+                // Initialize noise with seed string
+                initNoise(seedStr);
                 biomeCellCache.clear(); // Clear biome cache for new seed
                 self.postMessage({ type: 'ready', jobId });
                 return;
@@ -18968,8 +18990,8 @@
 
             if (type === 'generate') {
                 // Ensure noise is initialized
-                if (!perm || workerSeed !== seed) {
-                    initNoise(seed);
+                if (!perm || workerSeedStr !== seedStr) {
+                    initNoise(seedStr);
                     biomeCellCache.clear();
                 }
 
@@ -18981,7 +19003,7 @@
                 // Generate terrain
                 const blocks = new Uint8Array(chunkSize * chunkSize * chunkHeight);
 
-                const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seed);
+                const caches = precalculateTerrainCaches(chunkSize, startX, startZ, seedStr);
                 const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
 
                 generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches);
@@ -19030,7 +19052,7 @@
                     this.currentSeed = null; // Track current world seed for worker init
 
                     this._initWorkers();
-                    logDebug(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+                    console.log(`[WorkerPool] Initialized with ${this.poolSize} workers`);
                 }
 
                 /**
@@ -19122,42 +19144,42 @@
                 }
 
                 /**
-                 * Initialize all workers with the world seed.
+                 * Initialize all workers with the world seed string.
                  * Must be called before generating terrain.
-                 * @param {number} seed - World seed.
+                 * @param {string} seedStr - World seed string.
                  * @returns {Promise<void>} Resolves when all workers are initialized.
                  */
-                async initWithSeed(seed) {
-                    this.currentSeed = seed;
+                async initWithSeed(seedStr) {
+                    this.currentSeed = seedStr;
                     const initPromises = [];
 
                     for (let i = 0; i < this.poolSize; i++) {
                         initPromises.push(new Promise((resolve, reject) => {
                             const jobId = this.nextJobId++;
                             this.pendingJobs.set(jobId, { resolve, reject });
-                            this.workers[i].postMessage({ type: 'init', jobId, seed });
+                            this.workers[i].postMessage({ type: 'init', jobId, seedStr });
                         }));
                     }
 
                     await Promise.all(initPromises);
-                    logDebug(`[WorkerPool] All ${this.poolSize} workers initialized with seed ${seed}`);
+                    console.log(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}`);
                 }
 
                 /**
                  * Queue a terrain generation job.
                  * @param {number} cx - Chunk X coordinate.
                  * @param {number} cz - Chunk Z coordinate.
-                 * @param {number} seed - World seed.
+                 * @param {string} seedStr - World seed string.
                  * @returns {Promise<{blocks: Uint8Array}>} Promise resolving to block data.
                  */
-                generateTerrain(cx, cz, seed) {
+                generateTerrain(cx, cz, seedStr) {
                     return new Promise((resolve, reject) => {
                         const jobId = this.nextJobId++;
 
                         this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
 
                         this.jobQueue.push({
-                            message: { type: 'generate', jobId, cx, cz, seed },
+                            message: { type: 'generate', jobId, cx, cz, seedStr },
                             transfer: []
                         });
 
@@ -19235,10 +19257,10 @@
                     return null; // Signal to use main thread
                 }
 
-                // Ensure workers are initialized with current seed
-                if (chunkWorkerPool.currentSeed !== worldConfig.seed) {
+                // Ensure workers are initialized with current seed string
+                if (chunkWorkerPool.currentSeed !== finalSeedDisplay) {
                     try {
-                        await chunkWorkerPool.initWithSeed(worldConfig.seed);
+                        await chunkWorkerPool.initWithSeed(finalSeedDisplay);
                     } catch (e) {
                         logDebug(`[WorkerPool] Init failed: ${e.message}`);
                         return null;
@@ -19246,7 +19268,7 @@
                 }
 
                 try {
-                    const result = await chunkWorkerPool.generateTerrain(cx, cz, worldConfig.seed);
+                    const result = await chunkWorkerPool.generateTerrain(cx, cz, finalSeedDisplay);
                     return result.blocks;
                 } catch (e) {
                     logDebug(`[Worker] Terrain gen failed for ${cx},${cz}: ${e.message}`);
@@ -21482,9 +21504,9 @@
                 // Initialize worker pool for chunk generation
                 if (!chunkWorkerPool && SETTINGS.useWorkers) {
                     chunkWorkerPool = new ChunkWorkerPool();
-                    // Initialize workers with seed immediately for faster first-chunk generation
-                    if (worldConfig.seed) {
-                        chunkWorkerPool.initWithSeed(worldConfig.seed).catch(e => {
+                    // Initialize workers with seed string immediately for faster first-chunk generation
+                    if (finalSeedDisplay) {
+                        chunkWorkerPool.initWithSeed(finalSeedDisplay).catch(e => {
                             logDebug(`[WorkerPool] Seed init failed: ${e.message}`);
                         });
                     }
@@ -33574,7 +33596,7 @@ self.onmessage = async (e) => {
                         try {
                             workerBlocks = await generateTerrainViaWorker(cx, cz);
                             if (workerBlocks) {
-                                logDebug(`[Worker] Chunk ${key} terrain generated via worker`);
+                                console.log(`[Worker] Chunk ${key} terrain generated via worker`);
                             }
                         } catch (e) {
                             logDebug(`[Worker] Failed, falling back to main thread: ${e.message}`);
