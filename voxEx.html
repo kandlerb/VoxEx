@@ -4958,6 +4958,7 @@
                 opfsCacheMaxMB: savedSettings.opfsCacheMaxMB ?? 500,                         // Max OPFS cache size in MB (auto-clear old if exceeded)
                 // Web Workers
                 useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
+                useWorkersForMesh: savedSettings.useWorkersForMesh !== undefined ? savedSettings.useWorkersForMesh : true, // Use Web Workers for mesh generation
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5168,6 +5169,7 @@
                 opfsCacheMaxMB: 500,               // Max OPFS cache size in MB
                 // Web Worker defaults
                 useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
+                useWorkersForMesh: true,           // Use Web Workers for mesh generation (Phase 4)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -12694,7 +12696,11 @@
                 if (typeof geometryPool !== 'undefined') {
                     const geoStats = geometryPool.getStats();
                     html += `GeoPool: T:${geoStats.terrainPoolSize}/${geoStats.maxPoolSize} W:${geoStats.waterPoolSize}/${geoStats.maxPoolSize}\n`;
-                    html += `GeoAlloc: T:${geoStats.terrainCreated} W:${geoStats.waterCreated}\n`;
+                    // terrainCreated is an object {small, medium, large} - sum all tiers
+                    const terrainTotal = typeof geoStats.terrainCreated === 'object'
+                        ? (geoStats.terrainCreated.small || 0) + (geoStats.terrainCreated.medium || 0) + (geoStats.terrainCreated.large || 0)
+                        : geoStats.terrainCreated;
+                    html += `GeoAlloc: T:${terrainTotal} W:${geoStats.waterCreated}\n`;
                 }
                 // Calculate raw chunk memory and oldest access time
                 const chunkMemoryMB = (chunks.size * CHUNK_DATA_SIZE / (1024 * 1024)).toFixed(1);
@@ -18552,6 +18558,100 @@
     const TOTAL_BIOME_WEIGHT = BIOME_WEIGHTS.reduce((a, b) => a + b, 0);
 
     // ============================================================
+    // MESH GENERATION CONSTANTS
+    // ============================================================
+    const UNLOADED_BLOCK = 255;
+    const TORCH = 10;
+    const NUM_TILES = 17;
+
+    // Face directions: [dx, dy, dz, nx, ny, nz]
+    const FACE_DIRECTIONS = [
+        [0, 1, 0, 0, 1, 0],   // Top (+Y)
+        [0, -1, 0, 0, -1, 0], // Bottom (-Y)
+        [1, 0, 0, 1, 0, 0],   // Right (+X)
+        [-1, 0, 0, -1, 0, 0], // Left (-X)
+        [0, 0, 1, 0, 0, 1],   // Back (+Z)
+        [0, 0, -1, 0, 0, -1]  // Front (-Z)
+    ];
+
+    // Block transparency lookup
+    const IS_TRANSPARENT_WORKER = new Uint8Array(256);
+    IS_TRANSPARENT_WORKER[AIR] = 1;
+    IS_TRANSPARENT_WORKER[WATER] = 1;
+    IS_TRANSPARENT_WORKER[LEAVES] = 1;
+    IS_TRANSPARENT_WORKER[LONGWOOD_LEAVES] = 1;
+    IS_TRANSPARENT_WORKER[TORCH] = 1;
+
+    // AO lookup table
+    const AO_LOOKUP = [1.0, 0.85, 0.7, 0.5];
+
+    // AO face configurations for each face direction
+    const AO_FACE_CONFIGS = {
+        top: [
+            [-1, 1, 0, 0, 1, 1, -1, 1, 1],
+            [1, 1, 0, 0, 1, 1, 1, 1, 1],
+            [1, 1, 0, 0, 1, -1, 1, 1, -1],
+            [-1, 1, 0, 0, 1, -1, -1, 1, -1]
+        ],
+        bottom: [
+            [-1, -1, 0, 0, -1, -1, -1, -1, -1],
+            [1, -1, 0, 0, -1, -1, 1, -1, -1],
+            [1, -1, 0, 0, -1, 1, 1, -1, 1],
+            [-1, -1, 0, 0, -1, 1, -1, -1, 1]
+        ],
+        right: [
+            [1, -1, 0, 1, 0, 1, 1, -1, 1],
+            [1, -1, 0, 1, 0, -1, 1, -1, -1],
+            [1, 1, 0, 1, 0, -1, 1, 1, -1],
+            [1, 1, 0, 1, 0, 1, 1, 1, 1]
+        ],
+        left: [
+            [-1, -1, 0, -1, 0, -1, -1, -1, -1],
+            [-1, -1, 0, -1, 0, 1, -1, -1, 1],
+            [-1, 1, 0, -1, 0, 1, -1, 1, 1],
+            [-1, 1, 0, -1, 0, -1, -1, 1, -1]
+        ],
+        back: [
+            [-1, 0, 1, 0, -1, 1, -1, -1, 1],
+            [1, 0, 1, 0, -1, 1, 1, -1, 1],
+            [1, 0, 1, 0, 1, 1, 1, 1, 1],
+            [-1, 0, 1, 0, 1, 1, -1, 1, 1]
+        ],
+        front: [
+            [1, 0, -1, 0, -1, -1, 1, -1, -1],
+            [-1, 0, -1, 0, -1, -1, -1, -1, -1],
+            [-1, 0, -1, 0, 1, -1, -1, 1, -1],
+            [1, 0, -1, 0, 1, -1, 1, 1, -1]
+        ]
+    };
+
+    // Face vertex cache for indexed geometry (4 vertices per face)
+    const faceVertexCacheIndexed = new Map();
+
+    function getCachedFaceVerticesIndexed(nx, ny, nz) {
+        const key = nx + ',' + ny + ',' + nz;
+        if (faceVertexCacheIndexed.has(key)) return faceVertexCacheIndexed.get(key);
+        const verts = new Float32Array(12);
+        let x1, y1, z1, x2, y2, z2, x3, y3, z3, x4, y4, z4;
+        if (ny > 0) { x1 = 0; y1 = 1; z1 = 1; x2 = 1; y2 = 1; z2 = 1; x3 = 1; y3 = 1; z3 = 0; x4 = 0; y4 = 1; z4 = 0; }
+        else if (ny < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 0; z3 = 1; x4 = 0; y4 = 0; z4 = 1; }
+        else if (nx > 0) { x1 = 1; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 0; x3 = 1; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 1; }
+        else if (nx < 0) { x1 = 0; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 1; x3 = 0; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 0; }
+        else if (nz > 0) { x1 = 0; y1 = 0; z1 = 1; x2 = 1; y2 = 0; z2 = 1; x3 = 1; y3 = 1; z3 = 1; x4 = 0; y4 = 1; z4 = 1; }
+        else { x1 = 1; y1 = 0; z1 = 0; x2 = 0; y2 = 0; z2 = 0; x3 = 0; y3 = 1; z3 = 0; x4 = 1; y4 = 1; z4 = 0; }
+        verts[0] = x1; verts[1] = y1; verts[2] = z1;
+        verts[3] = x2; verts[4] = y2; verts[5] = z2;
+        verts[6] = x3; verts[7] = y3; verts[8] = z3;
+        verts[9] = x4; verts[10] = y4; verts[11] = z4;
+        faceVertexCacheIndexed.set(key, verts);
+        return verts;
+    }
+
+    /* __MESH_FUNCS_START__ */
+    // Placeholder - mesh functions will be injected here by buildChunkWorkerCode()
+    /* __MESH_FUNCS_END__ */
+
+    // ============================================================
     // NOISE SYSTEM
     // ============================================================
     let perm = null;
@@ -19765,6 +19865,277 @@
                     blocks: blocks
                 }, [blocks.buffer]);
             }
+
+            if (type === 'mesh') {
+                // Mesh generation in worker
+                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
+                const chunkSize = CHUNK_SIZE;
+                const chunkHeight = CHUNK_HEIGHT;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+
+                // Build local block getter (handles neighbor lookups)
+                const getLocal = (lx, ly, lz) => {
+                    if (ly < 0 || ly >= chunkHeight) return 0;
+                    // Center chunk (most common case)
+                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
+                        return centerBlocks[lx + lz * 16 + ly * 256];
+                    }
+                    // North neighbor (z < 0)
+                    if (lz < 0 && lx >= 0 && lx < 16) {
+                        if (!neighbors.n) return UNLOADED_BLOCK;
+                        return neighbors.n[lx + 15 * 16 + ly * 256];
+                    }
+                    // South neighbor (z > 15)
+                    if (lz > 15 && lx >= 0 && lx < 16) {
+                        if (!neighbors.s) return UNLOADED_BLOCK;
+                        return neighbors.s[lx + 0 * 16 + ly * 256];
+                    }
+                    // East neighbor (x > 15)
+                    if (lx > 15 && lz >= 0 && lz < 16) {
+                        if (!neighbors.e) return UNLOADED_BLOCK;
+                        return neighbors.e[0 + lz * 16 + ly * 256];
+                    }
+                    // West neighbor (x < 0)
+                    if (lx < 0 && lz >= 0 && lz < 16) {
+                        if (!neighbors.w) return UNLOADED_BLOCK;
+                        return neighbors.w[15 + lz * 16 + ly * 256];
+                    }
+                    // Diagonal neighbors
+                    if (lz < 0 && lx < 0) {
+                        if (!neighbors.nw) return UNLOADED_BLOCK;
+                        return neighbors.nw[15 + 15 * 16 + ly * 256];
+                    }
+                    if (lz < 0 && lx > 15) {
+                        if (!neighbors.ne) return UNLOADED_BLOCK;
+                        return neighbors.ne[0 + 15 * 16 + ly * 256];
+                    }
+                    if (lz > 15 && lx < 0) {
+                        if (!neighbors.sw) return UNLOADED_BLOCK;
+                        return neighbors.sw[15 + 0 * 16 + ly * 256];
+                    }
+                    if (lz > 15 && lx > 15) {
+                        if (!neighbors.se) return UNLOADED_BLOCK;
+                        return neighbors.se[0 + 0 * 16 + ly * 256];
+                    }
+                    return 0;
+                };
+
+                // Build local light getter
+                const getLocalLight = (lx, ly, lz) => {
+                    if (ly < 0 || ly >= chunkHeight) return 15;
+                    // Center chunk
+                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
+                        const idx = lx + lz * 16 + ly * 256;
+                        const sky = centerSkyLight ? centerSkyLight[idx] : 15;
+                        const block = centerBlockLight ? centerBlockLight[idx] : 0;
+                        const maxLight = Math.max(sky, block);
+                        return maxLight < 3 ? 3 : maxLight;
+                    }
+                    // For neighbors, use full light (simplified)
+                    return 15;
+                };
+
+                // Helper to check if block is a leaf
+                const isLeafBlockWorker = (id) => id === LEAVES || id === LONGWOOD_LEAVES;
+
+                // Get UV from map data
+                const getBlockUVWorker = (blockId) => {
+                    if (uvMapData && uvMapData[blockId]) return uvMapData[blockId];
+                    return { top: [0, 0], bottom: [0, 0], side: [0, 0] };
+                };
+
+                // AO helper functions
+                const getAOConfig = (nx, ny, nz) => {
+                    if (ny > 0) return AO_FACE_CONFIGS.top;
+                    if (ny < 0) return AO_FACE_CONFIGS.bottom;
+                    if (nx > 0) return AO_FACE_CONFIGS.right;
+                    if (nx < 0) return AO_FACE_CONFIGS.left;
+                    if (nz > 0) return AO_FACE_CONFIGS.back;
+                    return AO_FACE_CONFIGS.front;
+                };
+
+                const calculateVertexAO = (lx, ly, lz, offsets) => {
+                    const s1 = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[0], ly + offsets[1], lz + offsets[2])] ? 0 : 1;
+                    const s2 = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[3], ly + offsets[4], lz + offsets[5])] ? 0 : 1;
+                    const c = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[6], ly + offsets[7], lz + offsets[8])] ? 0 : 1;
+                    return AO_LOOKUP[s1 + s2 + c];
+                };
+
+                const calculateFaceAO = (nx, ny, nz, lx, ly, lz, blockId) => {
+                    if (!settingsAO || blockId === WATER) return [1, 1, 1, 1];
+                    const config = getAOConfig(nx, ny, nz);
+                    return [
+                        calculateVertexAO(lx, ly, lz, config[0]),
+                        calculateVertexAO(lx, ly, lz, config[1]),
+                        calculateVertexAO(lx, ly, lz, config[2]),
+                        calculateVertexAO(lx, ly, lz, config[3])
+                    ];
+                };
+
+                // Allocate output buffers (indexed geometry: 4 verts per face)
+                const terrainPos = new Float32Array(maxFaces * 12);
+                const terrainNorm = new Float32Array(maxFaces * 12);
+                const terrainUvs = new Float32Array(maxFaces * 8);
+                const terrainCols = new Float32Array(maxFaces * 12);
+                const terrainIndices = new Uint32Array(maxFaces * 6);
+
+                const waterPos = new Float32Array(maxFaces * 12);
+                const waterNorm = new Float32Array(maxFaces * 12);
+                const waterUvs = new Float32Array(maxFaces * 8);
+                const waterCols = new Float32Array(maxFaces * 12);
+                const waterIndices = new Uint32Array(maxFaces * 6);
+                const waterShore = new Float32Array(maxFaces * 4);
+                const waterThickness = new Float32Array(maxFaces * 4);
+
+                let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0;
+                let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wIIdx = 0, wVertCount = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0;
+
+                // Process all blocks
+                for (let y = 0; y < chunkHeight; y++) {
+                    const yOffset = y * 256;
+                    for (let z = 0; z < 16; z++) {
+                        const zOffset = z * 16;
+                        for (let x = 0; x < 16; x++) {
+                            const idx = x + zOffset + yOffset;
+                            const id = centerBlocks[idx];
+                            if (id === AIR || id === TORCH) continue;
+
+                            const wx = startX + x;
+                            const wy = y - WORLD_DIMS.yOffset;
+                            const wz = startZ + z;
+                            const uv = getBlockUVWorker(id);
+                            const isWater = id === WATER;
+
+                            for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                const face = FACE_DIRECTIONS[faceIdx];
+                                const lx = x + face[0];
+                                const ly = y + face[1];
+                                const lz = z + face[2];
+                                const nx = face[3], ny = face[4], nz = face[5];
+                                const uvCoord = faceIdx === 0 ? uv.top : faceIdx === 1 ? uv.bottom : uv.side;
+                                const nid = getLocal(lx, ly, lz);
+
+                                const draw = isWater
+                                    ? (nid === AIR || isLeafBlockWorker(nid))
+                                    : IS_TRANSPARENT_WORKER[nid];
+
+                                if (draw) {
+                                    const pos = isWater ? waterPos : terrainPos;
+                                    const norm = isWater ? waterNorm : terrainNorm;
+                                    const uvs = isWater ? waterUvs : terrainUvs;
+                                    const cols = isWater ? waterCols : terrainCols;
+                                    const indices = isWater ? waterIndices : terrainIndices;
+                                    let vIdx = isWater ? wVIdx : tVIdx;
+                                    let uvIdx = isWater ? wUvIdx : tUvIdx;
+                                    let cIdx = isWater ? wCIdx : tCIdx;
+                                    let iIdx = isWater ? wIIdx : tIIdx;
+                                    const vertCount = isWater ? wVertCount : tVertCount;
+
+                                    // Write vertices (4 per face)
+                                    const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
+                                    pos[vIdx] = verts[0] + wx; pos[vIdx+1] = verts[1] + wy; pos[vIdx+2] = verts[2] + wz;
+                                    norm[vIdx] = nx; norm[vIdx+1] = ny; norm[vIdx+2] = nz;
+                                    pos[vIdx+3] = verts[3] + wx; pos[vIdx+4] = verts[4] + wy; pos[vIdx+5] = verts[5] + wz;
+                                    norm[vIdx+3] = nx; norm[vIdx+4] = ny; norm[vIdx+5] = nz;
+                                    pos[vIdx+6] = verts[6] + wx; pos[vIdx+7] = verts[7] + wy; pos[vIdx+8] = verts[8] + wz;
+                                    norm[vIdx+6] = nx; norm[vIdx+7] = ny; norm[vIdx+8] = nz;
+                                    pos[vIdx+9] = verts[9] + wx; pos[vIdx+10] = verts[10] + wy; pos[vIdx+11] = verts[11] + wz;
+                                    norm[vIdx+9] = nx; norm[vIdx+10] = ny; norm[vIdx+11] = nz;
+
+                                    // Calculate AO and light
+                                    const ao = calculateFaceAO(nx, ny, nz, x, y, z, id);
+                                    const lightLevel = getLocalLight(lx, ly, lz) / 15.0;
+
+                                    // Write colors (4 vertices)
+                                    const c1 = ao[0] * lightLevel, c2 = ao[1] * lightLevel;
+                                    const c3 = ao[2] * lightLevel, c4 = ao[3] * lightLevel;
+                                    cols[cIdx] = c1; cols[cIdx+1] = c1; cols[cIdx+2] = c1;
+                                    cols[cIdx+3] = c2; cols[cIdx+4] = c2; cols[cIdx+5] = c2;
+                                    cols[cIdx+6] = c3; cols[cIdx+7] = c3; cols[cIdx+8] = c3;
+                                    cols[cIdx+9] = c4; cols[cIdx+10] = c4; cols[cIdx+11] = c4;
+
+                                    // Write UVs (4 vertices)
+                                    const tileW = 1 / NUM_TILES;
+                                    const u0 = uvCoord[0], u1 = uvCoord[0] + tileW;
+                                    const v0 = uvCoord[1], v1 = uvCoord[1] + 1.0;
+                                    uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
+                                    uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
+                                    uvs[uvIdx+4] = u1; uvs[uvIdx+5] = v1;
+                                    uvs[uvIdx+6] = u0; uvs[uvIdx+7] = v1;
+
+                                    // Write indices (6 per face = 2 triangles)
+                                    indices[iIdx] = vertCount; indices[iIdx+1] = vertCount + 1; indices[iIdx+2] = vertCount + 3;
+                                    indices[iIdx+3] = vertCount + 1; indices[iIdx+4] = vertCount + 2; indices[iIdx+5] = vertCount + 3;
+
+                                    // Update counters
+                                    if (isWater) {
+                                        wVIdx = vIdx + 12; wUvIdx = uvIdx + 8; wCIdx = cIdx + 12;
+                                        wIIdx = iIdx + 6; wVertCount += 4; wFaceCount++;
+                                        // Water shore/thickness (simplified)
+                                        waterShore[wSIdx] = 1; waterShore[wSIdx+1] = 1; waterShore[wSIdx+2] = 1; waterShore[wSIdx+3] = 1;
+                                        waterThickness[wTIdx] = 0; waterThickness[wTIdx+1] = 0; waterThickness[wTIdx+2] = 0; waterThickness[wTIdx+3] = 0;
+                                        wSIdx += 4; wTIdx += 4;
+                                    } else {
+                                        tVIdx = vIdx + 12; tUvIdx = uvIdx + 8; tCIdx = cIdx + 12;
+                                        tIIdx = iIdx + 6; tVertCount += 4; tFaceCount++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Create COPIES of arrays (not views) - subarray() shares the underlying buffer
+                // which causes "buffer already transferred" errors if multiple chunks share buffers
+                const tPosOut = new Float32Array(terrainPos.subarray(0, tVIdx));
+                const tNormOut = new Float32Array(terrainNorm.subarray(0, tVIdx));
+                const tUvsOut = new Float32Array(terrainUvs.subarray(0, tUvIdx));
+                const tColsOut = new Float32Array(terrainCols.subarray(0, tCIdx));
+                const tIdxOut = new Uint32Array(terrainIndices.subarray(0, tIIdx));
+
+                const wPosOut = new Float32Array(waterPos.subarray(0, wVIdx));
+                const wNormOut = new Float32Array(waterNorm.subarray(0, wVIdx));
+                const wUvsOut = new Float32Array(waterUvs.subarray(0, wUvIdx));
+                const wColsOut = new Float32Array(waterCols.subarray(0, wCIdx));
+                const wIdxOut = new Uint32Array(waterIndices.subarray(0, wIIdx));
+                const wShoreOut = new Float32Array(waterShore.subarray(0, wSIdx));
+                const wThickOut = new Float32Array(waterThickness.subarray(0, wTIdx));
+
+                // Build transfer list - each array now has its own unique buffer
+                const transferList = [
+                    tPosOut.buffer, tNormOut.buffer, tUvsOut.buffer, tColsOut.buffer, tIdxOut.buffer,
+                    wPosOut.buffer, wNormOut.buffer, wUvsOut.buffer, wColsOut.buffer, wIdxOut.buffer,
+                    wShoreOut.buffer, wThickOut.buffer
+                ];
+
+                self.postMessage({
+                    type: 'mesh',
+                    jobId: jobId,
+                    cx: cx,
+                    cz: cz,
+                    terrain: {
+                        positions: tPosOut,
+                        normals: tNormOut,
+                        uvs: tUvsOut,
+                        colors: tColsOut,
+                        indices: tIdxOut,
+                        faceCount: tFaceCount,
+                        vertexCount: tVertCount
+                    },
+                    water: {
+                        positions: wPosOut,
+                        normals: wNormOut,
+                        uvs: wUvsOut,
+                        colors: wColsOut,
+                        indices: wIdxOut,
+                        shore: wShoreOut,
+                        thickness: wThickOut,
+                        faceCount: wFaceCount,
+                        vertexCount: wVertCount
+                    }
+                }, transferList);
+            }
         } catch (error) {
             self.postMessage({
                 type: 'error',
@@ -20007,22 +20378,67 @@
                  * Queue a mesh generation job.
                  * @param {number} cx - Chunk X coordinate.
                  * @param {number} cz - Chunk Z coordinate.
-                 * @param {Uint8Array} blocks - Block data (will be transferred, becomes unusable!).
-                 * @param {Object} neighborBlocks - Neighboring chunk data.
-                 * @returns {Promise<{positions: Float32Array, normals: Float32Array, uvs: Float32Array, colors: Float32Array, indices: Uint32Array, faceCount: number}>} Promise resolving to mesh data.
+                 * @param {Object} chunkData - Center chunk data with blocks, skyLight, blockLight.
+                 * @param {Object} neighbors - Neighbor chunk data (n, s, e, w, nw, ne, sw, se).
+                 * @param {Object} uvMapData - UV map data for block textures.
+                 * @param {number} maxFaces - Maximum faces to generate.
+                 * @returns {Promise<Object>} Promise resolving to mesh data.
                  */
-                generateMesh(cx, cz, blocks, neighborBlocks) {
+                generateMesh(cx, cz, chunkData, neighbors, uvMapData, maxFaces) {
                     return new Promise((resolve, reject) => {
                         const jobId = this.nextJobId++;
 
                         this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
 
+                        // Extract center chunk data - COPY buffers since we can't transfer data still in use
+                        const centerBlocks = chunkData.blocks
+                            ? new Uint8Array(chunkData.blocks)
+                            : new Uint8Array(chunkData);
+                        const centerSkyLight = chunkData.skyLight
+                            ? new Uint8Array(chunkData.skyLight)
+                            : null;
+                        const centerBlockLight = chunkData.blockLight
+                            ? new Uint8Array(chunkData.blockLight)
+                            : null;
+
+                        // Copy neighbor block data (can't transfer chunks still in use by main thread)
+                        const neighborData = {};
+                        const dirs = ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
+                        for (const dir of dirs) {
+                            if (neighbors[dir]) {
+                                const nData = neighbors[dir].blocks || neighbors[dir];
+                                if (nData && nData.length > 0) {
+                                    neighborData[dir] = new Uint8Array(nData);
+                                }
+                            }
+                        }
+
                         // Collect all transferable buffers
-                        const transfer = [blocks.buffer];
-                        // Note: neighborBlocks would need copies since we can't transfer chunks still in use
+                        const transfer = [centerBlocks.buffer];
+                        if (centerSkyLight) transfer.push(centerSkyLight.buffer);
+                        if (centerBlockLight) transfer.push(centerBlockLight.buffer);
+                        for (const dir of dirs) {
+                            if (neighborData[dir]) {
+                                transfer.push(neighborData[dir].buffer);
+                            }
+                        }
 
                         this.jobQueue.push({
-                            message: { type: 'mesh', jobId, cx, cz, blocks, neighborBlocks },
+                            message: {
+                                type: 'mesh',
+                                jobId,
+                                cx,
+                                cz,
+                                centerBlocks,
+                                centerSkyLight,
+                                centerBlockLight,
+                                neighbors: neighborData,
+                                uvMapData,
+                                maxFaces,
+                                settingsAO: SETTINGS.AO,
+                                settingsWaterFogDensity: SETTINGS.waterFogDensity,
+                                settingsWaterColor: SETTINGS.waterColor
+                            },
                             transfer: transfer
                         });
 
@@ -20089,6 +20505,265 @@
                 } catch (e) {
                     logDebug(`[Worker] Terrain gen failed for ${cx},${cz}: ${e.message}`);
                     return null; // Signal to use main thread fallback
+                }
+            }
+
+            /**
+             * Wrap a promise with a timeout.
+             * @param {Promise} promise - The promise to wrap.
+             * @param {number} ms - Timeout in milliseconds.
+             * @param {string} label - Label for timeout error message.
+             * @returns {Promise} Promise that rejects on timeout.
+             */
+            function promiseWithTimeout(promise, ms, label = 'Operation') {
+                let timeoutId;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutId = setTimeout(() => {
+                        reject(new Error(`${label} timed out after ${ms}ms`));
+                    }, ms);
+                });
+                return Promise.race([promise, timeoutPromise]).finally(() => {
+                    clearTimeout(timeoutId);
+                });
+            }
+
+            // Timeout for worker mesh generation (ms) - if exceeded, falls back to sync
+            const WORKER_MESH_TIMEOUT_MS = 500;
+
+            /**
+             * Generate mesh data using worker pool.
+             * Falls back to null if workers unavailable or disabled.
+             * @param {number} cx - Chunk X coordinate.
+             * @param {number} cz - Chunk Z coordinate.
+             * @param {Object} chunkData - Center chunk data.
+             * @param {Object} neighbors - Neighbor chunk data.
+             * @returns {Promise<Object|null>} Mesh data, or null if workers unavailable.
+             */
+            async function generateMeshViaWorker(cx, cz, chunkData, neighbors) {
+                // Check if workers are available and enabled for mesh generation
+                if (!chunkWorkerPool || !SETTINGS.useWorkers || !SETTINGS.useWorkersForMesh) {
+                    return null; // Signal to use main thread
+                }
+
+                // Ensure workers are initialized with current seed string
+                if (chunkWorkerPool.currentSeed !== finalSeedDisplay) {
+                    try {
+                        await promiseWithTimeout(
+                            chunkWorkerPool.initWithSeed(finalSeedDisplay),
+                            2000,
+                            'Worker init'
+                        );
+                    } catch (e) {
+                        logDebug(`[WorkerPool] Init failed: ${e.message}`);
+                        return null;
+                    }
+                }
+
+                try {
+                    // MAX_FACES_PER_CHUNK constant
+                    const maxFaces = 65536;
+                    const result = await promiseWithTimeout(
+                        chunkWorkerPool.generateMesh(cx, cz, chunkData, neighbors, uvMap, maxFaces),
+                        WORKER_MESH_TIMEOUT_MS,
+                        `Mesh gen ${cx},${cz}`
+                    );
+                    return result;
+                } catch (e) {
+                    logDebug(`[Worker] Mesh gen failed for ${cx},${cz}: ${e.message}`);
+                    return null; // Signal to use main thread fallback
+                }
+            }
+
+            /**
+             * Apply mesh data from worker to Three.js geometry and add to scene.
+             * @param {string} cKey - Chunk key.
+             * @param {number} cx - Chunk X coordinate.
+             * @param {number} cz - Chunk Z coordinate.
+             * @param {Object} meshData - Mesh data from worker.
+             */
+            function applyWorkerMeshData(cKey, cx, cz, meshData) {
+                const { terrain, water } = meshData;
+
+                // Release existing meshes
+                if (chunkMeshes.has(cKey)) releaseMeshForKey(cKey);
+                if (chunkMeshes.has(cKey + "_WATER")) releaseMeshForKey(cKey + "_WATER");
+
+                // Create terrain mesh if has faces
+                if (terrain && terrain.faceCount > 0) {
+                    const geo = geometryPool.acquireTerrain(terrain.faceCount);
+
+                    // Copy worker data to geometry buffers
+                    const posAttr = geo.attributes.position;
+                    const normAttr = geo.attributes.normal;
+                    const uvAttr = geo.attributes.uv;
+                    const colorAttr = geo.attributes.color;
+                    const indexAttr = geo.index;
+
+                    // Copy positions
+                    for (let i = 0; i < terrain.positions.length; i++) {
+                        posAttr.array[i] = terrain.positions[i];
+                    }
+                    posAttr.needsUpdate = true;
+
+                    // Copy normals
+                    for (let i = 0; i < terrain.normals.length; i++) {
+                        normAttr.array[i] = terrain.normals[i];
+                    }
+                    normAttr.needsUpdate = true;
+
+                    // Copy UVs
+                    for (let i = 0; i < terrain.uvs.length; i++) {
+                        uvAttr.array[i] = terrain.uvs[i];
+                    }
+                    uvAttr.needsUpdate = true;
+
+                    // Copy colors
+                    for (let i = 0; i < terrain.colors.length; i++) {
+                        colorAttr.array[i] = terrain.colors[i];
+                    }
+                    colorAttr.needsUpdate = true;
+
+                    // Copy indices
+                    for (let i = 0; i < terrain.indices.length; i++) {
+                        indexAttr.array[i] = terrain.indices[i];
+                    }
+                    indexAttr.needsUpdate = true;
+
+                    geo.setDrawRange(0, terrain.indices.length);
+                    geo.computeBoundingSphere();
+
+                    const mesh = new THREE.Mesh(geo, voxelMaterial);
+                    mesh.position.set(0, 0, 0);
+                    mesh.frustumCulled = true;
+                    scene.add(mesh);
+                    chunkMeshes.set(cKey, mesh);
+                }
+
+                // Create water mesh if has faces
+                if (water && water.faceCount > 0) {
+                    const wGeo = geometryPool.acquireWater(water.faceCount);
+
+                    // Copy positions
+                    const wPosAttr = wGeo.attributes.position;
+                    for (let i = 0; i < water.positions.length; i++) {
+                        wPosAttr.array[i] = water.positions[i];
+                    }
+                    wPosAttr.needsUpdate = true;
+
+                    // Copy normals
+                    const wNormAttr = wGeo.attributes.normal;
+                    for (let i = 0; i < water.normals.length; i++) {
+                        wNormAttr.array[i] = water.normals[i];
+                    }
+                    wNormAttr.needsUpdate = true;
+
+                    // Copy UVs
+                    const wUvAttr = wGeo.attributes.uv;
+                    for (let i = 0; i < water.uvs.length; i++) {
+                        wUvAttr.array[i] = water.uvs[i];
+                    }
+                    wUvAttr.needsUpdate = true;
+
+                    // Copy colors
+                    const wColorAttr = wGeo.attributes.color;
+                    for (let i = 0; i < water.colors.length; i++) {
+                        wColorAttr.array[i] = water.colors[i];
+                    }
+                    wColorAttr.needsUpdate = true;
+
+                    // Copy indices
+                    const wIndexAttr = wGeo.index;
+                    for (let i = 0; i < water.indices.length; i++) {
+                        wIndexAttr.array[i] = water.indices[i];
+                    }
+                    wIndexAttr.needsUpdate = true;
+
+                    // Copy shore distance if available
+                    if (wGeo.attributes.shoreDist && water.shore) {
+                        const shoreAttr = wGeo.attributes.shoreDist;
+                        for (let i = 0; i < water.shore.length; i++) {
+                            shoreAttr.array[i] = water.shore[i];
+                        }
+                        shoreAttr.needsUpdate = true;
+                    }
+
+                    // Copy water thickness if available
+                    if (wGeo.attributes.waterThickness && water.thickness) {
+                        const thickAttr = wGeo.attributes.waterThickness;
+                        for (let i = 0; i < water.thickness.length; i++) {
+                            thickAttr.array[i] = water.thickness[i];
+                        }
+                        thickAttr.needsUpdate = true;
+                    }
+
+                    wGeo.setDrawRange(0, water.indices.length);
+                    wGeo.computeBoundingSphere();
+
+                    const wMesh = new THREE.Mesh(wGeo, waterMaterial);
+                    wMesh.position.set(0, 0, 0);
+                    wMesh.frustumCulled = true;
+                    wMesh.renderOrder = 1;
+                    scene.add(wMesh);
+                    chunkMeshes.set(cKey + "_WATER", wMesh);
+                }
+
+                // Mark as meshed
+                meshedChunkKeys.add(cKey);
+                markMeshCountDirty();
+                queuedChunkKeys.delete(cKey);
+
+                logDebug(`[Mesh] Worker mesh applied for ${cKey}: terrain=${terrain?.faceCount || 0} faces, water=${water?.faceCount || 0} faces`);
+            }
+
+            /**
+             * Async render chunk using worker for mesh generation if available.
+             * @param {number} cx - Chunk X coordinate.
+             * @param {number} cz - Chunk Z coordinate.
+             * @param {number} distSq - Distance squared from player.
+             * @returns {Promise<boolean>} True if mesh was generated (sync or async).
+             */
+            async function renderChunkAsync(cx, cz, distSq = 0) {
+                const cKey = getChunkKey(cx, cz);
+                const centerData = chunkDataPool.get(cKey);
+                if (!centerData) return false;
+
+                // Check if we should use worker mesh generation
+                if (!chunkWorkerPool || !SETTINGS.useWorkers || !SETTINGS.useWorkersForMesh) {
+                    // Fallback to synchronous rendering
+                    renderChunk(cx, cz, distSq);
+                    return true;
+                }
+
+                // Gather neighbor data
+                const neighbors = {
+                    n: chunkDataPool.get(`${cx},${cz - 1}`),
+                    s: chunkDataPool.get(`${cx},${cz + 1}`),
+                    e: chunkDataPool.get(`${cx + 1},${cz}`),
+                    w: chunkDataPool.get(`${cx - 1},${cz}`),
+                    nw: chunkDataPool.get(`${cx - 1},${cz - 1}`),
+                    ne: chunkDataPool.get(`${cx + 1},${cz - 1}`),
+                    sw: chunkDataPool.get(`${cx - 1},${cz + 1}`),
+                    se: chunkDataPool.get(`${cx + 1},${cz + 1}`)
+                };
+
+                try {
+                    const meshData = await generateMeshViaWorker(cx, cz, centerData, neighbors);
+
+                    if (!meshData) {
+                        // Worker failed or unavailable, use sync fallback
+                        renderChunk(cx, cz, distSq);
+                        return true;
+                    }
+
+                    // Apply mesh data to scene
+                    applyWorkerMeshData(cKey, cx, cz, meshData);
+                    return true;
+
+                } catch (error) {
+                    logDebug(`[Mesh] Worker failed for ${cKey}: ${error.message}`);
+                    // Fallback to synchronous rendering
+                    renderChunk(cx, cz, distSq);
+                    return true;
                 }
             }
 
@@ -22323,10 +22998,14 @@
                 if (!chunkWorkerPool && SETTINGS.useWorkers) {
                     chunkWorkerPool = new ChunkWorkerPool();
                     // Initialize workers with seed string immediately for faster first-chunk generation
+                    // MUST await to prevent race condition where mesh generation starts before workers ready
                     if (finalSeedDisplay) {
-                        chunkWorkerPool.initWithSeed(finalSeedDisplay).catch(e => {
+                        try {
+                            await chunkWorkerPool.initWithSeed(finalSeedDisplay);
+                            logDebug(`[WorkerPool] Workers initialized with seed: ${finalSeedDisplay}`);
+                        } catch (e) {
                             logDebug(`[WorkerPool] Seed init failed: ${e.message}`);
-                        });
+                        }
                     }
                 }
                 const isNewWorld = !(await isWorldPreGenerated(seedStr)); // NOW check if this is a new world (after scene exists)
@@ -24690,7 +25369,12 @@ self.onmessage = async (e) => {
                     const chunk = readyChunks[i];
                     // Render the chunk (creates mesh and adds to scene)
                     const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
-                    renderChunk(chunk.cx, chunk.cz, distSq);
+                    // Use worker mesh generation if enabled, otherwise fall back to sync
+                    if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                        await renderChunkAsync(chunk.cx, chunk.cz, distSq);
+                    } else {
+                        renderChunk(chunk.cx, chunk.cz, distSq);
+                    }
                     activeChunks.add(chunk.key);
                     rendered++;
                     // Update progress and yield every RENDER_BATCH_SIZE chunks
@@ -36525,7 +37209,12 @@ self.onmessage = async (e) => {
                     if (isDirty) { releaseMeshForKey(job.key); releaseMeshForKey(job.key + "_WATER"); dirtyChunks.delete(job.key); }
                     // OPTIMIZATION: Pass distance for LOD calculation
                     const jobDistSq = job.dist || 0;
-                    renderChunk(jobCx, jobCz, jobDistSq);
+                    // Use worker mesh generation if enabled, otherwise fall back to sync
+                    if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                        await renderChunkAsync(jobCx, jobCz, jobDistSq);
+                    } else {
+                        renderChunk(jobCx, jobCz, jobDistSq);
+                    }
                     recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
                     chunkUpdateDiagnostics.pending.delete(job.key);
                     if (isDirty) { const terrainOK = chunkMeshes.has(job.key); meshLifecycleStats.mark("dirtyRebuild", { key: job.key, terrainAttached: terrainOK, waterAttached: chunkMeshes.has(job.key + "_WATER"), }); }
@@ -36558,7 +37247,12 @@ self.onmessage = async (e) => {
                         const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
                         const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                         const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
-                        renderChunk(cx, cz, neighborDistSq);
+                        // Use worker mesh generation if enabled, otherwise fall back to sync
+                        if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                            await renderChunkAsync(cx, cz, neighborDistSq);
+                        } else {
+                            renderChunk(cx, cz, neighborDistSq);
+                        }
                         recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                     }
                 }
@@ -36843,7 +37537,11 @@ self.onmessage = async (e) => {
                 const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
                 if (chunkBuildQueue.length > 0 && (time - prevTime < 32 || hasEditWork)) {
                     const chunkBuildStart = perfMonitor.start("chunkBuild");
-                    processChunkQueue();
+                    // Add error handling to prevent silent failures from async processChunkQueue
+                    processChunkQueue().catch(e => {
+                        logDebug(`[ChunkQueue] Error in processChunkQueue: ${e.message}`);
+                        console.error('[ChunkQueue] processChunkQueue error:', e);
+                    });
                     perfMonitor.end("chunkBuild", chunkBuildStart);
                 }
                 // Run chunk streaming updates - now internally event-driven
