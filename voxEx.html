@@ -12696,7 +12696,11 @@
                 if (typeof geometryPool !== 'undefined') {
                     const geoStats = geometryPool.getStats();
                     html += `GeoPool: T:${geoStats.terrainPoolSize}/${geoStats.maxPoolSize} W:${geoStats.waterPoolSize}/${geoStats.maxPoolSize}\n`;
-                    html += `GeoAlloc: T:${geoStats.terrainCreated} W:${geoStats.waterCreated}\n`;
+                    // terrainCreated is an object {small, medium, large} - sum all tiers
+                    const terrainTotal = typeof geoStats.terrainCreated === 'object'
+                        ? (geoStats.terrainCreated.small || 0) + (geoStats.terrainCreated.medium || 0) + (geoStats.terrainCreated.large || 0)
+                        : geoStats.terrainCreated;
+                    html += `GeoAlloc: T:${terrainTotal} W:${geoStats.waterCreated}\n`;
                 }
                 // Calculate raw chunk memory and oldest access time
                 const chunkMemoryMB = (chunks.size * CHUNK_DATA_SIZE / (1024 * 1024)).toFixed(1);
@@ -20082,21 +20086,23 @@
                     }
                 }
 
-                // Trim arrays to actual size and transfer
-                const tPosOut = terrainPos.subarray(0, tVIdx);
-                const tNormOut = terrainNorm.subarray(0, tVIdx);
-                const tUvsOut = terrainUvs.subarray(0, tUvIdx);
-                const tColsOut = terrainCols.subarray(0, tCIdx);
-                const tIdxOut = terrainIndices.subarray(0, tIIdx);
+                // Create COPIES of arrays (not views) - subarray() shares the underlying buffer
+                // which causes "buffer already transferred" errors if multiple chunks share buffers
+                const tPosOut = new Float32Array(terrainPos.subarray(0, tVIdx));
+                const tNormOut = new Float32Array(terrainNorm.subarray(0, tVIdx));
+                const tUvsOut = new Float32Array(terrainUvs.subarray(0, tUvIdx));
+                const tColsOut = new Float32Array(terrainCols.subarray(0, tCIdx));
+                const tIdxOut = new Uint32Array(terrainIndices.subarray(0, tIIdx));
 
-                const wPosOut = waterPos.subarray(0, wVIdx);
-                const wNormOut = waterNorm.subarray(0, wVIdx);
-                const wUvsOut = waterUvs.subarray(0, wUvIdx);
-                const wColsOut = waterCols.subarray(0, wCIdx);
-                const wIdxOut = waterIndices.subarray(0, wIIdx);
-                const wShoreOut = waterShore.subarray(0, wSIdx);
-                const wThickOut = waterThickness.subarray(0, wTIdx);
+                const wPosOut = new Float32Array(waterPos.subarray(0, wVIdx));
+                const wNormOut = new Float32Array(waterNorm.subarray(0, wVIdx));
+                const wUvsOut = new Float32Array(waterUvs.subarray(0, wUvIdx));
+                const wColsOut = new Float32Array(waterCols.subarray(0, wCIdx));
+                const wIdxOut = new Uint32Array(waterIndices.subarray(0, wIIdx));
+                const wShoreOut = new Float32Array(waterShore.subarray(0, wSIdx));
+                const wThickOut = new Float32Array(waterThickness.subarray(0, wTIdx));
 
+                // Build transfer list - each array now has its own unique buffer
                 const transferList = [
                     tPosOut.buffer, tNormOut.buffer, tUvsOut.buffer, tColsOut.buffer, tIdxOut.buffer,
                     wPosOut.buffer, wNormOut.buffer, wUvsOut.buffer, wColsOut.buffer, wIdxOut.buffer,
@@ -20503,6 +20509,28 @@
             }
 
             /**
+             * Wrap a promise with a timeout.
+             * @param {Promise} promise - The promise to wrap.
+             * @param {number} ms - Timeout in milliseconds.
+             * @param {string} label - Label for timeout error message.
+             * @returns {Promise} Promise that rejects on timeout.
+             */
+            function promiseWithTimeout(promise, ms, label = 'Operation') {
+                let timeoutId;
+                const timeoutPromise = new Promise((_, reject) => {
+                    timeoutId = setTimeout(() => {
+                        reject(new Error(`${label} timed out after ${ms}ms`));
+                    }, ms);
+                });
+                return Promise.race([promise, timeoutPromise]).finally(() => {
+                    clearTimeout(timeoutId);
+                });
+            }
+
+            // Timeout for worker mesh generation (ms) - if exceeded, falls back to sync
+            const WORKER_MESH_TIMEOUT_MS = 500;
+
+            /**
              * Generate mesh data using worker pool.
              * Falls back to null if workers unavailable or disabled.
              * @param {number} cx - Chunk X coordinate.
@@ -20520,7 +20548,11 @@
                 // Ensure workers are initialized with current seed string
                 if (chunkWorkerPool.currentSeed !== finalSeedDisplay) {
                     try {
-                        await chunkWorkerPool.initWithSeed(finalSeedDisplay);
+                        await promiseWithTimeout(
+                            chunkWorkerPool.initWithSeed(finalSeedDisplay),
+                            2000,
+                            'Worker init'
+                        );
                     } catch (e) {
                         logDebug(`[WorkerPool] Init failed: ${e.message}`);
                         return null;
@@ -20530,7 +20562,11 @@
                 try {
                     // MAX_FACES_PER_CHUNK constant
                     const maxFaces = 65536;
-                    const result = await chunkWorkerPool.generateMesh(cx, cz, chunkData, neighbors, uvMap, maxFaces);
+                    const result = await promiseWithTimeout(
+                        chunkWorkerPool.generateMesh(cx, cz, chunkData, neighbors, uvMap, maxFaces),
+                        WORKER_MESH_TIMEOUT_MS,
+                        `Mesh gen ${cx},${cz}`
+                    );
                     return result;
                 } catch (e) {
                     logDebug(`[Worker] Mesh gen failed for ${cx},${cz}: ${e.message}`);
@@ -22962,10 +22998,14 @@
                 if (!chunkWorkerPool && SETTINGS.useWorkers) {
                     chunkWorkerPool = new ChunkWorkerPool();
                     // Initialize workers with seed string immediately for faster first-chunk generation
+                    // MUST await to prevent race condition where mesh generation starts before workers ready
                     if (finalSeedDisplay) {
-                        chunkWorkerPool.initWithSeed(finalSeedDisplay).catch(e => {
+                        try {
+                            await chunkWorkerPool.initWithSeed(finalSeedDisplay);
+                            logDebug(`[WorkerPool] Workers initialized with seed: ${finalSeedDisplay}`);
+                        } catch (e) {
                             logDebug(`[WorkerPool] Seed init failed: ${e.message}`);
-                        });
+                        }
                     }
                 }
                 const isNewWorld = !(await isWorldPreGenerated(seedStr)); // NOW check if this is a new world (after scene exists)
@@ -37497,7 +37537,11 @@ self.onmessage = async (e) => {
                 const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
                 if (chunkBuildQueue.length > 0 && (time - prevTime < 32 || hasEditWork)) {
                     const chunkBuildStart = perfMonitor.start("chunkBuild");
-                    processChunkQueue();
+                    // Add error handling to prevent silent failures from async processChunkQueue
+                    processChunkQueue().catch(e => {
+                        logDebug(`[ChunkQueue] Error in processChunkQueue: ${e.message}`);
+                        console.error('[ChunkQueue] processChunkQueue error:', e);
+                    });
                     perfMonitor.end("chunkBuild", chunkBuildStart);
                 }
                 // Run chunk streaming updates - now internally event-driven
