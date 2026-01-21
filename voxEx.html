@@ -4959,6 +4959,7 @@
                 // Web Workers
                 useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
                 useWorkersForMesh: savedSettings.useWorkersForMesh !== undefined ? savedSettings.useWorkersForMesh : true, // Use Web Workers for mesh generation
+                useSharedArrayBuffer: savedSettings.useSharedArrayBuffer !== undefined ? savedSettings.useSharedArrayBuffer : true, // Use SharedArrayBuffer for zero-copy worker data (requires crossOriginIsolated)
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5170,6 +5171,7 @@
                 // Web Worker defaults
                 useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
                 useWorkersForMesh: true,           // Use Web Workers for mesh generation (Phase 4)
+                useSharedArrayBuffer: true,        // Use SharedArrayBuffer for zero-copy worker data (auto-disabled if not supported)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -19992,6 +19994,11 @@
     // ============================================================
     // MESSAGE HANDLER
     // ============================================================
+    // SharedArrayBuffer support - store reference for zero-copy data access
+    let sharedBuffer = null;
+    let sharedDataView = null;
+    let chunkDataSize = 0; // Size of blocks/skyLight/blockLight per chunk
+
     self.onmessage = function(e) {
         const { type, jobId, cx, cz, seedStr } = e.data;
 
@@ -20000,6 +20007,14 @@
                 // Initialize noise with seed string
                 initNoise(seedStr);
                 biomeCellCache.clear(); // Clear biome cache for new seed
+
+                // Store shared buffer reference if provided
+                if (e.data.sharedBuffer) {
+                    sharedBuffer = e.data.sharedBuffer;
+                    sharedDataView = new Uint8Array(sharedBuffer);
+                    chunkDataSize = e.data.chunkDataSize || (16 * 16 * 320);
+                }
+
                 self.postMessage({ type: 'ready', jobId });
                 return;
             }
@@ -20051,11 +20066,41 @@
 
             if (type === 'mesh') {
                 // Mesh generation in worker
-                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
+                const { useSharedMemory, centerSlot, neighborSlots, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
                 const chunkSize = CHUNK_SIZE;
                 const chunkHeight = CHUNK_HEIGHT;
                 const startX = cx * chunkSize;
                 const startZ = cz * chunkSize;
+
+                // Get chunk data - either from SharedArrayBuffer or from transferred data
+                let centerBlocks, centerSkyLight, centerBlockLight, neighbors;
+
+                if (useSharedMemory && sharedDataView && centerSlot !== undefined) {
+                    // Zero-copy path: read directly from SharedArrayBuffer
+                    const slotSize = chunkDataSize * 3; // blocks + skyLight + blockLight
+                    const centerOffset = centerSlot * slotSize;
+
+                    // Create views into shared memory (no copy!)
+                    centerBlocks = new Uint8Array(sharedBuffer, centerOffset, chunkDataSize);
+                    centerSkyLight = new Uint8Array(sharedBuffer, centerOffset + chunkDataSize, chunkDataSize);
+                    centerBlockLight = new Uint8Array(sharedBuffer, centerOffset + chunkDataSize * 2, chunkDataSize);
+
+                    // Build neighbor views
+                    neighbors = {};
+                    if (neighborSlots) {
+                        for (const dir in neighborSlots) {
+                            const nSlot = neighborSlots[dir];
+                            const nOffset = nSlot * slotSize;
+                            neighbors[dir] = new Uint8Array(sharedBuffer, nOffset, chunkDataSize);
+                        }
+                    }
+                } else {
+                    // Transferable path: use transferred data
+                    centerBlocks = e.data.centerBlocks;
+                    centerSkyLight = e.data.centerSkyLight;
+                    centerBlockLight = e.data.centerBlockLight;
+                    neighbors = e.data.neighbors || {};
+                }
 
                 // Build local block getter (handles neighbor lookups)
                 const getLocal = (lx, ly, lz) => {
@@ -20438,11 +20483,22 @@
                         totalExecutionMs: 0,
                         avgQueueWaitMs: 0,
                         avgExecutionMs: 0,
-                        peakQueueLength: 0
+                        peakQueueLength: 0,
+                        sharedMemoryHits: 0,
+                        sharedMemoryMisses: 0
                     };
 
+                    // SharedArrayBuffer support for zero-copy worker data
+                    this.sharedMemory = null;
+                    this.useSharedMemory = SETTINGS.useSharedArrayBuffer && SHARED_ARRAY_BUFFER_AVAILABLE;
+                    if (this.useSharedMemory) {
+                        this.sharedMemory = new SharedChunkMemory(128); // 128 slots = ~30MB
+                        sharedChunkMemory = this.sharedMemory; // Set global reference
+                    }
+
                     this._initWorkers();
-                    logDebug(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+                    logDebug(`[WorkerPool] Initialized with ${this.poolSize} workers` +
+                             (this.useSharedMemory ? ' (SharedArrayBuffer enabled)' : ' (using Transferable)'));
                 }
 
                 /**
@@ -20522,6 +20578,13 @@
                         this._stats.terrainJobsCompleted++;
                     } else if (job.type === 'mesh') {
                         this._stats.meshJobsCompleted++;
+                    }
+
+                    // Release shared memory slots if used
+                    if (job.sharedSlots && this.sharedMemory) {
+                        for (const slot of job.sharedSlots) {
+                            this.sharedMemory.release(slot);
+                        }
                     }
 
                     if (type === 'error') {
@@ -20613,16 +20676,28 @@
                     this.currentSeed = seedStr;
                     const initPromises = [];
 
+                    // Get shared buffer reference (if available)
+                    const sharedBuffer = this.sharedMemory ? this.sharedMemory.getSharedBuffer() : null;
+                    const chunkDataSize = this.sharedMemory ? this.sharedMemory.CHUNK_DATA_SIZE : null;
+
                     for (let i = 0; i < this.poolSize; i++) {
                         initPromises.push(new Promise((resolve, reject) => {
                             const jobId = this.nextJobId++;
                             this.pendingJobs.set(jobId, { resolve, reject });
-                            this.workers[i].postMessage({ type: 'init', jobId, seedStr });
+                            // Pass shared buffer to worker during init (only once per worker)
+                            this.workers[i].postMessage({
+                                type: 'init',
+                                jobId,
+                                seedStr,
+                                sharedBuffer,      // SharedArrayBuffer or null
+                                chunkDataSize      // Size of each data section (blocks, skyLight, blockLight)
+                            });
                         }));
                     }
 
                     await Promise.all(initPromises);
-                    console.log(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}`);
+                    logDebug(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}` +
+                             (sharedBuffer ? ' (SharedArrayBuffer passed)' : ''));
                 }
 
                 /**
@@ -20717,59 +20792,164 @@
 
                         this._stats.meshJobsQueued++;
 
-                        // Extract center chunk data - COPY buffers since we can't transfer data still in use
-                        const centerBlocks = chunkData.blocks
-                            ? new Uint8Array(chunkData.blocks)
-                            : new Uint8Array(chunkData);
-                        const centerSkyLight = chunkData.skyLight
-                            ? new Uint8Array(chunkData.skyLight)
-                            : null;
-                        const centerBlockLight = chunkData.blockLight
-                            ? new Uint8Array(chunkData.blockLight)
-                            : null;
-
-                        // Copy neighbor block data (can't transfer chunks still in use by main thread)
-                        const neighborData = {};
                         const dirs = ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
-                        for (const dir of dirs) {
-                            if (neighbors[dir]) {
-                                const nData = neighbors[dir].blocks || neighbors[dir];
-                                if (nData && nData.length > 0) {
-                                    neighborData[dir] = new Uint8Array(nData);
-                                }
+
+                        // Try to use SharedArrayBuffer path (zero-copy)
+                        if (this.useSharedMemory && this.sharedMemory && this.sharedMemory.enabled) {
+                            const useShared = this._trySharedMemoryMesh(
+                                jobId, cx, cz, chunkKey, chunkData, neighbors, dirs, uvMapData, maxFaces
+                            );
+                            if (useShared) {
+                                this._stats.sharedMemoryHits++;
+                                this._processQueue();
+                                return;
                             }
+                            this._stats.sharedMemoryMisses++;
+                            // Fall through to Transferable path
                         }
 
-                        // Collect all transferable buffers
-                        const transfer = [centerBlocks.buffer];
-                        if (centerSkyLight) transfer.push(centerSkyLight.buffer);
-                        if (centerBlockLight) transfer.push(centerBlockLight.buffer);
-                        for (const dir of dirs) {
-                            if (neighborData[dir]) {
-                                transfer.push(neighborData[dir].buffer);
-                            }
-                        }
-
-                        this.jobQueue.push({
-                            message: {
-                                type: 'mesh',
-                                jobId,
-                                cx,
-                                cz,
-                                centerBlocks,
-                                centerSkyLight,
-                                centerBlockLight,
-                                neighbors: neighborData,
-                                uvMapData,
-                                maxFaces,
-                                settingsAO: SETTINGS.AO,
-                                settingsWaterFogDensity: SETTINGS.waterFogDensity,
-                                settingsWaterColor: SETTINGS.waterColor
-                            },
-                            transfer: transfer
-                        });
-
+                        // Fallback: Transferable objects path (copies data)
+                        this._transferableMesh(jobId, cx, cz, chunkData, neighbors, dirs, uvMapData, maxFaces);
                         this._processQueue();
+                    });
+                }
+
+                /**
+                 * Try to use SharedArrayBuffer for mesh generation (zero-copy).
+                 * @private
+                 * @returns {boolean} True if shared memory was used successfully.
+                 */
+                _trySharedMemoryMesh(jobId, cx, cz, chunkKey, chunkData, neighbors, dirs, uvMapData, maxFaces) {
+                    const sharedMem = this.sharedMemory;
+
+                    // Allocate center chunk
+                    const centerBlocks = chunkData.blocks || chunkData;
+                    const centerSkyLight = chunkData.skyLight || null;
+                    const centerBlockLight = chunkData.blockLight || null;
+
+                    const centerSlot = sharedMem.allocate(chunkKey, centerBlocks, centerSkyLight, centerBlockLight);
+                    if (centerSlot === -1) return false; // Allocation failed
+
+                    // Allocate neighbor chunks
+                    const neighborSlots = {};
+                    const allocatedSlots = [centerSlot];
+                    let allocationSuccess = true;
+
+                    for (const dir of dirs) {
+                        if (neighbors[dir]) {
+                            const nBlocks = neighbors[dir].blocks || neighbors[dir];
+                            const nSkyLight = neighbors[dir].skyLight || null;
+                            const nBlockLight = neighbors[dir].blockLight || null;
+
+                            // Generate neighbor key based on direction
+                            let ncx = cx, ncz = cz;
+                            if (dir.includes('n')) ncz -= 1;
+                            if (dir.includes('s')) ncz += 1;
+                            if (dir.includes('e')) ncx += 1;
+                            if (dir.includes('w')) ncx -= 1;
+                            const neighborKey = `${ncx},${ncz}`;
+
+                            const slot = sharedMem.allocate(neighborKey, nBlocks, nSkyLight, nBlockLight);
+                            if (slot === -1) {
+                                allocationSuccess = false;
+                                break;
+                            }
+                            neighborSlots[dir] = slot;
+                            allocatedSlots.push(slot);
+                        }
+                    }
+
+                    if (!allocationSuccess) {
+                        // Release all allocated slots and fall back to Transferable
+                        for (const slot of allocatedSlots) {
+                            sharedMem.release(slot);
+                        }
+                        return false;
+                    }
+
+                    // Track slots for release after job completes
+                    const pendingJob = this.pendingJobs.get(jobId);
+                    if (pendingJob) {
+                        pendingJob.sharedSlots = allocatedSlots;
+                    }
+
+                    // Queue job with slot offsets (no data copy!)
+                    this.jobQueue.push({
+                        message: {
+                            type: 'mesh',
+                            jobId,
+                            cx,
+                            cz,
+                            useSharedMemory: true,
+                            centerSlot,
+                            neighborSlots,
+                            uvMapData,
+                            maxFaces,
+                            settingsAO: SETTINGS.AO,
+                            settingsWaterFogDensity: SETTINGS.waterFogDensity,
+                            settingsWaterColor: SETTINGS.waterColor
+                        },
+                        transfer: [] // No transferables needed - data is in SharedArrayBuffer
+                    });
+
+                    return true;
+                }
+
+                /**
+                 * Use Transferable objects for mesh generation (copies data).
+                 * @private
+                 */
+                _transferableMesh(jobId, cx, cz, chunkData, neighbors, dirs, uvMapData, maxFaces) {
+                    // Extract center chunk data - COPY buffers since we can't transfer data still in use
+                    const centerBlocks = chunkData.blocks
+                        ? new Uint8Array(chunkData.blocks)
+                        : new Uint8Array(chunkData);
+                    const centerSkyLight = chunkData.skyLight
+                        ? new Uint8Array(chunkData.skyLight)
+                        : null;
+                    const centerBlockLight = chunkData.blockLight
+                        ? new Uint8Array(chunkData.blockLight)
+                        : null;
+
+                    // Copy neighbor block data (can't transfer chunks still in use by main thread)
+                    const neighborData = {};
+                    for (const dir of dirs) {
+                        if (neighbors[dir]) {
+                            const nData = neighbors[dir].blocks || neighbors[dir];
+                            if (nData && nData.length > 0) {
+                                neighborData[dir] = new Uint8Array(nData);
+                            }
+                        }
+                    }
+
+                    // Collect all transferable buffers
+                    const transfer = [centerBlocks.buffer];
+                    if (centerSkyLight) transfer.push(centerSkyLight.buffer);
+                    if (centerBlockLight) transfer.push(centerBlockLight.buffer);
+                    for (const dir of dirs) {
+                        if (neighborData[dir]) {
+                            transfer.push(neighborData[dir].buffer);
+                        }
+                    }
+
+                    this.jobQueue.push({
+                        message: {
+                            type: 'mesh',
+                            jobId,
+                            cx,
+                            cz,
+                            useSharedMemory: false,
+                            centerBlocks,
+                            centerSkyLight,
+                            centerBlockLight,
+                            neighbors: neighborData,
+                            uvMapData,
+                            maxFaces,
+                            settingsAO: SETTINGS.AO,
+                            settingsWaterFogDensity: SETTINGS.waterFogDensity,
+                            settingsWaterColor: SETTINGS.waterColor
+                        },
+                        transfer: transfer
                     });
                 }
 
@@ -20835,7 +21015,7 @@
                  * @returns {Object} Comprehensive pool stats.
                  */
                 getStats() {
-                    return {
+                    const stats = {
                         poolSize: this.poolSize,
                         busyWorkers: this.workerBusy.filter(b => b).length,
                         queueLength: this.jobQueue.length,
@@ -20852,8 +21032,21 @@
                         meshJobsDeduplicated: this._stats.meshJobsDeduplicated,
                         avgQueueWaitMs: this._stats.avgQueueWaitMs.toFixed(2),
                         avgExecutionMs: this._stats.avgExecutionMs.toFixed(2),
-                        peakQueueLength: this._stats.peakQueueLength
+                        peakQueueLength: this._stats.peakQueueLength,
+                        // SharedArrayBuffer stats
+                        useSharedMemory: this.useSharedMemory,
+                        sharedMemoryHits: this._stats.sharedMemoryHits,
+                        sharedMemoryMisses: this._stats.sharedMemoryMisses
                     };
+
+                    // Add shared memory pool stats if available
+                    if (this.sharedMemory && this.sharedMemory.enabled) {
+                        const memStats = this.sharedMemory.getStats();
+                        stats.sharedMemorySlots = `${memStats.usedSlots}/${memStats.maxSlots}`;
+                        stats.sharedMemoryMB = memStats.usedMB;
+                    }
+
+                    return stats;
                 }
 
                 /**
@@ -20876,7 +21069,7 @@
                 }
 
                 /**
-                 * Terminate all workers.
+                 * Terminate all workers and clean up shared memory.
                  */
                 terminate() {
                     for (const worker of this.workers) {
@@ -20887,75 +21080,255 @@
                     this.pendingJobs.clear();
                     this.queuedChunks.clear();
                     this.cancelledJobs.clear();
+
+                    // Clear shared memory
+                    if (this.sharedMemory) {
+                        this.sharedMemory.clear();
+                        this.sharedMemory = null;
+                        sharedChunkMemory = null;
+                    }
+
                     logDebug('[WorkerPool] Terminated all workers');
                 }
             }
 
             // =====================================================
-            // SHAREDARRAYBUFFER INVESTIGATION FOR TRUE ZERO-COPY
+            // SHAREDARRAYBUFFER FOR TRUE ZERO-COPY WORKER DATA
             // =====================================================
-            //
-            // CURRENT STATE:
-            // The ChunkWorkerPool uses Transferable objects (ArrayBuffer.transfer)
-            // to pass data to workers. This is efficient but requires:
-            // 1. Copying chunk data before transfer (lines 20693-20712)
-            // 2. The original buffer becomes unusable after transfer
-            //
-            // SHAREDARRAYBUFFER BENEFITS:
-            // - True zero-copy sharing: same memory accessible by main thread AND workers
-            // - No copying overhead for mesh generation input data
-            // - Chunks could be kept in SharedArrayBuffer, workers read directly
-            //
-            // REQUIREMENTS FOR SHAREDARRAYBUFFER:
-            // 1. HTTPS required (not localhost for security)
-            // 2. Cross-Origin-Opener-Policy: same-origin
-            // 3. Cross-Origin-Embedder-Policy: require-corp
-            // 4. Check: self.crossOriginIsolated === true
-            //
-            // IMPLEMENTATION BLUEPRINT:
-            // ```javascript
-            // // 1. Check support
-            // const canUseSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined'
-            //     && self.crossOriginIsolated === true;
-            //
-            // // 2. Create shared chunk storage
-            // const CHUNK_SIZE = 16 * 16 * 320; // blocks per chunk
-            // const MAX_SHARED_CHUNKS = 256;
-            // const sharedChunkData = canUseSharedArrayBuffer
-            //     ? new SharedArrayBuffer(CHUNK_SIZE * MAX_SHARED_CHUNKS)
-            //     : null;
-            //
-            // // 3. Chunk allocation with Atomics for thread safety
-            // const chunkAllocationBitmap = canUseSharedArrayBuffer
-            //     ? new Int32Array(new SharedArrayBuffer(MAX_SHARED_CHUNKS * 4))
-            //     : null;
-            //
-            // // 4. Worker reads directly from shared memory:
-            // // worker.postMessage({ type: 'mesh', sharedData: sharedChunkData, offset: chunkOffset });
-            // // Worker can Atomics.load() to safely read chunk data
-            //
-            // // 5. Main thread writes with Atomics.store() for visibility
-            // ```
-            //
-            // TRADE-OFFS:
-            // - PRO: Eliminates ~1.6MB copy per mesh job (center + 8 neighbors)
-            // - PRO: Reduces GC pressure from temporary TypedArrays
-            // - CON: Requires specific HTTP headers (hosting constraint)
-            // - CON: More complex synchronization (Atomics)
-            // - CON: Need to manage shared memory allocation/deallocation
-            // - CON: Workers can't use transferList with SharedArrayBuffer
-            //
-            // RECOMMENDATION:
-            // Implement as optional feature behind SETTINGS.useSharedArrayBuffer flag.
-            // Fall back to current Transferable approach when crossOriginIsolated is false.
-            // Start with read-only shared chunk data for mesh generation.
-            //
-            // ESTIMATED PERFORMANCE GAIN:
-            // - Current: ~1-2ms copy time per mesh job (depends on neighbor count)
-            // - With SAB: ~0ms copy time
-            // - Net savings: 1-2ms per mesh job × ~100 jobs during initial load = 100-200ms
-            //
-            // =====================================================
+            // Requirements: crossOriginIsolated === true (COOP/COEP headers)
+            // Falls back to Transferable objects when not available.
+
+            /**
+             * Check if SharedArrayBuffer is available and usable.
+             * Requires crossOriginIsolated context (COOP/COEP headers).
+             * @returns {boolean} True if SharedArrayBuffer can be used.
+             */
+            function canUseSharedArrayBuffer() {
+                return typeof SharedArrayBuffer !== 'undefined' &&
+                       typeof self !== 'undefined' &&
+                       self.crossOriginIsolated === true;
+            }
+
+            // Cache the check result (won't change during session)
+            const SHARED_ARRAY_BUFFER_AVAILABLE = canUseSharedArrayBuffer();
+
+            /**
+             * SharedChunkMemory - Manages a pool of SharedArrayBuffer memory for chunk data.
+             * Allows workers to read chunk data directly without copying.
+             * Uses slot-based allocation with reference counting.
+             */
+            class SharedChunkMemory {
+                /**
+                 * Create a shared memory pool for chunks.
+                 * @param {number} [maxSlots=128] - Maximum number of chunk slots.
+                 */
+                constructor(maxSlots = 128) {
+                    if (!SHARED_ARRAY_BUFFER_AVAILABLE) {
+                        this.enabled = false;
+                        logDebug('[SharedMem] SharedArrayBuffer not available (crossOriginIsolated: ' +
+                                 (typeof self !== 'undefined' ? self.crossOriginIsolated : 'N/A') + ')');
+                        return;
+                    }
+
+                    this.enabled = true;
+                    this.maxSlots = maxSlots;
+
+                    // Each slot holds: blocks (81920) + skyLight (81920) + blockLight (81920) = 245760 bytes
+                    this.CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                    this.SLOT_SIZE = this.CHUNK_DATA_SIZE * 3; // blocks + skyLight + blockLight
+
+                    // Main shared memory buffer for all chunk data
+                    this.sharedBuffer = new SharedArrayBuffer(this.SLOT_SIZE * maxSlots);
+                    this.dataView = new Uint8Array(this.sharedBuffer);
+
+                    // Slot management (not shared - main thread only)
+                    this.slotToChunk = new Map();  // slotIndex -> chunkKey
+                    this.chunkToSlot = new Map();  // chunkKey -> slotIndex
+                    this.slotRefCount = new Uint8Array(maxSlots); // Reference count per slot
+                    this.freeSlots = [];
+                    for (let i = maxSlots - 1; i >= 0; i--) {
+                        this.freeSlots.push(i);
+                    }
+
+                    // Statistics
+                    this._stats = {
+                        allocations: 0,
+                        deallocations: 0,
+                        hits: 0,
+                        misses: 0,
+                        evictions: 0
+                    };
+
+                    logDebug(`[SharedMem] Initialized with ${maxSlots} slots (${(this.SLOT_SIZE * maxSlots / 1024 / 1024).toFixed(1)} MB)`);
+                }
+
+                /**
+                 * Get the shared buffer for passing to workers.
+                 * @returns {SharedArrayBuffer|null}
+                 */
+                getSharedBuffer() {
+                    return this.enabled ? this.sharedBuffer : null;
+                }
+
+                /**
+                 * Allocate a slot for a chunk and copy data into shared memory.
+                 * @param {string} key - Chunk key.
+                 * @param {Uint8Array} blocks - Block data.
+                 * @param {Uint8Array|null} skyLight - Sky light data.
+                 * @param {Uint8Array|null} blockLight - Block light data.
+                 * @returns {number} Slot index, or -1 if allocation failed.
+                 */
+                allocate(key, blocks, skyLight, blockLight) {
+                    if (!this.enabled) return -1;
+
+                    // Check if already allocated
+                    if (this.chunkToSlot.has(key)) {
+                        const slot = this.chunkToSlot.get(key);
+                        this.slotRefCount[slot]++;
+                        this._stats.hits++;
+                        return slot;
+                    }
+
+                    this._stats.misses++;
+
+                    // Get a free slot
+                    let slot = this.freeSlots.pop();
+                    if (slot === undefined) {
+                        // No free slots - try to evict unreferenced slot
+                        slot = this._evictUnreferencedSlot();
+                        if (slot === -1) {
+                            logDebug('[SharedMem] No slots available for allocation');
+                            return -1;
+                        }
+                    }
+
+                    // Copy data into shared memory
+                    const baseOffset = slot * this.SLOT_SIZE;
+                    this.dataView.set(blocks, baseOffset);
+                    if (skyLight) {
+                        this.dataView.set(skyLight, baseOffset + this.CHUNK_DATA_SIZE);
+                    }
+                    if (blockLight) {
+                        this.dataView.set(blockLight, baseOffset + this.CHUNK_DATA_SIZE * 2);
+                    }
+
+                    // Track allocation
+                    this.slotToChunk.set(slot, key);
+                    this.chunkToSlot.set(key, slot);
+                    this.slotRefCount[slot] = 1;
+                    this._stats.allocations++;
+
+                    return slot;
+                }
+
+                /**
+                 * Release a reference to a slot.
+                 * Slot becomes eligible for eviction when refCount reaches 0.
+                 * @param {number} slot - Slot index.
+                 */
+                release(slot) {
+                    if (!this.enabled || slot < 0 || slot >= this.maxSlots) return;
+                    if (this.slotRefCount[slot] > 0) {
+                        this.slotRefCount[slot]--;
+                    }
+                }
+
+                /**
+                 * Release a chunk by key.
+                 * @param {string} key - Chunk key.
+                 */
+                releaseByKey(key) {
+                    if (!this.enabled) return;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot !== undefined) {
+                        this.release(slot);
+                    }
+                }
+
+                /**
+                 * Deallocate a chunk completely (remove from shared memory).
+                 * @param {string} key - Chunk key.
+                 */
+                deallocate(key) {
+                    if (!this.enabled) return;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot === undefined) return;
+
+                    this.chunkToSlot.delete(key);
+                    this.slotToChunk.delete(slot);
+                    this.slotRefCount[slot] = 0;
+                    this.freeSlots.push(slot);
+                    this._stats.deallocations++;
+                }
+
+                /**
+                 * Get slot info for a chunk (for passing to worker).
+                 * @param {string} key - Chunk key.
+                 * @returns {{slot: number, offset: number, size: number}|null}
+                 */
+                getSlotInfo(key) {
+                    if (!this.enabled) return null;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot === undefined) return null;
+                    return {
+                        slot,
+                        offset: slot * this.SLOT_SIZE,
+                        blockSize: this.CHUNK_DATA_SIZE
+                    };
+                }
+
+                /**
+                 * Evict an unreferenced slot for reuse.
+                 * @private
+                 * @returns {number} Evicted slot index, or -1 if none available.
+                 */
+                _evictUnreferencedSlot() {
+                    for (let i = 0; i < this.maxSlots; i++) {
+                        if (this.slotRefCount[i] === 0 && this.slotToChunk.has(i)) {
+                            const key = this.slotToChunk.get(i);
+                            this.chunkToSlot.delete(key);
+                            this.slotToChunk.delete(i);
+                            this._stats.evictions++;
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                /**
+                 * Get memory statistics.
+                 * @returns {Object}
+                 */
+                getStats() {
+                    const usedSlots = this.maxSlots - this.freeSlots.length;
+                    return {
+                        enabled: this.enabled,
+                        maxSlots: this.maxSlots,
+                        usedSlots,
+                        freeSlots: this.freeSlots.length,
+                        memoryMB: (this.SLOT_SIZE * this.maxSlots / 1024 / 1024).toFixed(1),
+                        usedMB: (this.SLOT_SIZE * usedSlots / 1024 / 1024).toFixed(1),
+                        ...this._stats
+                    };
+                }
+
+                /**
+                 * Clear all allocations.
+                 */
+                clear() {
+                    if (!this.enabled) return;
+                    this.slotToChunk.clear();
+                    this.chunkToSlot.clear();
+                    this.slotRefCount.fill(0);
+                    this.freeSlots.length = 0;
+                    for (let i = this.maxSlots - 1; i >= 0; i--) {
+                        this.freeSlots.push(i);
+                    }
+                }
+            }
+
+            // Global shared memory instance (initialized with worker pool)
+            let sharedChunkMemory = null;
 
             // Global worker pool instance (initialized after game starts)
             let chunkWorkerPool = null;
