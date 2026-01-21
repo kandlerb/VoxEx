@@ -25569,18 +25569,23 @@ self.onmessage = async (e) => {
                 logDebug(`[PreGen] Cached chunks processed in ${cacheProcessTime.toFixed(2)}ms`);
 
                 // === PHASE 1C: Generate missing chunks (slow path) ===
-                // Increased batch size from 10 to 18 for better throughput
+                // Batch size for parallel generation - allows multiple workers to be utilized
                 const GEN_BATCH_SIZE = 18;
                 let generatedCount = 0;
                 if (chunksNeedingGeneration.length > 0) {
                     if (progressText) progressText.textContent = `Generating ${chunksNeedingGeneration.length} new chunks...`;
-                    logDebug(`[PreGen] Phase 1C: Generating ${chunksNeedingGeneration.length} new chunks...`);
+                    logDebug(`[PreGen] Phase 1C: Generating ${chunksNeedingGeneration.length} new chunks (parallel workers)...`);
                     const genStartTime = performance.now();
                     for (let i = 0; i < chunksNeedingGeneration.length && !skipRequested; i += GEN_BATCH_SIZE) {
                         const batch = chunksNeedingGeneration.slice(i, i + GEN_BATCH_SIZE);
-                        for (const chunk of batch) {
-                            // Use generateChunkData which handles all the generation logic
-                            const data = await generateChunkData(chunk.cx, chunk.cz);
+                        // Queue all chunk generation jobs in parallel to utilize all available workers
+                        const generationPromises = batch.map(chunk =>
+                            generateChunkData(chunk.cx, chunk.cz).then(data => ({ chunk, data }))
+                        );
+                        // Wait for entire batch to complete (workers process in parallel)
+                        const results = await Promise.all(generationPromises);
+                        // Process all results from this batch
+                        for (const { chunk, data } of results) {
                             // Ensure it's in the active memory map
                             if (!chunks.has(chunk.key)) {
                                 chunks.set(chunk.key, data);
@@ -25603,7 +25608,7 @@ self.onmessage = async (e) => {
                 }
 
                 // === PHASE 2: Render all ready chunks ===
-                // Increased batch size from 10 to 20, render cached (closer) chunks first
+                // Batch size for parallel rendering - allows multiple workers to be utilized
                 // Sort by distance from spawn for better visual loading
                 readyChunks.sort((a, b) => {
                     const distA = a.cx * a.cx + a.cz * a.cz;
@@ -25611,30 +25616,40 @@ self.onmessage = async (e) => {
                     return distA - distB;
                 });
                 if (progressText) progressText.textContent = `Rendering ${readyChunks.length} chunks...`;
-                logDebug(`[PreGen] Phase 2: Rendering ${readyChunks.length} chunks...`);
+                logDebug(`[PreGen] Phase 2: Rendering ${readyChunks.length} chunks (parallel workers)...`);
                 const RENDER_BATCH_SIZE = 20;
                 let rendered = 0;
                 const renderStartTime = performance.now();
-                for (let i = 0; i < readyChunks.length && !skipRequested; i++) {
-                    const chunk = readyChunks[i];
-                    // Render the chunk (creates mesh and adds to scene)
-                    const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
-                    // Use worker mesh generation if enabled, otherwise fall back to sync
-                    if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
-                        await renderChunkAsync(chunk.cx, chunk.cz, distSq);
+                const useAsyncRendering = SETTINGS.useWorkersForMesh && chunkWorkerPool;
+                for (let i = 0; i < readyChunks.length && !skipRequested; i += RENDER_BATCH_SIZE) {
+                    const batch = readyChunks.slice(i, i + RENDER_BATCH_SIZE);
+                    if (useAsyncRendering) {
+                        // Queue all render jobs in parallel to utilize all available workers
+                        const renderPromises = batch.map(chunk => {
+                            const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
+                            return renderChunkAsync(chunk.cx, chunk.cz, distSq).then(() => chunk);
+                        });
+                        // Wait for entire batch to complete (workers process in parallel)
+                        const results = await Promise.all(renderPromises);
+                        for (const chunk of results) {
+                            activeChunks.add(chunk.key);
+                            rendered++;
+                        }
                     } else {
-                        renderChunk(chunk.cx, chunk.cz, distSq);
+                        // Sync rendering - process sequentially within batch
+                        for (const chunk of batch) {
+                            const distSq = chunk.cx * chunk.cx + chunk.cz * chunk.cz;
+                            renderChunk(chunk.cx, chunk.cz, distSq);
+                            activeChunks.add(chunk.key);
+                            rendered++;
+                        }
                     }
-                    activeChunks.add(chunk.key);
-                    rendered++;
-                    // Update progress and yield every RENDER_BATCH_SIZE chunks
-                    if (rendered % RENDER_BATCH_SIZE === 0) {
-                        const percent = 50 + Math.floor((rendered / readyChunks.length) * 50);
-                        if (progressBar) progressBar.style.width = `${percent}%`;
-                        if (progressText) progressText.textContent = `Rendering ${rendered}/${readyChunks.length}...`;
-                        // Yield to browser to keep UI responsive
-                        await new Promise((resolve) => setTimeout(resolve, 0));
-                    }
+                    // Update progress and yield after each batch
+                    const percent = 50 + Math.floor((rendered / readyChunks.length) * 50);
+                    if (progressBar) progressBar.style.width = `${percent}%`;
+                    if (progressText) progressText.textContent = `Rendering ${rendered}/${readyChunks.length}...`;
+                    // Yield to browser to keep UI responsive
+                    await new Promise((resolve) => setTimeout(resolve, 0));
                 }
                 const renderTime = performance.now() - renderStartTime;
                 // Final progress update
