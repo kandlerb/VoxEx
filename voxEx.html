@@ -21284,8 +21284,11 @@
                     geo.boundingSphere = new THREE.Sphere();
                     geo.boundingBox = new THREE.Box3();
 
-                    // Store tier info in userData for pool management
+                    // Store tier info and buffer capacities in userData for pool management
+                    // WebGPU requires update ranges to not exceed buffer capacity
                     geo.userData.maxFaces = maxFaces;
+                    geo.userData.maxVerts = maxVerts;
+                    geo.userData.maxIndices = maxIndices;
                     geo.userData.tier = tier;
 
                     this._stats.terrainCreated[tier]++;
@@ -21339,6 +21342,11 @@
 
                     geo.boundingSphere = new THREE.Sphere();
                     geo.boundingBox = new THREE.Box3();
+
+                    // Store buffer capacities in userData for WebGPU compatibility
+                    // WebGPU requires update ranges to not exceed buffer capacity
+                    geo.userData.maxVerts = waterMaxVerts;
+                    geo.userData.maxIndices = waterMaxIdx;
 
                     this._stats.waterCreated++;
                     return geo;
@@ -25237,20 +25245,8 @@ self.onmessage = async (e) => {
                 if (supported) {
                     logDebug('[OPFS] Support check: Supported');
                 } else if (reason === 'file-protocol') {
-                    // Friendly message for file:// protocol users
-                    console.warn(
-                        '%c[VoxEx] OPFS disk storage disabled (file:// protocol)',
-                        'color: #ff9800; font-weight: bold'
-                    );
-                    console.info(
-                        '%c[VoxEx] OPFS requires HTTP/HTTPS. To enable disk-based chunk storage:\n' +
-                        '  1. Open a terminal in the VoxEx folder\n' +
-                        '  2. Run: python -m http.server 8080\n' +
-                        '  3. Open: http://localhost:8080/voxEx.html\n\n' +
-                        'The game works fine without OPFS, but will use more RAM for chunk data.',
-                        'color: #2196f3'
-                    );
-                    logDebug('[OPFS] Disabled: file:// protocol detected');
+                    // Info message for file:// protocol users (not a warning - game works fine without OPFS)
+                    logDebug('[OPFS] Disabled: file:// protocol detected (game works fine without it)');
                 } else {
                     logDebug(`[OPFS] Support check: Not supported (${reason})`);
                 }
@@ -26219,9 +26215,11 @@ self.onmessage = async (e) => {
                 //     powerPreference: 'high-performance',
                 //     stencil: false
                 // });
+                // Note: Chrome on Windows shows "powerPreference option is currently ignored" warning
+                // This is a known Chrome bug (crbug.com/369219127) - the warning can be safely ignored
                 renderer = new THREE.WebGPURenderer({
                     antialias: SETTINGS.antialiasing,
-                    powerPreference: 'high-performance',
+                    powerPreference: 'high-performance',  // Ignored on Windows WebGPU due to Chrome bug
                     stencil: false
                     // forceWebGL: true  // Removed in Phase 5 - native WebGPU now enabled
                 });
@@ -37743,6 +37741,18 @@ self.onmessage = async (e) => {
                         // This selects small/medium/large tier based on tFaceCount, saving ~65% memory overall
                         const terrainGeo = geometryPool.acquireTerrain(tFaceCount);
 
+                        // Get buffer capacities from geometry userData (WebGPU requires strict bounds)
+                        const tMaxVerts = terrainGeo.userData.maxVerts ?? MAX_VERTICES_PER_CHUNK;
+                        const tMaxIndices = terrainGeo.userData.maxIndices ?? MAX_INDICES_PER_CHUNK;
+                        const tMaxPosSize = tMaxVerts * 3;  // position/normal/color: 3 floats per vertex
+                        const tMaxUvSize = tMaxVerts * 2;   // uv: 2 floats per vertex
+
+                        // Clamp indices to buffer capacity (WebGPU writeBuffer validation)
+                        const tVIdxClamped = Math.min(tVIdx, tMaxPosSize);
+                        const tUvIdxClamped = Math.min(tUvIdx, tMaxUvSize);
+                        const tCIdxClamped = Math.min(tCIdx, tMaxPosSize);
+                        const tIIdxClamped = Math.min(tIIdx, tMaxIndices);
+
                         // Update buffer data in-place (no allocation)
                         const posAttr = terrainGeo.attributes.position;
                         const normAttr = terrainGeo.attributes.normal;
@@ -37750,40 +37760,45 @@ self.onmessage = async (e) => {
                         const colAttr = terrainGeo.attributes.color;
                         const idxAttr = terrainGeo.index;
 
-                        // Copy from work buffers to geometry buffers
-                        posAttr.array.set(terrainPos.subarray(0, tVIdx));
-                        normAttr.array.set(terrainNorm.subarray(0, tVIdx));
-                        uvAttr.array.set(terrainUvs.subarray(0, tUvIdx));
-                        colAttr.array.set(terrainCols.subarray(0, tCIdx));
-                        idxAttr.array.set(terrainIndices.subarray(0, tIIdx));
+                        // Copy from work buffers to geometry buffers (clamped to capacity)
+                        posAttr.array.set(terrainPos.subarray(0, tVIdxClamped));
+                        normAttr.array.set(terrainNorm.subarray(0, tVIdxClamped));
+                        uvAttr.array.set(terrainUvs.subarray(0, tUvIdxClamped));
+                        colAttr.array.set(terrainCols.subarray(0, tCIdxClamped));
+                        idxAttr.array.set(terrainIndices.subarray(0, tIIdxClamped));
 
-                        // Mark attributes as needing GPU upload - only upload the portion we actually filled
+                        // Mark attributes as needing GPU upload - clamped to buffer capacity
                         posAttr.clearUpdateRanges();
-                        posAttr.addUpdateRange(0, tVIdx);
+                        posAttr.addUpdateRange(0, tVIdxClamped);
                         posAttr.needsUpdate = true;
 
                         normAttr.clearUpdateRanges();
-                        normAttr.addUpdateRange(0, tVIdx);
+                        normAttr.addUpdateRange(0, tVIdxClamped);
                         normAttr.needsUpdate = true;
 
                         uvAttr.clearUpdateRanges();
-                        uvAttr.addUpdateRange(0, tUvIdx);
+                        uvAttr.addUpdateRange(0, tUvIdxClamped);
                         uvAttr.needsUpdate = true;
 
                         colAttr.clearUpdateRanges();
-                        colAttr.addUpdateRange(0, tCIdx);
+                        colAttr.addUpdateRange(0, tCIdxClamped);
                         colAttr.needsUpdate = true;
 
                         idxAttr.clearUpdateRanges();
-                        idxAttr.addUpdateRange(0, tIIdx);
+                        idxAttr.addUpdateRange(0, tIIdxClamped);
                         idxAttr.needsUpdate = true;
 
-                        // Set draw range to only render valid portion
-                        terrainGeo.setDrawRange(0, tIIdx);
+                        // Set draw range to only render valid portion (clamped)
+                        terrainGeo.setDrawRange(0, tIIdxClamped);
 
                         // DIAGNOSTIC: Verify drawRange was set correctly
-                        if (terrainGeo.drawRange.count !== tIIdx) {
-                            console.error(`[renderChunk] ${cKey}: drawRange mismatch! Expected ${tIIdx}, got ${terrainGeo.drawRange.count}`);
+                        if (terrainGeo.drawRange.count !== tIIdxClamped) {
+                            console.error(`[renderChunk] ${cKey}: drawRange mismatch! Expected ${tIIdxClamped}, got ${terrainGeo.drawRange.count}`);
+                        }
+
+                        // Log if clamping occurred (indicates buffer size mismatch)
+                        if (tIIdxClamped !== tIIdx) {
+                            logDebug(`[Chunks] ${cKey}: Buffer clamped (indices ${tIIdx} → ${tIIdxClamped})`);
                         }
 
                         // Update bounds using pre-computed tight bounds from section data
@@ -37807,6 +37822,20 @@ self.onmessage = async (e) => {
                         // Acquire pooled geometry with pre-allocated buffers
                         const waterGeo = geometryPool.acquireWater();
 
+                        // Get buffer capacities from geometry userData (WebGPU requires strict bounds)
+                        const wMaxVerts = waterGeo.userData.maxVerts ?? (MAX_VERTICES_PER_CHUNK / 4);
+                        const wMaxIndices = waterGeo.userData.maxIndices ?? (MAX_INDICES_PER_CHUNK / 4);
+                        const wMaxPosSize = wMaxVerts * 3;  // position/normal/color: 3 floats per vertex
+                        const wMaxUvSize = wMaxVerts * 2;   // uv: 2 floats per vertex
+
+                        // Clamp indices to buffer capacity (WebGPU writeBuffer validation)
+                        const wVIdxClamped = Math.min(wVIdx, wMaxPosSize);
+                        const wUvIdxClamped = Math.min(wUvIdx, wMaxUvSize);
+                        const wCIdxClamped = Math.min(wCIdx, wMaxPosSize);
+                        const wSIdxClamped = Math.min(wSIdx, wMaxVerts);  // shoreDist: 1 float per vertex
+                        const wTIdxClamped = Math.min(wTIdx, wMaxVerts);  // thickness: 1 float per vertex
+                        const wIIdxClamped = Math.min(wIIdx, wMaxIndices);
+
                         // Update buffer data in-place (no allocation)
                         const posAttr = waterGeo.attributes.position;
                         const normAttr = waterGeo.attributes.normal;
@@ -37816,50 +37845,55 @@ self.onmessage = async (e) => {
                         const thickAttr = waterGeo.attributes.waterThickness;
                         const idxAttr = waterGeo.index;
 
-                        // Copy from work buffers to geometry buffers
-                        posAttr.array.set(waterPos.subarray(0, wVIdx));
-                        normAttr.array.set(waterNorm.subarray(0, wVIdx));
-                        uvAttr.array.set(waterUvs.subarray(0, wUvIdx));
-                        colAttr.array.set(waterCols.subarray(0, wCIdx));
-                        shoreAttr.array.set(waterShore.subarray(0, wSIdx));
-                        thickAttr.array.set(waterThickness.subarray(0, wTIdx));
-                        idxAttr.array.set(waterIndices.subarray(0, wIIdx));
+                        // Copy from work buffers to geometry buffers (clamped to capacity)
+                        posAttr.array.set(waterPos.subarray(0, wVIdxClamped));
+                        normAttr.array.set(waterNorm.subarray(0, wVIdxClamped));
+                        uvAttr.array.set(waterUvs.subarray(0, wUvIdxClamped));
+                        colAttr.array.set(waterCols.subarray(0, wCIdxClamped));
+                        shoreAttr.array.set(waterShore.subarray(0, wSIdxClamped));
+                        thickAttr.array.set(waterThickness.subarray(0, wTIdxClamped));
+                        idxAttr.array.set(waterIndices.subarray(0, wIIdxClamped));
 
-                        // Mark attributes as needing GPU upload - only upload the portion we actually filled
+                        // Mark attributes as needing GPU upload - clamped to buffer capacity
                         posAttr.clearUpdateRanges();
-                        posAttr.addUpdateRange(0, wVIdx);
+                        posAttr.addUpdateRange(0, wVIdxClamped);
                         posAttr.needsUpdate = true;
 
                         normAttr.clearUpdateRanges();
-                        normAttr.addUpdateRange(0, wVIdx);
+                        normAttr.addUpdateRange(0, wVIdxClamped);
                         normAttr.needsUpdate = true;
 
                         uvAttr.clearUpdateRanges();
-                        uvAttr.addUpdateRange(0, wUvIdx);
+                        uvAttr.addUpdateRange(0, wUvIdxClamped);
                         uvAttr.needsUpdate = true;
 
                         colAttr.clearUpdateRanges();
-                        colAttr.addUpdateRange(0, wCIdx);
+                        colAttr.addUpdateRange(0, wCIdxClamped);
                         colAttr.needsUpdate = true;
 
                         shoreAttr.clearUpdateRanges();
-                        shoreAttr.addUpdateRange(0, wSIdx);
+                        shoreAttr.addUpdateRange(0, wSIdxClamped);
                         shoreAttr.needsUpdate = true;
 
                         thickAttr.clearUpdateRanges();
-                        thickAttr.addUpdateRange(0, wTIdx);
+                        thickAttr.addUpdateRange(0, wTIdxClamped);
                         thickAttr.needsUpdate = true;
 
                         idxAttr.clearUpdateRanges();
-                        idxAttr.addUpdateRange(0, wIIdx);
+                        idxAttr.addUpdateRange(0, wIIdxClamped);
                         idxAttr.needsUpdate = true;
 
-                        // Set draw range to only render valid portion
-                        waterGeo.setDrawRange(0, wIIdx);
+                        // Set draw range to only render valid portion (clamped)
+                        waterGeo.setDrawRange(0, wIIdxClamped);
 
                         // DIAGNOSTIC: Verify drawRange was set correctly
-                        if (waterGeo.drawRange.count !== wIIdx) {
-                            console.error(`[renderChunk] ${cKey}_WATER: drawRange mismatch! Expected ${wIIdx}, got ${waterGeo.drawRange.count}`);
+                        if (waterGeo.drawRange.count !== wIIdxClamped) {
+                            console.error(`[renderChunk] ${cKey}_WATER: drawRange mismatch! Expected ${wIIdxClamped}, got ${waterGeo.drawRange.count}`);
+                        }
+
+                        // Log if clamping occurred (indicates buffer size mismatch)
+                        if (wIIdxClamped !== wIIdx) {
+                            logDebug(`[Chunks] ${cKey}_WATER: Buffer clamped (indices ${wIIdx} → ${wIIdxClamped})`);
                         }
 
                         // Update bounds using pre-computed tight bounds from section data
