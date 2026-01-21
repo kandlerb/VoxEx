@@ -5657,6 +5657,17 @@
             // =====================================================
             // GEOMETRY BUFFER POOL CONSTANTS
             // =====================================================
+            // =====================================================
+            // WEBGPU BUFFER SIZE SAFETY
+            // =====================================================
+            // WebGPU has a maxBufferSize limit (typically 256MB, varies by device).
+            // We use a conservative 128MB ceiling to ensure compatibility.
+            // Current chunk buffers are ~3.1MB each, well under this limit.
+            const WEBGPU_SAFE_BUFFER_BYTES = 128 * 1024 * 1024; // 128MB safe ceiling
+            const BYTES_PER_VERTEX = 44; // pos(12) + norm(12) + uv(8) + col(12) = 44 bytes
+            const WEBGPU_MAX_SAFE_VERTICES = Math.floor(WEBGPU_SAFE_BUFFER_BYTES / BYTES_PER_VERTEX);
+            // ~2.9M vertices max - our 65K vertices per chunk is 45x under this limit
+
             // Maximum faces per chunk (based on actual usage: ~2-3K typical, 5K common max)
             // 16×16×320 chunk = ~150K max exposed faces, but typical is ~2-3K
             // Increased from 8K to 16K to handle complex terrain (mountains, caves)
@@ -21298,8 +21309,14 @@
                     const geo = new THREE.BufferGeometry();
 
                     // Allocate buffers sized for this tier
-                    const maxVerts = maxFaces * 4;
+                    let maxVerts = maxFaces * 4;
                     const maxIndices = maxFaces * 6;
+
+                    // WebGPU safety check - cap vertices if exceeding safe limit
+                    if (maxVerts > WEBGPU_MAX_SAFE_VERTICES) {
+                        logDebug(`[GeoPool] Warning: Capping vertices from ${maxVerts} to ${WEBGPU_MAX_SAFE_VERTICES} for WebGPU compatibility`);
+                        maxVerts = WEBGPU_MAX_SAFE_VERTICES;
+                    }
 
                     const posArray = new Float32Array(maxVerts * 3);
                     const normArray = new Float32Array(maxVerts * 3);
@@ -26279,6 +26296,39 @@ self.onmessage = async (e) => {
                 // Log which backend we're using
                 const backendName = renderer.backend?.name || 'WebGL';
                 logDebug(`[Renderer] Backend: ${backendName}`);
+
+                // Query WebGPU device limits for buffer size safety checks
+                // This helps prevent "writeBuffer too large" errors on devices with lower limits
+                try {
+                    if (backendName === 'WebGPU' && renderer.backend?.device?.limits) {
+                        const limits = renderer.backend.device.limits;
+                        window.GPU_MAX_BUFFER_SIZE = limits.maxBufferSize || (256 * 1024 * 1024);
+                        window.GPU_MAX_STORAGE_BUFFER_SIZE = limits.maxStorageBufferBindingSize || (128 * 1024 * 1024);
+                        logDebug(`[WebGPU] Device limits: maxBufferSize=${(window.GPU_MAX_BUFFER_SIZE / 1024 / 1024).toFixed(0)}MB, maxStorageBuffer=${(window.GPU_MAX_STORAGE_BUFFER_SIZE / 1024 / 1024).toFixed(0)}MB`);
+                    } else {
+                        // WebGL fallback - use generous limits
+                        window.GPU_MAX_BUFFER_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
+                        window.GPU_MAX_STORAGE_BUFFER_SIZE = 2 * 1024 * 1024 * 1024;
+                        logDebug(`[WebGL] Using default buffer limits (2GB)`);
+                    }
+                } catch (e) {
+                    // Fallback if limit query fails
+                    window.GPU_MAX_BUFFER_SIZE = 256 * 1024 * 1024; // 256MB safe default
+                    window.GPU_MAX_STORAGE_BUFFER_SIZE = 128 * 1024 * 1024;
+                    logDebug(`[Renderer] Could not query device limits, using safe defaults: ${e.message}`);
+                }
+
+                // Validate our buffer sizes are within device limits
+                const largestBufferBytes = GEO_TIER_LARGE_BYTES;
+                const bufferSafetyMargin = window.GPU_MAX_BUFFER_SIZE / largestBufferBytes;
+                if (bufferSafetyMargin < 2) {
+                    console.warn(`[WebGPU] Low buffer safety margin: ${bufferSafetyMargin.toFixed(1)}x. ` +
+                        `Largest geometry (${(largestBufferBytes/1024/1024).toFixed(1)}MB) is close to device limit ` +
+                        `(${(window.GPU_MAX_BUFFER_SIZE/1024/1024).toFixed(0)}MB)`);
+                } else {
+                    logDebug(`[WebGPU] Buffer safety OK: ${bufferSafetyMargin.toFixed(0)}x margin ` +
+                        `(${(largestBufferBytes/1024/1024).toFixed(1)}MB geometry vs ${(window.GPU_MAX_BUFFER_SIZE/1024/1024).toFixed(0)}MB limit)`);
+                }
 
                 // Update webgpuStatusCache with active backend info
                 if (webgpuStatusCache !== null) {
