@@ -4959,6 +4959,7 @@
                 // Web Workers
                 useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
                 useWorkersForMesh: savedSettings.useWorkersForMesh !== undefined ? savedSettings.useWorkersForMesh : true, // Use Web Workers for mesh generation
+                useSharedArrayBuffer: savedSettings.useSharedArrayBuffer !== undefined ? savedSettings.useSharedArrayBuffer : true, // Use SharedArrayBuffer for zero-copy worker data (requires crossOriginIsolated)
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5170,6 +5171,7 @@
                 // Web Worker defaults
                 useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
                 useWorkersForMesh: true,           // Use Web Workers for mesh generation (Phase 4)
+                useSharedArrayBuffer: true,        // Use SharedArrayBuffer for zero-copy worker data (auto-disabled if not supported)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -14504,7 +14506,174 @@
             };
             const activeChunks = new Set();
             const globalPendingMods = new Map();
-            const chunkBuildQueue = [];
+
+            // =====================================================
+            // PRIORITY QUEUE (MIN-HEAP) FOR CHUNK BUILD QUEUE
+            // =====================================================
+            // O(log n) insertion and extraction instead of O(n log n) sort per frame.
+            // Priority is based on distance (lower = higher priority).
+            // Dirty chunks get priority boost (negative offset).
+            /**
+             * Min-heap priority queue for chunk build jobs.
+             * Lower priority values are extracted first.
+             */
+            class ChunkPriorityQueue {
+                constructor() {
+                    /** @type {Array<{key: string, cx: number, cz: number, priority: number, dirty: boolean}>} */
+                    this.heap = [];
+                    /** @type {Map<string, number>} chunkKey -> heap index for O(1) contains check */
+                    this.indexMap = new Map();
+                    /** @type {number} */
+                    this._stats = { insertions: 0, extractions: 0, updates: 0 };
+                }
+
+                /** @returns {number} Number of items in queue. */
+                get length() { return this.heap.length; }
+
+                /**
+                 * Check if chunk is already in queue.
+                 * @param {string} key - Chunk key.
+                 * @returns {boolean}
+                 */
+                has(key) { return this.indexMap.has(key); }
+
+                /**
+                 * Insert or update a job in the queue.
+                 * @param {string} key - Chunk key.
+                 * @param {number} cx - Chunk X.
+                 * @param {number} cz - Chunk Z.
+                 * @param {number} priority - Priority value (lower = higher priority).
+                 * @param {boolean} [dirty=false] - Is this a dirty chunk (block change).
+                 */
+                insert(key, cx, cz, priority, dirty = false) {
+                    // Dirty chunks get massive priority boost
+                    const effectivePriority = dirty ? priority - 1000000 : priority;
+
+                    if (this.indexMap.has(key)) {
+                        // Update existing entry if new priority is better
+                        const idx = this.indexMap.get(key);
+                        if (effectivePriority < this.heap[idx].priority) {
+                            this.heap[idx].priority = effectivePriority;
+                            this.heap[idx].dirty = dirty;
+                            this._bubbleUp(idx);
+                            this._stats.updates++;
+                        }
+                        return;
+                    }
+
+                    const job = { key, cx, cz, priority: effectivePriority, dirty };
+                    this.heap.push(job);
+                    this.indexMap.set(key, this.heap.length - 1);
+                    this._bubbleUp(this.heap.length - 1);
+                    this._stats.insertions++;
+                }
+
+                /**
+                 * Extract the highest priority (lowest value) job.
+                 * @returns {{key: string, cx: number, cz: number, priority: number, dirty: boolean}|null}
+                 */
+                extract() {
+                    if (this.heap.length === 0) return null;
+
+                    const min = this.heap[0];
+                    this.indexMap.delete(min.key);
+
+                    if (this.heap.length === 1) {
+                        this.heap.pop();
+                    } else {
+                        this.heap[0] = this.heap.pop();
+                        this.indexMap.set(this.heap[0].key, 0);
+                        this._bubbleDown(0);
+                    }
+
+                    this._stats.extractions++;
+                    return min;
+                }
+
+                /**
+                 * Remove a specific chunk from the queue.
+                 * @param {string} key - Chunk key.
+                 * @returns {boolean} True if removed.
+                 */
+                remove(key) {
+                    if (!this.indexMap.has(key)) return false;
+
+                    const idx = this.indexMap.get(key);
+                    this.indexMap.delete(key);
+
+                    if (idx === this.heap.length - 1) {
+                        this.heap.pop();
+                    } else {
+                        this.heap[idx] = this.heap.pop();
+                        this.indexMap.set(this.heap[idx].key, idx);
+                        this._bubbleUp(idx);
+                        this._bubbleDown(idx);
+                    }
+                    return true;
+                }
+
+                /**
+                 * Clear all items from the queue.
+                 */
+                clear() {
+                    this.heap.length = 0;
+                    this.indexMap.clear();
+                }
+
+                /** @private */
+                _bubbleUp(idx) {
+                    while (idx > 0) {
+                        const parentIdx = (idx - 1) >> 1;
+                        if (this.heap[idx].priority >= this.heap[parentIdx].priority) break;
+                        this._swap(idx, parentIdx);
+                        idx = parentIdx;
+                    }
+                }
+
+                /** @private */
+                _bubbleDown(idx) {
+                    const length = this.heap.length;
+                    while (true) {
+                        const leftIdx = (idx << 1) + 1;
+                        const rightIdx = leftIdx + 1;
+                        let smallest = idx;
+
+                        if (leftIdx < length && this.heap[leftIdx].priority < this.heap[smallest].priority) {
+                            smallest = leftIdx;
+                        }
+                        if (rightIdx < length && this.heap[rightIdx].priority < this.heap[smallest].priority) {
+                            smallest = rightIdx;
+                        }
+                        if (smallest === idx) break;
+
+                        this._swap(idx, smallest);
+                        idx = smallest;
+                    }
+                }
+
+                /** @private */
+                _swap(i, j) {
+                    const temp = this.heap[i];
+                    this.heap[i] = this.heap[j];
+                    this.heap[j] = temp;
+                    this.indexMap.set(this.heap[i].key, i);
+                    this.indexMap.set(this.heap[j].key, j);
+                }
+
+                /**
+                 * Get statistics.
+                 * @returns {{length: number, insertions: number, extractions: number, updates: number}}
+                 */
+                getStats() {
+                    return {
+                        length: this.heap.length,
+                        ...this._stats
+                    };
+                }
+            }
+
+            // Use priority queue instead of array for O(log n) operations
+            const chunkBuildQueue = new ChunkPriorityQueue();
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
             // Track tight bounds effectiveness for frustum culling
@@ -17520,7 +17689,7 @@
                 if (false && chunkUpdateDiagnostics.pending.size > 0) {
                     for (const [key, entry] of chunkUpdateDiagnostics.pending) {
                         const stale = now - entry.last > 2000;
-                        const notQueued = !pendingChunkUpdates.has(key) && !deferredChunkUpdates.has(key) && !queuedChunkKeys.has(key) && !chunkBuildQueue.some((job) => job.key === key);
+                        const notQueued = !pendingChunkUpdates.has(key) && !deferredChunkUpdates.has(key) && !queuedChunkKeys.has(key) && !chunkBuildQueue.has(key);
                         if (stale && notQueued) {
                             logDebug(`[ChunkUpdate] Stale pending trace for ${key}`, {
                                 state: entry.state,
@@ -19825,6 +19994,11 @@
     // ============================================================
     // MESSAGE HANDLER
     // ============================================================
+    // SharedArrayBuffer support - store reference for zero-copy data access
+    let sharedBuffer = null;
+    let sharedDataView = null;
+    let chunkDataSize = 0; // Size of blocks/skyLight/blockLight per chunk
+
     self.onmessage = function(e) {
         const { type, jobId, cx, cz, seedStr } = e.data;
 
@@ -19833,6 +20007,14 @@
                 // Initialize noise with seed string
                 initNoise(seedStr);
                 biomeCellCache.clear(); // Clear biome cache for new seed
+
+                // Store shared buffer reference if provided
+                if (e.data.sharedBuffer) {
+                    sharedBuffer = e.data.sharedBuffer;
+                    sharedDataView = new Uint8Array(sharedBuffer);
+                    chunkDataSize = e.data.chunkDataSize || (16 * 16 * 320);
+                }
+
                 self.postMessage({ type: 'ready', jobId });
                 return;
             }
@@ -19884,11 +20066,41 @@
 
             if (type === 'mesh') {
                 // Mesh generation in worker
-                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
+                const { useSharedMemory, centerSlot, neighborSlots, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
                 const chunkSize = CHUNK_SIZE;
                 const chunkHeight = CHUNK_HEIGHT;
                 const startX = cx * chunkSize;
                 const startZ = cz * chunkSize;
+
+                // Get chunk data - either from SharedArrayBuffer or from transferred data
+                let centerBlocks, centerSkyLight, centerBlockLight, neighbors;
+
+                if (useSharedMemory && sharedDataView && centerSlot !== undefined) {
+                    // Zero-copy path: read directly from SharedArrayBuffer
+                    const slotSize = chunkDataSize * 3; // blocks + skyLight + blockLight
+                    const centerOffset = centerSlot * slotSize;
+
+                    // Create views into shared memory (no copy!)
+                    centerBlocks = new Uint8Array(sharedBuffer, centerOffset, chunkDataSize);
+                    centerSkyLight = new Uint8Array(sharedBuffer, centerOffset + chunkDataSize, chunkDataSize);
+                    centerBlockLight = new Uint8Array(sharedBuffer, centerOffset + chunkDataSize * 2, chunkDataSize);
+
+                    // Build neighbor views
+                    neighbors = {};
+                    if (neighborSlots) {
+                        for (const dir in neighborSlots) {
+                            const nSlot = neighborSlots[dir];
+                            const nOffset = nSlot * slotSize;
+                            neighbors[dir] = new Uint8Array(sharedBuffer, nOffset, chunkDataSize);
+                        }
+                    }
+                } else {
+                    // Transferable path: use transferred data
+                    centerBlocks = e.data.centerBlocks;
+                    centerSkyLight = e.data.centerSkyLight;
+                    centerBlockLight = e.data.centerBlockLight;
+                    neighbors = e.data.neighbors || {};
+                }
 
                 // Build local block getter (handles neighbor lookups)
                 const getLocal = (lx, ly, lz) => {
@@ -20246,13 +20458,47 @@
                     this.poolSize = poolSize || Math.min(4, Math.max(1, cores - 1));
                     this.workers = [];
                     this.jobQueue = [];
-                    this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz}
+                    this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz, type, queuedAt, startedAt}
                     this.nextJobId = 0;
                     this.workerBusy = []; // Track which workers are busy
                     this.currentSeed = null; // Track current world seed for worker init
 
+                    // Job deduplication: track queued chunks to prevent duplicate jobs
+                    this.queuedChunks = new Map(); // "cx,cz" -> {terrainJobId, meshJobId}
+
+                    // Job cancellation: track cancelled job IDs (resolved as null)
+                    this.cancelledJobs = new Set();
+
+                    // Enhanced statistics for profiling
+                    this._stats = {
+                        terrainJobsQueued: 0,
+                        terrainJobsCompleted: 0,
+                        terrainJobsCancelled: 0,
+                        terrainJobsDeduplicated: 0,
+                        meshJobsQueued: 0,
+                        meshJobsCompleted: 0,
+                        meshJobsCancelled: 0,
+                        meshJobsDeduplicated: 0,
+                        totalQueueWaitMs: 0,
+                        totalExecutionMs: 0,
+                        avgQueueWaitMs: 0,
+                        avgExecutionMs: 0,
+                        peakQueueLength: 0,
+                        sharedMemoryHits: 0,
+                        sharedMemoryMisses: 0
+                    };
+
+                    // SharedArrayBuffer support for zero-copy worker data
+                    this.sharedMemory = null;
+                    this.useSharedMemory = SETTINGS.useSharedArrayBuffer && SHARED_ARRAY_BUFFER_AVAILABLE;
+                    if (this.useSharedMemory) {
+                        this.sharedMemory = new SharedChunkMemory(128); // 128 slots = ~30MB
+                        sharedChunkMemory = this.sharedMemory; // Set global reference
+                    }
+
                     this._initWorkers();
-                    console.log(`[WorkerPool] Initialized with ${this.poolSize} workers`);
+                    logDebug(`[WorkerPool] Initialized with ${this.poolSize} workers` +
+                             (this.useSharedMemory ? ' (SharedArrayBuffer enabled)' : ' (using Transferable)'));
                 }
 
                 /**
@@ -20286,16 +20532,60 @@
                  */
                 _handleWorkerMessage(workerIndex, event) {
                     const { type, jobId, error, ...data } = event.data;
+                    const now = performance.now();
 
                     this.workerBusy[workerIndex] = false;
 
                     const job = this.pendingJobs.get(jobId);
                     if (!job) {
-                        console.warn(`[WorkerPool] Received result for unknown job ${jobId}`);
+                        // Check if job was cancelled
+                        if (this.cancelledJobs.has(jobId)) {
+                            this.cancelledJobs.delete(jobId);
+                            this._processQueue();
+                            return;
+                        }
+                        logDebug(`[WorkerPool] Received result for unknown job ${jobId}`);
                         return;
                     }
 
                     this.pendingJobs.delete(jobId);
+
+                    // Track execution time statistics
+                    if (job.startedAt) {
+                        const execMs = now - job.startedAt;
+                        this._stats.totalExecutionMs += execMs;
+                        const completedCount = this._stats.terrainJobsCompleted + this._stats.meshJobsCompleted + 1;
+                        this._stats.avgExecutionMs = this._stats.totalExecutionMs / completedCount;
+                    }
+
+                    // Remove from queued chunks tracking
+                    const chunkKey = `${job.cx},${job.cz}`;
+                    const queuedEntry = this.queuedChunks.get(chunkKey);
+                    if (queuedEntry) {
+                        if (job.type === 'generate' && queuedEntry.terrainJobId === jobId) {
+                            queuedEntry.terrainJobId = null;
+                        } else if (job.type === 'mesh' && queuedEntry.meshJobId === jobId) {
+                            queuedEntry.meshJobId = null;
+                        }
+                        // Clean up entry if no jobs remain
+                        if (!queuedEntry.terrainJobId && !queuedEntry.meshJobId) {
+                            this.queuedChunks.delete(chunkKey);
+                        }
+                    }
+
+                    // Update completion stats
+                    if (job.type === 'generate') {
+                        this._stats.terrainJobsCompleted++;
+                    } else if (job.type === 'mesh') {
+                        this._stats.meshJobsCompleted++;
+                    }
+
+                    // Release shared memory slots if used
+                    if (job.sharedSlots && this.sharedMemory) {
+                        for (const slot of job.sharedSlots) {
+                            this.sharedMemory.release(slot);
+                        }
+                    }
 
                     if (type === 'error') {
                         job.reject(new Error(error));
@@ -20336,11 +20626,41 @@
                  * @private
                  */
                 _processQueue() {
+                    // Track peak queue length
+                    if (this.jobQueue.length > this._stats.peakQueueLength) {
+                        this._stats.peakQueueLength = this.jobQueue.length;
+                    }
+
                     while (this.jobQueue.length > 0) {
                         const workerIndex = this._getIdleWorker();
                         if (workerIndex === -1) break; // All workers busy
 
                         const job = this.jobQueue.shift();
+                        const jobId = job.message.jobId;
+
+                        // Skip cancelled jobs
+                        if (this.cancelledJobs.has(jobId)) {
+                            this.cancelledJobs.delete(jobId);
+                            const pendingJob = this.pendingJobs.get(jobId);
+                            if (pendingJob) {
+                                this.pendingJobs.delete(jobId);
+                                pendingJob.resolve(null); // Resolve as null to indicate cancellation
+                            }
+                            continue;
+                        }
+
+                        // Track queue wait time
+                        const pendingJob = this.pendingJobs.get(jobId);
+                        if (pendingJob && pendingJob.queuedAt) {
+                            const waitMs = performance.now() - pendingJob.queuedAt;
+                            this._stats.totalQueueWaitMs += waitMs;
+                            const queuedCount = this._stats.terrainJobsQueued + this._stats.meshJobsQueued;
+                            if (queuedCount > 0) {
+                                this._stats.avgQueueWaitMs = this._stats.totalQueueWaitMs / queuedCount;
+                            }
+                            pendingJob.startedAt = performance.now();
+                        }
+
                         this.workerBusy[workerIndex] = true;
                         this.workers[workerIndex].postMessage(job.message, job.transfer || []);
                     }
@@ -20356,30 +20676,69 @@
                     this.currentSeed = seedStr;
                     const initPromises = [];
 
+                    // Get shared buffer reference (if available)
+                    const sharedBuffer = this.sharedMemory ? this.sharedMemory.getSharedBuffer() : null;
+                    const chunkDataSize = this.sharedMemory ? this.sharedMemory.CHUNK_DATA_SIZE : null;
+
                     for (let i = 0; i < this.poolSize; i++) {
                         initPromises.push(new Promise((resolve, reject) => {
                             const jobId = this.nextJobId++;
                             this.pendingJobs.set(jobId, { resolve, reject });
-                            this.workers[i].postMessage({ type: 'init', jobId, seedStr });
+                            // Pass shared buffer to worker during init (only once per worker)
+                            this.workers[i].postMessage({
+                                type: 'init',
+                                jobId,
+                                seedStr,
+                                sharedBuffer,      // SharedArrayBuffer or null
+                                chunkDataSize      // Size of each data section (blocks, skyLight, blockLight)
+                            });
                         }));
                     }
 
                     await Promise.all(initPromises);
-                    console.log(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}`);
+                    logDebug(`[WorkerPool] All ${this.poolSize} workers initialized with seed: ${seedStr}` +
+                             (sharedBuffer ? ' (SharedArrayBuffer passed)' : ''));
                 }
 
                 /**
-                 * Queue a terrain generation job.
+                 * Queue a terrain generation job with deduplication.
                  * @param {number} cx - Chunk X coordinate.
                  * @param {number} cz - Chunk Z coordinate.
                  * @param {string} seedStr - World seed string.
-                 * @returns {Promise<{blocks: Uint8Array}>} Promise resolving to block data.
+                 * @returns {Promise<{blocks: Uint8Array}|null>} Promise resolving to block data, or null if deduplicated.
                  */
                 generateTerrain(cx, cz, seedStr) {
+                    const chunkKey = `${cx},${cz}`;
+
+                    // Check for duplicate terrain job
+                    const existing = this.queuedChunks.get(chunkKey);
+                    if (existing && existing.terrainJobId !== null) {
+                        this._stats.terrainJobsDeduplicated++;
+                        // Return the existing pending promise via wrapping
+                        const existingJob = this.pendingJobs.get(existing.terrainJobId);
+                        if (existingJob) {
+                            return new Promise((resolve, reject) => {
+                                const origResolve = existingJob.resolve;
+                                const origReject = existingJob.reject;
+                                existingJob.resolve = (result) => { origResolve(result); resolve(result); };
+                                existingJob.reject = (err) => { origReject(err); reject(err); };
+                            });
+                        }
+                    }
+
                     return new Promise((resolve, reject) => {
                         const jobId = this.nextJobId++;
+                        const now = performance.now();
 
-                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz, type: 'generate', queuedAt: now });
+
+                        // Track for deduplication
+                        if (!this.queuedChunks.has(chunkKey)) {
+                            this.queuedChunks.set(chunkKey, { terrainJobId: null, meshJobId: null });
+                        }
+                        this.queuedChunks.get(chunkKey).terrainJobId = jobId;
+
+                        this._stats.terrainJobsQueued++;
 
                         this.jobQueue.push({
                             message: { type: 'generate', jobId, cx, cz, seedStr },
@@ -20391,92 +20750,326 @@
                 }
 
                 /**
-                 * Queue a mesh generation job.
+                 * Queue a mesh generation job with deduplication.
                  * @param {number} cx - Chunk X coordinate.
                  * @param {number} cz - Chunk Z coordinate.
                  * @param {Object} chunkData - Center chunk data with blocks, skyLight, blockLight.
                  * @param {Object} neighbors - Neighbor chunk data (n, s, e, w, nw, ne, sw, se).
                  * @param {Object} uvMapData - UV map data for block textures.
                  * @param {number} maxFaces - Maximum faces to generate.
-                 * @returns {Promise<Object>} Promise resolving to mesh data.
+                 * @returns {Promise<Object|null>} Promise resolving to mesh data, or null if deduplicated/cancelled.
                  */
                 generateMesh(cx, cz, chunkData, neighbors, uvMapData, maxFaces) {
+                    const chunkKey = `${cx},${cz}`;
+
+                    // Check for duplicate mesh job (but allow if terrain job exists - different type)
+                    const existing = this.queuedChunks.get(chunkKey);
+                    if (existing && existing.meshJobId !== null) {
+                        this._stats.meshJobsDeduplicated++;
+                        // Return the existing pending promise via wrapping
+                        const existingJob = this.pendingJobs.get(existing.meshJobId);
+                        if (existingJob) {
+                            return new Promise((resolve, reject) => {
+                                const origResolve = existingJob.resolve;
+                                const origReject = existingJob.reject;
+                                existingJob.resolve = (result) => { origResolve(result); resolve(result); };
+                                existingJob.reject = (err) => { origReject(err); reject(err); };
+                            });
+                        }
+                    }
+
                     return new Promise((resolve, reject) => {
                         const jobId = this.nextJobId++;
+                        const now = performance.now();
 
-                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
+                        this.pendingJobs.set(jobId, { resolve, reject, cx, cz, type: 'mesh', queuedAt: now });
 
-                        // Extract center chunk data - COPY buffers since we can't transfer data still in use
-                        const centerBlocks = chunkData.blocks
-                            ? new Uint8Array(chunkData.blocks)
-                            : new Uint8Array(chunkData);
-                        const centerSkyLight = chunkData.skyLight
-                            ? new Uint8Array(chunkData.skyLight)
-                            : null;
-                        const centerBlockLight = chunkData.blockLight
-                            ? new Uint8Array(chunkData.blockLight)
-                            : null;
+                        // Track for deduplication
+                        if (!this.queuedChunks.has(chunkKey)) {
+                            this.queuedChunks.set(chunkKey, { terrainJobId: null, meshJobId: null });
+                        }
+                        this.queuedChunks.get(chunkKey).meshJobId = jobId;
 
-                        // Copy neighbor block data (can't transfer chunks still in use by main thread)
-                        const neighborData = {};
+                        this._stats.meshJobsQueued++;
+
                         const dirs = ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
-                        for (const dir of dirs) {
-                            if (neighbors[dir]) {
-                                const nData = neighbors[dir].blocks || neighbors[dir];
-                                if (nData && nData.length > 0) {
-                                    neighborData[dir] = new Uint8Array(nData);
-                                }
+
+                        // Try to use SharedArrayBuffer path (zero-copy)
+                        if (this.useSharedMemory && this.sharedMemory && this.sharedMemory.enabled) {
+                            const useShared = this._trySharedMemoryMesh(
+                                jobId, cx, cz, chunkKey, chunkData, neighbors, dirs, uvMapData, maxFaces
+                            );
+                            if (useShared) {
+                                this._stats.sharedMemoryHits++;
+                                this._processQueue();
+                                return;
                             }
+                            this._stats.sharedMemoryMisses++;
+                            // Fall through to Transferable path
                         }
 
-                        // Collect all transferable buffers
-                        const transfer = [centerBlocks.buffer];
-                        if (centerSkyLight) transfer.push(centerSkyLight.buffer);
-                        if (centerBlockLight) transfer.push(centerBlockLight.buffer);
-                        for (const dir of dirs) {
-                            if (neighborData[dir]) {
-                                transfer.push(neighborData[dir].buffer);
-                            }
-                        }
-
-                        this.jobQueue.push({
-                            message: {
-                                type: 'mesh',
-                                jobId,
-                                cx,
-                                cz,
-                                centerBlocks,
-                                centerSkyLight,
-                                centerBlockLight,
-                                neighbors: neighborData,
-                                uvMapData,
-                                maxFaces,
-                                settingsAO: SETTINGS.AO,
-                                settingsWaterFogDensity: SETTINGS.waterFogDensity,
-                                settingsWaterColor: SETTINGS.waterColor
-                            },
-                            transfer: transfer
-                        });
-
+                        // Fallback: Transferable objects path (copies data)
+                        this._transferableMesh(jobId, cx, cz, chunkData, neighbors, dirs, uvMapData, maxFaces);
                         this._processQueue();
                     });
                 }
 
                 /**
-                 * Get pool statistics.
-                 * @returns {{poolSize: number, busyWorkers: number, queueLength: number, pendingJobs: number}} Pool stats.
+                 * Try to use SharedArrayBuffer for mesh generation (zero-copy).
+                 * @private
+                 * @returns {boolean} True if shared memory was used successfully.
                  */
-                getStats() {
-                    return {
-                        poolSize: this.poolSize,
-                        busyWorkers: this.workerBusy.filter(b => b).length,
-                        queueLength: this.jobQueue.length,
-                        pendingJobs: this.pendingJobs.size
-                    };
+                _trySharedMemoryMesh(jobId, cx, cz, chunkKey, chunkData, neighbors, dirs, uvMapData, maxFaces) {
+                    const sharedMem = this.sharedMemory;
+
+                    // Allocate center chunk
+                    const centerBlocks = chunkData.blocks || chunkData;
+                    const centerSkyLight = chunkData.skyLight || null;
+                    const centerBlockLight = chunkData.blockLight || null;
+
+                    const centerSlot = sharedMem.allocate(chunkKey, centerBlocks, centerSkyLight, centerBlockLight);
+                    if (centerSlot === -1) return false; // Allocation failed
+
+                    // Allocate neighbor chunks
+                    const neighborSlots = {};
+                    const allocatedSlots = [centerSlot];
+                    let allocationSuccess = true;
+
+                    for (const dir of dirs) {
+                        if (neighbors[dir]) {
+                            const nBlocks = neighbors[dir].blocks || neighbors[dir];
+                            const nSkyLight = neighbors[dir].skyLight || null;
+                            const nBlockLight = neighbors[dir].blockLight || null;
+
+                            // Generate neighbor key based on direction
+                            let ncx = cx, ncz = cz;
+                            if (dir.includes('n')) ncz -= 1;
+                            if (dir.includes('s')) ncz += 1;
+                            if (dir.includes('e')) ncx += 1;
+                            if (dir.includes('w')) ncx -= 1;
+                            const neighborKey = `${ncx},${ncz}`;
+
+                            const slot = sharedMem.allocate(neighborKey, nBlocks, nSkyLight, nBlockLight);
+                            if (slot === -1) {
+                                allocationSuccess = false;
+                                break;
+                            }
+                            neighborSlots[dir] = slot;
+                            allocatedSlots.push(slot);
+                        }
+                    }
+
+                    if (!allocationSuccess) {
+                        // Release all allocated slots and fall back to Transferable
+                        for (const slot of allocatedSlots) {
+                            sharedMem.release(slot);
+                        }
+                        return false;
+                    }
+
+                    // Track slots for release after job completes
+                    const pendingJob = this.pendingJobs.get(jobId);
+                    if (pendingJob) {
+                        pendingJob.sharedSlots = allocatedSlots;
+                    }
+
+                    // Queue job with slot offsets (no data copy!)
+                    this.jobQueue.push({
+                        message: {
+                            type: 'mesh',
+                            jobId,
+                            cx,
+                            cz,
+                            useSharedMemory: true,
+                            centerSlot,
+                            neighborSlots,
+                            uvMapData,
+                            maxFaces,
+                            settingsAO: SETTINGS.AO,
+                            settingsWaterFogDensity: SETTINGS.waterFogDensity,
+                            settingsWaterColor: SETTINGS.waterColor
+                        },
+                        transfer: [] // No transferables needed - data is in SharedArrayBuffer
+                    });
+
+                    return true;
                 }
 
                 /**
-                 * Terminate all workers.
+                 * Use Transferable objects for mesh generation (copies data).
+                 * @private
+                 */
+                _transferableMesh(jobId, cx, cz, chunkData, neighbors, dirs, uvMapData, maxFaces) {
+                    // Extract center chunk data - COPY buffers since we can't transfer data still in use
+                    const centerBlocks = chunkData.blocks
+                        ? new Uint8Array(chunkData.blocks)
+                        : new Uint8Array(chunkData);
+                    const centerSkyLight = chunkData.skyLight
+                        ? new Uint8Array(chunkData.skyLight)
+                        : null;
+                    const centerBlockLight = chunkData.blockLight
+                        ? new Uint8Array(chunkData.blockLight)
+                        : null;
+
+                    // Copy neighbor block data (can't transfer chunks still in use by main thread)
+                    const neighborData = {};
+                    for (const dir of dirs) {
+                        if (neighbors[dir]) {
+                            const nData = neighbors[dir].blocks || neighbors[dir];
+                            if (nData && nData.length > 0) {
+                                neighborData[dir] = new Uint8Array(nData);
+                            }
+                        }
+                    }
+
+                    // Collect all transferable buffers
+                    const transfer = [centerBlocks.buffer];
+                    if (centerSkyLight) transfer.push(centerSkyLight.buffer);
+                    if (centerBlockLight) transfer.push(centerBlockLight.buffer);
+                    for (const dir of dirs) {
+                        if (neighborData[dir]) {
+                            transfer.push(neighborData[dir].buffer);
+                        }
+                    }
+
+                    this.jobQueue.push({
+                        message: {
+                            type: 'mesh',
+                            jobId,
+                            cx,
+                            cz,
+                            useSharedMemory: false,
+                            centerBlocks,
+                            centerSkyLight,
+                            centerBlockLight,
+                            neighbors: neighborData,
+                            uvMapData,
+                            maxFaces,
+                            settingsAO: SETTINGS.AO,
+                            settingsWaterFogDensity: SETTINGS.waterFogDensity,
+                            settingsWaterColor: SETTINGS.waterColor
+                        },
+                        transfer: transfer
+                    });
+                }
+
+                /**
+                 * Cancel all pending jobs for a specific chunk.
+                 * Jobs already sent to workers will complete but results will be discarded.
+                 * @param {number} cx - Chunk X coordinate.
+                 * @param {number} cz - Chunk Z coordinate.
+                 * @returns {number} Number of jobs cancelled.
+                 */
+                cancelChunkJobs(cx, cz) {
+                    const chunkKey = `${cx},${cz}`;
+                    const entry = this.queuedChunks.get(chunkKey);
+                    if (!entry) return 0;
+
+                    let cancelled = 0;
+
+                    if (entry.terrainJobId !== null) {
+                        this.cancelledJobs.add(entry.terrainJobId);
+                        this._stats.terrainJobsCancelled++;
+                        cancelled++;
+                    }
+
+                    if (entry.meshJobId !== null) {
+                        this.cancelledJobs.add(entry.meshJobId);
+                        this._stats.meshJobsCancelled++;
+                        cancelled++;
+                    }
+
+                    this.queuedChunks.delete(chunkKey);
+                    return cancelled;
+                }
+
+                /**
+                 * Cancel all pending jobs outside a given radius from player chunk.
+                 * Useful when player teleports or moves quickly.
+                 * @param {number} playerCx - Player chunk X coordinate.
+                 * @param {number} playerCz - Player chunk Z coordinate.
+                 * @param {number} radius - Radius in chunks to keep.
+                 * @returns {number} Number of jobs cancelled.
+                 */
+                cancelJobsOutsideRadius(playerCx, playerCz, radius) {
+                    const radiusSq = radius * radius;
+                    let cancelled = 0;
+
+                    for (const [chunkKey, entry] of this.queuedChunks) {
+                        const [cx, cz] = chunkKey.split(',').map(Number);
+                        const distSq = (cx - playerCx) * (cx - playerCx) + (cz - playerCz) * (cz - playerCz);
+
+                        if (distSq > radiusSq) {
+                            cancelled += this.cancelChunkJobs(cx, cz);
+                        }
+                    }
+
+                    if (cancelled > 0) {
+                        logDebug(`[WorkerPool] Cancelled ${cancelled} jobs outside radius ${radius}`);
+                    }
+                    return cancelled;
+                }
+
+                /**
+                 * Get pool statistics including profiling data.
+                 * @returns {Object} Comprehensive pool stats.
+                 */
+                getStats() {
+                    const stats = {
+                        poolSize: this.poolSize,
+                        busyWorkers: this.workerBusy.filter(b => b).length,
+                        queueLength: this.jobQueue.length,
+                        pendingJobs: this.pendingJobs.size,
+                        queuedChunks: this.queuedChunks.size,
+                        // Profiling stats
+                        terrainJobsQueued: this._stats.terrainJobsQueued,
+                        terrainJobsCompleted: this._stats.terrainJobsCompleted,
+                        terrainJobsCancelled: this._stats.terrainJobsCancelled,
+                        terrainJobsDeduplicated: this._stats.terrainJobsDeduplicated,
+                        meshJobsQueued: this._stats.meshJobsQueued,
+                        meshJobsCompleted: this._stats.meshJobsCompleted,
+                        meshJobsCancelled: this._stats.meshJobsCancelled,
+                        meshJobsDeduplicated: this._stats.meshJobsDeduplicated,
+                        avgQueueWaitMs: this._stats.avgQueueWaitMs.toFixed(2),
+                        avgExecutionMs: this._stats.avgExecutionMs.toFixed(2),
+                        peakQueueLength: this._stats.peakQueueLength,
+                        // SharedArrayBuffer stats
+                        useSharedMemory: this.useSharedMemory,
+                        sharedMemoryHits: this._stats.sharedMemoryHits,
+                        sharedMemoryMisses: this._stats.sharedMemoryMisses
+                    };
+
+                    // Add shared memory pool stats if available
+                    if (this.sharedMemory && this.sharedMemory.enabled) {
+                        const memStats = this.sharedMemory.getStats();
+                        stats.sharedMemorySlots = `${memStats.usedSlots}/${memStats.maxSlots}`;
+                        stats.sharedMemoryMB = memStats.usedMB;
+                    }
+
+                    return stats;
+                }
+
+                /**
+                 * Reset profiling statistics.
+                 */
+                resetStats() {
+                    this._stats.terrainJobsQueued = 0;
+                    this._stats.terrainJobsCompleted = 0;
+                    this._stats.terrainJobsCancelled = 0;
+                    this._stats.terrainJobsDeduplicated = 0;
+                    this._stats.meshJobsQueued = 0;
+                    this._stats.meshJobsCompleted = 0;
+                    this._stats.meshJobsCancelled = 0;
+                    this._stats.meshJobsDeduplicated = 0;
+                    this._stats.totalQueueWaitMs = 0;
+                    this._stats.totalExecutionMs = 0;
+                    this._stats.avgQueueWaitMs = 0;
+                    this._stats.avgExecutionMs = 0;
+                    this._stats.peakQueueLength = 0;
+                }
+
+                /**
+                 * Terminate all workers and clean up shared memory.
                  */
                 terminate() {
                     for (const worker of this.workers) {
@@ -20485,9 +21078,257 @@
                     this.workers = [];
                     this.jobQueue = [];
                     this.pendingJobs.clear();
+                    this.queuedChunks.clear();
+                    this.cancelledJobs.clear();
+
+                    // Clear shared memory
+                    if (this.sharedMemory) {
+                        this.sharedMemory.clear();
+                        this.sharedMemory = null;
+                        sharedChunkMemory = null;
+                    }
+
                     logDebug('[WorkerPool] Terminated all workers');
                 }
             }
+
+            // =====================================================
+            // SHAREDARRAYBUFFER FOR TRUE ZERO-COPY WORKER DATA
+            // =====================================================
+            // Requirements: crossOriginIsolated === true (COOP/COEP headers)
+            // Falls back to Transferable objects when not available.
+
+            /**
+             * Check if SharedArrayBuffer is available and usable.
+             * Requires crossOriginIsolated context (COOP/COEP headers).
+             * @returns {boolean} True if SharedArrayBuffer can be used.
+             */
+            function canUseSharedArrayBuffer() {
+                return typeof SharedArrayBuffer !== 'undefined' &&
+                       typeof self !== 'undefined' &&
+                       self.crossOriginIsolated === true;
+            }
+
+            // Cache the check result (won't change during session)
+            const SHARED_ARRAY_BUFFER_AVAILABLE = canUseSharedArrayBuffer();
+
+            /**
+             * SharedChunkMemory - Manages a pool of SharedArrayBuffer memory for chunk data.
+             * Allows workers to read chunk data directly without copying.
+             * Uses slot-based allocation with reference counting.
+             */
+            class SharedChunkMemory {
+                /**
+                 * Create a shared memory pool for chunks.
+                 * @param {number} [maxSlots=128] - Maximum number of chunk slots.
+                 */
+                constructor(maxSlots = 128) {
+                    if (!SHARED_ARRAY_BUFFER_AVAILABLE) {
+                        this.enabled = false;
+                        logDebug('[SharedMem] SharedArrayBuffer not available (crossOriginIsolated: ' +
+                                 (typeof self !== 'undefined' ? self.crossOriginIsolated : 'N/A') + ')');
+                        return;
+                    }
+
+                    this.enabled = true;
+                    this.maxSlots = maxSlots;
+
+                    // Each slot holds: blocks (81920) + skyLight (81920) + blockLight (81920) = 245760 bytes
+                    this.CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight;
+                    this.SLOT_SIZE = this.CHUNK_DATA_SIZE * 3; // blocks + skyLight + blockLight
+
+                    // Main shared memory buffer for all chunk data
+                    this.sharedBuffer = new SharedArrayBuffer(this.SLOT_SIZE * maxSlots);
+                    this.dataView = new Uint8Array(this.sharedBuffer);
+
+                    // Slot management (not shared - main thread only)
+                    this.slotToChunk = new Map();  // slotIndex -> chunkKey
+                    this.chunkToSlot = new Map();  // chunkKey -> slotIndex
+                    this.slotRefCount = new Uint8Array(maxSlots); // Reference count per slot
+                    this.freeSlots = [];
+                    for (let i = maxSlots - 1; i >= 0; i--) {
+                        this.freeSlots.push(i);
+                    }
+
+                    // Statistics
+                    this._stats = {
+                        allocations: 0,
+                        deallocations: 0,
+                        hits: 0,
+                        misses: 0,
+                        evictions: 0
+                    };
+
+                    logDebug(`[SharedMem] Initialized with ${maxSlots} slots (${(this.SLOT_SIZE * maxSlots / 1024 / 1024).toFixed(1)} MB)`);
+                }
+
+                /**
+                 * Get the shared buffer for passing to workers.
+                 * @returns {SharedArrayBuffer|null}
+                 */
+                getSharedBuffer() {
+                    return this.enabled ? this.sharedBuffer : null;
+                }
+
+                /**
+                 * Allocate a slot for a chunk and copy data into shared memory.
+                 * @param {string} key - Chunk key.
+                 * @param {Uint8Array} blocks - Block data.
+                 * @param {Uint8Array|null} skyLight - Sky light data.
+                 * @param {Uint8Array|null} blockLight - Block light data.
+                 * @returns {number} Slot index, or -1 if allocation failed.
+                 */
+                allocate(key, blocks, skyLight, blockLight) {
+                    if (!this.enabled) return -1;
+
+                    // Check if already allocated
+                    if (this.chunkToSlot.has(key)) {
+                        const slot = this.chunkToSlot.get(key);
+                        this.slotRefCount[slot]++;
+                        this._stats.hits++;
+                        return slot;
+                    }
+
+                    this._stats.misses++;
+
+                    // Get a free slot
+                    let slot = this.freeSlots.pop();
+                    if (slot === undefined) {
+                        // No free slots - try to evict unreferenced slot
+                        slot = this._evictUnreferencedSlot();
+                        if (slot === -1) {
+                            logDebug('[SharedMem] No slots available for allocation');
+                            return -1;
+                        }
+                    }
+
+                    // Copy data into shared memory
+                    const baseOffset = slot * this.SLOT_SIZE;
+                    this.dataView.set(blocks, baseOffset);
+                    if (skyLight) {
+                        this.dataView.set(skyLight, baseOffset + this.CHUNK_DATA_SIZE);
+                    }
+                    if (blockLight) {
+                        this.dataView.set(blockLight, baseOffset + this.CHUNK_DATA_SIZE * 2);
+                    }
+
+                    // Track allocation
+                    this.slotToChunk.set(slot, key);
+                    this.chunkToSlot.set(key, slot);
+                    this.slotRefCount[slot] = 1;
+                    this._stats.allocations++;
+
+                    return slot;
+                }
+
+                /**
+                 * Release a reference to a slot.
+                 * Slot becomes eligible for eviction when refCount reaches 0.
+                 * @param {number} slot - Slot index.
+                 */
+                release(slot) {
+                    if (!this.enabled || slot < 0 || slot >= this.maxSlots) return;
+                    if (this.slotRefCount[slot] > 0) {
+                        this.slotRefCount[slot]--;
+                    }
+                }
+
+                /**
+                 * Release a chunk by key.
+                 * @param {string} key - Chunk key.
+                 */
+                releaseByKey(key) {
+                    if (!this.enabled) return;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot !== undefined) {
+                        this.release(slot);
+                    }
+                }
+
+                /**
+                 * Deallocate a chunk completely (remove from shared memory).
+                 * @param {string} key - Chunk key.
+                 */
+                deallocate(key) {
+                    if (!this.enabled) return;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot === undefined) return;
+
+                    this.chunkToSlot.delete(key);
+                    this.slotToChunk.delete(slot);
+                    this.slotRefCount[slot] = 0;
+                    this.freeSlots.push(slot);
+                    this._stats.deallocations++;
+                }
+
+                /**
+                 * Get slot info for a chunk (for passing to worker).
+                 * @param {string} key - Chunk key.
+                 * @returns {{slot: number, offset: number, size: number}|null}
+                 */
+                getSlotInfo(key) {
+                    if (!this.enabled) return null;
+                    const slot = this.chunkToSlot.get(key);
+                    if (slot === undefined) return null;
+                    return {
+                        slot,
+                        offset: slot * this.SLOT_SIZE,
+                        blockSize: this.CHUNK_DATA_SIZE
+                    };
+                }
+
+                /**
+                 * Evict an unreferenced slot for reuse.
+                 * @private
+                 * @returns {number} Evicted slot index, or -1 if none available.
+                 */
+                _evictUnreferencedSlot() {
+                    for (let i = 0; i < this.maxSlots; i++) {
+                        if (this.slotRefCount[i] === 0 && this.slotToChunk.has(i)) {
+                            const key = this.slotToChunk.get(i);
+                            this.chunkToSlot.delete(key);
+                            this.slotToChunk.delete(i);
+                            this._stats.evictions++;
+                            return i;
+                        }
+                    }
+                    return -1;
+                }
+
+                /**
+                 * Get memory statistics.
+                 * @returns {Object}
+                 */
+                getStats() {
+                    const usedSlots = this.maxSlots - this.freeSlots.length;
+                    return {
+                        enabled: this.enabled,
+                        maxSlots: this.maxSlots,
+                        usedSlots,
+                        freeSlots: this.freeSlots.length,
+                        memoryMB: (this.SLOT_SIZE * this.maxSlots / 1024 / 1024).toFixed(1),
+                        usedMB: (this.SLOT_SIZE * usedSlots / 1024 / 1024).toFixed(1),
+                        ...this._stats
+                    };
+                }
+
+                /**
+                 * Clear all allocations.
+                 */
+                clear() {
+                    if (!this.enabled) return;
+                    this.slotToChunk.clear();
+                    this.chunkToSlot.clear();
+                    this.slotRefCount.fill(0);
+                    this.freeSlots.length = 0;
+                    for (let i = this.maxSlots - 1; i >= 0; i--) {
+                        this.freeSlots.push(i);
+                    }
+                }
+            }
+
+            // Global shared memory instance (initialized with worker pool)
+            let sharedChunkMemory = null;
 
             // Global worker pool instance (initialized after game starts)
             let chunkWorkerPool = null;
@@ -23924,7 +24765,7 @@
                     releaseMeshForKey(key); // Dispose and remove old mesh
                     // Add to build queue to be re-rendered with new settings
                     const [cx, cz] = key.split(",").map(Number);
-                    if (!chunkBuildQueue.some((q) => q.key === key)) { chunkBuildQueue.push({ key, cx, cz, priority: 1 }); }
+                    if (!chunkBuildQueue.has(key)) { chunkBuildQueue.insert(key, cx, cz, 1, false); }
                 }
             }
             function rebuildTorchLightingForActiveChunks() {
@@ -24421,13 +25262,21 @@ self.onmessage = async (e) => {
 
             /**
              * ChunkDiskStorage - Manages chunk data persistence via OPFS.
-             * Uses a Web Worker for synchronous file I/O operations.
+             * Uses a pool of Web Workers for parallel file I/O operations.
+             * Chunks are partitioned across workers by key hash for consistency.
              */
             class ChunkDiskStorage {
-                constructor() {
-                    /** @type {Worker|null} */
-                    this.worker = null;
-                    /** @type {Map<number, {resolve: Function, reject: Function}>} */
+                /**
+                 * Create OPFS storage with worker pool.
+                 * @param {number} [poolSize=2] - Number of workers in pool (1-4).
+                 */
+                constructor(poolSize = 2) {
+                    // Clamp pool size to reasonable range
+                    this.poolSize = Math.min(4, Math.max(1, poolSize));
+
+                    /** @type {Worker[]} */
+                    this.workers = [];
+                    /** @type {Map<number, {resolve: Function, reject: Function, workerIdx: number}>} */
                     this.pending = new Map();
                     /** @type {number} */
                     this.nextId = 0;
@@ -24447,12 +25296,28 @@ self.onmessage = async (e) => {
                         deletes: 0,
                         bytesWritten: 0,
                         bytesRead: 0,
-                        errors: 0
+                        errors: 0,
+                        // Per-worker stats
+                        workerOps: new Array(this.poolSize).fill(0)
                     };
                 }
 
                 /**
-                 * Initialize the OPFS worker and storage.
+                 * Hash a chunk key to determine which worker handles it.
+                 * Ensures consistent worker assignment for the same key.
+                 * @param {string} key - Chunk key like "5,-3"
+                 * @returns {number} Worker index (0 to poolSize-1)
+                 */
+                _hashKey(key) {
+                    let hash = 0;
+                    for (let i = 0; i < key.length; i++) {
+                        hash = ((hash << 5) - hash + key.charCodeAt(i)) | 0;
+                    }
+                    return Math.abs(hash) % this.poolSize;
+                }
+
+                /**
+                 * Initialize the OPFS worker pool and storage.
                  * @returns {Promise<boolean>} True if initialization successful
                  */
                 async init() {
@@ -24467,36 +25332,52 @@ self.onmessage = async (e) => {
                     }
 
                     try {
-                        // Create worker from inline code
+                        // Create worker pool from inline code
                         const blob = new Blob([OPFS_WORKER_CODE], { type: 'application/javascript' });
                         const workerUrl = URL.createObjectURL(blob);
-                        this.worker = new Worker(workerUrl);
 
-                        // Set up message handler
-                        this.worker.onmessage = (e) => {
-                            const { id, success, result, error } = e.data;
-                            const pending = this.pending.get(id);
-                            if (pending) {
-                                this.pending.delete(id);
-                                if (success) {
-                                    pending.resolve(result);
-                                } else {
-                                    this._stats.errors++;
-                                    pending.reject(new Error(error));
+                        const initPromises = [];
+
+                        for (let i = 0; i < this.poolSize; i++) {
+                            const worker = new Worker(workerUrl);
+                            const workerIdx = i;
+
+                            // Set up message handler for this worker
+                            worker.onmessage = (e) => {
+                                const { id, success, result, error } = e.data;
+                                const pending = this.pending.get(id);
+                                if (pending) {
+                                    this.pending.delete(id);
+                                    this._stats.workerOps[pending.workerIdx]++;
+                                    if (success) {
+                                        pending.resolve(result);
+                                    } else {
+                                        this._stats.errors++;
+                                        pending.reject(new Error(error));
+                                    }
                                 }
-                            }
-                        };
+                            };
 
-                        this.worker.onerror = (e) => {
-                            logDebug('[OPFS] Worker error:', e.message);
-                            this._stats.errors++;
-                        };
+                            worker.onerror = (e) => {
+                                logDebug(`[OPFS] Worker ${workerIdx} error:`, e.message);
+                                this._stats.errors++;
+                            };
 
-                        // Initialize OPFS in worker
-                        const initResult = await this._request('init');
-                        if (!initResult) {
-                            throw new Error('Worker init returned false');
+                            this.workers.push(worker);
+
+                            // Initialize this worker
+                            initPromises.push(this._requestToWorker(i, 'init'));
                         }
+
+                        // Wait for all workers to initialize
+                        const results = await Promise.all(initPromises);
+                        const allInitialized = results.every(r => r === true);
+
+                        if (!allInitialized) {
+                            throw new Error('One or more OPFS workers failed to initialize');
+                        }
+
+                        URL.revokeObjectURL(workerUrl);
 
                         this.ready = true;
                         this.supported = true;
@@ -24506,29 +25387,33 @@ self.onmessage = async (e) => {
                     } catch (e) {
                         logDebug('[OPFS] Initialization failed:', e.message);
                         this.initFailed = true;
-                        if (this.worker) {
-                            this.worker.terminate();
-                            this.worker = null;
+                        // Terminate any workers that were created
+                        for (const worker of this.workers) {
+                            worker.terminate();
                         }
+                        this.workers = [];
                         return false;
                     }
                 }
 
                 /**
-                 * Send a request to the worker and wait for response.
+                 * Send a request to a specific worker and wait for response.
+                 * @private
+                 * @param {number} workerIdx - Worker index
                  * @param {string} type - Request type
                  * @param {string|null} [key=null] - Chunk key
                  * @param {ArrayBuffer|Uint8Array|null} [data=null] - Data for write operations
                  * @returns {Promise<*>} Result from worker
                  */
-                _request(type, key = null, data = null) {
-                    if (!this.worker && type !== 'init') {
-                        return Promise.reject(new Error('OPFS not initialized'));
+                _requestToWorker(workerIdx, type, key = null, data = null) {
+                    const worker = this.workers[workerIdx];
+                    if (!worker) {
+                        return Promise.reject(new Error(`OPFS worker ${workerIdx} not available`));
                     }
 
                     return new Promise((resolve, reject) => {
                         const id = this.nextId++;
-                        this.pending.set(id, { resolve, reject });
+                        this.pending.set(id, { resolve, reject, workerIdx });
 
                         // Transfer ArrayBuffer if provided (zero-copy)
                         const transfer = [];
@@ -24538,8 +25423,26 @@ self.onmessage = async (e) => {
                             transfer.push(data.buffer);
                         }
 
-                        this.worker.postMessage({ type, key, data, id }, transfer);
+                        worker.postMessage({ type, key, data, id }, transfer);
                     });
+                }
+
+                /**
+                 * Send a request to the appropriate worker based on chunk key.
+                 * @param {string} type - Request type
+                 * @param {string|null} [key=null] - Chunk key
+                 * @param {ArrayBuffer|Uint8Array|null} [data=null] - Data for write operations
+                 * @returns {Promise<*>} Result from worker
+                 */
+                _request(type, key = null, data = null) {
+                    if (this.workers.length === 0 && type !== 'init') {
+                        return Promise.reject(new Error('OPFS not initialized'));
+                    }
+
+                    // For key-based operations, route to specific worker
+                    // For global operations (list, clear, stats), use first worker
+                    const workerIdx = key ? this._hashKey(key) : 0;
+                    return this._requestToWorker(workerIdx, type, key, data);
                 }
 
                 /**
@@ -24656,9 +25559,11 @@ self.onmessage = async (e) => {
 
                     return {
                         ...this._stats,
+                        poolSize: this.poolSize,
                         hitRate: `${hitRate}%`,
                         bytesWrittenMB: (this._stats.bytesWritten / (1024 * 1024)).toFixed(2),
-                        bytesReadMB: (this._stats.bytesRead / (1024 * 1024)).toFixed(2)
+                        bytesReadMB: (this._stats.bytesRead / (1024 * 1024)).toFixed(2),
+                        workerOps: [...this._stats.workerOps]
                     };
                 }
 
@@ -37113,7 +38018,25 @@ self.onmessage = async (e) => {
                             totalChecked++;
                             if (!isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir)) { culled++; continue; }
                             neededKeys.add(key);
-                            if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) { needed.push({ key, cx, cz, dist: distSq }); }
+                            if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) {
+                                // FRUSTUM-BASED PRIORITY BOOST: Chunks aligned with view direction get higher priority
+                                // Calculate dot product between chunk direction and camera direction
+                                let effectiveDist = distSq;
+                                if (hasHorizontalCameraDir && distSq > 1) {
+                                    const chunkDirLen = Math.sqrt(distSq);
+                                    const normDx = dx / chunkDirLen;
+                                    const normDz = dz / chunkDirLen;
+                                    // Dot product: 1 = directly ahead, -1 = behind, 0 = perpendicular
+                                    const dot = normDx * normCamX + normDz * normCamZ;
+                                    // Boost chunks ahead (dot > 0.5) by reducing effective distance by up to 50%
+                                    // dot of 1.0 = 50% reduction, dot of 0.5 = 0% reduction
+                                    if (dot > 0.5) {
+                                        const boost = (dot - 0.5) * 2; // 0 to 1 range
+                                        effectiveDist = distSq * (1 - boost * 0.5);
+                                    }
+                                }
+                                needed.push({ key, cx, cz, dist: effectiveDist });
+                            }
                         }
                     }
                     // Refresh cache snapshot when recomputed
@@ -37179,14 +38102,18 @@ self.onmessage = async (e) => {
                 // Double check using the fast Set lookup
                 for (const job of needed) {
                     if (!queuedChunkKeys.has(job.key)) {
-                        chunkBuildQueue.push(job);
+                        const isDirty = dirtyChunks.has(job.key);
+                        chunkBuildQueue.insert(job.key, job.cx, job.cz, job.dist, isDirty);
                         queuedChunkKeys.add(job.key);
                         chunkDataPool.setMeshState(job.key, MESH_STATE.QUEUED);
                     }
                 }
                 // Optional: Clean queue set occasionally to prevent memory leaks
                 // (if chunks are cancelled but remain in set)
-                if (queuedChunkKeys.size > chunkBuildQueue.length * 2) { queuedChunkKeys.clear(); chunkBuildQueue.forEach((j) => queuedChunkKeys.add(j.key)); }
+                if (queuedChunkKeys.size > chunkBuildQueue.length * 2) {
+                    queuedChunkKeys.clear();
+                    for (const job of chunkBuildQueue.heap) { queuedChunkKeys.add(job.key); }
+                }
                 // --- 7B. Smart Memory Management (throttled to 1s interval) ---
                 // Only run memory checks periodically to reduce CPU usage when idle
                 if (needsMemoryCheck) {
@@ -37235,35 +38162,8 @@ self.onmessage = async (e) => {
                 const initialQueueLength = chunkBuildQueue.length;
                 let inspected = 0;
                 heartbeatChunkUpdates();
-                // --- PRIORITY: Sort queue by distance (closest chunks first) ---
-                // Calculate player chunk position for distance sorting
-                if (chunkBuildQueue.length > 1 && controls && controls.getObject) {
-                    const playerPos = getPlayerWorldPosition();
-                    const playerChunkX = Math.floor(playerPos.x / WORLD_DIMS.chunkSize);
-                    const playerChunkZ = Math.floor(playerPos.z / WORLD_DIMS.chunkSize);
-                    // Update distance for all jobs and sort by distance (closest first)
-                    for (const job of chunkBuildQueue) {
-                        if (typeof job.cx !== "number" || typeof job.cz !== "number") {
-                            if (job.key) {
-                                const [jcX, jcZ] = job.key.split(",").map(Number);
-                                job.cx = jcX;
-                                job.cz = jcZ;
-                            }
-                        }
-                        if (typeof job.cx === "number" && typeof job.cz === "number") {
-                            job.dist = (job.cx - playerChunkX) * (job.cx - playerChunkX) + (job.cz - playerChunkZ) * (job.cz - playerChunkZ);
-                        }
-                    }
-                    chunkBuildQueue.sort((a, b) => {
-                        const distA = a.dist || 0;
-                        const distB = b.dist || 0;
-                        // Dirty chunks (block changes) get highest priority
-                        if (dirtyChunks.has(a.key) && !dirtyChunks.has(b.key)) return -1;
-                        if (dirtyChunks.has(b.key) && !dirtyChunks.has(a.key)) return 1;
-                        // Then sort by distance (closer = higher priority)
-                        return distA - distB;
-                    });
-                }
+                // NOTE: Priority queue is self-sorting (min-heap), no need for explicit sort.
+                // Priority is set at insertion time based on distance and dirty status.
                 // OPTIMIZATION: Use frame budget to limit chunk builds
                 // Reserve 5ms for chunk building (more conservative to prevent frame spikes)
                 const CHUNK_BUILD_BUDGET_MS = 5;
@@ -37293,14 +38193,17 @@ self.onmessage = async (e) => {
                         break;
                     }
                     inspected++;
-                    const job = chunkBuildQueue.shift();
+                    const job = chunkBuildQueue.extract();
                     if (!job) continue;
-                    if (!job.key) job.key = getChunkKey(job.cx, job.cz);
-                    if (typeof job.cx !== "number" || typeof job.cz !== "number") { const [jcX, jcZ] = job.key.split(",").map(Number); job.cx = jcX; job.cz = jcZ; }
                     const jobCx = job.cx;
                     const jobCz = job.cz;
-                    const allowLightingBypass = job.allowLightingBypass || forceLightingBypassKeys.has(job.key);
-                    if (chunkOrNeighborsPending(jobCx, jobCz) && !allowLightingBypass) { chunkBuildQueue.push(job); if (isDebug && dirtyChunks.has(job.key)) { logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`); } continue; }
+                    const allowLightingBypass = forceLightingBypassKeys.has(job.key);
+                    if (chunkOrNeighborsPending(jobCx, jobCz) && !allowLightingBypass) {
+                        // Re-insert deferred job with slightly lower priority (add 1 to delay it)
+                        chunkBuildQueue.insert(job.key, job.cx, job.cz, job.priority + 1, job.dirty);
+                        if (isDebug && job.dirty) { logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`); }
+                        continue;
+                    }
                     if (processed.has(job.key)) continue;
                     const isDirty = dirtyChunks.has(job.key);
                     if (!isDirty && chunkMeshes.has(job.key)) continue;
@@ -37314,7 +38217,8 @@ self.onmessage = async (e) => {
                     // momentarily during mesh rebuild. Old mesh stays visible until new mesh is ready.
                     if (isDirty) { dirtyChunks.delete(job.key); }
                     // OPTIMIZATION: Pass distance for LOD calculation
-                    const jobDistSq = job.dist || 0;
+                    // Priority = distance for normal jobs, distance - 1000000 for dirty jobs
+                    const jobDistSq = job.dirty ? job.priority + 1000000 : job.priority;
                     // Use worker mesh generation if enabled, otherwise fall back to sync
                     if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
                         await renderChunkAsync(jobCx, jobCz, jobDistSq);
