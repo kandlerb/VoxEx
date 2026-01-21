@@ -6074,16 +6074,18 @@
             import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
             import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 
-            // === WebGPU Migration Phase 2 ===
-            // TSL (Three.js Shading Language) imports for WebGPU-native post-processing
+            // === WebGPU Migration Phase 2 & 3 ===
+            // TSL (Three.js Shading Language) imports for WebGPU-native post-processing and materials
             import {
                 pass, uniform, Fn,
                 vec2, vec3, vec4, float, int,
                 uv, length, smoothstep, mix, dot, exp, sin, cos,
-                clamp, max, min, step, abs, fract, floor,
+                clamp, max, min, step, abs, fract, floor, pow, normalize, mod,
                 texture, textureLoad,
                 If, select, Loop,
-                positionWorld, cameraPosition
+                positionWorld, positionLocal, positionView, cameraPosition,
+                pointUV, attribute,
+                MeshBasicNodeMaterial, PointsNodeMaterial
             } from "three/tsl";
             // PostProcessing for TSL-based effect chain
             import { PostProcessing } from "three/addons/tsl/display/PostProcessing.js";
@@ -15836,6 +15838,51 @@
                         blending: THREE.NormalBlending
                     });
 
+                    // === WebGPU Migration Phase 3.2: TSL Particle Material ===
+                    // Create TSL-based particle material using PointsNodeMaterial
+                    const particleTimeUniform = uniform(0.0);
+
+                    this.materialTSL = new PointsNodeMaterial({
+                        transparent: true,
+                        depthWrite: false,
+                        blending: THREE.NormalBlending
+                    });
+
+                    // Get attributes (set on BufferGeometry)
+                    const particleSize = attribute('size');
+                    const particleColor = attribute('color'); // vec4
+
+                    // Point size calculation: size * (300.0 / -mvPosition.z)
+                    this.materialTSL.sizeNode = (() => {
+                        const depth = positionView.z.negate();
+                        return particleSize.mul(float(300.0).div(depth));
+                    })();
+
+                    // Color/fragment calculation with Chebyshev distance for square shape
+                    this.materialTSL.colorNode = (() => {
+                        // gl_PointCoord equivalent in TSL is pointUV
+                        const center = pointUV.sub(vec2(0.5, 0.5));
+
+                        // Chebyshev distance for square shape: max(abs(x), abs(y))
+                        const dist = max(abs(center.x), abs(center.y));
+
+                        // Sharp square edges with fade at boundary
+                        // Discard handled by setting alpha to 0 for dist > 0.5
+                        const insideSquare = step(dist, float(0.5));
+                        const edgeAlpha = float(1.0).sub(smoothstep(float(0.4), float(0.5), dist));
+                        const finalAlpha = particleColor.a.mul(edgeAlpha).mul(insideSquare);
+
+                        return vec4(particleColor.r, particleColor.g, particleColor.b, finalAlpha);
+                    })();
+
+                    // Store TSL uniform reference
+                    this.uniformsTSL = {
+                        time: particleTimeUniform
+                    };
+
+                    // Store TSL material reference
+                    window.particleMaterialTSL = this.materialTSL;
+
                     this.mesh = new THREE.Points(this.geometry, this.material);
                     this.mesh.frustumCulled = false;
                     this.scene.add(this.mesh);
@@ -16318,11 +16365,67 @@
                         blending: THREE.AdditiveBlending
                     });
 
+                    // === WebGPU Migration Phase 3.3: TSL Star Material ===
+                    // Create TSL uniforms for this star layer
+                    const starTimeUniform = uniform(0.0);
+                    const starVisibilityUniform = uniform(0.0);
+                    const starTwinkleSpeedUniform = uniform(config.twinkle);
+                    const starBrightnessUniform = uniform(config.brightness);
+
+                    const materialTSL = new PointsNodeMaterial({
+                        transparent: true,
+                        depthWrite: false,
+                        depthTest: true,
+                        blending: THREE.AdditiveBlending
+                    });
+
+                    // Get attributes
+                    const starSize = attribute('size');
+                    const starColor = attribute('color'); // vec3
+                    const twinklePhaseAttr = attribute('twinklePhase');
+
+                    // Point size calculation
+                    materialTSL.sizeNode = (() => {
+                        const depth = positionView.z.negate();
+                        return starSize.mul(float(400.0).div(depth));
+                    })();
+
+                    // Color with twinkle animation
+                    materialTSL.colorNode = (() => {
+                        // Twinkle calculation: 0.7 + 0.3 * sin(time * twinkleSpeed + phase)
+                        const twinkle = float(0.7).add(
+                            float(0.3).mul(sin(starTimeUniform.mul(starTwinkleSpeedUniform).add(twinklePhaseAttr)))
+                        );
+                        const alpha = starVisibilityUniform.mul(twinkle).mul(1.2);
+
+                        // Color with brightness boost
+                        const boostedColor = starColor.mul(starBrightnessUniform).mul(1.5);
+
+                        // Chebyshev distance for square shape
+                        const center = pointUV.sub(vec2(0.5, 0.5));
+                        const dist = max(abs(center.x), abs(center.y));
+
+                        // Square edge handling
+                        const insideSquare = step(dist, float(0.5));
+                        const edgeAlpha = float(1.0).sub(smoothstep(float(0.35), float(0.5), dist));
+                        const finalAlpha = alpha.mul(edgeAlpha).mul(insideSquare);
+
+                        return vec4(boostedColor, finalAlpha);
+                    })();
+
+                    // Store TSL uniforms for this layer
+                    const uniformsTSL = {
+                        time: starTimeUniform,
+                        visibility: starVisibilityUniform,
+                        twinkleSpeed: starTwinkleSpeedUniform,
+                        brightness: starBrightnessUniform
+                    };
+
                     const stars = new THREE.Points(geometry, material);
                     stars.renderOrder = -100 + layerIdx;  // Render FIRST (background), before everything else
                     theScene.add(stars);
 
-                    starLayers.push({ mesh: stars, material, geometry, layerIndex: layerIdx });
+                    starLayers.push({ mesh: stars, material, materialTSL, uniformsTSL, geometry, layerIndex: layerIdx });
                 }
 
                 return starLayers.length > 0 ? starLayers[0] : null;
@@ -16345,6 +16448,11 @@
                     if (layer.material && layer.material.uniforms) {
                         layer.material.uniforms.time.value = time * 0.001;
                         layer.material.uniforms.visibility.value = visibility;
+                    }
+                    // === WebGPU Migration Phase 3.3: Sync TSL star uniforms ===
+                    if (layer.uniformsTSL) {
+                        layer.uniformsTSL.time.value = time * 0.001;
+                        layer.uniformsTSL.visibility.value = visibility;
                     }
                     // Make stars follow the camera so they're always at the same relative distance
                     if (layer.mesh && cameraPosition) {
@@ -16513,11 +16621,95 @@
                     blending: THREE.NormalBlending
                 });
 
+                // === WebGPU Migration Phase 3.4: TSL Cloud Material ===
+                // Create TSL uniforms for cloud material
+                const cloudTimeUniform = uniform(0.0);
+                const cloudSpeedUniform = uniform(SETTINGS.cloudSpeed);
+                const cloudPlayerPosUniform = uniform(new THREE.Vector3(0, 0, 0));
+                const cloudDayNightFactorUniform = uniform(1.0);
+
+                const materialTSL = new PointsNodeMaterial({
+                    transparent: true,
+                    depthWrite: false,
+                    depthTest: true,
+                    blending: THREE.NormalBlending
+                });
+
+                // Get attributes
+                const cloudSize = attribute('size');
+                const cloudAlpha = attribute('alpha');
+                const driftPhaseAttr = attribute('driftPhase');
+
+                // Position with drift animation and player-relative wrapping
+                // Note: TSL positionNode modifies vertex positions
+                materialTSL.positionNode = (() => {
+                    let pos = positionLocal;
+
+                    // Drift animation
+                    const driftX = sin(cloudTimeUniform.mul(cloudSpeedUniform).add(driftPhaseAttr)).mul(5.0);
+                    const driftZ = cloudTimeUniform.mul(cloudSpeedUniform).mul(10.0);
+
+                    // Apply drift
+                    const driftedX = pos.x.add(driftX);
+                    const driftedZ = pos.z.add(driftZ);
+
+                    // Wrap around player (mod operation)
+                    // pos.x = mod(pos.x - playerPos.x + 400.0, 800.0) - 400.0 + playerPos.x
+                    const wrappedX = mod(driftedX.sub(cloudPlayerPosUniform.x).add(400.0), float(800.0)).sub(400.0).add(cloudPlayerPosUniform.x);
+                    const wrappedZ = mod(driftedZ.sub(cloudPlayerPosUniform.z).add(400.0), float(800.0)).sub(400.0).add(cloudPlayerPosUniform.z);
+
+                    return vec3(wrappedX, pos.y, wrappedZ);
+                })();
+
+                // Point size calculation
+                materialTSL.sizeNode = (() => {
+                    const depth = positionView.z.negate();
+                    return cloudSize.mul(float(300.0).div(depth));
+                })();
+
+                // Color with day/night transition
+                materialTSL.colorNode = (() => {
+                    const dayColor = vec3(0.95, 0.95, 1.0);
+                    const darkNightColor = vec3(0.02, 0.03, 0.05);
+
+                    // Squared factor for faster color transition
+                    const colorFactor = cloudDayNightFactorUniform.mul(cloudDayNightFactorUniform);
+                    const cloudColor = mix(darkNightColor, dayColor, colorFactor);
+
+                    // Alpha with squared falloff at night
+                    const alphaFactor = cloudDayNightFactorUniform.mul(cloudDayNightFactorUniform);
+                    const baseAlpha = cloudAlpha.mul(alphaFactor).mul(0.9);
+
+                    // Chebyshev distance for square shape
+                    const center = pointUV.sub(vec2(0.5, 0.5));
+                    const dist = max(abs(center.x), abs(center.y));
+
+                    // Square edge handling
+                    const insideSquare = step(dist, float(0.5));
+                    const edgeSoftness = float(1.0).sub(smoothstep(float(0.3), float(0.5), dist));
+
+                    // Internal shading for depth: 0.9 + 0.1 * (1.0 - dist * 2.0)
+                    const shading = float(0.9).add(float(0.1).mul(float(1.0).sub(dist.mul(2.0))));
+                    const shadedColor = cloudColor.mul(shading);
+
+                    const finalAlpha = baseAlpha.mul(edgeSoftness).mul(insideSquare);
+
+                    return vec4(shadedColor, finalAlpha);
+                })();
+
+                // Store TSL uniforms
+                const uniformsTSL = {
+                    time: cloudTimeUniform,
+                    cloudSpeed: cloudSpeedUniform,
+                    playerPos: cloudPlayerPosUniform,
+                    dayNightFactor: cloudDayNightFactorUniform
+                };
+
                 const clouds = new THREE.Points(geometry, material);
                 clouds.renderOrder = -50;  // Render after stars (-100) but before terrain (0)
                 theScene.add(clouds);
 
-                cloudParticles = { mesh: clouds, material, geometry };
+                cloudParticles = { mesh: clouds, material, materialTSL, uniformsTSL, geometry };
                 return cloudParticles;
             }
 
@@ -16553,6 +16745,15 @@
                     }
                 }
                 cloudParticles.material.uniforms.dayNightFactor.value = dayNightFactor;
+
+                // === WebGPU Migration Phase 3.4: Sync TSL cloud uniforms ===
+                if (cloudParticles.uniformsTSL) {
+                    cloudParticles.uniformsTSL.time.value = time * 0.001;
+                    cloudParticles.uniformsTSL.dayNightFactor.value = dayNightFactor;
+                    if (playerPos) {
+                        cloudParticles.uniformsTSL.playerPos.value.copy(playerPos);
+                    }
+                }
 
                 // Debug: Log dayNightFactor at night (remove after testing)
                 if (dayNightTime > 0.7 || dayNightTime < 0.2) {
@@ -25712,6 +25913,11 @@ self.onmessage = async (e) => {
                         // Fog copies sky bottom for seamless horizon blend
                         if (scene?.fog) scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
                     }
+                    // === WebGPU Migration Phase 3.1: Sync TSL sky uniforms ===
+                    if (window.skyUniformsTSL) {
+                        window.skyUniformsTSL.topColor.value.lerpColors(nightSkyTop, daySkyTop, t);
+                        window.skyUniformsTSL.bottomColor.value.lerpColors(nightSkyBottom, daySkyBottom, t);
+                    }
                 };
                 // 1. Setup Scene + Sky
                 scene = new THREE.Scene();
@@ -25747,6 +25953,47 @@ self.onmessage = async (e) => {
 					`,
                     side: THREE.BackSide,
                 });
+
+                // === WebGPU Migration Phase 3.1: TSL Sky Material ===
+                // Create TSL uniforms for sky gradient
+                const skyTopColorUniform = uniform(new THREE.Color(SETTINGS.daySkyBottom));
+                const skyBottomColorUniform = uniform(new THREE.Color(SETTINGS.daySkyBottom));
+                const skyOffsetUniform = uniform(-130.0);
+                const skyExponentUniform = uniform(0.3);
+
+                // Create TSL-based sky material
+                const skyMaterialTSL = new MeshBasicNodeMaterial({
+                    side: THREE.BackSide
+                });
+
+                // Define color calculation as TSL node graph
+                // Equivalent to: pos = worldPos + offset; h = normalize(pos).y; t = pow(max(h,0), exp); color = mix(bottom, top, t)
+                skyMaterialTSL.colorNode = (() => {
+                    // Get world position and apply vertical offset
+                    const pos = positionWorld.add(vec3(0.0, skyOffsetUniform, 0.0));
+
+                    // Normalize and get Y component (height factor)
+                    const h = normalize(pos).y;
+
+                    // Apply exponent curve: max(pow(max(h, 0), exponent), 0)
+                    const t = max(pow(max(h, float(0.0)), skyExponentUniform), float(0.0));
+
+                    // Mix between bottom and top colors based on height factor
+                    return mix(skyBottomColorUniform, skyTopColorUniform, t);
+                })();
+
+                // Store TSL uniform references for day/night color updates
+                window.skyUniformsTSL = {
+                    topColor: skyTopColorUniform,
+                    bottomColor: skyBottomColorUniform,
+                    offset: skyOffsetUniform,
+                    exponent: skyExponentUniform
+                };
+
+                // Store TSL material reference
+                window.skyMaterialTSL = skyMaterialTSL;
+
+                // Use GLSL material by default, can switch to TSL by setting window.useTSLMaterials = true
                 skybox = new THREE.Mesh(skyGeo, skyMaterial);
                 scene.add(skybox);
                 // 2. Sun Sprite
@@ -29768,6 +30015,48 @@ self.onmessage = async (e) => {
                     fog: false // We handle fog manually in shader
                 });
                 window.waterMaterialRefraction = waterMaterialRefraction; // Expose for render loop
+
+                // === WebGPU Migration Phase 3.5: TSL Water Refraction Material ===
+                // Note: This is a complex material that samples a render target texture
+                // The TSL version provides the uniform structure; full implementation
+                // requires proper render target texture node handling in TSL
+
+                // TSL uniforms for water refraction
+                const waterRefractionTextureUniform = uniform(null); // Set to render target texture
+                const waterSurfaceTextureUniform = uniform(tex);
+                const waterTimeUniform = uniform(0.0);
+                const waterOpacityUniform = uniform(SETTINGS.waterOpacity);
+                const waterRefractionStrengthUniform = uniform(SETTINGS.waterRefractionStrength);
+                const waterColorUniform = uniform(new THREE.Color(SETTINGS.waterColor));
+                const waterFogColorUniform = uniform(new THREE.Color(0xb3d9ff));
+                const waterFogNearUniform = uniform(1.0);
+                const waterFogFarUniform = uniform(400.0);
+                const waterAbsorptionRUniform = uniform(SETTINGS.waterAbsorptionR);
+                const waterAbsorptionGUniform = uniform(SETTINGS.waterAbsorptionG);
+                const waterAbsorptionBUniform = uniform(SETTINGS.waterAbsorptionB);
+                const waterDepthScaleUniform = uniform(0.15);
+
+                // Store TSL uniforms for water refraction
+                // Note: Full TSL material implementation requires proper texture sampling
+                // which may need additional Three.js WebGPU APIs
+                window.waterRefractionUniformsTSL = {
+                    refractionTexture: waterRefractionTextureUniform,
+                    waterTexture: waterSurfaceTextureUniform,
+                    time: waterTimeUniform,
+                    opacity: waterOpacityUniform,
+                    refractionStrength: waterRefractionStrengthUniform,
+                    waterColor: waterColorUniform,
+                    fogColor: waterFogColorUniform,
+                    fogNear: waterFogNearUniform,
+                    fogFar: waterFogFarUniform,
+                    absorptionR: waterAbsorptionRUniform,
+                    absorptionG: waterAbsorptionGUniform,
+                    absorptionB: waterAbsorptionBUniform,
+                    waterDepthScale: waterDepthScaleUniform
+                };
+
+                // Log that TSL water refraction uniforms are ready
+                logDebug('[Materials] TSL water refraction uniforms initialized');
 
                 // Select initial water material based on setting
                 waterMaterial = SETTINGS.waterFastMode ? waterMaterialFast : (SETTINGS.waterRefractionEnabled ? waterMaterialRefraction : waterMaterialStandard);
@@ -38156,6 +38445,12 @@ self.onmessage = async (e) => {
                         skyMaterial.uniforms.bottomColor.value.lerp(nightSkyBottom, undergroundFactor);
                     }
 
+                    // === WebGPU Migration Phase 3.1: Sync TSL sky uniforms ===
+                    if (window.skyUniformsTSL) {
+                        window.skyUniformsTSL.topColor.value.copy(skyMaterial.uniforms.topColor.value);
+                        window.skyUniformsTSL.bottomColor.value.copy(skyMaterial.uniforms.bottomColor.value);
+                    }
+
                     // Fog color: black when underground, sky color otherwise (but not when underwater)
                     if (scene.fog && !isUnderwater) {
                         if (isUnderground) {
@@ -39186,6 +39481,17 @@ self.onmessage = async (e) => {
                         mat.uniforms.fogColor.value.copy(scene.fog.color);
                         mat.uniforms.fogNear.value = scene.fog.near;
                         mat.uniforms.fogFar.value = scene.fog.far;
+                    }
+                    // === WebGPU Migration Phase 3.5: Sync TSL water refraction uniforms ===
+                    if (window.waterRefractionUniformsTSL) {
+                        window.waterRefractionUniformsTSL.time.value = performance.now();
+                        window.waterRefractionUniformsTSL.opacity.value = SETTINGS.waterOpacity;
+                        window.waterRefractionUniformsTSL.refractionStrength.value = SETTINGS.waterRefractionStrength;
+                        if (scene.fog) {
+                            window.waterRefractionUniformsTSL.fogColor.value.copy(scene.fog.color);
+                            window.waterRefractionUniformsTSL.fogNear.value = scene.fog.near;
+                            window.waterRefractionUniformsTSL.fogFar.value = scene.fog.far;
+                        }
                     }
                 }
 
