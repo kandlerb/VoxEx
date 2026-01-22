@@ -1225,6 +1225,22 @@
             }
             return total / maxValue;
         }
+
+        /**
+         * FBM with domain warping - matches voxEx.html fbmWithDomainWarp()
+         * @param {number} x - X coordinate
+         * @param {number} z - Z coordinate
+         * @param {number} octaves - Number of octaves
+         * @param {number} persistence - Amplitude multiplier
+         * @param {number} lacunarity - Frequency multiplier
+         * @returns {number} Noise value
+         */
+        fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
+            const warpScale = 0.03;
+            const offsetX = this.fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
+            const offsetZ = this.fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
+            return this.fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
+        }
     }
 
     // ============================================
@@ -1492,35 +1508,229 @@
         }
 
         /**
-         * Get terrain height at world coordinates.
-         * MUST match voxEx.html HEIGHT_FUNCS for each biome type!
+         * Get terrain height at world coordinates using full biome blending.
+         * Matches voxEx.html blendedHeight() with 4-cell biome interpolation.
          * @param {number} wx - World X
          * @param {number} wz - World Z
          * @returns {number} Terrain height
          */
         getHeight(wx, wz) {
-            // Get biome for this location
-            const biome = this.getBiome(wx, wz);
-            // Use biome.id (terrain editor uses 'id'), not biome.name (voxEx.html uses 'name')
-            const biomeName = biome?.id || 'plains';
-            // CRITICAL: Use the first RNG call value (numericSeed) NOT the hashed seed
-            // voxEx.html stores rng.next() as worldConfig.seed/workerNumericSeed for height functions
-            const seed = this.terrainNoise.numericSeed;
+            return this.blendedHeight(wx, wz);
+        }
 
-            // Dispatch to biome-specific height function (matches voxEx.html HEIGHT_FUNCS)
+        /**
+         * Get raw biome height without blending (used internally for cell sampling).
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {Object} biome - Biome configuration
+         * @param {number} seed - Numeric seed
+         * @returns {number} Raw terrain height
+         */
+        getRawBiomeHeight(gx, gz, biome, seed) {
+            const biomeName = biome?.id || 'plains';
             switch (biomeName) {
                 case 'plains':
-                    return this.plainsHeight(wx, wz, biome, seed);
+                    return this.plainsHeight(gx, gz, biome, seed);
                 case 'hills':
-                    return this.hillsHeight(wx, wz, biome, seed);
+                    return this.hillsHeight(gx, gz, biome, seed);
                 case 'mountains':
-                    return this.mountainsHeight(wx, wz, biome, seed);
+                    return this.mountainsHeight(gx, gz, biome, seed);
                 case 'forests':
                 case 'swamp':
                 case 'longwoods':
                 default:
-                    return this.defaultHeight(wx, wz, biome, seed);
+                    return this.defaultHeight(gx, gz, biome, seed);
             }
+        }
+
+        /**
+         * Continental height factor (-1 to 1) for ocean vs inland.
+         * Matches voxEx.html continentalHeight()
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @returns {number} Continental factor (-1 to 1)
+         */
+        continentalHeight(gx, gz, seed) {
+            const base = this.terrainNoise.fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
+            const erosion = this.terrainNoise.fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8);
+            let c = base * 0.7 + erosion * 0.3;
+            c += 0.3;
+            return Math.max(-1, Math.min(1, c));
+        }
+
+        /**
+         * Get biome height at a cell center with continental scaling.
+         * Matches voxEx.html getBiomeHeightAtCell()
+         * @param {number} cx - Cell X
+         * @param {number} cz - Cell Z
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @param {number} continentFactor - Continental factor (-1 to 1)
+         * @returns {number} Height at cell
+         */
+        getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
+            const cellSize = this.params.params.biomes.cellSize;
+            const centerX = cx * cellSize + cellSize * 0.5;
+            const centerZ = cz * cellSize + cellSize * 0.5;
+            const biome = this.getBiome(centerX, centerZ);
+            let h = this.getRawBiomeHeight(gx, gz, biome, seed);
+            // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
+            const t = (continentFactor + 1) * 0.5; // -1..1 → 0..1
+            const factor = 0.3 + t * 0.7;
+            h = biome.baseHeight + (h - biome.baseHeight) * factor;
+            // Add height boost for inland areas (mountains)
+            h += Math.max(0, continentFactor - 0.15) * 10;
+            return h;
+        }
+
+        /**
+         * Get ocean factor at position (0 = deep ocean, 1 = land).
+         * Matches voxEx.html getOceanFactor()
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @returns {number} Ocean factor (0-1)
+         */
+        getOceanFactor(gx, gz, seed) {
+            const oceanScale = 0.0008;
+            const oceanNoise = this.terrainNoise.noise2D(gx * oceanScale + seed * 1.5, gz * oceanScale - seed * 0.8);
+            const coastScale = 0.004;
+            const coastNoise = this.terrainNoise.noise2D(gx * coastScale + seed * 2.1, gz * coastScale + seed * 1.3);
+            const detailScale = 0.02;
+            const detailNoise = this.terrainNoise.noise2D(gx * detailScale - seed * 0.5, gz * detailScale + seed * 0.9) * 0.1;
+            const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
+            const oceanThreshold = -0.3;
+            const shallowThreshold = -0.1;
+            if (combined < oceanThreshold) {
+                return 0.0; // Deep ocean
+            } else if (combined < shallowThreshold) {
+                let t = (combined - oceanThreshold) / (shallowThreshold - oceanThreshold);
+                return t * t * (3 - 2 * t);
+            }
+            return 1.0; // Land
+        }
+
+        /**
+         * Get ocean depth at position.
+         * Matches voxEx.html getOceanDepth()
+         * @param {number} oceanFactor - Ocean factor (0-1)
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @returns {number} Ocean depth
+         */
+        getOceanDepth(oceanFactor, gx, gz, seed) {
+            const baseOceanDepth = 20;
+            const depthNoise = this.terrainNoise.noise2D(gx * 0.008 + seed * 0.9, gz * 0.008 - seed * 0.6);
+            const depthVariation = (depthNoise + 1) * 0.5 * 15;
+            const centerFactor = 1.0 - oceanFactor;
+            return baseOceanDepth + depthVariation * centerFactor;
+        }
+
+        /**
+         * Get river factor at position (0 = river center, 1 = land).
+         * Matches voxEx.html getRiverFactor()
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @returns {number} River factor (0-1)
+         */
+        getRiverFactor(gx, gz, seed) {
+            const warpScale = 0.004;
+            const warpStrength = 20.0;
+            const wx = gx + this.terrainNoise.noise2D(gx * warpScale, gz * warpScale) * warpStrength;
+            const wz = gz + this.terrainNoise.noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
+            const scale = 0.001;
+            const n = Math.abs(this.terrainNoise.noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
+            const coastNoiseScale = 0.05;
+            const coastNoise = this.terrainNoise.noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
+            const coastVariation = coastNoise * 0.02;
+            const riverThreshold = 0.02 + coastVariation;
+            const bankThreshold = 0.05 + coastVariation * 2;
+            if (n < riverThreshold) {
+                return 0.0; // River center
+            } else if (n < bankThreshold) {
+                let t = (n - riverThreshold) / (bankThreshold - riverThreshold);
+                return t * t * (3 - 2 * t);
+            }
+            return 1.0; // Land
+        }
+
+        /**
+         * Get river depth at position.
+         * Matches voxEx.html getRiverDepth()
+         * @param {number} riverFactor - River factor (0-1)
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @param {number} seed - Numeric seed
+         * @returns {number} River depth
+         */
+        getRiverDepth(riverFactor, gx, gz, seed) {
+            const baseRiverDepth = 6;
+            const depthNoise = this.terrainNoise.noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
+            const depthVariation = (depthNoise + 1) * 0.5 * 3;
+            const centerFactor = 1.0 - riverFactor;
+            return baseRiverDepth + depthVariation * centerFactor;
+        }
+
+        /**
+         * Full blended height with 4-cell biome interpolation.
+         * Matches voxEx.html blendedHeight() exactly!
+         * @param {number} gx - World X
+         * @param {number} gz - World Z
+         * @returns {number} Blended terrain height
+         */
+        blendedHeight(gx, gz) {
+            const seed = this.terrainNoise.numericSeed;
+            const seaLevel = this.params.params.terrain.seaLevel;
+            const cellSize = this.params.params.biomes.cellSize;
+
+            // 1. Get continentalness (-1 to 1)
+            const c = this.continentalHeight(gx, gz, seed);
+
+            // 2. Biome grid interpolation (4-cell smoothstep)
+            const u = gx / cellSize - 0.5;
+            const v = gz / cellSize - 0.5;
+            const x0 = Math.floor(u);
+            const z0 = Math.floor(v);
+            const x1 = x0 + 1;
+            const z1 = z0 + 1;
+            const wx = u - x0;
+            const wz = v - z0;
+            const sx = wx * wx * (3 - 2 * wx); // smoothstep
+            const sz = wz * wz * (3 - 2 * wz);
+
+            // 3. Sample 4 biomes and calculate heights
+            const h00 = this.getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+            const h10 = this.getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+            const h01 = this.getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+            const h11 = this.getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+            const h0 = h00 + sx * (h10 - h00);
+            const h1 = h01 + sx * (h11 - h01);
+            let finalHeight = h0 + sz * (h1 - h0);
+
+            // 4. Apply oceans first (larger scale feature)
+            const oceanFactor = this.getOceanFactor(gx, gz, seed);
+            if (oceanFactor < 1.0) {
+                const oceanDepth = this.getOceanDepth(oceanFactor, gx, gz, seed);
+                const oceanFloor = seaLevel - oceanDepth;
+                const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+                finalHeight = oceanFloor + bank * (finalHeight - oceanFloor);
+            }
+
+            // 5. Apply rivers (can carve through ocean edges too)
+            const r = this.getRiverFactor(gx, gz, seed);
+            if (r < 1.0) {
+                const riverDepth = this.getRiverDepth(r, gx, gz, seed);
+                const riverBed = seaLevel - riverDepth;
+                const bank = r * r * (3 - 2 * r);
+                const carvedHeight = Math.min(finalHeight, riverBed);
+                finalHeight = carvedHeight + bank * (finalHeight - carvedHeight);
+            }
+
+            return Math.floor(finalHeight);
         }
 
         /**
