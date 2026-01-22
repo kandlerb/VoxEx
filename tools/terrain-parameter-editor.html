@@ -1572,14 +1572,18 @@
          */
         getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
             const cellSize = this.params.params.biomes.cellSize;
+            const globalBase = this.params.params.terrain.baseHeight;
             const centerX = cx * cellSize + cellSize * 0.5;
             const centerZ = cz * cellSize + cellSize * 0.5;
             const biome = this.getBiome(centerX, centerZ);
+            // Height functions now return values with global terrain params applied
             let h = this.getRawBiomeHeight(gx, gz, biome, seed);
-            // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
+            // Apply continental scaling using global base height
             const t = (continentFactor + 1) * 0.5; // -1..1 → 0..1
             const factor = 0.3 + t * 0.7;
-            h = biome.baseHeight + (h - biome.baseHeight) * factor;
+            const biomeOffset = biome.baseHeight - 64;
+            const effectiveBase = globalBase + biomeOffset;
+            h = effectiveBase + (h - effectiveBase) * factor;
             // Add height boost for inland areas (mountains)
             h += Math.max(0, continentFactor - 0.15) * 10;
             return h;
@@ -1743,39 +1747,75 @@
         /**
          * Default height function - rolling noise (Forests, Swamp, Longwoods)
          * Matches voxEx.html defaultHeightFunc()
+         * Uses terrain.noise.* parameters for noise generation
          */
         defaultHeight(gx, gz, biome, seed) {
-            const n = this.terrainNoise.fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
-            return Math.floor(biome.baseHeight + n * biome.amplitude);
+            const noise = this.params.params.terrain.noise;
+            const globalBase = this.params.params.terrain.baseHeight;
+            const globalAmp = this.params.params.terrain.heightAmplitude;
+            // Use terrain noise parameters instead of hardcoded values
+            const n = this.terrainNoise.fbm2D(
+                gx * noise.frequency,
+                gz * noise.frequency,
+                noise.octaves,
+                noise.persistence,
+                noise.lacunarity
+            );
+            // Blend global and biome settings: global base + biome offset + scaled amplitude
+            const biomeOffset = biome.baseHeight - 64; // Biome deviation from default
+            const ampScale = biome.amplitude / 48; // Biome amplitude relative to default
+            return Math.floor(globalBase + biomeOffset + n * globalAmp * ampScale);
         }
 
         /**
          * Hills height function - "billowy" rounded hills
          * Matches voxEx.html hillsHeightFunc()
+         * Uses terrain.noise.* parameters for noise generation
          */
         hillsHeight(gx, gz, biome, seed) {
-            let n = Math.abs(this.terrainNoise.noise2D(gx * biome.roughness, gz * biome.roughness));
+            const noise = this.params.params.terrain.noise;
+            const globalBase = this.params.params.terrain.baseHeight;
+            const globalAmp = this.params.params.terrain.heightAmplitude;
+            // Use terrain noise frequency
+            let n = Math.abs(this.terrainNoise.noise2D(gx * noise.frequency, gz * noise.frequency));
             n = n * n;
-            return Math.floor(biome.baseHeight + n * biome.amplitude);
+            // Blend global and biome settings
+            const biomeOffset = biome.baseHeight - 64;
+            const ampScale = biome.amplitude / 48;
+            return Math.floor(globalBase + biomeOffset + n * globalAmp * ampScale);
         }
 
         /**
          * Plains height function - gentle rolling terrain
          * Matches voxEx.html plainsHeightFunc()
+         * Uses terrain.noise.* parameters for noise generation
          */
         plainsHeight(gx, gz, biome, seed) {
-            const base = this.terrainNoise.noise2D(gx * 0.003, gz * 0.003);
-            const detail = this.terrainNoise.noise2D(gx * 0.05, gz * 0.05) * 0.1;
-            return Math.floor(biome.baseHeight + (base + detail) * biome.amplitude);
+            const noise = this.params.params.terrain.noise;
+            const globalBase = this.params.params.terrain.baseHeight;
+            const globalAmp = this.params.params.terrain.heightAmplitude;
+            // Use terrain noise frequency (plains use lower freq for gentler terrain)
+            const baseFreq = noise.frequency * 0.375; // Scale to match original 0.003 when freq=0.008
+            const base = this.terrainNoise.noise2D(gx * baseFreq, gz * baseFreq);
+            const detail = this.terrainNoise.noise2D(gx * noise.frequency * 6.25, gz * noise.frequency * 6.25) * 0.1;
+            // Blend global and biome settings
+            const biomeOffset = biome.baseHeight - 64;
+            const ampScale = biome.amplitude / 48;
+            return Math.floor(globalBase + biomeOffset + (base + detail) * globalAmp * ampScale);
         }
 
         /**
          * Mountains height function - complex terrain with ridges, valleys, peaks
          * Matches voxEx.html mountainsHeightFunc()
+         * Uses terrain.noise.* parameters for noise generation
          */
         mountainsHeight(gx, gz, biome, seed) {
-            // Domain warping for winding ridge lines
-            const warpScale = 0.0015;
+            const noise = this.params.params.terrain.noise;
+            const globalBase = this.params.params.terrain.baseHeight;
+            const globalAmp = this.params.params.terrain.heightAmplitude;
+            // Domain warping for winding ridge lines - scale by terrain frequency
+            const freqScale = noise.frequency / 0.008; // Relative to default frequency
+            const warpScale = 0.0015 * freqScale;
             const warpStrength = 80;
             const warpX = gx + this.terrainNoise.noise2D(gx * warpScale + seed, gz * warpScale) * warpStrength;
             const warpZ = gz + this.terrainNoise.noise2D(gx * warpScale + 100, gz * warpScale + seed) * warpStrength;
@@ -1786,19 +1826,20 @@
             const regionScale = 0.15 + Math.pow((regionNoise + 1) * 0.5, 0.8) * 0.55 +
                                Math.pow((regionNoise2 + 1) * 0.5, 1.2) * 0.30;
 
-            // Main ridge system with ridged noise
-            const rx = warpX * biome.roughness;
-            const rz = warpZ * biome.roughness;
+            // Main ridge system with ridged noise - use terrain noise octaves and lacunarity
+            const rx = warpX * biome.roughness * freqScale;
+            const rz = warpZ * biome.roughness * freqScale;
             let ridgeSum = 0;
             let amp = 1.0;
             let freq = 1.0;
-            for (let i = 0; i < 6; i++) {
+            const octaveCount = Math.min(noise.octaves + 2, 8); // Mountains need more detail
+            for (let i = 0; i < octaveCount; i++) {
                 let n = 1.0 - Math.abs(this.terrainNoise.noise2D(rx * freq + seed * 10, rz * freq + seed * 10));
                 const sharpness = i < 2 ? 1.5 : 1.2;
                 n = Math.pow(n, sharpness);
                 ridgeSum += n * amp;
-                freq *= 2.0;
-                amp *= 0.52;
+                freq *= noise.lacunarity;
+                amp *= noise.persistence;
             }
             ridgeSum = ridgeSum / 2.2;
 
@@ -1854,8 +1895,11 @@
             const foothillBase = (baseNoise + 1) * 0.5 * 0.15;
             totalHeight = foothillBase + totalHeight * 0.85;
 
-            const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
-            return Math.floor(Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285));
+            // Blend global and biome settings for final height
+            const biomeOffset = biome.baseHeight - 64;
+            const ampScale = biome.amplitude / 48;
+            const rawHeight = globalBase + biomeOffset + totalHeight * globalAmp * ampScale;
+            return Math.floor(Math.min(Math.max(rawHeight, globalBase + biomeOffset - 10), 285));
         }
 
         /**
