@@ -38638,6 +38638,20 @@ self.onmessage = async (e) => {
                 const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
+                // OPTIMIZATION: Purge stale chunks from build queue when player moves to a new chunk
+                const playerChunkChanged = chunkX !== lastChunkX || chunkZ !== lastChunkZ;
+                if (playerChunkChanged && chunkBuildQueue.length > 0) {
+                    const purgeMaxDistSq = currentRenderRadius * currentRenderRadius;
+                    for (let i = chunkBuildQueue.length - 1; i >= 0; i--) {
+                        const qJob = chunkBuildQueue[i];
+                        const qdx = (qJob.cx ?? 0) - chunkX;
+                        const qdz = (qJob.cz ?? 0) - chunkZ;
+                        if (qdx * qdx + qdz * qdz > purgeMaxDistSq) {
+                            queuedChunkKeys.delete(qJob.key);
+                            chunkBuildQueue.splice(i, 1);
+                        }
+                    }
+                }
                 // Update state
                 lastChunkX = chunkX;
                 lastChunkZ = chunkZ;
@@ -38813,6 +38827,15 @@ self.onmessage = async (e) => {
                 // Optional: Clean queue set occasionally to prevent memory leaks
                 // (if chunks are cancelled but remain in set)
                 if (queuedChunkKeys.size > chunkBuildQueue.length * 2) { queuedChunkKeys.clear(); chunkBuildQueue.forEach((j) => queuedChunkKeys.add(j.key)); }
+                // OPTIMIZATION: Cap queue size - evict farthest entries if queue grows too large
+                const MAX_CHUNK_QUEUE_SIZE = 64;
+                if (chunkBuildQueue.length > MAX_CHUNK_QUEUE_SIZE) {
+                    chunkBuildQueue.sort((a, b) => (a.dist ?? 0) - (b.dist ?? 0));
+                    while (chunkBuildQueue.length > MAX_CHUNK_QUEUE_SIZE) {
+                        const evicted = chunkBuildQueue.pop();
+                        queuedChunkKeys.delete(evicted.key);
+                    }
+                }
                 // --- 7B. Smart Memory Management (throttled to 1s interval) ---
                 // Only run memory checks periodically to reduce CPU usage when idle
                 if (needsMemoryCheck) {
@@ -38930,6 +38953,11 @@ self.onmessage = async (e) => {
                     if (processed.has(job.key)) continue;
                     const isDirty = dirtyChunks.has(job.key);
                     if (!isDirty && chunkMeshes.has(job.key)) continue;
+                    // OPTIMIZATION: Re-validate distance - skip if player moved beyond render distance
+                    // job.dist was already recalculated with current player position during sort phase above
+                    if (!isDirty && job.dist > currentRenderRadius * currentRenderRadius) {
+                        continue; // Skip stale job - chunk is now out of render distance
+                    }
                     processed.add(job.key);
                     forceLightingBypassKeys.delete(job.key);
                     queuedChunkKeys.delete(job.key); // Allow re-queueing later if needed
