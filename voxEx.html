@@ -17478,16 +17478,17 @@
                 }
             }
             function flushAllDeferredChunkUpdates(reason = "idle") {
-                if (pendingLightChunks.size > 0 || deferredChunkUpdates.size === 0) return;
+                if (deferredChunkUpdates.size === 0) return;
                 let flushed = 0;
                 for (const key of deferredChunkUpdates) {
-                    deferredChunkUpdates.delete(key);
                     const [cx, cz] = key.split(",").map(Number);
+                    // Flush per-chunk: only skip if THIS chunk's neighborhood still has pending light
+                    if (chunkOrNeighborsPending(cx, cz)) continue;
+                    deferredChunkUpdates.delete(key);
                     recordChunkUpdateState(key, reason, "deferred-flush");
-                    scheduleChunkUpdate(cx, cz, true, `${reason}-flush`);
+                    scheduleChunkUpdate(cx, cz, true, `${reason}-flush`, { immediate: true });
                     flushed++;
                 }
-                // Lightweight diagnostic to help track stuck chunk rebuilds without spamming logs
                 if (flushed > 0) { chunkUpdateDiagnostics.deferredFlushes += flushed; console.debug(`Flushed ${flushed} deferred chunk updates after ${reason}`); }
             }
             function forceDrainDeferredChunkUpdates(reason = "watchdog") {
@@ -17513,7 +17514,8 @@
                     const [cx, cz] = key.split(",").map(Number);
                     if (chunkOrNeighborsPending(cx, cz)) continue;
                     deferredChunkUpdates.delete(key);
-                    scheduleChunkUpdate(cx, cz, true, "light-unblocked");
+                    // Use immediate dispatch - these are player edits that already waited for lighting
+                    scheduleChunkUpdate(cx, cz, true, "light-unblocked", { immediate: true });
                 }
             }
             function watchdogPendingLightChunks(now = performance.now()) {
@@ -17583,8 +17585,8 @@
                 if (now - chunkUpdateDiagnostics.lastHeartbeat < 200) return;
                 chunkUpdateDiagnostics.lastHeartbeat = now;
                 if (!updateTimeout && pendingChunkUpdates.size > 0) { dispatchPendingChunkUpdates("heartbeat"); }
-                if (pendingLightChunks.size === 0 && deferredChunkUpdates.size > 0) { flushAllDeferredChunkUpdates("heartbeat"); }
-                else { watchdogPendingLightChunks(now); }
+                if (deferredChunkUpdates.size > 0) { flushAllDeferredChunkUpdates("heartbeat"); }
+                if (pendingLightChunks.size > 0) { watchdogPendingLightChunks(now); }
                 // Stale pending trace diagnostics (set first condition to isDebug to re-enable)
                 if (false && chunkUpdateDiagnostics.pending.size > 0) {
                     for (const [key, entry] of chunkUpdateDiagnostics.pending) {
@@ -18315,7 +18317,7 @@
             //   - Adds to pendingChunkUpdates Set (O(1) insertion)
             //   - Uses string key concatenation (acceptable - event-driven)
             //   - No-op: Already well-optimized with debouncing and deferral
-            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false } = {}) {
+            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false, immediate = false } = {}) {
                 const key = `${cx},${cz}`;
                 if (bypassLighting) { forceLightingBypassKeys.add(key); }
                 recordChunkUpdateState(key, source, "scheduled");
@@ -18327,9 +18329,14 @@
                 }
                 pendingChunkUpdates.add(key);
                 dirtyChunks.add(key);
-                if (updateTimeout) { clearTimeout(updateTimeout); chunkUpdateDiagnostics.debounceResets++; }
-                // Debounce: Wait 50ms after the last block change
-                updateTimeout = setTimeout(() => { dispatchPendingChunkUpdates("debounce"); updateTimeout = null; }, 50);
+                if (immediate) {
+                    // Player edits: dispatch immediately without debounce for instant feedback
+                    dispatchPendingChunkUpdates(source);
+                } else {
+                    if (updateTimeout) { clearTimeout(updateTimeout); chunkUpdateDiagnostics.debounceResets++; }
+                    // Debounce: Wait 50ms after the last block change
+                    updateTimeout = setTimeout(() => { dispatchPendingChunkUpdates("debounce"); updateTimeout = null; }, 50);
+                }
             }
             class SeededRandom {
                 constructor(seed) {
@@ -24750,14 +24757,29 @@
                     processed++;
                 }
                 if (sunlightBudget > 0) { processSunlightQueue(sunlightBudget); } // Spread sunlight work across frames to avoid spikes during large edits
-                if (pendingLightChunks.size === 0) { flushAllDeferredChunkUpdates("light-queue-idle"); } // If lighting is idle but rebuilds were deferred, flush them now
+                flushAllDeferredChunkUpdates("light-queue-idle"); // Flush any deferred chunks whose local neighborhood lighting is complete
             }
             function createLightTaskTracker(initialChunks = []) {
                 const tracked = new Set(initialChunks);
                 return {
                     tracked,
                     mark: (chunkKey) => { if (!chunkKey || tracked.has(chunkKey)) return; tracked.add(chunkKey); markPendingLight(chunkKey); },
-                    finalize: () => { tracked.forEach((chunkKey) => clearPendingLight(chunkKey)); tracked.clear(); },
+                    finalize: () => {
+                        tracked.forEach((chunkKey) => {
+                            clearPendingLight(chunkKey);
+                            // Schedule rebuild for all chunks touched by BFS light propagation.
+                            // Without this, cross-chunk light updates modify blockLight values
+                            // but never trigger mesh rebuilds for non-edge chunks.
+                            // bypassLighting is safe because the BFS already ran synchronously
+                            // and updated all blockLight values before this point.
+                            if (chunks.has(chunkKey) && !pendingChunkUpdates.has(chunkKey)) {
+                                const [cx, cz] = chunkKey.split(",").map(Number);
+                                dirtyChunks.add(chunkKey);
+                                scheduleChunkUpdate(cx, cz, true, "light-propagation", { bypassLighting: true, immediate: true });
+                            }
+                        });
+                        tracked.clear();
+                    },
                 };
             }
             function finalizeLightTracker(tracker) { if (!tracker || tracker.done) return; tracker.done = true; tracker.finalize(); }
@@ -25350,6 +25372,19 @@
                         primeColumn: IS_TRANSPARENT[id] && !IS_TRANSPARENT[oldId],
                         pendingLightChunks: new Set([key]),
                     });
+                } else {
+                    // FIX: When the same position changes again before the first job
+                    // is processed, update the existing job's newId to reflect the
+                    // current block state. This prevents orphaned light when a torch
+                    // is placed and broken quickly (the removal would otherwise be lost).
+                    for (let i = lightUpdateQueue.length - 1; i >= 0; i--) {
+                        if (lightUpdateQueue[i].key === jobKey) {
+                            const existingJob = lightUpdateQueue[i];
+                            existingJob.newId = id;
+                            existingJob.primeColumn = IS_TRANSPARENT[id] && !IS_TRANSPARENT[existingJob.oldId];
+                            break;
+                        }
+                    }
                 }
             }
             /**
@@ -39009,10 +39044,10 @@ self.onmessage = async (e) => {
             function updateLocalArea(x, y, z) {
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
-                // Schedule center chunk update - let lighting complete naturally to avoid flickering
-                // force=true ensures it gets processed, but bypassLighting=false lets the lighting
-                // system finish before rebuilding the mesh
-                scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: false });
+                // Schedule center chunk update with immediate dispatch and lighting bypass.
+                // The light job for player edits is critical (same chunk) and processes before
+                // mesh build in updateChunkSystem(), so bypassing the pending check is safe.
+                scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: true, immediate: true });
 
                 // Check boundaries and update neighbors if necessary
                 const lx = ((x % 16) + 16) % 16;
