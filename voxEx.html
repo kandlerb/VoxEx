@@ -20006,12 +20006,27 @@
                 const wShoreOut = new Float32Array(waterShore.subarray(0, wSIdx));
                 const wThickOut = new Float32Array(waterThickness.subarray(0, wTIdx));
 
-                // Build transfer list - each array now has its own unique buffer
+                // Collect input buffers to return to main thread for pool reuse
+                const returnBuffers = [centerBlocks, centerSkyLight, centerBlockLight];
+                if (neighbors.n) returnBuffers.push(neighbors.n);
+                if (neighbors.s) returnBuffers.push(neighbors.s);
+                if (neighbors.e) returnBuffers.push(neighbors.e);
+                if (neighbors.w) returnBuffers.push(neighbors.w);
+                if (neighbors.nw) returnBuffers.push(neighbors.nw);
+                if (neighbors.ne) returnBuffers.push(neighbors.ne);
+                if (neighbors.sw) returnBuffers.push(neighbors.sw);
+                if (neighbors.se) returnBuffers.push(neighbors.se);
+
+                // Build transfer list - output arrays + returned input arrays
                 const transferList = [
                     tPosOut.buffer, tNormOut.buffer, tUvsOut.buffer, tColsOut.buffer, tIdxOut.buffer,
                     wPosOut.buffer, wNormOut.buffer, wUvsOut.buffer, wColsOut.buffer, wIdxOut.buffer,
                     wShoreOut.buffer, wThickOut.buffer
                 ];
+                // Add input buffers to transfer list for zero-copy return
+                for (let i = 0; i < returnBuffers.length; i++) {
+                    transferList.push(returnBuffers[i].buffer);
+                }
 
                 self.postMessage({
                     type: 'mesh',
@@ -20037,7 +20052,8 @@
                         thickness: wThickOut,
                         faceCount: wFaceCount,
                         vertexCount: wVertCount
-                    }
+                    },
+                    returnBuffers: returnBuffers
                 }, transferList);
             }
         } catch (error) {
@@ -20155,6 +20171,119 @@
             }
 
             /**
+             * Pool of reusable transfer buffers for worker communication.
+             * Reduces GC pressure by reusing Uint8Array buffers instead of allocating new ones.
+             */
+            class TransferBufferPool {
+                /**
+                 * Create a transfer buffer pool.
+                 * @param {number} [maxBuffers=64] - Maximum buffers to keep in pool.
+                 */
+                constructor(maxBuffers = 64) {
+                    this.pool = [];
+                    this.maxBuffers = maxBuffers;
+                    this.bufferSize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT; // 81920 bytes
+
+                    // Track buffers in flight to workers
+                    this.inFlight = new Map(); // jobId -> Uint8Array[]
+
+                    // Statistics
+                    this._stats = {
+                        acquired: 0,
+                        released: 0,
+                        created: 0,
+                        poolHits: 0,
+                        inFlightPeak: 0
+                    };
+                }
+
+                /**
+                 * Acquire a chunk-sized Uint8Array from pool or create new.
+                 * @returns {Uint8Array} Buffer of size 81920.
+                 */
+                acquire() {
+                    this._stats.acquired++;
+                    if (this.pool.length > 0) {
+                        this._stats.poolHits++;
+                        return this.pool.pop();
+                    }
+                    this._stats.created++;
+                    return new Uint8Array(this.bufferSize);
+                }
+
+                /**
+                 * Copy source data into a pooled buffer.
+                 * @param {Uint8Array} source - Source chunk data.
+                 * @returns {Uint8Array} Pooled buffer with copied data.
+                 */
+                acquireAndCopy(source) {
+                    const buffer = this.acquire();
+                    buffer.set(source);
+                    return buffer;
+                }
+
+                /**
+                 * Track buffers sent to worker for later return.
+                 * @param {number} jobId - Worker job ID.
+                 * @param {Uint8Array[]} buffers - Buffers transferred.
+                 */
+                trackInFlight(jobId, buffers) {
+                    this.inFlight.set(jobId, buffers);
+                    this._stats.inFlightPeak = Math.max(this._stats.inFlightPeak, this.inFlight.size);
+                }
+
+                /**
+                 * Return a buffer to the pool.
+                 * @param {Uint8Array} buffer - Buffer to release.
+                 */
+                release(buffer) {
+                    this._stats.released++;
+                    // Only pool if under limit and correct size
+                    if (buffer && buffer.length === this.bufferSize && this.pool.length < this.maxBuffers) {
+                        this.pool.push(buffer);
+                    }
+                }
+
+                /**
+                 * Release all buffers tracked for a job ID.
+                 * Called when worker returns buffers or job completes.
+                 * @param {number} jobId - Worker job ID.
+                 * @param {Uint8Array[]} [returnedBuffers] - Buffers returned from worker.
+                 */
+                releaseJob(jobId, returnedBuffers) {
+                    // Clear tracking
+                    this.inFlight.delete(jobId);
+
+                    // Re-pool returned buffers
+                    if (returnedBuffers) {
+                        for (const buf of returnedBuffers) {
+                            if (buf) this.release(buf);
+                        }
+                    }
+                }
+
+                /**
+                 * Get pool statistics.
+                 * @returns {Object} Pool stats.
+                 */
+                getStats() {
+                    const hitRate = this._stats.acquired > 0
+                        ? ((this._stats.poolHits / this._stats.acquired) * 100).toFixed(1)
+                        : '0.0';
+                    return {
+                        poolSize: this.pool.length,
+                        maxBuffers: this.maxBuffers,
+                        inFlight: this.inFlight.size,
+                        inFlightPeak: this._stats.inFlightPeak,
+                        hitRate: hitRate + '%',
+                        created: this._stats.created,
+                        acquired: this._stats.acquired,
+                        released: this._stats.released
+                    };
+                }
+            }
+
+            /**
              * Pool of Web Workers for parallel chunk generation and meshing.
              * Uses Transferable objects for zero-copy data transfer.
              */
@@ -20173,6 +20302,9 @@
                     this.nextJobId = 0;
                     this.workerBusy = []; // Track which workers are busy
                     this.currentSeed = null; // Track current world seed for worker init
+
+                    // Buffer pool for mesh generation input data (reduces GC pressure)
+                    this.transferPool = new TransferBufferPool();
 
                     this._initWorkers();
                     console.log(`[WorkerPool] Initialized with ${this.poolSize} workers`);
@@ -20208,7 +20340,7 @@
                  * @param {MessageEvent} event - The message event from the worker.
                  */
                 _handleWorkerMessage(workerIndex, event) {
-                    const { type, jobId, error, ...data } = event.data;
+                    const { type, jobId, error, returnBuffers, ...data } = event.data;
 
                     this.workerBusy[workerIndex] = false;
 
@@ -20219,6 +20351,11 @@
                     }
 
                     this.pendingJobs.delete(jobId);
+
+                    // Re-pool returned input buffers from mesh generation
+                    if (returnBuffers && returnBuffers.length > 0) {
+                        this.transferPool.releaseJob(jobId, returnBuffers);
+                    }
 
                     if (type === 'error') {
                         job.reject(new Error(error));
@@ -20329,38 +20466,46 @@
 
                         this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
 
-                        // Extract center chunk data - COPY buffers since we can't transfer data still in use
-                        const centerBlocks = chunkData.blocks
-                            ? new Uint8Array(chunkData.blocks)
-                            : new Uint8Array(chunkData);
-                        const centerSkyLight = chunkData.skyLight
-                            ? new Uint8Array(chunkData.skyLight)
-                            : null;
-                        const centerBlockLight = chunkData.blockLight
-                            ? new Uint8Array(chunkData.blockLight)
-                            : null;
+                        // Track pooled buffers for this job (will be returned by worker)
+                        const pooledBuffers = [];
 
-                        // Copy neighbor block data (can't transfer chunks still in use by main thread)
+                        // Use pooled buffers instead of allocating new ones (reduces GC pressure)
+                        const centerBlocks = this.transferPool.acquireAndCopy(
+                            chunkData.blocks || chunkData
+                        );
+                        pooledBuffers.push(centerBlocks);
+
+                        let centerSkyLight = null;
+                        if (chunkData.skyLight) {
+                            centerSkyLight = this.transferPool.acquireAndCopy(chunkData.skyLight);
+                            pooledBuffers.push(centerSkyLight);
+                        }
+
+                        let centerBlockLight = null;
+                        if (chunkData.blockLight) {
+                            centerBlockLight = this.transferPool.acquireAndCopy(chunkData.blockLight);
+                            pooledBuffers.push(centerBlockLight);
+                        }
+
+                        // Copy neighbor block data using pooled buffers
                         const neighborData = {};
                         const dirs = ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
                         for (const dir of dirs) {
                             if (neighbors[dir]) {
                                 const nData = neighbors[dir].blocks || neighbors[dir];
                                 if (nData && nData.length > 0) {
-                                    neighborData[dir] = new Uint8Array(nData);
+                                    const pooledNeighbor = this.transferPool.acquireAndCopy(nData);
+                                    neighborData[dir] = pooledNeighbor;
+                                    pooledBuffers.push(pooledNeighbor);
                                 }
                             }
                         }
 
+                        // Track buffers in flight for this job
+                        this.transferPool.trackInFlight(jobId, pooledBuffers);
+
                         // Collect all transferable buffers
-                        const transfer = [centerBlocks.buffer];
-                        if (centerSkyLight) transfer.push(centerSkyLight.buffer);
-                        if (centerBlockLight) transfer.push(centerBlockLight.buffer);
-                        for (const dir of dirs) {
-                            if (neighborData[dir]) {
-                                transfer.push(neighborData[dir].buffer);
-                            }
-                        }
+                        const transfer = pooledBuffers.map(buf => buf.buffer);
 
                         this.jobQueue.push({
                             message: {
@@ -20533,41 +20678,26 @@
                 if (terrain && terrain.faceCount > 0) {
                     const geo = geometryPool.acquireTerrain(terrain.faceCount);
 
-                    // Copy worker data to geometry buffers
+                    // Copy worker data to geometry buffers using TypedArray.set() for optimal performance
                     const posAttr = geo.attributes.position;
                     const normAttr = geo.attributes.normal;
                     const uvAttr = geo.attributes.uv;
                     const colorAttr = geo.attributes.color;
                     const indexAttr = geo.index;
 
-                    // Copy positions
-                    for (let i = 0; i < terrain.positions.length; i++) {
-                        posAttr.array[i] = terrain.positions[i];
-                    }
+                    posAttr.array.set(terrain.positions);
                     posAttr.needsUpdate = true;
 
-                    // Copy normals
-                    for (let i = 0; i < terrain.normals.length; i++) {
-                        normAttr.array[i] = terrain.normals[i];
-                    }
+                    normAttr.array.set(terrain.normals);
                     normAttr.needsUpdate = true;
 
-                    // Copy UVs
-                    for (let i = 0; i < terrain.uvs.length; i++) {
-                        uvAttr.array[i] = terrain.uvs[i];
-                    }
+                    uvAttr.array.set(terrain.uvs);
                     uvAttr.needsUpdate = true;
 
-                    // Copy colors
-                    for (let i = 0; i < terrain.colors.length; i++) {
-                        colorAttr.array[i] = terrain.colors[i];
-                    }
+                    colorAttr.array.set(terrain.colors);
                     colorAttr.needsUpdate = true;
 
-                    // Copy indices
-                    for (let i = 0; i < terrain.indices.length; i++) {
-                        indexAttr.array[i] = terrain.indices[i];
-                    }
+                    indexAttr.array.set(terrain.indices);
                     indexAttr.needsUpdate = true;
 
                     geo.setDrawRange(0, terrain.indices.length);
@@ -20584,57 +20714,37 @@
                 if (water && water.faceCount > 0) {
                     const wGeo = geometryPool.acquireWater(water.faceCount);
 
-                    // Copy positions
+                    // Copy worker data to geometry buffers using TypedArray.set() for optimal performance
                     const wPosAttr = wGeo.attributes.position;
-                    for (let i = 0; i < water.positions.length; i++) {
-                        wPosAttr.array[i] = water.positions[i];
-                    }
+                    wPosAttr.array.set(water.positions);
                     wPosAttr.needsUpdate = true;
 
-                    // Copy normals
                     const wNormAttr = wGeo.attributes.normal;
-                    for (let i = 0; i < water.normals.length; i++) {
-                        wNormAttr.array[i] = water.normals[i];
-                    }
+                    wNormAttr.array.set(water.normals);
                     wNormAttr.needsUpdate = true;
 
-                    // Copy UVs
                     const wUvAttr = wGeo.attributes.uv;
-                    for (let i = 0; i < water.uvs.length; i++) {
-                        wUvAttr.array[i] = water.uvs[i];
-                    }
+                    wUvAttr.array.set(water.uvs);
                     wUvAttr.needsUpdate = true;
 
-                    // Copy colors
                     const wColorAttr = wGeo.attributes.color;
-                    for (let i = 0; i < water.colors.length; i++) {
-                        wColorAttr.array[i] = water.colors[i];
-                    }
+                    wColorAttr.array.set(water.colors);
                     wColorAttr.needsUpdate = true;
 
-                    // Copy indices
                     const wIndexAttr = wGeo.index;
-                    for (let i = 0; i < water.indices.length; i++) {
-                        wIndexAttr.array[i] = water.indices[i];
-                    }
+                    wIndexAttr.array.set(water.indices);
                     wIndexAttr.needsUpdate = true;
 
                     // Copy shore distance if available
                     if (wGeo.attributes.shoreDist && water.shore) {
-                        const shoreAttr = wGeo.attributes.shoreDist;
-                        for (let i = 0; i < water.shore.length; i++) {
-                            shoreAttr.array[i] = water.shore[i];
-                        }
-                        shoreAttr.needsUpdate = true;
+                        wGeo.attributes.shoreDist.array.set(water.shore);
+                        wGeo.attributes.shoreDist.needsUpdate = true;
                     }
 
                     // Copy water thickness if available
                     if (wGeo.attributes.waterThickness && water.thickness) {
-                        const thickAttr = wGeo.attributes.waterThickness;
-                        for (let i = 0; i < water.thickness.length; i++) {
-                            thickAttr.array[i] = water.thickness[i];
-                        }
-                        thickAttr.needsUpdate = true;
+                        wGeo.attributes.waterThickness.array.set(water.thickness);
+                        wGeo.attributes.waterThickness.needsUpdate = true;
                     }
 
                     wGeo.setDrawRange(0, water.indices.length);
