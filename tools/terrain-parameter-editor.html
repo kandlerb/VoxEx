@@ -1013,6 +1013,7 @@
 
         /**
          * Generate seeded permutation table using Fisher-Yates shuffle
+         * MUST match voxEx.html initNoise() exactly for consistent terrain!
          * @param {number} seed - Seed value
          * @returns {number[]} Permutation table (512 elements)
          */
@@ -1020,10 +1021,15 @@
             const rng = mulberry32(seed);
             const p = Array.from({ length: 256 }, (_, i) => i);
 
-            // Fisher-Yates shuffle
-            for (let i = 255; i > 0; i--) {
-                const j = Math.floor(rng() * (i + 1));
-                [p[i], p[j]] = [p[j], p[i]];
+            // CRITICAL: Consume first RNG call - this is worldConfig.seed in main game
+            // The main game does: worldConfig.seed = rng.next(); before the shuffle
+            this.numericSeed = rng();
+
+            // Fisher-Yates shuffle - MUST match voxEx.html forward loop exactly!
+            // Main game: for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; }
+            for (let i = 0; i < 256; i++) {
+                const r = Math.floor(rng() * (256 - i)) + i;
+                [p[i], p[r]] = [p[r], p[i]];
             }
 
             // Double for wrapping
@@ -1051,17 +1057,18 @@
         }
 
         /**
-         * 2D gradient function
+         * 2D gradient function - MUST match voxEx.html grad() exactly!
          * @param {number} hash - Hash value
          * @param {number} x - X coordinate
          * @param {number} y - Y coordinate
          * @returns {number} Gradient contribution
          */
         grad2D(hash, x, y) {
-            const h = hash & 3;
-            const u = h < 2 ? x : y;
-            const v = h < 2 ? y : x;
-            return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+            // Match voxEx.html: const grad = (h, x, y) => { const u = h < 8 ? x : y; const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0); return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v); };
+            const h = hash & 15;
+            const u = h < 8 ? x : y;
+            const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
+            return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
         }
 
         /**
@@ -1196,6 +1203,27 @@
             }
 
             return value / maxAmplitude;
+        }
+
+        /**
+         * FBM 2D matching voxEx.html signature exactly.
+         * IMPORTANT: Starts with frequency=1 (coordinates should be pre-scaled)
+         * @param {number} x - X coordinate (pre-scaled by roughness)
+         * @param {number} z - Z coordinate (pre-scaled by roughness)
+         * @param {number} octaves - Number of octaves (default 4)
+         * @param {number} persistence - Amplitude multiplier (default 0.5)
+         * @param {number} lacunarity - Frequency multiplier (default 2.0)
+         * @returns {number} Noise value (-1 to 1)
+         */
+        fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
+            let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
+            for (let i = 0; i < octaves; i++) {
+                total += this.noise2D(x * frequency, z * frequency) * amplitude;
+                maxValue += amplitude;
+                amplitude *= persistence;
+                frequency *= lacunarity;
+            }
+            return total / maxValue;
         }
     }
 
@@ -1425,12 +1453,15 @@
         }
 
         /**
-         * Update noise generators when seed changes
+         * Update noise generators when seed changes.
+         * CRITICAL: Must match voxEx.html noise initialization!
+         * Main game uses SAME noise function for terrain AND biome selection.
          */
         updateNoise() {
             const seed = this.params.getNumericSeed();
             this.terrainNoise = new SeededNoise(seed);
-            this.biomeNoise = new SeededNoise(seed + 1000);
+            // NOTE: Main game uses same noise for biome selection, no separate biomeNoise!
+            // Cave noise uses different seeds to avoid correlation
             this.caveNoise1 = new SeededNoise(seed + 3000);
             this.caveNoise2 = new SeededNoise(seed + 4000);
             this.riverNoise = new SeededNoise(seed + 5000);
@@ -1462,37 +1493,154 @@
 
         /**
          * Get terrain height at world coordinates.
-         * Uses biome-specific parameters (roughness, amplitude, baseHeight) matching voxEx.html.
+         * MUST match voxEx.html HEIGHT_FUNCS for each biome type!
          * @param {number} wx - World X
          * @param {number} wz - World Z
          * @returns {number} Terrain height
          */
         getHeight(wx, wz) {
-            const p = this.params.params;
-            const noise = p.terrain.noise;
-
             // Get biome for this location
             const biome = this.getBiome(wx, wz);
+            const biomeName = biome?.name || 'plains';
+            const seed = this.params.getNumericSeed();
 
-            // Use biome-specific parameters if available, otherwise fall back to global
-            const roughness = biome?.roughness ?? noise.frequency;
-            const amplitude = biome?.amplitude ?? p.terrain.heightAmplitude;
-            const baseHeight = biome?.baseHeight ?? p.terrain.baseHeight;
+            // Dispatch to biome-specific height function (matches voxEx.html HEIGHT_FUNCS)
+            switch (biomeName) {
+                case 'plains':
+                    return this.plainsHeight(wx, wz, biome, seed);
+                case 'hills':
+                    return this.hillsHeight(wx, wz, biome, seed);
+                case 'mountains':
+                    return this.mountainsHeight(wx, wz, biome, seed);
+                case 'forests':
+                case 'swamp':
+                case 'longwoods':
+                default:
+                    return this.defaultHeight(wx, wz, biome, seed);
+            }
+        }
 
-            const n = this.terrainNoise.fractal2D(
-                wx, wz,
-                noise.octaves,
-                roughness,
-                noise.lacunarity,
-                noise.persistence
-            );
+        /**
+         * Default height function - rolling noise (Forests, Swamp, Longwoods)
+         * Matches voxEx.html defaultHeightFunc()
+         */
+        defaultHeight(gx, gz, biome, seed) {
+            const n = this.terrainNoise.fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
+            return Math.floor(biome.baseHeight + n * biome.amplitude);
+        }
 
-            return baseHeight + n * amplitude;
+        /**
+         * Hills height function - "billowy" rounded hills
+         * Matches voxEx.html hillsHeightFunc()
+         */
+        hillsHeight(gx, gz, biome, seed) {
+            let n = Math.abs(this.terrainNoise.noise2D(gx * biome.roughness, gz * biome.roughness));
+            n = n * n;
+            return Math.floor(biome.baseHeight + n * biome.amplitude);
+        }
+
+        /**
+         * Plains height function - gentle rolling terrain
+         * Matches voxEx.html plainsHeightFunc()
+         */
+        plainsHeight(gx, gz, biome, seed) {
+            const base = this.terrainNoise.noise2D(gx * 0.003, gz * 0.003);
+            const detail = this.terrainNoise.noise2D(gx * 0.05, gz * 0.05) * 0.1;
+            return Math.floor(biome.baseHeight + (base + detail) * biome.amplitude);
+        }
+
+        /**
+         * Mountains height function - complex terrain with ridges, valleys, peaks
+         * Matches voxEx.html mountainsHeightFunc()
+         */
+        mountainsHeight(gx, gz, biome, seed) {
+            // Domain warping for winding ridge lines
+            const warpScale = 0.0015;
+            const warpStrength = 80;
+            const warpX = gx + this.terrainNoise.noise2D(gx * warpScale + seed, gz * warpScale) * warpStrength;
+            const warpZ = gz + this.terrainNoise.noise2D(gx * warpScale + 100, gz * warpScale + seed) * warpStrength;
+
+            // Regional variation (foothills vs major peaks)
+            const regionNoise = this.terrainNoise.noise2D(gx * 0.0006 + seed * 0.3, gz * 0.0006 - seed * 0.3);
+            const regionNoise2 = this.terrainNoise.noise2D(gx * 0.001 + seed * 0.7, gz * 0.001 + seed * 0.2);
+            const regionScale = 0.15 + Math.pow((regionNoise + 1) * 0.5, 0.8) * 0.55 +
+                               Math.pow((regionNoise2 + 1) * 0.5, 1.2) * 0.30;
+
+            // Main ridge system with ridged noise
+            const rx = warpX * biome.roughness;
+            const rz = warpZ * biome.roughness;
+            let ridgeSum = 0;
+            let amp = 1.0;
+            let freq = 1.0;
+            for (let i = 0; i < 6; i++) {
+                let n = 1.0 - Math.abs(this.terrainNoise.noise2D(rx * freq + seed * 10, rz * freq + seed * 10));
+                const sharpness = i < 2 ? 1.5 : 1.2;
+                n = Math.pow(n, sharpness);
+                ridgeSum += n * amp;
+                freq *= 2.0;
+                amp *= 0.52;
+            }
+            ridgeSum = ridgeSum / 2.2;
+
+            // Valley carving
+            const valleyNoise = this.terrainNoise.noise2D(gx * 0.003 + seed * 5, gz * 0.003 - seed * 5);
+            const valleyNoise2 = this.terrainNoise.noise2D(gx * 0.006 - seed * 2, gz * 0.006 + seed * 2);
+            const valleyFactor = Math.max(0, -valleyNoise * 0.5 - valleyNoise2 * 0.3);
+            const valleyCarve = valleyFactor * 0.35;
+
+            // Saddles and passes
+            const saddleNoise = this.terrainNoise.noise2D(gx * 0.008 + seed * 8, gz * 0.008 - seed * 8);
+            const saddleFactor = saddleNoise > 0.6 ? (saddleNoise - 0.6) * 0.5 : 0;
+
+            // Peak variation
+            const peakTypeNoise = this.terrainNoise.noise2D(gx * 0.004 + seed * 12, gz * 0.004 - seed * 12);
+            let peakBonus = 0;
+            if (peakTypeNoise > 0.5 && ridgeSum > 0.6) {
+                const spireNoise = this.terrainNoise.noise2D(gx * 0.02 + seed * 15, gz * 0.02 - seed * 15);
+                if (spireNoise > 0.6) {
+                    peakBonus = Math.pow((spireNoise - 0.6) * 2.5, 2) * 0.25;
+                }
+            } else if (peakTypeNoise < -0.3 && ridgeSum > 0.5) {
+                peakBonus = ridgeSum * 0.1;
+            }
+
+            // Cliff bands
+            const preHeight = ridgeSum - valleyCarve - saddleFactor + peakBonus;
+            const cliffBandNoise = this.terrainNoise.noise2D(gx * 0.05 + seed * 20, gz * 0.05);
+            let cliffBonus = 0;
+            if (preHeight > 0.35 && preHeight < 0.45 && cliffBandNoise > 0.3) {
+                cliffBonus = (cliffBandNoise - 0.3) * 0.08;
+            } else if (preHeight > 0.65 && preHeight < 0.75 && cliffBandNoise > 0.2) {
+                cliffBonus = (cliffBandNoise - 0.2) * 0.1;
+            }
+
+            // Erosion detail
+            const erosionNoise = this.terrainNoise.noise2D(gx * 0.08 + seed * 3, gz * 0.08 - seed * 3);
+            const erosionNoise2 = this.terrainNoise.noise2D(gx * 0.15 - seed * 4, gz * 0.15 + seed * 4);
+            const erosionAmount = (Math.abs(erosionNoise) * 0.04 + Math.abs(erosionNoise2) * 0.02) *
+                                 (0.5 + ridgeSum * 0.5);
+
+            // Gullies
+            const gullyNoise = 1.0 - Math.abs(this.terrainNoise.noise2D(gx * 0.025 + seed * 25, gz * 0.025 - seed * 25));
+            const gullyCarve = gullyNoise > 0.85 ? (gullyNoise - 0.85) * 0.15 : 0;
+
+            // Combine all factors
+            let totalHeight = ridgeSum - valleyCarve - saddleFactor + peakBonus + cliffBonus +
+                             erosionAmount - gullyCarve;
+            totalHeight *= regionScale;
+
+            // Foothill transition
+            const baseNoise = this.terrainNoise.noise2D(gx * 0.002, gz * 0.002);
+            const foothillBase = (baseNoise + 1) * 0.5 * 0.15;
+            totalHeight = foothillBase + totalHeight * 0.85;
+
+            const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
+            return Math.floor(Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285));
         }
 
         /**
          * Get biome at world coordinates using cell-based weighted selection.
-         * Matches voxEx.html getBiomeAt() algorithm exactly.
+         * MUST match voxEx.html getBiomeParams() / getBiomeCellValue() exactly!
          * @param {number} wx - World X
          * @param {number} wz - World Z
          * @returns {Object|null} Biome object or null
@@ -1508,39 +1656,32 @@
                 return this.biomeCellCache.get(key);
             }
 
-            // Calculate biome at cell center
-            const centerX = cellX * cellSize + cellSize * 0.5;
-            const centerZ = cellZ * cellSize + cellSize * 0.5;
-            const biome = this.getRawBiome(centerX, centerZ);
+            // Calculate biome using cell coordinates (NOT world coordinates!)
+            // MUST match voxEx.html getBiomeCellValue(): noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000)
+            const biome = this.getBiomeCellValue(cellX, cellZ);
 
             this.biomeCellCache.set(key, biome);
             return biome;
         }
 
         /**
-         * Get raw biome using weighted noise selection.
-         * Matches voxEx.html getRawBiome() algorithm exactly.
-         * @param {number} wx - World X
-         * @param {number} wz - World Z
+         * Get biome for a cell using noise-weighted selection.
+         * MUST match voxEx.html getBiomeCellValue() exactly!
+         * @param {number} cellX - Cell X coordinate
+         * @param {number} cellZ - Cell Z coordinate
          * @returns {Object} Biome object
          */
-        getRawBiome(wx, wz) {
-            const seed = this.params.getNumericSeed();
-            const biomeFrequency = this.params.params.biomes.frequency;
+        getBiomeCellValue(cellX, cellZ) {
+            // CRITICAL: Match voxEx.html exactly - use SAME noise function (terrainNoise)
+            // with cell coordinates, 0.1 frequency, and +1000 offset
+            const cellNoise = this.terrainNoise.noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
+            const normalizedNoise = (cellNoise + 1) * 0.5;
 
-            // Sample biome noise with seed offset (matches voxEx.html)
-            const noiseVal = this.biomeNoise.noise2D(
-                wx * biomeFrequency + seed * 0.37,
-                wz * biomeFrequency - seed * 0.71
-            );
-
-            // Map noise -1..1 to 0..1
-            const t = (noiseVal + 1) * 0.5;
-            const target = t * this.biomeTable.totalWeight;
-
-            // Find biome by cumulative weight threshold
+            // Find biome by cumulative weight (normalized to 0-1 range)
+            let accumulated = 0;
             for (const entry of this.biomeTable.cumulative) {
-                if (target <= entry.threshold) {
+                accumulated = entry.threshold / this.biomeTable.totalWeight;
+                if (normalizedNoise <= accumulated) {
                     return entry.biome;
                 }
             }
@@ -1549,19 +1690,30 @@
         }
 
         /**
+         * Legacy method for compatibility - now redirects to getBiomeCellValue
+         * @deprecated Use getBiome() instead
+         */
+        getRawBiome(wx, wz) {
+            const cellSize = this.params.params.biomes.cellSize;
+            const cellX = Math.floor(wx / cellSize);
+            const cellZ = Math.floor(wz / cellSize);
+            return this.getBiomeCellValue(cellX, cellZ);
+        }
+
+        /**
          * Get biome noise value at coordinates (for debugging/visualization).
+         * MUST match voxEx.html getBiomeCellValue() algorithm!
          * @param {number} wx - World X
          * @param {number} wz - World Z
          * @returns {number} Noise value 0-1
          */
         getBiomeNoiseValue(wx, wz) {
-            const seed = this.params.getNumericSeed();
-            const biomeFrequency = this.params.params.biomes.frequency;
-            const noiseVal = this.biomeNoise.noise2D(
-                wx * biomeFrequency + seed * 0.37,
-                wz * biomeFrequency - seed * 0.71
-            );
-            return (noiseVal + 1) * 0.5;
+            const cellSize = this.params.params.biomes.cellSize;
+            const cellX = Math.floor(wx / cellSize);
+            const cellZ = Math.floor(wz / cellSize);
+            // Match voxEx.html: noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000)
+            const cellNoise = this.terrainNoise.noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
+            return (cellNoise + 1) * 0.5;
         }
 
         /**
