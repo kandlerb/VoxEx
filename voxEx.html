@@ -2109,6 +2109,7 @@
                     <h1>Performance</h1>
                     <button class="menu-btn category-btn" id="btn-performance-rendering">Rendering</button>
                     <button class="menu-btn category-btn" id="btn-performance-streaming">Streaming</button>
+                    <button class="menu-btn category-btn" id="btn-performance-workers">Workers</button>
                     <button class="menu-btn" id="btn-back-from-performance" style="margin-top: 20px">Back</button>
                 </div>
                 <!-- Performance > Rendering -->
@@ -2170,6 +2171,27 @@
                     </div>
                     <button class="menu-btn" id="btn-reset-performance-streaming" style="margin-top: 20px; background: #884400; border-color: #aa5500">Reset to Default</button>
                     <button class="menu-btn" id="btn-back-from-performance-streaming">Back</button>
+                </div>
+                <!-- Performance > Workers -->
+                <div id="settings-performance-workers" class="settings-panel" style="display: none">
+                    <h1>Performance › Workers</h1>
+                    <p style="font-size: 12px; color: #aaa; margin-bottom: 15px">Web Workers offload terrain and mesh generation to background threads for better performance.</p>
+                    <div class="setting-item">
+                        <label for="use-workers-toggle">Enable Terrain Workers</label>
+                        <input type="checkbox" id="use-workers-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="use-workers-mesh-toggle">Enable Mesh Workers</label>
+                        <input type="checkbox" id="use-workers-mesh-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="worker-pool-size-slider">Worker Pool Size: <span id="worker-pool-size-val">Auto</span></label>
+                        <input type="range" id="worker-pool-size-slider" min="0" max="8" step="1" />
+                    </div>
+                    <p id="worker-pool-hint" style="font-size: 11px; color: #888; margin-top: -10px">0 = Auto (CPU cores - 1, max 4). Higher values may improve chunk loading but use more resources.</p>
+                    <p id="worker-restart-notice" style="color: #ffcc00; display: none; font-size: 12px">Worker changes take effect on next world load.</p>
+                    <button class="menu-btn" id="btn-reset-performance-workers" style="margin-top: 20px; background: #884400; border-color: #aa5500">Reset to Default</button>
+                    <button class="menu-btn" id="btn-back-from-performance-workers">Back</button>
                 </div>
                 <!-- Graphics Settings -->
                 <div id="settings-graphics" class="settings-panel" style="display: none">
@@ -3267,9 +3289,11 @@
                 // NAVIGATION - Performance branches
                 document.getElementById("btn-performance-rendering")?.addEventListener("click", () => showPanel("settings-performance-rendering"));
                 document.getElementById("btn-performance-streaming")?.addEventListener("click", () => showPanel("settings-performance-streaming"));
+                document.getElementById("btn-performance-workers")?.addEventListener("click", () => showPanel("settings-performance-workers"));
                 document.getElementById("btn-back-from-performance")?.addEventListener("click", () => showPanel("settings-menu"));
                 document.getElementById("btn-back-from-performance-rendering")?.addEventListener("click", () => showPanel("settings-performance"));
                 document.getElementById("btn-back-from-performance-streaming")?.addEventListener("click", () => showPanel("settings-performance"));
+                document.getElementById("btn-back-from-performance-workers")?.addEventListener("click", () => showPanel("settings-performance"));
                 // NAVIGATION - Graphics branches
                 document.getElementById("btn-graphics-visual")?.addEventListener("click", () => showPanel("settings-graphics-visual"));
                 document.getElementById("btn-graphics-lighting")?.addEventListener("click", () => showPanel("settings-graphics-lighting"));
@@ -5002,6 +5026,7 @@
                 // Web Workers
                 useWorkers: savedSettings.useWorkers !== undefined ? savedSettings.useWorkers : true, // Use Web Workers for chunk generation
                 useWorkersForMesh: savedSettings.useWorkersForMesh !== undefined ? savedSettings.useWorkersForMesh : true, // Use Web Workers for mesh generation
+                workerPoolSize: savedSettings.workerPoolSize ?? 0, // Number of workers (0 = auto)
                 preGenRenderDistance: savedSettings.preGenRenderDistance || 16,
                 dynamicRenderDistance: savedSettings.dynamicRenderDistance !== undefined ? savedSettings.dynamicRenderDistance : false,
                 lowerBoundFPS: savedSettings.lowerBoundFPS || 30,
@@ -5213,6 +5238,7 @@
                 // Web Worker defaults
                 useWorkers: true,                  // Use Web Workers for chunk generation (disable if issues)
                 useWorkersForMesh: true,           // Use Web Workers for mesh generation (Phase 4)
+                workerPoolSize: 0,                 // Number of workers (0 = auto: CPU cores - 1, max 4)
                 preGenRenderDistance: 16,
                 dynamicRenderDistance: false,
                 lowerBoundFPS: 30,
@@ -19677,199 +19703,16 @@
         return c0 * (1 - tz) + c1 * tz;
     }
 
-    // ============================================================
-    // TERRAIN GENERATION PASS
-    // ============================================================
-    function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches) {
-        const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
-        const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
-
-        // Elevation thresholds
-        const SNOW_LINE = 190;
-        const SNOW_PATCHES_LINE = 160;
-        const HIGH_ROCK_LINE = 140;
-        const ROCK_LINE = 110;
-        const ALPINE_LINE = 85;
-        const RIVER_MAX_ELEVATION = 75;
-
-        // Slope thresholds
-        const CLIFF_SLOPE = 8;
-        const STEEP_SLOPE = 5;
-        const MODERATE_SLOPE = 3;
-
-        for (let lx = 0; lx < chunkSize; lx++) {
-            for (let lz = 0; lz < chunkSize; lz++) {
-                const idx = lx + lz * chunkSize;
-                const worldTopY = heightCache[idx];
-                const riverFactor = riverCache[idx];
-                const biome = biomeCache[idx];
-                const isMountain = biome && biome.tags && biome.tags.includes("mountain");
-                const gx = startX + lx;
-                const gz = startZ + lz;
-
-                // Slope analysis
-                let maxSlope = 0;
-                let slopeNorth = 0, slopeSouth = 0;
-                const neighborOffsets = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [1, -1], [-1, 1], [1, 1]];
-                for (const [dx, dz] of neighborOffsets) {
-                    const nx = lx + dx;
-                    const nz = lz + dz;
-                    if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
-                        const nIdx = nx + nz * chunkSize;
-                        const neighborY = heightCache[nIdx];
-                        const slope = worldTopY - neighborY;
-                        const absSlope = Math.abs(slope);
-                        if (absSlope > maxSlope) maxSlope = absSlope;
-                        if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
-                        if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
-                    }
-                }
-
-                const isCliff = maxSlope >= CLIFF_SLOPE;
-                const isSteep = maxSlope >= STEEP_SLOPE;
-                const isModerate = maxSlope >= MODERATE_SLOPE;
-                const northFacing = slopeNorth > slopeSouth + 1;
-                const isExposedRidge = slopeNorth > 2 && slopeSouth > 2;
-
-                // Noise for surface variation
-                const surfaceNoise = noise2D(gx * 0.1, gz * 0.1);
-                const patchNoise = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
-                const detailNoise = noise2D(gx * 0.2 + 200, gz * 0.2 + 200);
-                const screeNoise = noise2D(gx * 0.08 + 300, gz * 0.08 + 300);
-
-                for (let ly = 0; ly < chunkHeight; ly++) {
-                    const worldY = ly - WORLD_DIMS.yOffset;
-                    const idx3D = lx + lz * chunkSize + ly * chunkSize * chunkSize;
-                    let id = AIR;
-
-                    if (worldY <= 0) {
-                        id = BEDROCK;
-                    } else if (worldY <= worldTopY) {
-                        const depth = worldTopY - worldY;
-
-                        if (depth === 0) {
-                            // Surface block logic
-                            if (riverFactor < 0.8 && worldTopY <= RIVER_MAX_ELEVATION) {
-                                id = SAND;
-                            } else if (worldY < WORLD_DIMS.seaLevel + 2 && worldY >= WORLD_DIMS.seaLevel - 1) {
-                                id = SAND;
-                            } else if (isMountain || worldTopY >= ALPINE_LINE) {
-                                // Mountain terrain
-                                if (worldTopY >= SNOW_LINE) {
-                                    if (isCliff) id = STONE;
-                                    else if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL;
-                                    else if (isExposedRidge && detailNoise > 0.4) id = STONE;
-                                    else id = SNOW;
-                                } else if (worldTopY >= SNOW_PATCHES_LINE) {
-                                    if (isCliff) id = STONE;
-                                    else if (northFacing && !isSteep && patchNoise > 0.2) id = SNOW;
-                                    else if (!isModerate && patchNoise > 0.5) id = SNOW;
-                                    else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL;
-                                    else id = surfaceNoise > 0.3 ? STONE : GRAVEL;
-                                } else if (worldTopY >= HIGH_ROCK_LINE) {
-                                    if (isCliff) id = STONE;
-                                    else if (isModerate && screeNoise > 0) id = GRAVEL;
-                                    else if (northFacing && !isSteep && patchNoise > 0.6) id = SNOW;
-                                    else id = surfaceNoise > 0.2 ? STONE : GRAVEL;
-                                } else if (worldTopY >= ROCK_LINE || isCliff) {
-                                    if (isCliff) id = STONE;
-                                    else if (!isModerate && detailNoise > 0.6) id = STONE;
-                                    else if (isModerate) id = screeNoise > 0 ? GRAVEL : STONE;
-                                    else {
-                                        const r = surfaceNoise + detailNoise * 0.5;
-                                        if (r > 0.4) id = STONE;
-                                        else if (r > -0.2) id = GRAVEL;
-                                        else id = STONE;
-                                    }
-                                } else if (worldTopY >= ALPINE_LINE) {
-                                    if (isCliff) id = STONE;
-                                    else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL;
-                                    else if (!isModerate) {
-                                        if (patchNoise > 0.3) id = GRASS;
-                                        else if (patchNoise > -0.2) id = DIRT;
-                                        else id = surfaceNoise > 0 ? STONE : GRAVEL;
-                                    } else {
-                                        if (patchNoise > 0.5) id = GRASS;
-                                        else if (patchNoise > 0) id = DIRT;
-                                        else id = GRAVEL;
-                                    }
-                                } else {
-                                    if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL;
-                                    else if (isModerate) id = patchNoise > -0.3 ? GRASS : DIRT;
-                                    else {
-                                        if (detailNoise > 0.7) id = STONE;
-                                        else if (patchNoise > -0.4) id = GRASS;
-                                        else id = DIRT;
-                                    }
-                                }
-                            } else {
-                                // Non-mountain low elevation
-                                if (isSteep) id = surfaceNoise > 0.5 ? STONE : DIRT;
-                                else if (detailNoise > 0.8) id = STONE;
-                                else id = GRASS;
-                            }
-
-                            if (id === GRASS && worldTopY < WORLD_DIMS.seaLevel) {
-                                id = DIRT;
-                            }
-                        } else if (depth < 4) {
-                            // Subsurface
-                            if (worldTopY >= HIGH_ROCK_LINE) id = STONE;
-                            else if (worldTopY >= ROCK_LINE) id = depth < 2 ? GRAVEL : STONE;
-                            else if (worldTopY >= ALPINE_LINE) id = depth < 2 ? DIRT : STONE;
-                            else if (isSteep) id = depth < 2 ? DIRT : STONE;
-                            else id = DIRT;
-                        } else {
-                            id = STONE;
-                        }
-                    }
-
-                    // Cave carving
-                    if (id !== AIR && id !== BEDROCK && id !== WATER) {
-                        const fadeStart = 30;
-                        const fadeEnd = 50;
-                        if (worldY < fadeEnd) {
-                            const n1 = interpolateCaveNoise(lx, ly, lz, caveCache1, cxDim, cxzStride);
-                            const n2 = interpolateCaveNoise(lx, ly, lz, caveCache2, cxDim, cxzStride);
-                            const widthNoise = widthNoiseCache[idx];
-                            let threshold = 0.015 + (widthNoise * 0.5 + 0.5) * 0.025;
-                            if (worldY > fadeStart) {
-                                const fade = 1.0 - (worldY - fadeStart) / (fadeEnd - fadeStart);
-                                threshold *= fade;
-                            }
-                            if (n1 * n1 + n2 * n2 < threshold) {
-                                id = AIR;
-                            }
-                        }
-                    }
-
-                    data[idx3D] = id;
-                }
-            }
-        }
-    }
-
-    function fillWaterPass(data, chunkSize, chunkHeight, heightCache) {
-        const seaLevel = WORLD_DIMS.seaLevel;
-        for (let wx = 0; wx < chunkSize; wx++) {
-            for (let wz = 0; wz < chunkSize; wz++) {
-                const worldTopY = heightCache[wx + wz * chunkSize];
-                if (worldTopY >= seaLevel) continue;
-                const waterStart = worldTopY + 1 + WORLD_DIMS.yOffset;
-                const waterEnd = Math.min(seaLevel + WORLD_DIMS.yOffset, chunkHeight - 1);
-                for (let wy = waterStart; wy <= waterEnd; wy++) {
-                    const waterIdx = wx + wz * chunkSize + wy * chunkSize * chunkSize;
-                    if (data[waterIdx] === AIR) data[waterIdx] = WATER;
-                }
-            }
-        }
-    }
+    /* __TERRAIN_PASS_START__ */
+    // generateTerrainPass and fillWaterPass are dynamically injected from main thread
+    // This ensures identical terrain generation between worker and main thread
+    /* __TERRAIN_PASS_END__ */
 
     // ============================================================
     // MESSAGE HANDLER
     // ============================================================
     self.onmessage = function(e) {
-        const { type, jobId, cx, cz, seedStr } = e.data;
+        const { type, jobId, cx, cz, seedStr, worldGenSettings } = e.data;
 
         try {
             if (type === 'init') {
@@ -19895,14 +19738,7 @@
                 // Generate terrain - use NUMERIC seed for height functions (matches main thread worldConfig.seed)
                 const blocks = new Uint8Array(chunkSize * chunkSize * chunkHeight);
 
-                const caches = precalculateTerrainCaches(chunkSize, startX, startZ, workerNumericSeed);
-                const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
-
-                generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches);
-                fillWaterPass(blocks, chunkSize, chunkHeight, caches.heightCache);
-
-                // --- Phase 3: Tree generation ---
-                // Helper functions for tree generation
+                // Helper functions for block access (used by terrain pass and tree generation)
                 const get = (x, y, z) => {
                     if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return 0;
                     return blocks[x + z * chunkSize + y * chunkSize * chunkSize];
@@ -19911,6 +19747,15 @@
                     if (x < 0 || x >= chunkSize || z < 0 || z >= chunkSize || y < 0 || y >= chunkHeight) return;
                     blocks[x + z * chunkSize + y * chunkSize * chunkSize] = id;
                 };
+
+                const caches = precalculateTerrainCaches(chunkSize, startX, startZ, workerNumericSeed);
+                const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
+
+                // Pass set function and worldGenSettings to match main thread signature
+                generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings);
+                fillWaterPass(blocks, chunkSize, chunkHeight, caches.heightCache);
+
+                // --- Phase 3: Tree generation ---
                 // Clear tree mask cache for this generation (ensures fresh calculation)
                 treeMaskCache.clear();
                 generateTreesForChunk(cx, cz, blocks, chunkSize, chunkHeight, startX, startZ, workerNumericSeed, get, set, caches);
@@ -20272,7 +20117,41 @@
                 // Replace content between markers with injected functions
                 const before = CHUNK_WORKER_CODE.substring(0, startIdx + startMarker.length);
                 const after = CHUNK_WORKER_CODE.substring(endIdx);
-                return before + '\n' + injectedCode + '\n    ' + after;
+                let workerCode = before + '\n' + injectedCode + '\n    ' + after;
+
+                // ============================================================
+                // INJECT TERRAIN PASS FUNCTIONS (generateTerrainPass, fillWaterPass)
+                // ============================================================
+                const terrainPassFuncs = [
+                    generateTerrainPass,
+                    fillWaterPass
+                ];
+
+                let terrainPassCode = '    // ============================================================\n';
+                terrainPassCode += '    // TERRAIN PASS FUNCTIONS - DYNAMICALLY INJECTED FROM MAIN THREAD\n';
+                terrainPassCode += '    // Ensures alpine lakes, slope analysis, and cave density match main thread\n';
+                terrainPassCode += '    // ============================================================\n\n';
+
+                for (const fn of terrainPassFuncs) {
+                    const source = fn.toString();
+                    const indentedSource = source.split('\n').map(line => '    ' + line).join('\n');
+                    terrainPassCode += indentedSource + '\n\n';
+                }
+
+                // Find and replace the terrain pass section
+                const passStartMarker = '/* __TERRAIN_PASS_START__ */';
+                const passEndMarker = '/* __TERRAIN_PASS_END__ */';
+                const passStartIdx = workerCode.indexOf(passStartMarker);
+                const passEndIdx = workerCode.indexOf(passEndMarker);
+
+                if (passStartIdx === -1 || passEndIdx === -1) {
+                    console.warn('[WorkerPool] Terrain pass markers not found, using static code');
+                    return workerCode;
+                }
+
+                const passBefore = workerCode.substring(0, passStartIdx + passStartMarker.length);
+                const passAfter = workerCode.substring(passEndIdx);
+                return passBefore + '\n' + terrainPassCode + '\n    ' + passAfter;
             }
 
             /**
@@ -20282,11 +20161,12 @@
             class ChunkWorkerPool {
                 /**
                  * Create a worker pool.
-                 * @param {number} [poolSize] - Number of workers (default: CPU cores - 1, min 1, max 4)
+                 * @param {number} [poolSize] - Number of workers (0 or undefined = auto: CPU cores - 1, min 1, max 4)
                  */
                 constructor(poolSize) {
                     const cores = navigator.hardwareConcurrency || 4;
-                    this.poolSize = poolSize || Math.min(4, Math.max(1, cores - 1));
+                    // poolSize of 0 means "auto" - calculate based on CPU cores
+                    this.poolSize = (poolSize && poolSize > 0) ? Math.min(8, Math.max(1, poolSize)) : Math.min(4, Math.max(1, cores - 1));
                     this.workers = [];
                     this.jobQueue = [];
                     this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz}
@@ -20425,7 +20305,7 @@
                         this.pendingJobs.set(jobId, { resolve, reject, cx, cz });
 
                         this.jobQueue.push({
-                            message: { type: 'generate', jobId, cx, cz, seedStr },
+                            message: { type: 'generate', jobId, cx, cz, seedStr, worldGenSettings: window.worldGenSettings },
                             transfer: []
                         });
 
@@ -23064,6 +22944,16 @@
                 if (memoryBudgetVal) memoryBudgetVal.textContent = SETTINGS.memoryBudgetMB;
                 if (autoMemoryToggle) autoMemoryToggle.checked = SETTINGS.enableAutoMemoryScaling;
 
+                // Performance - Workers
+                const useWorkersToggle = document.getElementById("use-workers-toggle");
+                const useWorkersMeshToggle = document.getElementById("use-workers-mesh-toggle");
+                const workerPoolSizeSlider = document.getElementById("worker-pool-size-slider");
+                const workerPoolSizeVal = document.getElementById("worker-pool-size-val");
+                if (useWorkersToggle) useWorkersToggle.checked = SETTINGS.useWorkers;
+                if (useWorkersMeshToggle) useWorkersMeshToggle.checked = SETTINGS.useWorkersForMesh;
+                if (workerPoolSizeSlider) workerPoolSizeSlider.value = SETTINGS.workerPoolSize;
+                if (workerPoolSizeVal) workerPoolSizeVal.textContent = SETTINGS.workerPoolSize === 0 ? "Auto" : SETTINGS.workerPoolSize;
+
                 // Graphics - Basic
                 const aoToggle = document.getElementById("ao-toggle");
                 const shadowsToggle = document.getElementById("shadows-toggle");
@@ -23525,6 +23415,33 @@
                 autoMemoryToggle?.addEventListener("change", () => {
                     SETTINGS.enableAutoMemoryScaling = autoMemoryToggle.checked;
                     saveSettings();
+                });
+
+                // === PERFORMANCE - WORKERS ===
+                const useWorkersToggle = document.getElementById("use-workers-toggle");
+                const useWorkersMeshToggle = document.getElementById("use-workers-mesh-toggle");
+                const workerPoolSizeSlider = document.getElementById("worker-pool-size-slider");
+                const workerPoolSizeVal = document.getElementById("worker-pool-size-val");
+                const workerRestartNotice = document.getElementById("worker-restart-notice");
+
+                useWorkersToggle?.addEventListener("change", () => {
+                    SETTINGS.useWorkers = useWorkersToggle.checked;
+                    saveSettings();
+                    if (workerRestartNotice) workerRestartNotice.style.display = "block";
+                });
+
+                useWorkersMeshToggle?.addEventListener("change", () => {
+                    SETTINGS.useWorkersForMesh = useWorkersMeshToggle.checked;
+                    saveSettings();
+                    if (workerRestartNotice) workerRestartNotice.style.display = "block";
+                });
+
+                workerPoolSizeSlider?.addEventListener("input", () => {
+                    const val = parseInt(workerPoolSizeSlider.value, 10);
+                    SETTINGS.workerPoolSize = val;
+                    if (workerPoolSizeVal) workerPoolSizeVal.textContent = val === 0 ? "Auto" : val;
+                    saveSettings();
+                    if (workerRestartNotice) workerRestartNotice.style.display = "block";
                 });
 
                 // === GRAPHICS - BASIC ===
@@ -24654,7 +24571,7 @@
                 await init(); // Initialize Three.js FIRST (creates scene, materials, controls)
                 // Initialize worker pool for chunk generation
                 if (!chunkWorkerPool && SETTINGS.useWorkers) {
-                    chunkWorkerPool = new ChunkWorkerPool();
+                    chunkWorkerPool = new ChunkWorkerPool(SETTINGS.workerPoolSize);
                     // Initialize workers with seed string immediately for faster first-chunk generation
                     // MUST await to prevent race condition where mesh generation starts before workers ready
                     if (finalSeedDisplay) {
@@ -29188,6 +29105,16 @@ self.onmessage = async (e) => {
                     if (memoryBudgetManager) memoryBudgetManager.setBudget(DEFAULTS.memoryBudgetMB);
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
+                });
+                // Reset Performance - Workers
+                document.getElementById("btn-reset-performance-workers")?.addEventListener("click", () => {
+                    SETTINGS.useWorkers = DEFAULTS.useWorkers;
+                    SETTINGS.useWorkersForMesh = DEFAULTS.useWorkersForMesh;
+                    SETTINGS.workerPoolSize = DEFAULTS.workerPoolSize;
+                    localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
+                    updateUIFromSettings();
+                    const workerRestartNotice = document.getElementById("worker-restart-notice");
+                    if (workerRestartNotice) workerRestartNotice.style.display = "block";
                 });
                 // Reset Graphics - Visual
                 document.getElementById("btn-reset-graphics-visual")?.addEventListener("click", () => {
@@ -36303,7 +36230,7 @@ self.onmessage = async (e) => {
                 return { caveCache1, caveCache2, cxDim, cxzStride };
             }
             // Generate terrain and carve caves
-            function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set) {
+            function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings) {
                 const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
                 const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
 
@@ -36620,7 +36547,7 @@ self.onmessage = async (e) => {
                                     const n1 = interpolateCaveNoise(lx, ly, lz, caveCache1, cxDim, cxzStride);
                                     const n2 = interpolateCaveNoise(lx, ly, lz, caveCache2, cxDim, cxzStride);
                                     const widthNoise = widthNoiseCache[idx];
-                                    const caveDensityMult = (window.worldGenSettings?.caveDensityMultiplier ?? 1.0);
+                                    const caveDensityMult = (worldGenSettings?.caveDensityMultiplier ?? 1.0);
                                     let threshold = (0.015 + (widthNoise * 0.5 + 0.5) * 0.025) * caveDensityMult;
                                     // Surface fading
                                     if (worldY > fadeStart) {
@@ -36963,7 +36890,7 @@ self.onmessage = async (e) => {
                     let genState = 0;
 
                     // --- PASS 1: Generate terrain with caves ---
-                    generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set);
+                    generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, window.worldGenSettings);
                     genState |= GEN_PASS.TERRAIN;
 
                     // --- PASS 2: Fill water ---
