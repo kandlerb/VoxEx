@@ -11,18 +11,22 @@ The launcher page runs browser compatibility tests (WebGL, GPU benchmarks) befor
 
 ## Architecture
 
-VoxEx is a **single-file application** - the entire game (~39K lines) runs from one HTML file with embedded CSS and JavaScript. No build tools, no bundlers, no external dependencies beyond Three.js from CDN.
+VoxEx is a **single-file application** - the entire game (~41K lines) runs from one HTML file with embedded CSS and JavaScript. No build tools, no bundlers, no external dependencies beyond Three.js from CDN.
 
 ### Repository Structure
 
 ```
 VoxEx/
-├── index.html               # System check & launcher
-├── voxEx.html               # Complete game (single file, ~39K lines)
-├── voxex-sound-formula.html # Sound synthesis demo
-├── CLAUDE.md                # AI assistant guidelines
-├── futureFeatures.md        # Feature roadmap
-└── chunkRenderingPlan.md    # Technical planning doc
+├── index.html                # System check & launcher
+├── voxEx.html                # Complete game (single file, ~41K lines)
+├── CLAUDE.md                 # AI assistant guidelines
+├── futureFeatures.md         # Feature roadmap
+├── tools/                    # Development utilities
+│   ├── KeyFrame_editor.html
+│   ├── terrain-parameter-editor.html
+│   ├── voxelEditor.html
+│   └── voxex-sound-formula.html
+└── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
 
 ### Design Philosophy
@@ -90,11 +94,14 @@ Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water,
 | SHIFT | Sprint |
 | F | Toggle Torch |
 | E | Inventory |
+| V | Toggle Third-Person Camera |
+| +/- | Zoom In/Out (third-person) |
 | 1-9 / Scroll | Hotbar |
 | Left Click | Break Block |
 | Right Click | Place Block |
 | F5 | Quick Save |
 | F9 | Quick Load |
+| O | Performance Overlay |
 | ~ (Tilde) | Debug Overlay |
 | ESC | Pause |
 
@@ -104,11 +111,12 @@ Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water,
 |------------|---------|---------|
 | Three.js | r160 | 3D rendering (loaded from CDN) |
 | PointerLockControls | Three.js addon | First-person camera controls |
+| Web Workers | Browser API | Off-thread chunk mesh generation |
+| Web Audio API | Browser API | Procedural sound synthesis |
 | IndexedDB | Browser API | Chunk persistence with RLE compression |
+| OPFS | Browser API | Origin Private File System disk cache |
 | LocalStorage | Browser API | Settings and save slots |
 | Canvas API | Browser API | Procedural 16x16 textures (17-tile atlas) |
-| Web Audio API | Browser API | Procedural sound synthesis |
-| Web Workers | Browser API | Off-thread mesh generation |
 
 ## For Developers
 
