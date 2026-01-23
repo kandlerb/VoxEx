@@ -18914,8 +18914,17 @@
     }
 
     function getBiomeParams(gx, gz) {
-        const cellX = Math.floor(gx / BIOME_CELL_SIZE);
-        const cellZ = Math.floor(gz / BIOME_CELL_SIZE);
+        // Two-octave domain warping for organic biome boundaries (matches main thread)
+        const gridScale = BIOME_CELL_SIZE;
+        const seed = workerNumericSeed;
+        const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                    + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+        const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                    + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+        const u = gx / gridScale - 0.5 + warpX;
+        const v = gz / gridScale - 0.5 + warpZ;
+        const cellX = Math.round(u);
+        const cellZ = Math.round(v);
         return getBiomeCellValue(cellX, cellZ);
     }
 
@@ -19496,9 +19505,9 @@
 
     // Get biome height at a cell center with continental scaling
     function getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
-        const centerX = cx * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
-        const centerZ = cz * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
-        const biome = getBiomeParams(centerX, centerZ);
+        // Use direct cell lookup (no warping) to avoid double-warping
+        // since cx,cz already come from warped coordinates in blendedHeight()
+        const biome = getBiomeCellValue(cx, cz);
         const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc;
         let h = hf(gx, gz, biome, seed);
         // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
@@ -19520,11 +19529,13 @@
 
         // 2. Biome grid interpolation with boundary warping
         const gridScale = BIOME_CELL_SIZE;
-        // Noise-based boundary warping for organic biome borders
-        const bwarpFreq = 0.001;
-        const bwarpAmt = 0.8;
-        const u = gx / gridScale - 0.5 + noise2D(gx * bwarpFreq + seed * 0.13, gz * bwarpFreq - seed * 0.07) * bwarpAmt;
-        const v = gz / gridScale - 0.5 + noise2D(gx * bwarpFreq - seed * 0.19, gz * bwarpFreq + seed * 0.11) * bwarpAmt;
+        // Two-octave domain warping for organic biome borders (matches main thread)
+        const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                    + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+        const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                    + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+        const u = gx / gridScale - 0.5 + warpX;
+        const v = gz / gridScale - 0.5 + warpZ;
         const x0 = Math.floor(u);
         const z0 = Math.floor(v);
         const x1 = x0 + 1;
@@ -35612,9 +35623,14 @@ self.onmessage = async (e) => {
                 const mask = getTreeMaskForChunk(cx, cz, seed);
                 return mask[lx + lz * cs] === 1;
             }
-            function getBiomeParams(gx, gz) {
-                const cellX = Math.floor(gx / BIOME_CELL_SIZE),
-                    cellZ = Math.floor(gz / BIOME_CELL_SIZE);
+            /**
+             * Look up the biome for a cell directly by cell coordinates (no warping).
+             * Uses 3x3 neighbor voting for smooth biome distributions.
+             * @param {number} cellX - Cell X coordinate in the biome grid.
+             * @param {number} cellZ - Cell Z coordinate in the biome grid.
+             * @returns {ResolvedBiome} The resolved biome for this cell.
+             */
+            function getBiomeCellDirect(cellX, cellZ) {
                 const key = cellX + "," + cellZ;
                 const cached = biomeCellCache.get(key);
                 if (cached) return cached;
@@ -35636,13 +35652,35 @@ self.onmessage = async (e) => {
                 for (const [name, score] of counts.entries()) {
                     if (score > bestScore) {
                         bestScore = score;
-                        // O(1) lookup via biomeByName Map instead of .find()
                         bestBiome = biomeByName.get(name) || getRawBiomeParams(centerX, centerZ);
                     }
                 }
                 if (!bestBiome) bestBiome = getRawBiomeParams(centerX, centerZ);
                 biomeCellCache.set(key, bestBiome);
                 return bestBiome;
+            }
+            /**
+             * Get biome parameters at a world position with domain-warped boundaries.
+             * Uses noise-based coordinate warping to create organic biome borders
+             * that align with height transitions in blendedHeight().
+             * @param {GlobalCoord} gx - Global X coordinate.
+             * @param {GlobalCoord} gz - Global Z coordinate.
+             * @returns {ResolvedBiome} The biome at this position.
+             */
+            function getBiomeParams(gx, gz) {
+                const gridScale = BIOME_CELL_SIZE;
+                const seed = worldConfig.seed;
+                // Two-octave domain warping for organic biome boundaries
+                // Must match the warping in blendedHeight() exactly
+                const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                            + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+                const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                            + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+                const u = gx / gridScale - 0.5 + warpX;
+                const v = gz / gridScale - 0.5 + warpZ;
+                const cellX = Math.round(u);
+                const cellZ = Math.round(v);
+                return getBiomeCellDirect(cellX, cellZ);
             }
             function getRawBiomeParams(gx, gz) {
                 const { seed, biomeFrequency } = worldConfig;
@@ -35663,11 +35701,14 @@ self.onmessage = async (e) => {
                 const c = continentalHeight(gx, gz, seed);
                 // 2. Biome grid interpolation with boundary warping
                 const gridScale = BIOME_CELL_SIZE;
-                // Noise-based boundary warping for organic biome borders
-                const bwarpFreq = 0.001;
-                const bwarpAmt = 0.8;
-                const u = gx / gridScale - 0.5 + noise2D(gx * bwarpFreq + seed * 0.13, gz * bwarpFreq - seed * 0.07) * bwarpAmt;
-                const v = gz / gridScale - 0.5 + noise2D(gx * bwarpFreq - seed * 0.19, gz * bwarpFreq + seed * 0.11) * bwarpAmt;
+                // Two-octave domain warping for organic biome borders
+                // Must match the warping in getBiomeParams() exactly
+                const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                            + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+                const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                            + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+                const u = gx / gridScale - 0.5 + warpX;
+                const v = gz / gridScale - 0.5 + warpZ;
                 const x0 = Math.floor(u);
                 const z0 = Math.floor(v);
                 const x1 = x0 + 1;
@@ -35709,10 +35750,9 @@ self.onmessage = async (e) => {
             }
             // UPDATE getBiomeHeightAtCell to use continentalness properly:
             function getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
-                const centerX = cx * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
-                const centerZ = cz * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
-                const biome = getBiomeParams(centerX, centerZ);
-                // Use HEIGHT_FUNCS lookup instead of biome.heightFunc for consistent behavior with workers
+                // Use direct cell lookup (no warping) to avoid double-warping
+                // since cx,cz already come from warped coordinates in blendedHeight()
+                const biome = getBiomeCellDirect(cx, cz);
                 const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc;
                 let h = hf(gx, gz, biome, seed);
                 // Apply continental scaling (ocean = 0.3x, inland = 1.0x)
