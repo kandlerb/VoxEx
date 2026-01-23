@@ -6215,9 +6215,11 @@
                  */
                 applyToRender(renderEngine) {
                     if (!renderEngine) return;
-                    // Apply fog settings
+                    // Apply fog settings (end 2 chunks before render edge)
                     if (renderEngine.scene?.fog) {
-                        renderEngine.scene.fog.far = this.get('renderDistance') * WORLD_DIMS.chunkSize;
+                        const fogFar = this.get('renderDistance') * WORLD_DIMS.chunkSize - WORLD_DIMS.chunkSize * 2;
+                        renderEngine.scene.fog.far = fogFar;
+                        renderEngine.scene.fog.near = fogFar * 0.6;
                     }
                     // Apply shadow settings
                     if (renderEngine.renderer) {
@@ -8728,7 +8730,7 @@
                 // OPTIMIZATION: setFog - no-op (called on settings change)
                 setFog(near, far, color) {
                     if (!this.scene.fog) {
-                        this.scene.fog = new THREE.Fog(color || 0x87ceeb, near, far);
+                        this.scene.fog = new THREE.Fog(color || SETTINGS.daySkyBottom, near, far);
                     } else {
                         this.scene.fog.near = near;
                         this.scene.fog.far = far;
@@ -8739,11 +8741,11 @@
                 // OPTIMIZATION: updateFogDistance - no-op (called on render distance change)
                 updateFogDistance(renderDistance) {
                     const fogFar = renderDistance * WORLD_DIMS.chunkSize;
-                    // Fog ends 1 chunk before edge for full occlusion
-                    const fogFarActual = fogFar - WORLD_DIMS.chunkSize;
+                    // Fog ends 2 chunks before edge for full occlusion of edge chunks
+                    const fogFarActual = fogFar - WORLD_DIMS.chunkSize * 2;
                     if (this.scene.fog) {
                         this.scene.fog.far = fogFarActual;
-                        this.scene.fog.near = fogFarActual * 0.5;
+                        this.scene.fog.near = fogFarActual * 0.6;
                     }
                 }
 
@@ -27108,16 +27110,16 @@ self.onmessage = async (e) => {
                 initBlockLookupTables();  // Initialize block type lookup tables
                 generateSpiralOffsets(32); // Pre-generate spiral loading pattern
 
-                nightSkyTop = new THREE.Color(SETTINGS.nightSkyBottom);  // Use bottom color for uniform sky
-                daySkyTop = new THREE.Color(SETTINGS.daySkyBottom);      // Use bottom color for uniform sky
+                nightSkyTop = new THREE.Color(SETTINGS.nightSkyTop);
+                daySkyTop = new THREE.Color(SETTINGS.daySkyTop);
                 nightSkyBottom = new THREE.Color(SETTINGS.nightSkyBottom);
                 daySkyBottom = new THREE.Color(SETTINGS.daySkyBottom);
                 // Fog colors are now tied to sky bottom colors (no separate fog color objects)
                 colorsInitialized = true;
                 const refreshSkyFogColorsFromSettings = () => {
                     if (!colorsInitialized) return;
-                    nightSkyTop.setHex(SETTINGS.nightSkyBottom);  // Use bottom color for uniform sky
-                    daySkyTop.setHex(SETTINGS.daySkyBottom);      // Use bottom color for uniform sky
+                    nightSkyTop.setHex(SETTINGS.nightSkyTop);
+                    daySkyTop.setHex(SETTINGS.daySkyTop);
                     nightSkyBottom.setHex(SETTINGS.nightSkyBottom);
                     daySkyBottom.setHex(SETTINGS.daySkyBottom);
                     // Fog uses sky bottom colors directly (unified)
@@ -27141,7 +27143,7 @@ self.onmessage = async (e) => {
                 const skyGeo = new THREE.SphereGeometry(500, 32, 15);
                 skyMaterial = new THREE.ShaderMaterial({
                     uniforms: {
-                        topColor: { value: new THREE.Color(SETTINGS.daySkyBottom) },  // Uniform sky color
+                        topColor: { value: new THREE.Color(SETTINGS.daySkyTop) },
                         bottomColor: { value: new THREE.Color(SETTINGS.daySkyBottom) },
                         offset: { value: -130.0 },  // ~15° above horizon before gradient starts
                         exponent: { value: 0.3 }, // Lower = more gradual gradient transition
@@ -27369,6 +27371,7 @@ self.onmessage = async (e) => {
                 });
                 renderer.setPixelRatio(window.devicePixelRatio * SETTINGS.pixelRatio);
                 renderer.setSize(window.innerWidth, window.innerHeight);
+                renderer.setClearColor(SETTINGS.daySkyBottom); // Match sky horizon to prevent gaps
                 renderer.info.autoReset = true; // Reset render stats each frame for accurate debug display
                 renderer.shadowMap.enabled = SETTINGS.shadows;
                 // OPTIMIZATION: Disable automatic shadow map updates - we control when shadows render
@@ -30800,7 +30803,7 @@ self.onmessage = async (e) => {
                             // Apply cylindrical fog (horizontal distance only)
                             vec2 fogDiffXZ = vWorldPosition.xz - cameraPosition.xz;
                             float fogDepth = length(fogDiffXZ);
-                            float fogFactor = smoothstep(fogNear, fogFar, fogDepth);
+                            float fogFactor = min(smoothstep(fogNear, fogFar, fogDepth) * 1.15, 1.0);
                             finalColor = mix(finalColor, fogColor, fogFactor);
 
                             gl_FragColor = vec4(finalColor, opacity * waterTex.a);
@@ -30855,7 +30858,9 @@ self.onmessage = async (e) => {
                                 #ifdef FOG_EXP2
                                     float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
                                 #else
-                                    float fogFactor = smoothstep(fogNear, fogFar, fogDepthCyl);
+                                    // Scale by 1.15 so fog reaches full opacity before fogFar,
+                                    // ensuring chunk edges are completely hidden
+                                    float fogFactor = min(smoothstep(fogNear, fogFar, fogDepthCyl) * 1.15, 1.0);
                                 #endif
                                 gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
                             #endif`
@@ -38699,11 +38704,11 @@ self.onmessage = async (e) => {
                 if (fogDistance !== lastFogFar && !isUnderwater) {
                     lastFogFar = fogDistance;
                     fogFar = fogDistance;
-                    // Fog ends 1 chunk BEFORE render distance so edge chunks are fully occluded
-                    // This ensures the outermost ring of chunks fades to complete opacity
+                    // Fog ends 2 chunks BEFORE render distance so edge chunks are fully occluded
+                    // This ensures the outermost 2 rings of chunks are invisible (fully in fog)
                     const chunkSize = WORLD_DIMS.chunkSize;
-                    const fogFarActual = fogDistance - chunkSize; // End fog 1 chunk before edge
-                    const fogNear = fogFarActual * 0.5; // Start fade at 50% for smooth gradient
+                    const fogFarActual = fogDistance - chunkSize * 2;
+                    const fogNear = fogFarActual * 0.6; // Start fade at 60% for tighter edge transition
                     if (scene.fog) { scene.fog.far = fogFarActual; scene.fog.near = fogNear;
                     } else { scene.fog = new THREE.Fog(SETTINGS.daySkyBottom, fogNear, fogFarActual); }
                 }
@@ -39231,11 +39236,14 @@ self.onmessage = async (e) => {
                     }
 
                     // Fog color: black when underground, sky color otherwise (but not when underwater)
+                    // Also sync renderer clear color so no gaps are visible
                     if (scene.fog && !isUnderwater) {
                         if (isUnderground) {
                             scene.fog.color.copy(_undergroundFogColor);
+                            renderer.setClearColor(_undergroundFogColor);
                         } else {
                             scene.fog.color.copy(skyMaterial.uniforms.bottomColor.value);
+                            renderer.setClearColor(skyMaterial.uniforms.bottomColor.value);
                         }
                     }
                 }
