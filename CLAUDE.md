@@ -9,8 +9,8 @@
 - **Platform**: HTML5 + JavaScript ES6 modules
 - **Main File**: `voxEx.html` (single file - no exceptions)
 - **Architecture**: Self-contained single-page application
-- **Tech Stack**: Three.js r160, WebGL, IndexedDB, LocalStorage
-- **Lines of Code**: ~23,000
+- **Tech Stack**: Three.js r160, WebGL, Web Workers, Web Audio, IndexedDB, OPFS, LocalStorage
+- **Lines of Code**: ~41,000
 
 ## Project Priorities
 
@@ -48,9 +48,17 @@ These are the core principles that guide all development decisions:
 
 ```
 VoxEx/
-├── .git/           # Git repository data
-├── voxEx.html      # Complete application (HTML + CSS + JS)
-└── CLAUDE.md       # This file
+├── index.html                # System check & launcher
+├── voxEx.html                # Complete game (HTML + CSS + JS, ~41K lines)
+├── CLAUDE.md                 # This file
+├── README.md                 # Project readme
+├── futureFeatures.md         # Feature roadmap
+├── tools/                    # Development utilities
+│   ├── KeyFrame_editor.html
+│   ├── terrain-parameter-editor.html
+│   ├── voxelEditor.html
+│   └── voxex-sound-formula.html
+└── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
 
 ## Technology Stack
@@ -59,7 +67,10 @@ VoxEx/
 |------------|---------|---------|
 | **Three.js** | 0.160.0 | 3D rendering, lighting, camera control |
 | **PointerLockControls** | Three.js addon | First-person camera/input control |
+| **Web Workers** | Native browser API | Off-thread chunk meshing via `ChunkWorkerPool` |
+| **Web Audio API** | Native browser API | Procedural sound synthesis (zombie growls, etc.) |
 | **IndexedDB** | Native browser API | Chunk data persistence with RLE compression |
+| **OPFS** | Native browser API | Origin Private File System disk cache (`ChunkDiskStorage`) |
 | **LocalStorage** | Native browser API | Game saves and settings storage |
 | **Canvas API** | Native | Procedural texture generation (Atlas) |
 | **WebGL** | Via Three.js | GPU-accelerated rendering |
@@ -72,34 +83,49 @@ VoxEx/
 │ - HUD: Crosshair, Hotbar, Block Name, Flight/Sprint Icons   │
 │ - Menus: Start, Pause, Settings, Controls, Seed Selection   │
 │ - Inventory: Drag-and-drop block selection (E key)          │
+│ - Performance Overlay (O key)                               │
 └───────────────┬─────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Game Engine (Three.js Renderer)                             │
-│ - Camera (First Person), Lighting (Day/Night), Skybox       │
+│ Game Engine (RenderEngine + Three.js)                       │
+│ - Camera (First/Third Person), Lighting (Day/Night), Skybox │
 │ - Voxel Torch Model (BoxGeometry)                           │
+│ - ParticleSystem (torch flames, water splashes)             │
 │ - Post-Processing: Volumetric Lighting, Zombie Effects      │
 └───────────────┬─────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ World Management System                                     │
+│ World Management System (VoxelWorld + TerrainGenerator)     │
 │ ├─ Chunk Generation (16×16×320)                             │
+│ ├─ ChunkWorkerPool (Web Workers for off-thread meshing)     │
+│ ├─ ChunkMesher (geometry building, face culling, AO)        │
 │ ├─ Biome System (Plains, Hills, Forests, Mountains,         │
 │ │                Swamp, Longwoods)                          │
 │ ├─ Structure Generation (Trees, Multi-trunk, Caves)         │
-│ └─ Block Logic (Optimized Face Culling, AO)                 │
+│ └─ ChunkNeighborCache (optimized neighbor lookups)          │
 └───────────────┬─────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Entity System                                               │
+│ Entity & Player Systems                                     │
+│ ├─ PlayerController (movement, physics, collision)          │
 │ ├─ EntityManager (zombie spawning, pooling)                 │
-│ ├─ Zombie AI (detection, pathfinding, despawn)              │
+│ ├─ Mob / Zombie AI (detection, pathfinding, despawn)        │
 │ └─ Zombie Effects (vignette, desaturation)                  │
+└───────────────┬─────────────────────────────────────────────┘
+                ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Memory & Performance Management                             │
+│ ├─ MemoryBudgetManager (memory usage tracking/limits)       │
+│ ├─ PerformanceMonitor (FPS, frame timing)                   │
+│ ├─ Object Pools (Float32Array, Uint8Array, Uint32Array,     │
+│ │                Vector3, ChunkData, GeometryBuffer)        │
+│ └─ SeededRandom (deterministic PRNG)                        │
 └───────────────┬─────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ Data Persistence Layer                                      │
 │ ├─ IndexedDB (Chunk Cache with RLE Compression)             │
+│ ├─ ChunkDiskStorage (OPFS-based disk cache)                 │
 │ └─ LocalStorage (Game Saves & Settings)                     │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -138,7 +164,7 @@ VoxEx/
 | **Swamp** | 1 | Low baseHeight 58, water pools, droopy trees |
 | **Longwoods** | 2 | Giant 2×2/3×3 trunk trees, heights 12-24, wide sparse canopies |
 
-Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific behavior:
+Biomes are configured in `BIOME_CONFIG` (~line 3946). Tags enable biome-specific behavior:
 - `"mountain"` — enables treeline and alpine terrain
 - `"forested"` — high tree density
 - `"giant_trees"` — uses multi-block trunks
@@ -148,8 +174,11 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 ### Chunk System
 - **Size**: 16×16×320 blocks (increased from 128 for taller mountains)
 - **Structure**: `{blocks: Uint8Array, skyLight: Uint8Array, blockLight: Uint8Array}`
-- **Rendering**: Geometries are pooled (Float32Array) and batched per chunk
+- **Meshing**: `ChunkMesher` builds geometry; `ChunkWorkerPool` offloads to Web Workers
+- **Pooling**: `ChunkDataPool`, `GeometryBufferPool`, `Float32ArrayPool` reduce allocations
+- **Caching**: `ChunkNeighborCache` optimizes neighbor lookups during meshing
 - **Optimization**: Hidden faces culled; Ambient Occlusion (AO) baked into vertex colors
+- **Memory**: `MemoryBudgetManager` tracks and limits chunk memory usage
 - **Backward Compatibility**: Supports both old (Uint8Array) and new (object) formats
 
 ### Lighting System
@@ -167,8 +196,10 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 - **Materials**: Lambert material for terrain; Transparent material for water
 - **Fog**: Custom cylindrical fog shader for smooth horizon blending
 - **Volumetric Effects**: God rays, volumetric fog (configurable via Settings › Graphics)
+- **Particles**: `ParticleSystem` for torch flames, water splashes, etc.
 - **Layers**: Layer 0 (world geometry), Layer 1 (viewmodels like torch)
-- **Camera**: Near plane 0.01, far plane 800, FOV 75° (80° when sprinting)
+- **Camera**: First-person and third-person (V key toggle); FOV 75° (80° when sprinting)
+- **Web Workers**: `ChunkWorkerPool` offloads mesh generation to background threads
 
 ### Torch Viewmodel
 - **Type**: 3D voxel model (stick + flame + glow) using BoxGeometry
@@ -188,20 +219,41 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 ### Persistence
 - **RLE Compression**: Chunk data (blocks + light) is Run-Length Encoded
 - **Format Version**: v2 includes separate arrays for blocks, skyLight, blockLight
+- **OPFS Disk Cache**: `ChunkDiskStorage` uses Origin Private File System for fast chunk caching
 - **Save Format**: JSON with Seed, Player Pos/Rot, and RLE-compressed modified chunks
 - **Quick Save/Load**: F5 saves, F9 loads (instant)
 - **Backward Compatibility**: Decompressor handles both v1 and v2 formats
 
-### Manager Classes
+### Classes
 
 | Class | Purpose |
 |-------|---------|
+| `VoxExGame` | Main game orchestrator, ties all systems together |
+| `VoxelWorld` | World management, chunk loading/unloading |
+| `TerrainGenerator` | Terrain and biome generation algorithms |
+| `ChunkMesher` | Geometry mesh building from chunk data |
+| `ChunkWorkerPool` | Web Worker management for off-thread meshing |
+| `RenderEngine` | Three.js rendering pipeline |
+| `PlayerController` | Player movement, physics, collision |
 | `UIManager` | HUD, hotbar, inventory, movement indicators |
 | `SettingsManager` | Settings persistence, UI binding |
 | `InputManager` | Keyboard/mouse input handling |
-| `PostProcessingManager` | Volumetric lighting, zombie effects |
 | `AudioManager` | Procedural sounds (zombie growls, etc.) |
-| `EntityManager` | Zombie spawning, AI, pooling |
+| `EntityManager` | Zombie spawning, lifecycle, pooling |
+| `Mob` | Zombie entity AI implementation |
+| `ParticleSystem` | Particle effects (torch flames, water, etc.) |
+| `PerformanceMonitor` | FPS tracking, frame timing metrics |
+| `MemoryBudgetManager` | Memory usage tracking and limits |
+| `ChunkDiskStorage` | OPFS-based disk cache for chunks |
+| `ChunkNeighborCache` | Optimized neighbor chunk lookups |
+| `ChunkDataPool` | Object pooling for chunk data structures |
+| `GeometryBufferPool` | GPU buffer reuse for meshes |
+| `Float32ArrayPool` | Pool for Float32Array objects |
+| `Uint8ArrayPool` | Pool for Uint8Array objects |
+| `Uint32ArrayPool` | Pool for Uint32Array objects |
+| `Vector3Pool` | Pool for Three.js Vector3 objects |
+| `SeededRandom` | Deterministic PRNG for world generation |
+| `SunlightTask` | Async sunlight propagation tasks |
 
 ## Naming Conventions
 
@@ -220,11 +272,14 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 | SHIFT | Sprint |
 | F | Toggle Torch |
 | E | Open/Close Inventory |
+| V | Toggle Third-Person Camera |
+| +/- | Zoom In/Out (third-person) |
 | 1-9 / Scroll | Select Hotbar Slot |
 | Left Click | Mine Block |
 | Right Click | Place Block |
 | F5 | Quick Save |
 | F9 | Quick Load |
+| O | Toggle Performance Overlay |
 | ~ (Tilde) | Toggle Debug Overlay |
 | ESC | Pause / Navigate Menus |
 
@@ -232,9 +287,9 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 
 ### When Modifying `voxEx.html`:
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, and JavaScript
-2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 2803) and add texture generation in `initTextures`. Current count: **17**
-3. **Block Config**: Add new blocks to `BLOCK_CONFIG` array (~line 2815). The system auto-derives inventory, textures, and transparency
-4. **Biome Config**: Add new biomes to `BIOME_CONFIG` (~line 3223). Missing fields inherit from `BIOME_DEFAULTS`
+2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 3514) and add texture generation in `initTextures`. Current count: **17**
+3. **Block Config**: Add new blocks to `BLOCK_CONFIG` array (~line 3533). The system auto-derives inventory, textures, and transparency
+4. **Biome Config**: Add new biomes to `BIOME_CONFIG` (~line 3946). Missing fields inherit from `BIOME_DEFAULTS`
 5. **UI Overlay**: UI elements toggled via `controls.lock`/`unlock` events
 6. **Light System**: When changing blocks, always call `calculateChunkSunlight()` to update lighting
 7. **Chunk Format**: Use `chunk.blocks`, `chunk.skyLight`, `chunk.blockLight` (with backward compatibility checks)
@@ -247,9 +302,15 @@ Biomes are configured in `BIOME_CONFIG` (~line 3223). Tags enable biome-specific
 - **Gen**: `function generateChunkData`, `function calculateChunkSunlight`
 - **Render**: `function renderChunk`, `function addFace`
 - **Light**: `function getSkyLight`, `function setSkyLight`, `getLocalLight`
-- **Input**: `function onKeyDown`, `function onMouseWheel`
+- **Input**: `const onKeyDown`, `function onKeyUp`, `onMouseWheel`
 - **Compression**: `ChunkCompressor.compress`, `ChunkCompressor.decompress`
-- **Managers**: `class UIManager`, `class EntityManager`, `class SettingsManager`
+- **Core Classes**: `class VoxExGame`, `class VoxelWorld`, `class TerrainGenerator`
+- **Rendering**: `class RenderEngine`, `class ChunkMesher`, `class ParticleSystem`
+- **Player/Entity**: `class PlayerController`, `class EntityManager`, `class Mob`
+- **UI/Settings**: `class UIManager`, `class SettingsManager`, `class InputManager`
+- **Workers**: `class ChunkWorkerPool`, `class ChunkDiskStorage`
+- **Memory**: `class MemoryBudgetManager`, `class PerformanceMonitor`
+- **Pools**: `class ChunkDataPool`, `class GeometryBufferPool`, `class Float32ArrayPool`
 
 ### Light Level Reference
 - **15**: Full sunlight (directly exposed to sky)
@@ -275,9 +336,9 @@ These rules ensure maintainable, performant JavaScript in the single-file archit
 
 ### JSDoc Documentation Standards
 
-The codebase uses JSDoc type definitions (~line 2634). All public functions require JSDoc.
+The codebase uses JSDoc type definitions (~line 3347). All public functions require JSDoc.
 
-**Existing Type Definitions:**
+**Core Type Definitions:**
 ```javascript
 /** @typedef {number} BlockId */
 /** @typedef {number} TileIndex */
@@ -290,6 +351,23 @@ The codebase uses JSDoc type definitions (~line 2634). All public functions requ
 /** @typedef {number} AOValue */
 /** @typedef {Object} Position3D */
 /** @typedef {Object} AABB */
+/** @typedef {Object} BlockHit */
+/** @typedef {Object} BlockInteractionResult */
+/** @typedef {Object} ChunkData */
+/** @typedef {Object} BlockConfigEntry */
+```
+
+**Tree/Biome Type Definitions** (~line 3782+):
+```javascript
+/** @typedef {Object} NoiseConfig */
+/** @typedef {Object} WorldConfig */
+/** @typedef {Object} TrunkConfig */
+/** @typedef {Object} CanopyConfig */
+/** @typedef {'round'|'conical'|'spherical'|'layered'|'umbrella'} CanopyShape */
+/** @typedef {Object} TreeConfig */
+/** @typedef {Object} BiomeTreeConfig */
+/** @typedef {Object} BiomeConfigEntry */
+/** @typedef {BiomeConfigEntry & {name: string}} ResolvedBiome */
 ```
 
 **Function Documentation Example:**
@@ -441,7 +519,7 @@ These rules tell Claude Code how to work on this repo without breaking things.
   - Quickly search the file for that name; **do not** redeclare an existing identifier in the same scope
   - Avoid confusing shadowing of important globals (e.g. `scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`)
 - When adding or changing settings:
-  - Add a sane default in `DEFAULTS` (~line 4421), wire it into `SETTINGS` (~line 4278)
+  - Add a sane default in `DEFAULTS` (~line 5215), wire it into `SETTINGS` (~line 5001)
   - Ensure it round-trips via the save/load system
   - Make sure any new DOM IDs used in JS exist in the HTML
 - Avoid heavy, deeply nested loops in hot paths (render loop, movement, chunk meshing):
