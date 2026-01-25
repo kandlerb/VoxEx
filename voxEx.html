@@ -19441,12 +19441,14 @@
             ridgeSum += (ridgeSum - 0.9) * 1.5;
         }
 
-        // Jagged detail - high-frequency micro-ridges
-        const jaggedFreq = 0.035;
+        // Jagged detail - high-frequency micro-ridges for sharp peaks
+        // Higher frequency (0.08) creates features visible within 16-block chunks
+        // Increased amplitude (0.12 + 0.08 = 0.20 max) for more visible jaggedness
+        const jaggedFreq = 0.08;
         const jagged1 = 1.0 - Math.abs(noise2D(gx * jaggedFreq + seed * 30, gz * jaggedFreq - seed * 30));
         const jagged2 = 1.0 - Math.abs(noise2D(gx * jaggedFreq * 2.3 - seed * 17, gz * jaggedFreq * 2.3 + seed * 13));
-        const jaggedAmount = (Math.pow(jagged1, 2.0) * 0.06 + Math.pow(jagged2, 2.5) * 0.04) *
-                            (0.3 + ridgeSum * 0.7);
+        const jaggedAmount = (Math.pow(jagged1, 1.8) * 0.12 + Math.pow(jagged2, 2.2) * 0.08) *
+                            (0.4 + ridgeSum * 0.6);
 
         // Valley carving
         const valleyNoise = noise2D(gx * 0.003 + seed * 5, gz * 0.003 - seed * 5);
@@ -19491,41 +19493,18 @@
         const gullyNoise = 1.0 - Math.abs(noise2D(gx * 0.025 + seed * 25, gz * 0.025 - seed * 25));
         const gullyCarve = gullyNoise > 0.85 ? (gullyNoise - 0.85) * 0.15 : 0;
 
-        // Ridge connection - connect nearby mountain biome cells (within 3 cells)
-        let ridgeConnect = 0;
+        // Ridge connection - continuous noise-based approach (no discrete cell lookups)
+        // This creates natural ridge connections without chunk boundary discontinuities
+        const ridgeConnectNoise1 = 1.0 - Math.abs(noise2D(gx * 0.004 + seed * 40, gz * 0.004 - seed * 40));
+        const ridgeConnectNoise2 = 1.0 - Math.abs(noise2D(gx * 0.008 - seed * 25, gz * 0.008 + seed * 35));
+        const ridgeConnect = Math.pow(ridgeConnectNoise1, 2.0) * 0.12 * ridgeSum +
+                            Math.pow(ridgeConnectNoise2, 2.5) * 0.08 * ridgeSum;
+
+        // Cell coordinates for edge falloff (still needed for biome boundary detection)
         const cellX = Math.floor(gx / BIOME_CELL_SIZE);
         const cellZ = Math.floor(gz / BIOME_CELL_SIZE);
         const localFracX = (gx / BIOME_CELL_SIZE) - cellX;
         const localFracZ = (gz / BIOME_CELL_SIZE) - cellZ;
-        for (let dx = -3; dx <= 3; dx++) {
-            for (let dz = -3; dz <= 3; dz++) {
-                if (dx === 0 && dz === 0) continue;
-                const dist = Math.sqrt(dx * dx + dz * dz);
-                if (dist > 3) continue;
-                const neighbor = getBiomeCellValue(cellX + dx, cellZ + dz);
-                if (neighbor && neighbor.tags && neighbor.tags.includes("mountain")) {
-                    const dirX = dx;
-                    const dirZ = dz;
-                    const dirLen = dist;
-                    const projT = (localFracX * dirX + localFracZ * dirZ) / (dirLen * dirLen);
-                    const clampT = Math.max(0, Math.min(1, projT));
-                    const projX = clampT * dirX;
-                    const projZ = clampT * dirZ;
-                    const perpDist = Math.sqrt((localFracX - projX) * (localFracX - projX) +
-                                              (localFracZ - projZ) * (localFracZ - projZ));
-                    const ridgeWidth = 0.25;
-                    const ridgeFalloff = Math.max(0, 1.0 - perpDist / ridgeWidth);
-                    const distFade = 1.0 - (dist / 3.5);
-                    const ridgeLineNoise = noise2D(
-                        (gx + dx * 50) * 0.01 + seed * 40,
-                        (gz + dz * 50) * 0.01 - seed * 40
-                    );
-                    const ridgeVariation = 0.6 + ridgeLineNoise * 0.4;
-                    ridgeConnect = Math.max(ridgeConnect,
-                        ridgeFalloff * ridgeFalloff * distFade * ridgeVariation * 0.3);
-                }
-            }
-        }
 
         // --- EDGE FALLOFF ---
         // Create natural foothills at mountain biome boundaries by reducing height
@@ -19652,6 +19631,20 @@
         if (maxCornerHeight > 140 && maxCornerHeight > finalHeight + 15) {
             const preservation = (maxCornerHeight - finalHeight) * 0.4;
             finalHeight += preservation;
+        }
+
+        // Post-blend jagged detail - applied AFTER biome interpolation to preserve sharpness
+        // This bypasses the smoothstep averaging that rounds off pre-blend jaggedness
+        const avgCornerHeight = (h00 + h10 + h01 + h11) * 0.25;
+        if (avgCornerHeight > 90) {
+            // Weight based on how mountainous the terrain is (0 at 90, 1 at 150+)
+            const mountainWeight = Math.min(1.0, (avgCornerHeight - 90) / 60);
+            const postJaggedFreq = 0.1;
+            const pj1 = 1.0 - Math.abs(noise2D(gx * postJaggedFreq + seed * 50, gz * postJaggedFreq - seed * 50));
+            const pj2 = 1.0 - Math.abs(noise2D(gx * postJaggedFreq * 2.1 - seed * 35, gz * postJaggedFreq * 2.1 + seed * 25));
+            // Direct block values for sharp, visible peaks
+            const postJagged = (Math.pow(pj1, 1.5) * 8 + Math.pow(pj2, 1.8) * 5) * mountainWeight;
+            finalHeight += postJagged;
         }
 
         // 4. Apply oceans first (larger scale feature)
@@ -35834,6 +35827,20 @@ self.onmessage = async (e) => {
                     finalHeight += preservation;
                 }
 
+                // Post-blend jagged detail - applied AFTER biome interpolation to preserve sharpness
+                // This bypasses the smoothstep averaging that rounds off pre-blend jaggedness
+                const avgCornerHeight = (h00 + h10 + h01 + h11) * 0.25;
+                if (avgCornerHeight > 90) {
+                    // Weight based on how mountainous the terrain is (0 at 90, 1 at 150+)
+                    const mountainWeight = Math.min(1.0, (avgCornerHeight - 90) / 60);
+                    const postJaggedFreq = 0.1;
+                    const pj1 = 1.0 - Math.abs(noise2D(gx * postJaggedFreq + seed * 50, gz * postJaggedFreq - seed * 50));
+                    const pj2 = 1.0 - Math.abs(noise2D(gx * postJaggedFreq * 2.1 - seed * 35, gz * postJaggedFreq * 2.1 + seed * 25));
+                    // Direct block values for sharp, visible peaks
+                    const postJagged = (Math.pow(pj1, 1.5) * 8 + Math.pow(pj2, 1.8) * 5) * mountainWeight;
+                    finalHeight += postJagged;
+                }
+
                 // 4. Apply oceans first (larger scale feature)
                 const oceanFactor = getOceanFactor(gx, gz, seed);
                 if (oceanFactor < 1.0) {
@@ -35980,13 +35987,15 @@ self.onmessage = async (e) => {
                 }
 
                 // --- 4. JAGGED DETAIL ---
-                // High-frequency micro-ridges that break up smooth surfaces
-                const jaggedFreq = 0.035;
+                // High-frequency micro-ridges for sharp peaks
+                // Higher frequency (0.08) creates features visible within 16-block chunks
+                // Increased amplitude (0.12 + 0.08 = 0.20 max) for more visible jaggedness
+                const jaggedFreq = 0.08;
                 const jagged1 = 1.0 - Math.abs(noise2D(gx * jaggedFreq + seed * 30, gz * jaggedFreq - seed * 30));
                 const jagged2 = 1.0 - Math.abs(noise2D(gx * jaggedFreq * 2.3 - seed * 17, gz * jaggedFreq * 2.3 + seed * 13));
                 // Jaggedness scales with altitude - higher areas are more jagged
-                const jaggedAmount = (Math.pow(jagged1, 2.0) * 0.06 + Math.pow(jagged2, 2.5) * 0.04) *
-                                    (0.3 + ridgeSum * 0.7);
+                const jaggedAmount = (Math.pow(jagged1, 1.8) * 0.12 + Math.pow(jagged2, 2.2) * 0.08) *
+                                    (0.4 + ridgeSum * 0.6);
 
                 // --- 5. VALLEY CARVING ---
                 const valleyNoise = noise2D(gx * 0.003 + seed * 5, gz * 0.003 - seed * 5);
@@ -36035,52 +36044,20 @@ self.onmessage = async (e) => {
                 const gullyCarve = gullyNoise > 0.85 ? (gullyNoise - 0.85) * 0.15 : 0;
 
                 // --- 11. RIDGE CONNECTION ---
-                // Connect ridges between nearby mountain biome cells (within 3 cells)
-                let ridgeConnect = 0;
+                // Continuous noise-based approach (no discrete cell lookups)
+                // This creates natural ridge connections without chunk boundary discontinuities
+                const ridgeConnectNoise1 = 1.0 - Math.abs(noise2D(gx * 0.004 + seed * 40, gz * 0.004 - seed * 40));
+                const ridgeConnectNoise2 = 1.0 - Math.abs(noise2D(gx * 0.008 - seed * 25, gz * 0.008 + seed * 35));
+                const ridgeConnect = Math.pow(ridgeConnectNoise1, 2.0) * 0.12 * ridgeSum +
+                                    Math.pow(ridgeConnectNoise2, 2.5) * 0.08 * ridgeSum;
+
+                // Cell coordinates for edge falloff (still needed for biome boundary detection)
                 const _biomeCell = typeof getBiomeCellDirect === 'function' ? getBiomeCellDirect :
                                    typeof getBiomeCellValue === 'function' ? getBiomeCellValue : null;
-                // Calculate cell coordinates (used for ridge connection and edge falloff)
                 const cellX = Math.floor(gx / BIOME_CELL_SIZE);
                 const cellZ = Math.floor(gz / BIOME_CELL_SIZE);
                 const localFracX = (gx / BIOME_CELL_SIZE) - cellX;
                 const localFracZ = (gz / BIOME_CELL_SIZE) - cellZ;
-                if (_biomeCell) {
-                for (let dx = -3; dx <= 3; dx++) {
-                    for (let dz = -3; dz <= 3; dz++) {
-                        if (dx === 0 && dz === 0) continue;
-                        const dist = Math.sqrt(dx * dx + dz * dz);
-                        if (dist > 3) continue;
-                        const neighbor = _biomeCell(cellX + dx, cellZ + dz);
-                        if (neighbor && neighbor.tags && neighbor.tags.includes("mountain")) {
-                            // Calculate ridge line between current cell center and neighbor center
-                            const dirX = dx;
-                            const dirZ = dz;
-                            const dirLen = dist;
-                            // Project current position onto the line between cell centers
-                            const projT = (localFracX * dirX + localFracZ * dirZ) / (dirLen * dirLen);
-                            const clampT = Math.max(0, Math.min(1, projT));
-                            // Perpendicular distance from the ridge line
-                            const projX = clampT * dirX;
-                            const projZ = clampT * dirZ;
-                            const perpDist = Math.sqrt((localFracX - projX) * (localFracX - projX) +
-                                                      (localFracZ - projZ) * (localFracZ - projZ));
-                            // Ridge width narrows with distance, using ridged falloff
-                            const ridgeWidth = 0.25;
-                            const ridgeFalloff = Math.max(0, 1.0 - perpDist / ridgeWidth);
-                            // Height contribution fades with distance between cells
-                            const distFade = 1.0 - (dist / 3.5);
-                            // Add ridge noise along the connecting line for variation
-                            const ridgeLineNoise = noise2D(
-                                (gx + dx * 50) * 0.01 + seed * 40,
-                                (gz + dz * 50) * 0.01 - seed * 40
-                            );
-                            const ridgeVariation = 0.6 + ridgeLineNoise * 0.4;
-                            ridgeConnect = Math.max(ridgeConnect,
-                                ridgeFalloff * ridgeFalloff * distFade * ridgeVariation * 0.3);
-                        }
-                    }
-                }
-                } // end if (_biomeCell)
 
                 // --- EDGE FALLOFF ---
                 // Create natural foothills at mountain biome boundaries by reducing height
