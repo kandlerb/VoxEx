@@ -23023,6 +23023,13 @@
              */
             class WorldPreviewRenderer {
                 /**
+                 * Mountain backbone threshold - cells above this are mountains.
+                 * Must match MOUNTAIN_THRESHOLD in worker and main thread (0.52).
+                 * @type {number}
+                 */
+                static MOUNTAIN_THRESHOLD = 0.52;
+
+                /**
                  * @param {HTMLCanvasElement} canvas - Canvas element.
                  */
                 constructor(canvas) {
@@ -23031,6 +23038,8 @@
                     this.noise = null;
                     this.seed = 0;
                     this.renderTimeout = null;
+                    this.mountainBackboneCache = new Map();
+                    this.clusterValidityCache = new Map();
                 }
                 /**
                  * Initialize with a seed value.
@@ -23039,6 +23048,9 @@
                 init(seed) {
                     this.seed = seed;
                     this.noise = new WorldPreviewNoise(seed);
+                    // Clear caches when seed changes
+                    this.mountainBackboneCache.clear();
+                    this.clusterValidityCache.clear();
                 }
                 /**
                  * Schedule a render with debouncing.
@@ -23060,27 +23072,127 @@
                     return Math.max(-1, Math.min(1, c));
                 }
                 /**
-                 * Get biome for a cell coordinate.
+                 * Get mountain backbone value for a cell.
+                 * Matches getMountainBackbone() in worker and main thread.
+                 * @param {number} cellX - Cell X coordinate.
+                 * @param {number} cellZ - Cell Z coordinate.
+                 * @returns {number} Backbone value 0-1 (higher = more likely mountain).
+                 */
+                getMountainBackbone(cellX, cellZ) {
+                    const key = cellX + ',' + cellZ;
+                    if (this.mountainBackboneCache.has(key)) return this.mountainBackboneCache.get(key);
+
+                    // Seed-based rotation for range direction variety
+                    const rotAngle = ((this.seed % 1000) / 1000) * Math.PI * 0.5;
+                    const cosR = Math.cos(rotAngle);
+                    const sinR = Math.sin(rotAngle);
+                    const rx = cellX * cosR - cellZ * sinR;
+                    const rz = cellX * sinR + cellZ * cosR;
+
+                    // Multi-octave ridge noise for natural-looking elongated ranges
+                    const scale = 0.07;
+                    let backbone = 0;
+                    let amp = 1.0;
+                    let freq = 1.0;
+                    for (let i = 0; i < 3; i++) {
+                        const n = this.noise.noise2D(rx * scale * freq + this.seed * 0.1, rz * scale * freq - this.seed * 0.1);
+                        backbone += (1.0 - Math.abs(n)) * amp;
+                        amp *= 0.5;
+                        freq *= 2.0;
+                    }
+                    backbone /= 1.75;
+
+                    // Add secondary perpendicular variation for width changes along range
+                    const widthVar = this.noise.noise2D(rx * 0.03 - this.seed * 0.2, rz * 0.03 + this.seed * 0.2);
+                    backbone += widthVar * 0.15;
+
+                    backbone = Math.max(0, Math.min(1, backbone));
+                    this.mountainBackboneCache.set(key, backbone);
+                    return backbone;
+                }
+                /**
+                 * Check if a mountain cluster meets minimum size requirements (2x4 cells).
+                 * Matches isValidMountainCluster() in worker and main thread.
+                 * @param {number} startCellX - Starting cell X.
+                 * @param {number} startCellZ - Starting cell Z.
+                 * @returns {boolean} True if cluster is valid.
+                 */
+                isValidMountainCluster(startCellX, startCellZ) {
+                    const key = startCellX + ',' + startCellZ;
+                    if (this.clusterValidityCache.has(key)) return this.clusterValidityCache.get(key);
+
+                    const visited = new Set();
+                    const queue = [[startCellX, startCellZ]];
+                    let minX = startCellX, maxX = startCellX;
+                    let minZ = startCellZ, maxZ = startCellZ;
+                    let cellCount = 0;
+                    const maxCells = 50;
+
+                    while (queue.length > 0 && cellCount < maxCells) {
+                        const [cx, cz] = queue.shift();
+                        const cellKey = cx + ',' + cz;
+                        if (visited.has(cellKey)) continue;
+
+                        const backbone = this.getMountainBackbone(cx, cz);
+                        if (backbone < WorldPreviewRenderer.MOUNTAIN_THRESHOLD) continue;
+
+                        visited.add(cellKey);
+                        cellCount++;
+                        minX = Math.min(minX, cx);
+                        maxX = Math.max(maxX, cx);
+                        minZ = Math.min(minZ, cz);
+                        maxZ = Math.max(maxZ, cz);
+
+                        const width = maxX - minX + 1;
+                        const height = maxZ - minZ + 1;
+                        if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
+                            for (const visitedKey of visited) {
+                                this.clusterValidityCache.set(visitedKey, true);
+                            }
+                            return true;
+                        }
+
+                        // Cardinal neighbors
+                        queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
+                    }
+
+                    // Cluster too small
+                    for (const visitedKey of visited) {
+                        this.clusterValidityCache.set(visitedKey, false);
+                    }
+                    return false;
+                }
+                /**
+                 * Get biome for a cell coordinate using mountain backbone system.
+                 * Mountains are only placed via backbone, not weighted selection.
                  * @param {number} cellX - Cell X.
                  * @param {number} cellZ - Cell Z.
                  * @param {number} biomeSizeMult - Biome size multiplier.
                  * @returns {Object} Biome object with name and color.
                  */
                 getBiomeForCell(cellX, cellZ, biomeSizeMult = 1.0) {
-                    // Scale frequency inversely with biome size multiplier
+                    // 1. Check mountain backbone first
+                    const backbone = this.getMountainBackbone(cellX, cellZ);
+                    if (backbone >= WorldPreviewRenderer.MOUNTAIN_THRESHOLD) {
+                        if (this.isValidMountainCluster(cellX, cellZ)) {
+                            return { name: 'mountains', color: { r: 140, g: 140, b: 140 }, baseHeight: 70, amplitude: 180, roughness: 0.003 };
+                        }
+                    }
+
+                    // 2. Regular biome selection (mountains excluded from weighted pool)
                     const freq = 0.1 / biomeSizeMult;
                     const noiseVal = this.noise.noise2D(cellX * freq + 1000, cellZ * freq + 1000);
                     const t = (noiseVal + 1) * 0.5;
-                    // Biome weights: plains(2), hills(2), forests(2), mountains(1), swamp(1), longwoods(2) = 10 total
+                    // Biome weights: plains(2), hills(2), forests(2), swamp(1), longwoods(2) = 9 total
+                    // Mountains are EXCLUDED - they're determined by backbone only
                     const biomes = [
                         { name: 'plains', weight: 2, color: { r: 124, g: 186, b: 61 }, baseHeight: 62, amplitude: 8, roughness: 0.006 },
                         { name: 'hills', weight: 2, color: { r: 90, g: 156, b: 46 }, baseHeight: 65, amplitude: 40, roughness: 0.010 },
                         { name: 'forests', weight: 2, color: { r: 45, g: 107, b: 34 }, baseHeight: 64, amplitude: 12, roughness: 0.015 },
-                        { name: 'mountains', weight: 1, color: { r: 140, g: 140, b: 140 }, baseHeight: 70, amplitude: 180, roughness: 0.003 },
                         { name: 'swamp', weight: 1, color: { r: 74, g: 93, b: 35 }, baseHeight: 58, amplitude: 5, roughness: 0.025 },
                         { name: 'longwoods', weight: 2, color: { r: 61, g: 122, b: 45 }, baseHeight: 68, amplitude: 25, roughness: 0.008 }
                     ];
-                    const totalWeight = 10;
+                    const totalWeight = 9;  // Excludes mountains
                     const target = t * totalWeight;
                     let accumulated = 0;
                     for (const biome of biomes) {
@@ -23400,17 +23512,18 @@
 
             /**
              * Hash a string to a numeric seed for preview.
+             * Uses the same algorithm as SeededRandom for consistency with actual game.
              * @param {string} str - String to hash.
              * @returns {number} Numeric hash.
              */
             function hashStringForPreview(str) {
-                let hash = 0;
+                // Match SeededRandom's string hashing algorithm exactly
+                let h = 0xdeadbeef;
                 for (let i = 0; i < str.length; i++) {
-                    const char = str.charCodeAt(i);
-                    hash = ((hash << 5) - hash) + char;
-                    hash = hash & hash;
+                    h = Math.imul(h ^ str.charCodeAt(i), 2654435761);
+                    h = (h ^ (h >>> 16)) >>> 0;
                 }
-                return Math.abs(hash);
+                return h;
             }
 
             // ===========================================
