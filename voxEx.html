@@ -4081,6 +4081,28 @@
                     },
                     tags: ["forested", "giant_trees"],
                 },
+                // Mountain foothills - transitional biome surrounding mountain ranges
+                // Never spawns via weighted selection (weight: 0), only via adjacency to mountains
+                mountain_foothills: {
+                    weight: 0,
+                    roughness: 0.006,
+                    amplitude: 55,
+                    baseHeight: 76,
+                    heightFunc: foothillsHeightFunc,
+                    trees: {
+                        density: 0.015,
+                        canopy: {
+                            shape: "conical",
+                            radius: 2,
+                            topExtension: 2,
+                            overlapDown: 1,
+                            taperFactor: 0.4,
+                            noiseStrength: 0.2,
+                            branchChance: 0.06,
+                        },
+                    },
+                    tags: ["mountain"],
+                },
             };
             /**
              * Default values for biome configuration fields.
@@ -17237,6 +17259,7 @@
                 hills: new THREE.Color(0.95, 0.97, 1.0),    // Slight blue
                 forests: new THREE.Color(0.92, 1.0, 0.92),  // Slight green
                 mountains: new THREE.Color(0.9, 0.95, 1.0), // Cool blue
+                mountain_foothills: new THREE.Color(0.93, 0.96, 1.0), // Light cool blue (between hills and mountains)
                 swamp: new THREE.Color(0.88, 0.92, 0.82),   // Murky green
                 default: new THREE.Color(1.0, 1.0, 1.0)
             };
@@ -17411,6 +17434,11 @@
             const BIOME_CELL_SIZE = 64;
             const biomeCellCache = new Map();
             const treeMaskCache = new Map();
+            // Mountain range system caches
+            const MOUNTAIN_THRESHOLD = 0.52;  // Backbone detection threshold
+            const mountainBackboneCache = new Map();
+            const clusterValidityCache = new Map();
+            const mountainWidthCache = new Map();
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
@@ -18644,6 +18672,18 @@
                 blocks: { log: LONGWOOD_LOG, leaves: LONGWOOD_LEAVES },
             },
         },
+        // Mountain foothills - transitional biome surrounding mountain ranges
+        // Never spawns via weighted selection (weight: 0), only via adjacency to mountains
+        mountain_foothills: {
+            weight: 0, roughness: 0.006, amplitude: 55, baseHeight: 76, tags: ["mountain"],
+            trees: {
+                density: 0.015,
+                canopy: {
+                    shape: "conical", radius: 2, topExtension: 2, overlapDown: 1,
+                    taperFactor: 0.4, noiseStrength: 0.2, branchChance: 0.06,
+                },
+            },
+        },
     };
     const BIOME_NAMES = Object.keys(BIOME_CONFIG);
     const BIOME_WEIGHTS = BIOME_NAMES.map(name => BIOME_CONFIG[name].weight);
@@ -18889,26 +18929,303 @@
     const BIOME_CELL_SIZE = 64;
     const biomeCellCache = new Map();
 
-    function getBiomeCellValue(cellX, cellZ) {
-        const key = cellX + ',' + cellZ;
-        if (biomeCellCache.has(key)) return biomeCellCache.get(key);
+    // ============================================================
+    // MOUNTAIN RANGE SYSTEM - Ridge-based elongated mountain ranges
+    // ============================================================
+    const MOUNTAIN_THRESHOLD = 0.52;  // Backbone detection threshold (lower = more mountains)
+    const mountainBackboneCache = new Map();
+    const clusterValidityCache = new Map();
+    const mountainWidthCache = new Map();
 
+    /**
+     * Calculate mountain backbone value using multi-octave ridge noise.
+     * Ridge noise creates elongated linear features ideal for mountain ranges.
+     * @param {number} cellX - Cell X coordinate
+     * @param {number} cellZ - Cell Z coordinate
+     * @param {number} seed - World seed
+     * @returns {number} Backbone value 0-1 (higher = more likely mountain)
+     */
+    function getMountainBackbone(cellX, cellZ, seed) {
+        const key = cellX + ',' + cellZ;
+        if (mountainBackboneCache.has(key)) return mountainBackboneCache.get(key);
+
+        // Seed-based rotation for range direction variety
+        const rotAngle = ((seed % 1000) / 1000) * Math.PI * 0.5;  // 0 to 90 degrees
+        const cosR = Math.cos(rotAngle);
+        const sinR = Math.sin(rotAngle);
+        const rx = cellX * cosR - cellZ * sinR;
+        const rz = cellX * sinR + cellZ * cosR;
+
+        // Multi-octave ridge noise for natural-looking elongated ranges
+        const scale = 0.07;  // Controls range spacing
+        let backbone = 0;
+        let amp = 1.0;
+        let freq = 1.0;
+        for (let i = 0; i < 3; i++) {
+            const n = noise2D(rx * scale * freq + seed * 0.1, rz * scale * freq - seed * 0.1);
+            backbone += (1.0 - Math.abs(n)) * amp;  // Ridge formula: peaks at zero-crossings
+            amp *= 0.5;
+            freq *= 2.0;
+        }
+        backbone /= 1.75;  // Normalize to ~0-1
+
+        // Add secondary perpendicular variation for width changes along range
+        const widthVar = noise2D(rx * 0.03 - seed * 0.2, rz * 0.03 + seed * 0.2);
+        backbone += widthVar * 0.15;
+
+        backbone = Math.max(0, Math.min(1, backbone));
+        mountainBackboneCache.set(key, backbone);
+        return backbone;
+    }
+
+    /**
+     * Check if a mountain cluster meets minimum size requirements (2x4 cells).
+     * Uses flood-fill with cardinal neighbors only.
+     * @param {number} startCellX - Starting cell X
+     * @param {number} startCellZ - Starting cell Z
+     * @param {number} seed - World seed
+     * @returns {boolean} True if cluster is valid (>= 2x4 or 4x2)
+     */
+    function isValidMountainCluster(startCellX, startCellZ, seed) {
+        const key = startCellX + ',' + startCellZ;
+        if (clusterValidityCache.has(key)) return clusterValidityCache.get(key);
+
+        const visited = new Set();
+        const queue = [[startCellX, startCellZ]];
+        let minX = startCellX, maxX = startCellX;
+        let minZ = startCellZ, maxZ = startCellZ;
+        let cellCount = 0;
+        const maxCells = 50;  // Limit flood-fill for performance
+
+        while (queue.length > 0 && cellCount < maxCells) {
+            const [cx, cz] = queue.shift();
+            const cellKey = cx + ',' + cz;
+            if (visited.has(cellKey)) continue;
+
+            const backbone = getMountainBackbone(cx, cz, seed);
+            if (backbone < MOUNTAIN_THRESHOLD) continue;
+
+            visited.add(cellKey);
+            cellCount++;
+            minX = Math.min(minX, cx);
+            maxX = Math.max(maxX, cx);
+            minZ = Math.min(minZ, cz);
+            maxZ = Math.max(maxZ, cz);
+
+            // Early exit if already large enough
+            const width = maxX - minX + 1;
+            const height = maxZ - minZ + 1;
+            if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
+                // Mark all visited cells as valid
+                for (const visitedKey of visited) {
+                    clusterValidityCache.set(visitedKey, true);
+                }
+                return true;
+            }
+
+            // Add cardinal neighbors only
+            queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
+        }
+
+        // Check final dimensions
+        const width = maxX - minX + 1;
+        const height = maxZ - minZ + 1;
+        const isValid = (width >= 2 && height >= 4) || (width >= 4 && height >= 2);
+
+        // Cache result for all visited cells
+        for (const visitedKey of visited) {
+            clusterValidityCache.set(visitedKey, isValid);
+        }
+        return isValid;
+    }
+
+    /**
+     * Measure the width of a mountain range at a given cell.
+     * Samples perpendicular to ridge direction.
+     * @param {number} cellX - Cell X coordinate
+     * @param {number} cellZ - Cell Z coordinate
+     * @param {number} seed - World seed
+     * @returns {number} Width in cells (1-16)
+     */
+    function getMountainWidth(cellX, cellZ, seed) {
+        const key = cellX + ',' + cellZ;
+        if (mountainWidthCache.has(key)) return mountainWidthCache.get(key);
+
+        let width = 1;  // Count self
+        const maxDist = 8;  // Max 8 cells in any direction
+
+        // Sample in 4 cardinal directions
+        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+        for (const [dx, dz] of dirs) {
+            for (let dist = 1; dist <= maxDist; dist++) {
+                const ncx = cellX + dx * dist;
+                const ncz = cellZ + dz * dist;
+                const backbone = getMountainBackbone(ncx, ncz, seed);
+                if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
+                    width++;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        width = Math.min(width, 16);  // Cap at 16
+        mountainWidthCache.set(key, width);
+        return width;
+    }
+
+    /**
+     * Find distance to nearest valid mountain backbone and its width.
+     * Used for determining foothill ring placement.
+     * @param {number} cellX - Cell X coordinate
+     * @param {number} cellZ - Cell Z coordinate
+     * @param {number} seed - World seed
+     * @returns {{distance: number, nearestWidth: number}} Distance (0 if in mountain) and width of nearest mountain
+     */
+    function getDistanceToMountainBackbone(cellX, cellZ, seed) {
+        // Check if this cell is in backbone
+        const backbone = getMountainBackbone(cellX, cellZ, seed);
+        if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(cellX, cellZ, seed)) {
+            return { distance: 0, nearestWidth: getMountainWidth(cellX, cellZ, seed) };
+        }
+
+        // Search outward in rings for nearest valid mountain
+        const maxSearchDist = 6;  // Max foothill depth we'd support
+        for (let dist = 1; dist <= maxSearchDist; dist++) {
+            // Check ring at this distance (cardinal + diagonal)
+            for (let dx = -dist; dx <= dist; dx++) {
+                for (let dz = -dist; dz <= dist; dz++) {
+                    // Only check cells at exactly this distance (ring perimeter)
+                    if (Math.abs(dx) !== dist && Math.abs(dz) !== dist) continue;
+
+                    const ncx = cellX + dx;
+                    const ncz = cellZ + dz;
+                    const nBackbone = getMountainBackbone(ncx, ncz, seed);
+                    if (nBackbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
+                        const nearestWidth = getMountainWidth(ncx, ncz, seed);
+                        // Use Chebyshev distance (max of abs dx, abs dz)
+                        const chebyshevDist = Math.max(Math.abs(dx), Math.abs(dz));
+                        return { distance: chebyshevDist, nearestWidth };
+                    }
+                }
+            }
+        }
+
+        return { distance: Infinity, nearestWidth: 0 };
+    }
+
+    /**
+     * Map mountain range width to amplitude scale.
+     * Narrow ridges = shorter peaks, wide ranges = tallest peaks.
+     * @param {number} width - Range width in cells
+     * @returns {number} Amplitude multiplier (0.4 to 1.0)
+     */
+    function getWidthAmplitudeScale(width) {
+        if (width <= 2) {
+            return 0.4 + (width - 1) * 0.2;  // 1→0.4, 2→0.6
+        } else if (width <= 4) {
+            return 0.6 + (width - 2) * 0.125;  // 3→0.725, 4→0.85
+        } else {
+            return Math.min(1.0, 0.85 + (width - 4) * 0.0375);  // 5→0.8875, 8→1.0
+        }
+    }
+
+    /**
+     * Get raw biome selection without mountain backbone resolution.
+     * Used internally by the biome resolution system.
+     * @param {number} cellX - Cell X coordinate
+     * @param {number} cellZ - Cell Z coordinate
+     * @returns {Object} Raw biome config (excluding mountains from weighted selection)
+     */
+    function getRawBiomeCellValue(cellX, cellZ) {
         // Deterministic biome selection based on cell position
         const cellNoise = noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
         const normalizedNoise = (cellNoise + 1) * 0.5;
 
+        // Filter out mountains from weighted selection (they're determined by backbone)
+        // Also filter out mountain_foothills (weight 0, determined by adjacency)
         let accumulated = 0;
         let selectedBiome = BIOME_NAMES[0];
+        let totalWeight = 0;
+
+        // Calculate total weight excluding mountains and foothills
         for (let i = 0; i < BIOME_NAMES.length; i++) {
-            accumulated += BIOME_WEIGHTS[i] / TOTAL_BIOME_WEIGHT;
+            const name = BIOME_NAMES[i];
+            if (name !== 'mountains' && name !== 'mountain_foothills') {
+                totalWeight += BIOME_WEIGHTS[i];
+            }
+        }
+
+        for (let i = 0; i < BIOME_NAMES.length; i++) {
+            const name = BIOME_NAMES[i];
+            if (name === 'mountains' || name === 'mountain_foothills') continue;
+
+            accumulated += BIOME_WEIGHTS[i] / totalWeight;
             if (normalizedNoise <= accumulated) {
-                selectedBiome = BIOME_NAMES[i];
+                selectedBiome = name;
                 break;
             }
         }
 
-        const config = BIOME_CONFIG[selectedBiome];
-        const result = { name: selectedBiome, ...config };
+        return { name: selectedBiome, ...BIOME_CONFIG[selectedBiome] };
+    }
+
+    /**
+     * Get resolved biome for a cell with mountain backbone system.
+     * Resolution order: backbone → cluster validation → width → foothills → regular biome
+     * @param {number} cellX - Cell X coordinate
+     * @param {number} cellZ - Cell Z coordinate
+     * @returns {Object} Resolved biome config with mountain metadata
+     */
+    function getBiomeCellValue(cellX, cellZ) {
+        const key = cellX + ',' + cellZ;
+        if (biomeCellCache.has(key)) return biomeCellCache.get(key);
+
+        const seed = workerNumericSeed;
+        let result;
+
+        // 1. Check if this cell is in a valid mountain backbone
+        const backbone = getMountainBackbone(cellX, cellZ, seed);
+        if (backbone >= MOUNTAIN_THRESHOLD) {
+            // Verify cluster meets minimum size (2x4)
+            if (isValidMountainCluster(cellX, cellZ, seed)) {
+                // Valid mountain cell - calculate width and amplitude scale
+                const width = getMountainWidth(cellX, cellZ, seed);
+                const amplitudeScale = getWidthAmplitudeScale(width);
+                result = {
+                    name: 'mountains',
+                    ...BIOME_CONFIG.mountains,
+                    _rangeWidth: width,
+                    _amplitudeScale: amplitudeScale
+                };
+                biomeCellCache.set(key, result);
+                return result;
+            }
+            // Invalid cluster (too small) - fall through to regular biome
+        }
+
+        // 2. Check if adjacent to valid mountain backbone (foothills)
+        const { distance, nearestWidth } = getDistanceToMountainBackbone(cellX, cellZ, seed);
+        const maxFoothillDepth = Math.ceil(nearestWidth / 3);
+
+        if (distance > 0 && distance <= maxFoothillDepth) {
+            // This cell is in the foothills ring
+            // Ring-based scaling: inner rings (closer to mountain) are taller
+            const ringFactor = 1.0 - ((distance - 1) / Math.max(1, maxFoothillDepth)) * 0.6;
+            result = {
+                name: 'mountain_foothills',
+                ...BIOME_CONFIG.mountain_foothills,
+                _foothillRing: distance,
+                _maxFoothillRing: maxFoothillDepth,
+                _parentWidth: nearestWidth,
+                _ringFactor: ringFactor
+            };
+            biomeCellCache.set(key, result);
+            return result;
+        }
+
+        // 3. Regular biome selection (mountains excluded from weighted pool)
+        result = getRawBiomeCellValue(cellX, cellZ);
         biomeCellCache.set(key, result);
         return result;
     }
@@ -19407,6 +19724,64 @@
         return biome.baseHeight + (base + detail) * biome.amplitude;
     }
 
+    /**
+     * Mountain foothills height function with ring-based scaling.
+     * Creates transitional terrain between mountains and lowlands.
+     * Uses scaled-down mountain features for natural look.
+     * @param {number} gx - Global X coordinate
+     * @param {number} gz - Global Z coordinate
+     * @param {Object} biome - Biome config with _ringFactor, _foothillRing, _maxFoothillRing
+     * @param {number} seed - World seed
+     * @returns {number} Terrain height
+     */
+    function foothillsHeightFunc(gx, gz, biome, seed) {
+        // Ring factor determines height scaling (1.0 = closest to mountain, lower = outer rings)
+        const ringFactor = biome._ringFactor ?? 1.0;
+        const ring = biome._foothillRing ?? 1;
+        const maxRing = biome._maxFoothillRing ?? 1;
+
+        // Effective base height decreases for outer rings
+        const effectiveBase = biome.baseHeight - (ring - 1) * 3;
+
+        // Effective amplitude scales with ring factor
+        const effectiveAmplitude = biome.amplitude * ringFactor;
+
+        // Use softer ridge noise for gentle rolling foothills
+        const warpScale = 0.002;
+        const warpStrength = 40;
+        const warpX = gx + noise2D(gx * warpScale + seed * 0.5, gz * warpScale) * warpStrength;
+        const warpZ = gz + noise2D(gx * warpScale + 50, gz * warpScale + seed * 0.5) * warpStrength;
+
+        // Multi-octave terrain with softer ridges than mountains
+        const rx = warpX * 0.005;
+        const rz = warpZ * 0.005;
+        let height = 0;
+        let amp = 1.0;
+        let freq = 1.0;
+        for (let i = 0; i < 4; i++) {
+            // Softer ridge formula (less extreme than mountains)
+            const n = noise2D(rx * freq + seed * 7, rz * freq - seed * 7);
+            const ridge = 1.0 - Math.abs(n) * 0.7;  // Softer ridge effect
+            height += ridge * amp;
+            freq *= 2.0;
+            amp *= 0.5;
+        }
+        height /= 1.875;  // Normalize
+
+        // Add gentle rolling detail
+        const detail = noise2D(gx * 0.02 + seed * 3, gz * 0.02 - seed * 3) * 0.15;
+        height += detail;
+
+        // Slight erosion for natural look
+        const erosion = Math.abs(noise2D(gx * 0.04 + seed * 2, gz * 0.04 - seed * 2)) * 0.1;
+        height -= erosion * 0.5;
+
+        height = Math.max(0, Math.min(1, height));
+
+        const rawHeight = effectiveBase + height * effectiveAmplitude;
+        return Math.min(Math.max(rawHeight, effectiveBase - 5), 200);
+    }
+
     // Comprehensive mountain generation with jagged ridges, sharp peaks, ridge connections
     function mountainsHeightFunc(gx, gz, biome, seed) {
         // Domain warping for winding ridge lines
@@ -19565,7 +19940,11 @@
         const foothillBase = (baseNoise + 1) * 0.5 * 0.04;
         totalHeight = foothillBase + totalHeight * 0.96;
 
-        const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
+        // Apply width-based amplitude scaling (narrow ridges = shorter peaks)
+        const amplitudeScale = biome._amplitudeScale ?? 1.0;
+        const effectiveAmplitude = biome.amplitude * amplitudeScale;
+
+        const rawHeight = biome.baseHeight + totalHeight * effectiveAmplitude;
         // Returns continuous height - flooring happens in blendedHeight()
         return Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285);
     }
@@ -19576,6 +19955,7 @@
         hills: hillsHeightFunc,
         forests: defaultHeightFunc,
         mountains: mountainsHeightFunc,
+        mountain_foothills: foothillsHeightFunc,
         swamp: defaultHeightFunc,
         longwoods: defaultHeightFunc
     };
@@ -19847,7 +20227,11 @@
             if (type === 'init') {
                 // Initialize noise with seed string
                 initNoise(seedStr);
-                biomeCellCache.clear(); // Clear biome cache for new seed
+                // Clear all biome and mountain caches for new seed
+                biomeCellCache.clear();
+                mountainBackboneCache.clear();
+                clusterValidityCache.clear();
+                mountainWidthCache.clear();
                 self.postMessage({ type: 'ready', jobId });
                 return;
             }
@@ -19856,7 +20240,11 @@
                 // Ensure noise is initialized
                 if (!perm || workerSeedStr !== seedStr) {
                     initNoise(seedStr);
+                    // Clear all biome and mountain caches for new seed
                     biomeCellCache.clear();
+                    mountainBackboneCache.clear();
+                    clusterValidityCache.clear();
+                    mountainWidthCache.clear();
                 }
 
                 const chunkSize = CHUNK_SIZE;
@@ -20194,6 +20582,7 @@
                     defaultHeightFunc,
                     hillsHeightFunc,
                     plainsHeightFunc,
+                    foothillsHeightFunc,
                     mountainsHeightFunc,
                     getBiomeHeightAtCell,
                     blendedHeight,
@@ -20228,6 +20617,7 @@
                 injectedCode += '        hills: hillsHeightFunc,\n';
                 injectedCode += '        forests: defaultHeightFunc,\n';
                 injectedCode += '        mountains: mountainsHeightFunc,\n';
+                injectedCode += '        mountain_foothills: foothillsHeightFunc,\n';
                 injectedCode += '        swamp: defaultHeightFunc,\n';
                 injectedCode += '        longwoods: defaultHeightFunc\n';
                 injectedCode += '    };\n';
@@ -35655,8 +36045,18 @@ self.onmessage = async (e) => {
                 biomeTable = { cumulative, totalWeight: total };
                 // Rebuild biomeByName map for O(1) lookups
                 rebuildBiomeByNameMap(biomes);
+                // Clear all biome and mountain caches for new seed
                 if (typeof biomeCellCache !== "undefined") {
                     biomeCellCache.clear();
+                }
+                if (typeof mountainBackboneCache !== "undefined") {
+                    mountainBackboneCache.clear();
+                }
+                if (typeof clusterValidityCache !== "undefined") {
+                    clusterValidityCache.clear();
+                }
+                if (typeof mountainWidthCache !== "undefined") {
+                    mountainWidthCache.clear();
                 }
             }
             let biomeTable = null;
@@ -35724,41 +36124,278 @@ self.onmessage = async (e) => {
                 const mask = getTreeMaskForChunk(cx, cz, seed);
                 return mask[lx + lz * cs] === 1;
             }
+            // ============================================================
+            // MOUNTAIN RANGE SYSTEM - Ridge-based elongated mountain ranges
+            // ============================================================
+
             /**
-             * Look up the biome for a cell directly by cell coordinates (no warping).
-             * Uses 3x3 neighbor voting for smooth biome distributions.
-             * @param {number} cellX - Cell X coordinate in the biome grid.
-             * @param {number} cellZ - Cell Z coordinate in the biome grid.
-             * @returns {ResolvedBiome} The resolved biome for this cell.
+             * Calculate mountain backbone value using multi-octave ridge noise.
+             * Ridge noise creates elongated linear features ideal for mountain ranges.
+             * @param {number} cellX - Cell X coordinate
+             * @param {number} cellZ - Cell Z coordinate
+             * @param {number} seed - World seed
+             * @returns {number} Backbone value 0-1 (higher = more likely mountain)
              */
-            function getBiomeCellDirect(cellX, cellZ) {
-                const key = cellX + "," + cellZ;
-                const cached = biomeCellCache.get(key);
-                if (cached) return cached;
+            function getMountainBackbone(cellX, cellZ, seed) {
+                const key = cellX + ',' + cellZ;
+                if (mountainBackboneCache.has(key)) return mountainBackboneCache.get(key);
+
+                // Seed-based rotation for range direction variety
+                const rotAngle = ((seed % 1000) / 1000) * Math.PI * 0.5;
+                const cosR = Math.cos(rotAngle);
+                const sinR = Math.sin(rotAngle);
+                const rx = cellX * cosR - cellZ * sinR;
+                const rz = cellX * sinR + cellZ * cosR;
+
+                // Multi-octave ridge noise for natural-looking elongated ranges
+                const scale = 0.07;
+                let backbone = 0;
+                let amp = 1.0;
+                let freq = 1.0;
+                for (let i = 0; i < 3; i++) {
+                    const n = noise2D(rx * scale * freq + seed * 0.1, rz * scale * freq - seed * 0.1);
+                    backbone += (1.0 - Math.abs(n)) * amp;
+                    amp *= 0.5;
+                    freq *= 2.0;
+                }
+                backbone /= 1.75;
+
+                const widthVar = noise2D(rx * 0.03 - seed * 0.2, rz * 0.03 + seed * 0.2);
+                backbone += widthVar * 0.15;
+
+                backbone = Math.max(0, Math.min(1, backbone));
+                mountainBackboneCache.set(key, backbone);
+                return backbone;
+            }
+
+            /**
+             * Check if a mountain cluster meets minimum size requirements (2x4 cells).
+             * @param {number} startCellX - Starting cell X
+             * @param {number} startCellZ - Starting cell Z
+             * @param {number} seed - World seed
+             * @returns {boolean} True if cluster is valid
+             */
+            function isValidMountainCluster(startCellX, startCellZ, seed) {
+                const key = startCellX + ',' + startCellZ;
+                if (clusterValidityCache.has(key)) return clusterValidityCache.get(key);
+
+                const visited = new Set();
+                const queue = [[startCellX, startCellZ]];
+                let minX = startCellX, maxX = startCellX;
+                let minZ = startCellZ, maxZ = startCellZ;
+                let cellCount = 0;
+                const maxCells = 50;
+
+                while (queue.length > 0 && cellCount < maxCells) {
+                    const [cx, cz] = queue.shift();
+                    const cellKey = cx + ',' + cz;
+                    if (visited.has(cellKey)) continue;
+
+                    const backbone = getMountainBackbone(cx, cz, seed);
+                    if (backbone < MOUNTAIN_THRESHOLD) continue;
+
+                    visited.add(cellKey);
+                    cellCount++;
+                    minX = Math.min(minX, cx);
+                    maxX = Math.max(maxX, cx);
+                    minZ = Math.min(minZ, cz);
+                    maxZ = Math.max(maxZ, cz);
+
+                    const width = maxX - minX + 1;
+                    const height = maxZ - minZ + 1;
+                    if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
+                        for (const visitedKey of visited) {
+                            clusterValidityCache.set(visitedKey, true);
+                        }
+                        return true;
+                    }
+
+                    queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
+                }
+
+                const width = maxX - minX + 1;
+                const height = maxZ - minZ + 1;
+                const isValid = (width >= 2 && height >= 4) || (width >= 4 && height >= 2);
+
+                for (const visitedKey of visited) {
+                    clusterValidityCache.set(visitedKey, isValid);
+                }
+                return isValid;
+            }
+
+            /**
+             * Measure the width of a mountain range at a given cell.
+             * @param {number} cellX - Cell X coordinate
+             * @param {number} cellZ - Cell Z coordinate
+             * @param {number} seed - World seed
+             * @returns {number} Width in cells (1-16)
+             */
+            function getMountainWidth(cellX, cellZ, seed) {
+                const key = cellX + ',' + cellZ;
+                if (mountainWidthCache.has(key)) return mountainWidthCache.get(key);
+
+                let width = 1;
+                const maxDist = 8;
+                const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+                for (const [dx, dz] of dirs) {
+                    for (let dist = 1; dist <= maxDist; dist++) {
+                        const ncx = cellX + dx * dist;
+                        const ncz = cellZ + dz * dist;
+                        const backbone = getMountainBackbone(ncx, ncz, seed);
+                        if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
+                            width++;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                width = Math.min(width, 16);
+                mountainWidthCache.set(key, width);
+                return width;
+            }
+
+            /**
+             * Find distance to nearest valid mountain backbone and its width.
+             * @param {number} cellX - Cell X coordinate
+             * @param {number} cellZ - Cell Z coordinate
+             * @param {number} seed - World seed
+             * @returns {{distance: number, nearestWidth: number}}
+             */
+            function getDistanceToMountainBackbone(cellX, cellZ, seed) {
+                const backbone = getMountainBackbone(cellX, cellZ, seed);
+                if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(cellX, cellZ, seed)) {
+                    return { distance: 0, nearestWidth: getMountainWidth(cellX, cellZ, seed) };
+                }
+
+                const maxSearchDist = 6;
+                for (let dist = 1; dist <= maxSearchDist; dist++) {
+                    for (let dx = -dist; dx <= dist; dx++) {
+                        for (let dz = -dist; dz <= dist; dz++) {
+                            if (Math.abs(dx) !== dist && Math.abs(dz) !== dist) continue;
+
+                            const ncx = cellX + dx;
+                            const ncz = cellZ + dz;
+                            const nBackbone = getMountainBackbone(ncx, ncz, seed);
+                            if (nBackbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
+                                const nearestWidth = getMountainWidth(ncx, ncz, seed);
+                                const chebyshevDist = Math.max(Math.abs(dx), Math.abs(dz));
+                                return { distance: chebyshevDist, nearestWidth };
+                            }
+                        }
+                    }
+                }
+
+                return { distance: Infinity, nearestWidth: 0 };
+            }
+
+            /**
+             * Map mountain range width to amplitude scale.
+             * @param {number} width - Range width in cells
+             * @returns {number} Amplitude multiplier (0.4 to 1.0)
+             */
+            function getWidthAmplitudeScale(width) {
+                if (width <= 2) {
+                    return 0.4 + (width - 1) * 0.2;
+                } else if (width <= 4) {
+                    return 0.6 + (width - 2) * 0.125;
+                } else {
+                    return Math.min(1.0, 0.85 + (width - 4) * 0.0375);
+                }
+            }
+
+            /**
+             * Get raw biome from weighted selection (excluding mountains).
+             * @param {number} cellX - Cell X coordinate
+             * @param {number} cellZ - Cell Z coordinate
+             * @returns {Object} Raw biome config
+             */
+            function getRawBiomeCellDirect(cellX, cellZ) {
                 const centerX = cellX * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const centerZ = cellZ * BIOME_CELL_SIZE + BIOME_CELL_SIZE * 0.5;
                 const counts = new Map();
                 for (let dx = -1; dx <= 1; dx++) {
                     for (let dz = -1; dz <= 1; dz++) {
-                        const sampleX = centerX + dx * BIOME_CELL_SIZE,
-                            sampleZ = centerZ + dz * BIOME_CELL_SIZE;
+                        const sampleX = centerX + dx * BIOME_CELL_SIZE;
+                        const sampleZ = centerZ + dz * BIOME_CELL_SIZE;
                         const biome = getRawBiomeParams(sampleX, sampleZ);
+                        // Skip mountains - they're determined by backbone
+                        if (biome.name === 'mountains' || biome.name === 'mountain_foothills') continue;
                         const dist = Math.sqrt(dx * dx + dz * dz);
                         const weight = dist === 0 ? 1.5 : 1.0 / (1.0 + dist);
                         counts.set(biome.name, (counts.get(biome.name) || 0) + weight);
                     }
                 }
-                let bestBiome = null,
-                    bestScore = -Infinity;
+                let bestBiome = null;
+                let bestScore = -Infinity;
                 for (const [name, score] of counts.entries()) {
                     if (score > bestScore) {
                         bestScore = score;
                         bestBiome = biomeByName.get(name) || getRawBiomeParams(centerX, centerZ);
                     }
                 }
-                if (!bestBiome) bestBiome = getRawBiomeParams(centerX, centerZ);
-                biomeCellCache.set(key, bestBiome);
+                if (!bestBiome) {
+                    // Fallback to plains if no valid biome found
+                    bestBiome = biomeByName.get('plains') || getRawBiomeParams(centerX, centerZ);
+                }
                 return bestBiome;
+            }
+
+            /**
+             * Get resolved biome for a cell with mountain backbone system.
+             * Resolution: backbone → cluster validation → width → foothills → regular biome
+             * @param {number} cellX - Cell X coordinate
+             * @param {number} cellZ - Cell Z coordinate
+             * @returns {ResolvedBiome} The resolved biome for this cell.
+             */
+            function getBiomeCellDirect(cellX, cellZ) {
+                const key = cellX + "," + cellZ;
+                const cached = biomeCellCache.get(key);
+                if (cached) return cached;
+
+                const seed = worldConfig.seed;
+                let result;
+
+                // 1. Check if this cell is in a valid mountain backbone
+                const backbone = getMountainBackbone(cellX, cellZ, seed);
+                if (backbone >= MOUNTAIN_THRESHOLD) {
+                    if (isValidMountainCluster(cellX, cellZ, seed)) {
+                        const width = getMountainWidth(cellX, cellZ, seed);
+                        const amplitudeScale = getWidthAmplitudeScale(width);
+                        const mountainBiome = biomeByName.get('mountains');
+                        result = {
+                            ...mountainBiome,
+                            _rangeWidth: width,
+                            _amplitudeScale: amplitudeScale
+                        };
+                        biomeCellCache.set(key, result);
+                        return result;
+                    }
+                }
+
+                // 2. Check if adjacent to valid mountain backbone (foothills)
+                const { distance, nearestWidth } = getDistanceToMountainBackbone(cellX, cellZ, seed);
+                const maxFoothillDepth = Math.ceil(nearestWidth / 3);
+
+                if (distance > 0 && distance <= maxFoothillDepth) {
+                    const ringFactor = 1.0 - ((distance - 1) / Math.max(1, maxFoothillDepth)) * 0.6;
+                    const foothillsBiome = biomeByName.get('mountain_foothills');
+                    result = {
+                        ...foothillsBiome,
+                        _foothillRing: distance,
+                        _maxFoothillRing: maxFoothillDepth,
+                        _parentWidth: nearestWidth,
+                        _ringFactor: ringFactor
+                    };
+                    biomeCellCache.set(key, result);
+                    return result;
+                }
+
+                // 3. Regular biome selection (mountains excluded)
+                result = getRawBiomeCellDirect(cellX, cellZ);
+                biomeCellCache.set(key, result);
+                return result;
             }
             /**
              * Get biome parameters at a world position with domain-warped boundaries.
@@ -36124,17 +36761,71 @@ self.onmessage = async (e) => {
                 const foothillBase = (baseNoise + 1) * 0.5 * 0.04;
                 totalHeight = foothillBase + totalHeight * 0.96;
 
+                // Apply width-based amplitude scaling (narrow ridges = shorter peaks)
+                const amplitudeScale = biome._amplitudeScale ?? 1.0;
+                const effectiveAmplitude = biome.amplitude * amplitudeScale;
+
                 // Final height calculation
                 // Returns continuous height - flooring happens in blendedHeight() for smooth interpolation
-                const rawHeight = biome.baseHeight + totalHeight * biome.amplitude;
+                const rawHeight = biome.baseHeight + totalHeight * effectiveAmplitude;
                 return Math.min(Math.max(rawHeight, biome.baseHeight - 10), 285);
             }
+
+            /**
+             * Mountain foothills height function with ring-based scaling.
+             * Creates transitional terrain between mountains and lowlands.
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {Object} biome - Biome config with _ringFactor, _foothillRing, _maxFoothillRing
+             * @param {number} seed - World seed
+             * @returns {number} Terrain height
+             */
+            function foothillsHeightFunc(gx, gz, biome, seed) {
+                const ringFactor = biome._ringFactor ?? 1.0;
+                const ring = biome._foothillRing ?? 1;
+                const maxRing = biome._maxFoothillRing ?? 1;
+
+                const effectiveBase = biome.baseHeight - (ring - 1) * 3;
+                const effectiveAmplitude = biome.amplitude * ringFactor;
+
+                const warpScale = 0.002;
+                const warpStrength = 40;
+                const warpX = gx + noise2D(gx * warpScale + seed * 0.5, gz * warpScale) * warpStrength;
+                const warpZ = gz + noise2D(gx * warpScale + 50, gz * warpScale + seed * 0.5) * warpStrength;
+
+                const rx = warpX * 0.005;
+                const rz = warpZ * 0.005;
+                let height = 0;
+                let amp = 1.0;
+                let freq = 1.0;
+                for (let i = 0; i < 4; i++) {
+                    const n = noise2D(rx * freq + seed * 7, rz * freq - seed * 7);
+                    const ridge = 1.0 - Math.abs(n) * 0.7;
+                    height += ridge * amp;
+                    freq *= 2.0;
+                    amp *= 0.5;
+                }
+                height /= 1.875;
+
+                const detail = noise2D(gx * 0.02 + seed * 3, gz * 0.02 - seed * 3) * 0.15;
+                height += detail;
+
+                const erosion = Math.abs(noise2D(gx * 0.04 + seed * 2, gz * 0.04 - seed * 2)) * 0.1;
+                height -= erosion * 0.5;
+
+                height = Math.max(0, Math.min(1, height));
+
+                const rawHeight = effectiveBase + height * effectiveAmplitude;
+                return Math.min(Math.max(rawHeight, effectiveBase - 5), 200);
+            }
+
             // Height function lookup table - used by getBiomeHeightAtCell for consistent behavior with workers
             const HEIGHT_FUNCS = {
                 plains: plainsHeightFunc,
                 hills: hillsHeightFunc,
                 forests: defaultHeightFunc,
                 mountains: mountainsHeightFunc,
+                mountain_foothills: foothillsHeightFunc,
                 swamp: defaultHeightFunc,
                 longwoods: defaultHeightFunc
             };
