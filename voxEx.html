@@ -6624,24 +6624,113 @@
                     return biome.baseHeight + baseNoise * biome.amplitude + combined;
                 }
 
+                // OPTIMIZATION: getPreRiverHeight - no-op (not called)
+                getPreRiverHeight(gx, gz, seed) {
+                    const c = this.continentalHeight(gx, gz, seed);
+                    const gridScale = this.BIOME_CELL_SIZE;
+                    const u = gx / gridScale - 0.5;
+                    const v = gz / gridScale - 0.5;
+                    const x0 = Math.floor(u), z0 = Math.floor(v);
+                    const x1 = x0 + 1, z1 = z0 + 1;
+                    const wx = u - x0, wz = v - z0;
+                    const sx = wx * wx * (3 - 2 * wx);
+                    const sz = wz * wz * (3 - 2 * wz);
+
+                    const h00 = this.getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+                    const h10 = this.getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+                    const h01 = this.getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+                    const h11 = this.getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+                    const h0 = h00 + (h10 - h00) * sx;
+                    const h1 = h01 + (h11 - h01) * sx;
+                    let finalHeight = h0 + (h1 - h0) * sz;
+
+                    const oceanFactor = this.getOceanFactor(gx, gz, seed);
+                    if (oceanFactor < 1.0) {
+                        const oceanDepth = this.getOceanDepth(oceanFactor, gx, gz, seed);
+                        const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+                        const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+                        finalHeight = oceanFloor + (finalHeight - oceanFloor) * bank;
+                    }
+                    return finalHeight;
+                }
+
+                // OPTIMIZATION: getLocalSlope - no-op (not called)
+                getLocalSlope(gx, gz, seed, sampleDist = 4) {
+                    const centerHeight = this.getPreRiverHeight(gx, gz, seed);
+                    let maxSlope = 0;
+                    const offsets = [[sampleDist, 0], [-sampleDist, 0], [0, sampleDist], [0, -sampleDist]];
+                    for (const [dx, dz] of offsets) {
+                        const neighborHeight = this.getPreRiverHeight(gx + dx, gz + dz, seed);
+                        const slope = Math.abs(centerHeight - neighborHeight) / sampleDist;
+                        if (slope > maxSlope) maxSlope = slope;
+                    }
+                    return maxSlope;
+                }
+
                 // OPTIMIZATION: getRiverFactor - no-op (not called)
                 getRiverFactor(gx, gz, seed) {
-                    // Reduce warp frequency and strength by 50%
                     const warpScale = 0.004;
-                    const warpStrength = 20.0;
+                    const baseWarpStrength = 20.0;
+
+                    const terrainHeight = this.getPreRiverHeight(gx, gz, seed);
+                    const elevationFactor = Math.max(0, 1.0 - (terrainHeight - WORLD_DIMS.seaLevel) / 40);
+                    const meanderBoost = elevationFactor * 15.0;
+                    const warpStrength = baseWarpStrength + meanderBoost;
+
                     const wx = gx + this.noise2D(gx * warpScale, gz * warpScale) * warpStrength;
                     const wz = gz + this.noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
-                    const scale = 0.001;
-                    const n = Math.abs(this.noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
 
-                    // Add coastal noise for natural shorelines
-                    const coastNoiseScale = 0.05;
+                    const meanderWavelength = 80 + this.noise2D(gx * 0.001, gz * 0.001) * 40;
+                    const meanderAmplitude = 8 + elevationFactor * 7;
+                    const meanderPhase = this.noise2D(gx * 0.0005 + seed * 2, gz * 0.0005) * Math.PI * 2;
+                    const meanderOffset = Math.sin(gx / meanderWavelength + meanderPhase) * meanderAmplitude;
+
+                    const scale = 0.001;
+                    const n = Math.abs(this.noise2D((wx + meanderOffset) * scale + seed * 0.1, wz * scale - seed * 0.1));
+
+                    const coastNoiseScale = 0.008;
                     const coastNoise = this.noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
                     const coastVariation = coastNoise * 0.02;
-                    const width = 0.055 + coastVariation;
+                    const baseWidth = 0.055 + coastVariation;
 
-                    if (n < width) {
-                        let t = n / width;
+                    const RIVER_SLOPE_THRESHOLD = 1.0;
+                    const RIVER_MAX_ELEVATION = 75;
+
+                    const slope = this.getLocalSlope(gx, gz, seed);
+                    const slopePenalty = Math.max(0, (slope - RIVER_SLOPE_THRESHOLD) * 2.0);
+                    const heightPenalty = Math.max(0, (terrainHeight - RIVER_MAX_ELEVATION) / 20);
+
+                    const terrainPenalty = Math.min(1.0, slopePenalty + heightPenalty);
+                    const effectiveWidth = baseWidth * (1.0 - terrainPenalty * 0.9);
+
+                    if (effectiveWidth < 0.01) return 1.0;
+
+                    if (n < effectiveWidth) {
+                        let t = n / effectiveWidth;
+                        return t * t * (3 - 2 * t);
+                    }
+                    return 1.0;
+                }
+
+                // OPTIMIZATION: getDeltaFingerFactor - no-op (not called)
+                getDeltaFingerFactor(gx, gz, seed, oceanFactor) {
+                    if (oceanFactor < 0.2 || oceanFactor > 0.95) return 1.0;
+
+                    const deltaIntensity = 1.0 - Math.abs(oceanFactor - 0.5) * 2;
+
+                    const fingerScale1 = 0.015;
+                    const fingerScale2 = 0.025;
+                    const fingerScale3 = 0.04;
+
+                    const finger1 = Math.abs(this.noise2D(gx * fingerScale1 + seed * 3.1, gz * fingerScale1 - seed * 1.7));
+                    const finger2 = Math.abs(this.noise2D(gx * fingerScale2 - seed * 2.3, gz * fingerScale2 + seed * 0.9));
+                    const finger3 = Math.abs(this.noise2D(gx * fingerScale3 + seed * 1.5, gz * fingerScale3 + seed * 2.1));
+
+                    const fingerWidth = 0.12 + deltaIntensity * 0.08;
+                    const minFinger = Math.min(finger1, finger2, finger3);
+
+                    if (minFinger < fingerWidth) {
+                        let t = minFinger / fingerWidth;
                         return t * t * (3 - 2 * t);
                     }
                     return 1.0;
@@ -6667,12 +6756,19 @@
                 }
 
                 // OPTIMIZATION: getRiverDepth - no-op (not called)
-                getRiverDepth(riverFactor, gx, gz, seed) {
+                getRiverDepth(riverFactor, gx, gz, seed, oceanFactor = 1.0) {
                     const baseRiverDepth = 6;
                     const depthNoise = this.noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
                     const depthVariation = (depthNoise + 1) * 0.5 * 3;
                     const centerFactor = 1.0 - riverFactor;
-                    return baseRiverDepth + depthVariation * centerFactor;
+                    let depth = baseRiverDepth + depthVariation * centerFactor;
+
+                    if (oceanFactor < 0.95) {
+                        const deltaShallowing = Math.max(0, 1.0 - oceanFactor) * 0.7;
+                        depth = depth * (1.0 - deltaShallowing);
+                        depth = Math.max(2, depth);
+                    }
+                    return depth;
                 }
 
                 // OPTIMIZATION: getOceanDepth - no-op (not called)
@@ -6707,7 +6803,7 @@
                     const h1 = h01 + (h11 - h01) * sx;
                     let finalHeight = h0 + (h1 - h0) * sz;
 
-                    // Apply oceans first (larger scale feature)
+                    // Apply oceans first
                     const oceanFactor = this.getOceanFactor(gx, gz, seed);
                     if (oceanFactor < 1.0) {
                         const oceanDepth = this.getOceanDepth(oceanFactor, gx, gz, seed);
@@ -6716,13 +6812,19 @@
                         finalHeight = oceanFloor + (finalHeight - oceanFloor) * bank;
                     }
 
-                    // Apply rivers (can carve through ocean edges too) - only if enabled
+                    // Apply rivers with delta support
                     if (window.worldGenSettings?.enableRivers !== false) {
                         const r = this.getRiverFactor(gx, gz, seed);
-                        if (r < 1.0) {
-                            const riverDepth = this.getRiverDepth(r, gx, gz, seed);
+                        const deltaFinger = this.getDeltaFingerFactor(gx, gz, seed, oceanFactor);
+
+                        const inRiver = r < 1.0;
+                        const inDeltaFinger = deltaFinger < 1.0 && r < 0.95;
+
+                        if (inRiver || inDeltaFinger) {
+                            const waterFactor = inDeltaFinger ? Math.min(r, deltaFinger) : r;
+                            const riverDepth = this.getRiverDepth(waterFactor, gx, gz, seed, oceanFactor);
                             const riverBed = WORLD_DIMS.seaLevel - riverDepth;
-                            const bank = r * r * (3 - 2 * r);
+                            const bank = waterFactor * waterFactor * (3 - 2 * waterFactor);
                             const carvedHeight = Math.min(finalHeight, riverBed);
                             finalHeight = carvedHeight + (finalHeight - carvedHeight) * bank;
                         }
@@ -20043,12 +20145,22 @@
             finalHeight = lerpValue(oceanFloor, finalHeight, bank);
         }
 
-        // 5. Apply rivers (can carve through ocean edges too)
+        // 5. Apply rivers with delta support
         const r = getRiverFactor(gx, gz, seed);
-        if (r < 1.0) {
-            const riverDepth = getRiverDepth(r, gx, gz, seed);
+        const deltaFinger = getDeltaFingerFactor(gx, gz, seed, oceanFactor);
+
+        // River carving: either main river channel OR delta finger channels near ocean
+        const inRiver = r < 1.0;
+        const inDeltaFinger = deltaFinger < 1.0 && r < 0.95; // Delta only where river is nearby
+
+        if (inRiver || inDeltaFinger) {
+            // Use the stronger water presence (lower factor = more water)
+            const waterFactor = inDeltaFinger ? Math.min(r, deltaFinger) : r;
+
+            // River depth with delta shallowing
+            const riverDepth = getRiverDepth(waterFactor, gx, gz, seed, oceanFactor);
             const riverBed = WORLD_DIMS.seaLevel - riverDepth;
-            const bank = r * r * (3 - 2 * r);
+            const bank = waterFactor * waterFactor * (3 - 2 * waterFactor);
             const carvedHeight = Math.min(finalHeight, riverBed);
             finalHeight = lerpValue(carvedHeight, finalHeight, bank);
         }
@@ -20056,27 +20168,512 @@
         return Math.floor(finalHeight);
     }
 
-    // River factor - determines river presence and bank transition
+    // ============================================================
+    // RIVER SYSTEM - Phase 1: Enhanced Natural Rivers
+    // ============================================================
+
+    /**
+     * Calculate terrain height WITHOUT river carving (for slope analysis).
+     * This avoids circular dependency when checking slope for river placement.
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @returns {number} Pre-river terrain height
+     */
+    function getPreRiverHeight(gx, gz, seed) {
+        // Simplified version of blendedHeight without river carving
+        const c = continentalHeight(gx, gz, seed);
+        const gridScale = BIOME_CELL_SIZE;
+        const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                    + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+        const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                    + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+        const u = gx / gridScale - 0.5 + warpX;
+        const v = gz / gridScale - 0.5 + warpZ;
+        const x0 = Math.floor(u);
+        const z0 = Math.floor(v);
+        const x1 = x0 + 1;
+        const z1 = z0 + 1;
+        const wx = u - x0;
+        const wz = v - z0;
+        const sx = wx * wx * (3 - 2 * wx);
+        const sz = wz * wz * (3 - 2 * wz);
+
+        const h00 = getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+        const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+        const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+        const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+        const h0 = lerpValue(h00, h10, sx);
+        const h1 = lerpValue(h01, h11, sx);
+        let finalHeight = lerpValue(h0, h1, sz);
+
+        // Apply ocean carving (same as blendedHeight)
+        const oceanFactor = getOceanFactor(gx, gz, seed);
+        if (oceanFactor < 1.0) {
+            const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
+            const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+            const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+            finalHeight = lerpValue(oceanFloor, finalHeight, bank);
+        }
+
+        return finalHeight;
+    }
+
+    /**
+     * Calculate local terrain slope at a position (max height diff to cardinal neighbors).
+     * Uses pre-river heights to avoid circular dependency.
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @param {number} [sampleDist=4] - Distance to sample neighbors
+     * @returns {number} Maximum slope (height difference) to any cardinal neighbor
+     */
+    function getLocalSlope(gx, gz, seed, sampleDist = 4) {
+        const centerHeight = getPreRiverHeight(gx, gz, seed);
+        let maxSlope = 0;
+
+        // Sample 4 cardinal directions
+        const offsets = [[sampleDist, 0], [-sampleDist, 0], [0, sampleDist], [0, -sampleDist]];
+        for (const [dx, dz] of offsets) {
+            const neighborHeight = getPreRiverHeight(gx + dx, gz + dz, seed);
+            const slope = Math.abs(centerHeight - neighborHeight) / sampleDist;
+            if (slope > maxSlope) maxSlope = slope;
+        }
+
+        return maxSlope;
+    }
+
+    /**
+     * River factor with enhanced meandering and terrain awareness.
+     * Rivers avoid steep terrain and meander more in flat areas.
+     * Optionally uses path-based rivers when worldGenSettings.usePathBasedRivers is true.
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @returns {number} River factor (0 = river center, 1 = not river)
+     */
     function getRiverFactor(gx, gz, seed) {
+        // Check if path-based rivers are enabled (Phase 2 system)
+        if (typeof window !== 'undefined' && window.worldGenSettings?.usePathBasedRivers) {
+            return getRiverFactorWithPaths(gx, gz, seed);
+        }
+
+        // --- Base river path from noise ---
         const warpScale = 0.004;
-        const warpStrength = 20.0;
+        const baseWarpStrength = 20.0;
+
+        // Get terrain height to modulate meandering (flatter = more meander)
+        const terrainHeight = getPreRiverHeight(gx, gz, seed);
+
+        // Increase meandering at low elevations (flatter terrain)
+        const elevationFactor = Math.max(0, 1.0 - (terrainHeight - WORLD_DIMS.seaLevel) / 40);
+        const meanderBoost = elevationFactor * 15.0;
+        const warpStrength = baseWarpStrength + meanderBoost;
+
+        // Domain warping for organic river paths
         const wx = gx + noise2D(gx * warpScale, gz * warpScale) * warpStrength;
         const wz = gz + noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
-        const scale = 0.001;
-        const n = Math.abs(noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
 
-        // Use finer coast noise scale (0.008) closer to river scale (0.001) to avoid
-        // beating patterns that cause striped sand along river edges
+        // Add sinusoidal meandering for natural S-curves
+        const meanderWavelength = 80 + noise2D(gx * 0.001, gz * 0.001) * 40; // 80-120 blocks
+        const meanderAmplitude = 8 + elevationFactor * 7; // 8-15 blocks amplitude
+        const meanderPhase = noise2D(gx * 0.0005 + seed * 2, gz * 0.0005) * Math.PI * 2;
+        const meanderOffset = Math.sin(gx / meanderWavelength + meanderPhase) * meanderAmplitude;
+
+        const scale = 0.001;
+        const n = Math.abs(noise2D((wx + meanderOffset) * scale + seed * 0.1, wz * scale - seed * 0.1));
+
+        // Variable width with coastal noise
         const coastNoiseScale = 0.008;
         const coastNoise = noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
         const coastVariation = coastNoise * 0.02;
-        const width = 0.055 + coastVariation;
+        const baseWidth = 0.055 + coastVariation;
 
-        if (n < width) {
-            let t = n / width;
+        // --- Terrain-aware river avoidance ---
+        const RIVER_SLOPE_THRESHOLD = 1.0;  // Blocks per block (45 degree equivalent)
+        const RIVER_MAX_ELEVATION = 75;     // Rivers avoid high terrain
+
+        // Check if terrain is too steep or too high for rivers
+        const slope = getLocalSlope(gx, gz, seed);
+        const slopePenalty = Math.max(0, (slope - RIVER_SLOPE_THRESHOLD) * 2.0);
+        const heightPenalty = Math.max(0, (terrainHeight - RIVER_MAX_ELEVATION) / 20);
+
+        // Narrow/eliminate river in steep/high terrain
+        const terrainPenalty = Math.min(1.0, slopePenalty + heightPenalty);
+        const effectiveWidth = baseWidth * (1.0 - terrainPenalty * 0.9);
+
+        if (effectiveWidth < 0.01) return 1.0; // No river in very steep terrain
+
+        if (n < effectiveWidth) {
+            let t = n / effectiveWidth;
             return t * t * (3 - 2 * t);
         }
         return 1.0;
+    }
+
+    /**
+     * Get delta finger factor for river delta splitting near ocean.
+     * Creates 2-5 branching channels where rivers meet the sea.
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @param {number} oceanFactor - Ocean proximity (0 = ocean, 1 = land)
+     * @returns {number} Delta finger factor (0 = in channel, 1 = not in channel)
+     */
+    function getDeltaFingerFactor(gx, gz, seed, oceanFactor) {
+        // Only create delta fingers near ocean (oceanFactor 0.3-0.9 = transition zone)
+        if (oceanFactor < 0.2 || oceanFactor > 0.95) return 1.0;
+
+        // Delta intensity increases as we approach ocean
+        const deltaIntensity = 1.0 - Math.abs(oceanFactor - 0.5) * 2;
+
+        // Create 3-5 finger channels using multi-frequency noise
+        const fingerScale1 = 0.015;
+        const fingerScale2 = 0.025;
+        const fingerScale3 = 0.04;
+
+        const finger1 = Math.abs(noise2D(gx * fingerScale1 + seed * 3.1, gz * fingerScale1 - seed * 1.7));
+        const finger2 = Math.abs(noise2D(gx * fingerScale2 - seed * 2.3, gz * fingerScale2 + seed * 0.9));
+        const finger3 = Math.abs(noise2D(gx * fingerScale3 + seed * 1.5, gz * fingerScale3 + seed * 2.1));
+
+        // Combine fingers - channels where any noise is low
+        const fingerWidth = 0.12 + deltaIntensity * 0.08; // Wider channels in delta zone
+        const minFinger = Math.min(finger1, finger2, finger3);
+
+        if (minFinger < fingerWidth) {
+            let t = minFinger / fingerWidth;
+            return t * t * (3 - 2 * t);
+        }
+        return 1.0;
+    }
+
+    // ============================================================
+    // RIVER SYSTEM - Phase 2: Gradient Descent River Network
+    // ============================================================
+
+    /**
+     * River network cache for gradient-descent traced rivers.
+     * Uses regional approach with LRU eviction for infinite world support.
+     */
+    const RiverNetworkCache = {
+        /** @type {Map<string, {paths: Array, timestamp: number}>} */
+        regions: new Map(),
+        /** Region size in blocks */
+        REGION_SIZE: 256,
+        /** Coarse grid sample distance */
+        SAMPLE_DIST: 8,
+        /** Max cached regions (LRU eviction) */
+        MAX_REGIONS: 64,
+        /** River search radius for point queries */
+        RIVER_SEARCH_RADIUS: 16,
+
+        /**
+         * Get region key from world coordinates.
+         * @param {number} gx - Global X
+         * @param {number} gz - Global Z
+         * @returns {string} Region key
+         */
+        getRegionKey(gx, gz) {
+            const rx = Math.floor(gx / this.REGION_SIZE);
+            const rz = Math.floor(gz / this.REGION_SIZE);
+            return `${rx},${rz}`;
+        },
+
+        /**
+         * Get or generate river paths for a region.
+         * @param {number} gx - Global X (any point in region)
+         * @param {number} gz - Global Z (any point in region)
+         * @param {number} seed - World seed
+         * @returns {Array<{points: Array<{x: number, z: number, height: number}>, volume: number}>}
+         */
+        getRegionRivers(gx, gz, seed) {
+            const key = this.getRegionKey(gx, gz);
+
+            if (this.regions.has(key)) {
+                const cached = this.regions.get(key);
+                cached.timestamp = Date.now();
+                return cached.paths;
+            }
+
+            // Evict oldest if at capacity
+            if (this.regions.size >= this.MAX_REGIONS) {
+                let oldestKey = null;
+                let oldestTime = Infinity;
+                for (const [k, v] of this.regions) {
+                    if (v.timestamp < oldestTime) {
+                        oldestTime = v.timestamp;
+                        oldestKey = k;
+                    }
+                }
+                if (oldestKey) this.regions.delete(oldestKey);
+            }
+
+            // Generate river paths for this region
+            const paths = this.generateRegionRivers(gx, gz, seed);
+            this.regions.set(key, { paths, timestamp: Date.now() });
+            return paths;
+        },
+
+        /**
+         * Generate river paths for a region using gradient descent.
+         * @param {number} gx - Global X (any point in region)
+         * @param {number} gz - Global Z (any point in region)
+         * @param {number} seed - World seed
+         * @returns {Array<{points: Array, volume: number, width: number}>}
+         */
+        generateRegionRivers(gx, gz, seed) {
+            const rx = Math.floor(gx / this.REGION_SIZE);
+            const rz = Math.floor(gz / this.REGION_SIZE);
+            const baseX = rx * this.REGION_SIZE;
+            const baseZ = rz * this.REGION_SIZE;
+
+            const paths = [];
+            const seededRandom = new SeededRandom(seed + rx * 7919 + rz * 6271);
+
+            // Find river sources - high elevation points with sufficient drainage potential
+            const sources = this.findRiverSources(baseX, baseZ, seed, seededRandom);
+
+            // Trace each river from source to destination (ocean/edge)
+            for (const source of sources) {
+                const path = this.traceRiverPath(source.x, source.z, seed, seededRandom);
+                if (path.points.length >= 5) { // Only keep rivers with meaningful length
+                    paths.push(path);
+                }
+            }
+
+            return paths;
+        },
+
+        /**
+         * Find potential river source points in a region.
+         * Sources are high elevation points that aren't too steep.
+         * @param {number} baseX - Region base X
+         * @param {number} baseZ - Region base Z
+         * @param {number} seed - World seed
+         * @param {SeededRandom} rng - Seeded random generator
+         * @returns {Array<{x: number, z: number, height: number}>}
+         */
+        findRiverSources(baseX, baseZ, seed, rng) {
+            const sources = [];
+            const sampleDist = this.SAMPLE_DIST * 4; // Coarser sampling for sources
+
+            for (let lx = 0; lx < this.REGION_SIZE; lx += sampleDist) {
+                for (let lz = 0; lz < this.REGION_SIZE; lz += sampleDist) {
+                    const gx = baseX + lx;
+                    const gz = baseZ + lz;
+                    const height = getPreRiverHeight(gx, gz, seed);
+
+                    // Rivers start from elevated areas (but not too high - no glacial rivers)
+                    if (height > 70 && height < 120) {
+                        // Use noise to determine if this is a source (sparse distribution)
+                        const sourceNoise = noise2D(gx * 0.008 + seed * 0.5, gz * 0.008 - seed * 0.3);
+                        if (sourceNoise > 0.6) {
+                            // Check slope isn't too steep
+                            const slope = getLocalSlope(gx, gz, seed, 8);
+                            if (slope < 1.5) {
+                                sources.push({ x: gx, z: gz, height });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Limit sources per region to prevent overcrowding
+            if (sources.length > 3) {
+                sources.sort((a, b) => b.height - a.height);
+                sources.length = 3;
+            }
+
+            return sources;
+        },
+
+        /**
+         * Trace a river path from source using gradient descent.
+         * @param {number} startX - Starting X coordinate
+         * @param {number} startZ - Starting Z coordinate
+         * @param {number} seed - World seed
+         * @param {SeededRandom} rng - Seeded random generator
+         * @returns {{points: Array<{x: number, z: number, height: number}>, volume: number, width: number}}
+         */
+        traceRiverPath(startX, startZ, seed, rng) {
+            const points = [];
+            const stepSize = this.SAMPLE_DIST;
+            const maxSteps = 200; // Prevent infinite loops
+
+            let x = startX;
+            let z = startZ;
+            let volume = 1; // Accumulated water volume (increases downstream)
+
+            for (let step = 0; step < maxSteps; step++) {
+                const height = getPreRiverHeight(x, z, seed);
+                const oceanFactor = getOceanFactor(x, z, seed);
+
+                points.push({ x, z, height, volume });
+
+                // Stop if we reach ocean
+                if (oceanFactor < 0.5 || height < WORLD_DIMS.seaLevel - 5) {
+                    break;
+                }
+
+                // Find lowest neighbor using gradient descent
+                let lowestHeight = height;
+                let nextX = x;
+                let nextZ = z;
+
+                // Check 8 directions with some randomness for natural paths
+                const directions = [
+                    [stepSize, 0], [-stepSize, 0], [0, stepSize], [0, -stepSize],
+                    [stepSize, stepSize], [-stepSize, stepSize],
+                    [stepSize, -stepSize], [-stepSize, -stepSize]
+                ];
+
+                // Shuffle directions slightly for variation
+                for (let i = directions.length - 1; i > 0; i--) {
+                    const j = Math.floor(rng.next() * (i + 1));
+                    [directions[i], directions[j]] = [directions[j], directions[i]];
+                }
+
+                for (const [dx, dz] of directions) {
+                    const nx = x + dx;
+                    const nz = z + dz;
+                    const nh = getPreRiverHeight(nx, nz, seed);
+
+                    // Prefer lower terrain, with slight preference for cardinal directions
+                    const diagonal = (dx !== 0 && dz !== 0) ? 0.1 : 0;
+                    if (nh < lowestHeight - diagonal) {
+                        lowestHeight = nh;
+                        nextX = nx;
+                        nextZ = nz;
+                    }
+                }
+
+                // If no lower neighbor found, we're in a local minimum (lake)
+                if (nextX === x && nextZ === z) {
+                    // Try to find an outlet with slight uphill tolerance
+                    for (const [dx, dz] of directions) {
+                        const nx = x + dx;
+                        const nz = z + dz;
+                        const nh = getPreRiverHeight(nx, nz, seed);
+                        // Allow slight uphill to escape local minima
+                        if (nh < height + 2 && nh < lowestHeight + 3) {
+                            lowestHeight = nh;
+                            nextX = nx;
+                            nextZ = nz;
+                        }
+                    }
+                    // If still stuck, end the river here (forms a lake)
+                    if (nextX === x && nextZ === z) break;
+                }
+
+                x = nextX;
+                z = nextZ;
+                volume += 0.1; // Volume increases downstream
+            }
+
+            // Calculate river width based on accumulated volume
+            const width = Math.min(12, 3 + Math.sqrt(volume) * 2);
+
+            return { points, volume, width };
+        },
+
+        /**
+         * Query if a point is near a traced river path.
+         * @param {number} gx - Global X
+         * @param {number} gz - Global Z
+         * @param {number} seed - World seed
+         * @returns {{inRiver: boolean, distance: number, riverWidth: number, flowDir: {x: number, z: number}|null}}
+         */
+        queryRiverAt(gx, gz, seed) {
+            const paths = this.getRegionRivers(gx, gz, seed);
+
+            let closestDist = Infinity;
+            let closestWidth = 0;
+            let flowDir = null;
+
+            for (const path of paths) {
+                for (let i = 0; i < path.points.length - 1; i++) {
+                    const p1 = path.points[i];
+                    const p2 = path.points[i + 1];
+
+                    // Calculate distance from point to line segment
+                    const dist = this.pointToSegmentDist(gx, gz, p1.x, p1.z, p2.x, p2.z);
+
+                    // Width increases downstream
+                    const segmentWidth = path.width * (0.5 + (i / path.points.length) * 0.5);
+
+                    if (dist < closestDist) {
+                        closestDist = dist;
+                        closestWidth = segmentWidth;
+                        flowDir = { x: p2.x - p1.x, z: p2.z - p1.z };
+                    }
+                }
+            }
+
+            const inRiver = closestDist < closestWidth;
+            return { inRiver, distance: closestDist, riverWidth: closestWidth, flowDir };
+        },
+
+        /**
+         * Calculate distance from point to line segment.
+         * @param {number} px - Point X
+         * @param {number} pz - Point Z
+         * @param {number} x1 - Segment start X
+         * @param {number} z1 - Segment start Z
+         * @param {number} x2 - Segment end X
+         * @param {number} z2 - Segment end Z
+         * @returns {number} Distance to segment
+         */
+        pointToSegmentDist(px, pz, x1, z1, x2, z2) {
+            const dx = x2 - x1;
+            const dz = z2 - z1;
+            const lenSq = dx * dx + dz * dz;
+
+            if (lenSq === 0) {
+                // Segment is a point
+                return Math.sqrt((px - x1) ** 2 + (pz - z1) ** 2);
+            }
+
+            // Project point onto line, clamped to segment
+            let t = ((px - x1) * dx + (pz - z1) * dz) / lenSq;
+            t = Math.max(0, Math.min(1, t));
+
+            const projX = x1 + t * dx;
+            const projZ = z1 + t * dz;
+
+            return Math.sqrt((px - projX) ** 2 + (pz - projZ) ** 2);
+        },
+
+        /**
+         * Clear the cache (useful when changing worlds).
+         */
+        clear() {
+            this.regions.clear();
+        }
+    };
+
+    /**
+     * Enhanced river factor that combines noise-based rivers with traced paths.
+     * Uses traced paths for more natural flow, with noise for detail.
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @returns {number} River factor (0 = river center, 1 = not river)
+     */
+    function getRiverFactorWithPaths(gx, gz, seed) {
+        // Query traced river paths
+        const riverQuery = RiverNetworkCache.queryRiverAt(gx, gz, seed);
+
+        if (riverQuery.inRiver) {
+            // Inside a traced river - use distance for smooth edges
+            const edgeDist = riverQuery.distance / riverQuery.riverWidth;
+            // Add noise for natural bank variation
+            const bankNoise = noise2D(gx * 0.1 + seed * 0.3, gz * 0.1 - seed * 0.2) * 0.15;
+            const adjustedDist = Math.max(0, Math.min(1, edgeDist + bankNoise));
+            return adjustedDist * adjustedDist * (3 - 2 * adjustedDist);
+        }
+
+        // Fall back to noise-based rivers for areas without traced paths
+        return getRiverFactor(gx, gz, seed);
     }
 
     // Ocean factor - determines ocean presence (0 = deep ocean, 1 = land)
@@ -20103,13 +20700,33 @@
         return 1.0; // Land
     }
 
-    // River depth (deeper in center)
-    function getRiverDepth(riverFactor, gx, gz, seed) {
+    /**
+     * River depth with delta shallowing near ocean.
+     * Rivers get shallower as they approach the sea, forming natural deltas.
+     * @param {number} riverFactor - River factor (0 = center, 1 = edge)
+     * @param {GlobalCoord} gx - Global X coordinate
+     * @param {GlobalCoord} gz - Global Z coordinate
+     * @param {number} seed - World seed
+     * @param {number} [oceanFactor=1.0] - Ocean proximity (0 = ocean, 1 = land)
+     * @returns {number} River depth in blocks
+     */
+    function getRiverDepth(riverFactor, gx, gz, seed, oceanFactor = 1.0) {
         const baseRiverDepth = 6;
         const depthNoise = noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
         const depthVariation = (depthNoise + 1) * 0.5 * 3;
         const centerFactor = 1.0 - riverFactor;
-        return baseRiverDepth + depthVariation * centerFactor;
+        let depth = baseRiverDepth + depthVariation * centerFactor;
+
+        // Delta shallowing - rivers get shallower near ocean
+        if (oceanFactor < 0.95) {
+            // Transition zone (0.3-0.95) = gradually shallower
+            const deltaShallowing = Math.max(0, 1.0 - oceanFactor) * 0.7;
+            depth = depth * (1.0 - deltaShallowing);
+            // Minimum depth of 2 blocks in delta
+            depth = Math.max(2, depth);
+        }
+
+        return depth;
     }
 
     // Ocean depth (much deeper than rivers)
@@ -22208,7 +22825,8 @@
                 // Store cave and river settings globally for generation functions to use
                 window.worldGenSettings = {
                     caveDensityMultiplier: caveMult,
-                    enableRivers: customWorldSettings.enableRivers
+                    enableRivers: customWorldSettings.enableRivers,
+                    usePathBasedRivers: customWorldSettings.usePathBasedRivers ?? false
                 };
             }
 
@@ -22801,6 +23419,7 @@
             customWorldSettings.enableTrees = true;
             customWorldSettings.enableCaves = true;
             customWorldSettings.enableRivers = true;
+            customWorldSettings.usePathBasedRivers = false; // Phase 2: gradient descent rivers (slower but more realistic)
             customWorldSettings.caveDensityMultiplier = 1.0;
             customWorldSettings.biomeSizeMultiplier = 1.0;
 
@@ -36837,13 +37456,20 @@ self.onmessage = async (e) => {
                     finalHeight = lerpValue(oceanFloor, finalHeight, bank);
                 }
 
-                // 5. Apply rivers (always enabled in terrain generation - rivers are deterministic)
+                // 5. Apply rivers with delta support
                 const r = getRiverFactor(gx, gz, seed);
-                if (r < 1.0) {
-                    const riverDepth = getRiverDepth(r, gx, gz, seed);
+                const deltaFinger = getDeltaFingerFactor(gx, gz, seed, oceanFactor);
+
+                // River carving: either main river channel OR delta finger channels near ocean
+                const inRiver = r < 1.0;
+                const inDeltaFinger = deltaFinger < 1.0 && r < 0.95;
+
+                if (inRiver || inDeltaFinger) {
+                    const waterFactor = inDeltaFinger ? Math.min(r, deltaFinger) : r;
+
+                    const riverDepth = getRiverDepth(waterFactor, gx, gz, seed, oceanFactor);
                     const riverBed = WORLD_DIMS.seaLevel - riverDepth;
-                    const bank = r * r * (3 - 2 * r);
-                    // Rivers carve down from current height (whether land or ocean edge)
+                    const bank = waterFactor * waterFactor * (3 - 2 * waterFactor);
                     const carvedHeight = Math.min(finalHeight, riverBed);
                     finalHeight = lerpValue(carvedHeight, finalHeight, bank);
                 }
@@ -37169,24 +37795,157 @@ self.onmessage = async (e) => {
                 swamp: defaultHeightFunc,
                 longwoods: defaultHeightFunc
             };
+            // ============================================================
+            // RIVER SYSTEM - Phase 1: Enhanced Natural Rivers (Worker)
+            // ============================================================
+
+            /**
+             * Calculate terrain height WITHOUT river carving (for slope analysis).
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @returns {number} Pre-river terrain height
+             */
+            function getPreRiverHeight(gx, gz, seed) {
+                const c = continentalHeight(gx, gz, seed);
+                const gridScale = BIOME_CELL_SIZE;
+                const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
+                            + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
+                const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
+                            + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
+                const u = gx / gridScale - 0.5 + warpX;
+                const v = gz / gridScale - 0.5 + warpZ;
+                const x0 = Math.floor(u);
+                const z0 = Math.floor(v);
+                const x1 = x0 + 1;
+                const z1 = z0 + 1;
+                const wx = u - x0;
+                const wz = v - z0;
+                const sx = wx * wx * (3 - 2 * wx);
+                const sz = wz * wz * (3 - 2 * wz);
+
+                const h00 = getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
+                const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
+                const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
+                const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
+                const h0 = lerpValue(h00, h10, sx);
+                const h1 = lerpValue(h01, h11, sx);
+                let finalHeight = lerpValue(h0, h1, sz);
+
+                const oceanFactor = getOceanFactor(gx, gz, seed);
+                if (oceanFactor < 1.0) {
+                    const oceanDepth = getOceanDepth(oceanFactor, gx, gz, seed);
+                    const oceanFloor = WORLD_DIMS.seaLevel - oceanDepth;
+                    const bank = oceanFactor * oceanFactor * (3 - 2 * oceanFactor);
+                    finalHeight = lerpValue(oceanFloor, finalHeight, bank);
+                }
+
+                return finalHeight;
+            }
+
+            /**
+             * Calculate local terrain slope (max height diff to cardinal neighbors).
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @param {number} [sampleDist=4] - Distance to sample neighbors
+             * @returns {number} Maximum slope to any cardinal neighbor
+             */
+            function getLocalSlope(gx, gz, seed, sampleDist = 4) {
+                const centerHeight = getPreRiverHeight(gx, gz, seed);
+                let maxSlope = 0;
+
+                const offsets = [[sampleDist, 0], [-sampleDist, 0], [0, sampleDist], [0, -sampleDist]];
+                for (const [dx, dz] of offsets) {
+                    const neighborHeight = getPreRiverHeight(gx + dx, gz + dz, seed);
+                    const slope = Math.abs(centerHeight - neighborHeight) / sampleDist;
+                    if (slope > maxSlope) maxSlope = slope;
+                }
+
+                return maxSlope;
+            }
+
+            /**
+             * River factor with enhanced meandering and terrain awareness.
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @returns {number} River factor (0 = river center, 1 = not river)
+             */
             function getRiverFactor(gx, gz, seed) {
-                // Reduce warp frequency and strength by 50%
-                const warpScale = 0.004; // Was 0.008
-                const warpStrength = 20.0; // Was 40.0
+                const warpScale = 0.004;
+                const baseWarpStrength = 20.0;
+
+                const terrainHeight = getPreRiverHeight(gx, gz, seed);
+
+                // Increase meandering at low elevations
+                const elevationFactor = Math.max(0, 1.0 - (terrainHeight - WORLD_DIMS.seaLevel) / 40);
+                const meanderBoost = elevationFactor * 15.0;
+                const warpStrength = baseWarpStrength + meanderBoost;
+
                 const wx = gx + noise2D(gx * warpScale, gz * warpScale) * warpStrength;
                 const wz = gz + noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
+
+                // Sinusoidal meandering for natural S-curves
+                const meanderWavelength = 80 + noise2D(gx * 0.001, gz * 0.001) * 40;
+                const meanderAmplitude = 8 + elevationFactor * 7;
+                const meanderPhase = noise2D(gx * 0.0005 + seed * 2, gz * 0.0005) * Math.PI * 2;
+                const meanderOffset = Math.sin(gx / meanderWavelength + meanderPhase) * meanderAmplitude;
+
                 const scale = 0.001;
-                const n = Math.abs(noise2D(wx * scale + seed * 0.1, wz * scale - seed * 0.1));
+                const n = Math.abs(noise2D((wx + meanderOffset) * scale + seed * 0.1, wz * scale - seed * 0.1));
 
-                // Add coastal noise for natural shorelines
-                const coastNoiseScale = 0.05;
+                const coastNoiseScale = 0.008;
                 const coastNoise = noise2D(gx * coastNoiseScale + seed * 0.7, gz * coastNoiseScale - seed * 0.3);
-                const coastVariation = coastNoise * 0.02; // Varies width by up to 0.02
-                const width = 0.055 + coastVariation;
+                const coastVariation = coastNoise * 0.02;
+                const baseWidth = 0.055 + coastVariation;
 
-                // Smoothstep with noisy edges
-                if (n < width) {
-                    let t = n / width;
+                // Terrain-aware river avoidance
+                const RIVER_SLOPE_THRESHOLD = 1.0;
+                const RIVER_MAX_ELEVATION = 75;
+
+                const slope = getLocalSlope(gx, gz, seed);
+                const slopePenalty = Math.max(0, (slope - RIVER_SLOPE_THRESHOLD) * 2.0);
+                const heightPenalty = Math.max(0, (terrainHeight - RIVER_MAX_ELEVATION) / 20);
+
+                const terrainPenalty = Math.min(1.0, slopePenalty + heightPenalty);
+                const effectiveWidth = baseWidth * (1.0 - terrainPenalty * 0.9);
+
+                if (effectiveWidth < 0.01) return 1.0;
+
+                if (n < effectiveWidth) {
+                    let t = n / effectiveWidth;
+                    return t * t * (3 - 2 * t);
+                }
+                return 1.0;
+            }
+
+            /**
+             * Delta finger factor for river delta splitting near ocean.
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @param {number} oceanFactor - Ocean proximity (0 = ocean, 1 = land)
+             * @returns {number} Delta finger factor (0 = in channel, 1 = not in channel)
+             */
+            function getDeltaFingerFactor(gx, gz, seed, oceanFactor) {
+                if (oceanFactor < 0.2 || oceanFactor > 0.95) return 1.0;
+
+                const deltaIntensity = 1.0 - Math.abs(oceanFactor - 0.5) * 2;
+
+                const fingerScale1 = 0.015;
+                const fingerScale2 = 0.025;
+                const fingerScale3 = 0.04;
+
+                const finger1 = Math.abs(noise2D(gx * fingerScale1 + seed * 3.1, gz * fingerScale1 - seed * 1.7));
+                const finger2 = Math.abs(noise2D(gx * fingerScale2 - seed * 2.3, gz * fingerScale2 + seed * 0.9));
+                const finger3 = Math.abs(noise2D(gx * fingerScale3 + seed * 1.5, gz * fingerScale3 + seed * 2.1));
+
+                const fingerWidth = 0.12 + deltaIntensity * 0.08;
+                const minFinger = Math.min(finger1, finger2, finger3);
+
+                if (minFinger < fingerWidth) {
+                    let t = minFinger / fingerWidth;
                     return t * t * (3 - 2 * t);
                 }
                 return 1.0;
@@ -37194,43 +37953,52 @@ self.onmessage = async (e) => {
 
             // Get ocean factor - oceans form where rivers end near continental edges
             function getOceanFactor(gx, gz, seed) {
-                // Large-scale ocean noise
                 const oceanScale = 0.0008;
                 const oceanNoise = noise2D(gx * oceanScale + seed * 1.5, gz * oceanScale - seed * 0.8);
 
-                // Secondary noise for irregular coastlines
                 const coastScale = 0.004;
                 const coastNoise = noise2D(gx * coastScale + seed * 2.1, gz * coastScale + seed * 1.3);
 
-                // Tertiary noise for small coastal features
                 const detailScale = 0.02;
                 const detailNoise = noise2D(gx * detailScale - seed * 0.5, gz * detailScale + seed * 0.9) * 0.1;
 
-                // Combine noises - ocean forms where combined noise is low
                 const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
-                const oceanThreshold = -0.3; // Below this is deep ocean
-                const shallowThreshold = -0.1; // Below this is shallow ocean/coast
+                const oceanThreshold = -0.3;
+                const shallowThreshold = -0.1;
 
                 if (combined < oceanThreshold) {
-                    return 0.0; // Deep ocean
+                    return 0.0;
                 } else if (combined < shallowThreshold) {
-                    // Smooth transition from deep ocean to coast
                     let t = (combined - oceanThreshold) / (shallowThreshold - oceanThreshold);
                     return t * t * (3 - 2 * t);
                 }
-                return 1.0; // Land
+                return 1.0;
             }
 
-            // Get river depth at location (deeper in center, shallower at edges)
-            function getRiverDepth(riverFactor, gx, gz, seed) {
-                // Base depth for rivers (deeper than before)
+            /**
+             * River depth with delta shallowing near ocean.
+             * @param {number} riverFactor - River factor (0 = center, 1 = edge)
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @param {number} [oceanFactor=1.0] - Ocean proximity (0 = ocean, 1 = land)
+             * @returns {number} River depth in blocks
+             */
+            function getRiverDepth(riverFactor, gx, gz, seed, oceanFactor = 1.0) {
                 const baseRiverDepth = 6;
-                // Center of river is deeper
                 const depthNoise = noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2);
-                const depthVariation = (depthNoise + 1) * 0.5 * 3; // 0-3 extra depth
-                // Deeper in center (where riverFactor is closer to 0)
+                const depthVariation = (depthNoise + 1) * 0.5 * 3;
                 const centerFactor = 1.0 - riverFactor;
-                return baseRiverDepth + depthVariation * centerFactor;
+                let depth = baseRiverDepth + depthVariation * centerFactor;
+
+                // Delta shallowing
+                if (oceanFactor < 0.95) {
+                    const deltaShallowing = Math.max(0, 1.0 - oceanFactor) * 0.7;
+                    depth = depth * (1.0 - deltaShallowing);
+                    depth = Math.max(2, depth);
+                }
+
+                return depth;
             }
 
             // Get ocean depth at location
