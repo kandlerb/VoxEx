@@ -17552,11 +17552,6 @@
             const BIOME_CELL_SIZE = 64;
             const biomeCellCache = new Map();
             const treeMaskCache = new Map();
-            // Mountain range system caches
-            const MOUNTAIN_THRESHOLD = 0.52;  // Backbone detection threshold
-            const mountainBackboneCache = new Map();
-            const clusterValidityCache = new Map();
-            const mountainWidthCache = new Map();
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
@@ -19047,209 +19042,8 @@
     const BIOME_CELL_SIZE = 64;
     const biomeCellCache = new Map();
 
-    // ============================================================
-    // MOUNTAIN RANGE SYSTEM - Ridge-based elongated mountain ranges
-    // ============================================================
-    const MOUNTAIN_THRESHOLD = 0.52;  // Backbone detection threshold (lower = more mountains)
-    const mountainBackboneCache = new Map();
-    const clusterValidityCache = new Map();
-    const mountainWidthCache = new Map();
-
     /**
-     * Calculate mountain backbone value using multi-octave ridge noise.
-     * Ridge noise creates elongated linear features ideal for mountain ranges.
-     * @param {number} cellX - Cell X coordinate
-     * @param {number} cellZ - Cell Z coordinate
-     * @param {number} seed - World seed
-     * @returns {number} Backbone value 0-1 (higher = more likely mountain)
-     */
-    function getMountainBackbone(cellX, cellZ, seed) {
-        const key = cellX + ',' + cellZ;
-        if (mountainBackboneCache.has(key)) return mountainBackboneCache.get(key);
-
-        // Seed-based rotation for range direction variety
-        const rotAngle = ((seed % 1000) / 1000) * Math.PI * 0.5;  // 0 to 90 degrees
-        const cosR = Math.cos(rotAngle);
-        const sinR = Math.sin(rotAngle);
-        const rx = cellX * cosR - cellZ * sinR;
-        const rz = cellX * sinR + cellZ * cosR;
-
-        // Multi-octave ridge noise for natural-looking elongated ranges
-        const scale = 0.07;  // Controls range spacing
-        let backbone = 0;
-        let amp = 1.0;
-        let freq = 1.0;
-        for (let i = 0; i < 3; i++) {
-            const n = noise2D(rx * scale * freq + seed * 0.1, rz * scale * freq - seed * 0.1);
-            backbone += (1.0 - Math.abs(n)) * amp;  // Ridge formula: peaks at zero-crossings
-            amp *= 0.5;
-            freq *= 2.0;
-        }
-        backbone /= 1.75;  // Normalize to ~0-1
-
-        // Add secondary perpendicular variation for width changes along range
-        const widthVar = noise2D(rx * 0.03 - seed * 0.2, rz * 0.03 + seed * 0.2);
-        backbone += widthVar * 0.15;
-
-        backbone = Math.max(0, Math.min(1, backbone));
-        mountainBackboneCache.set(key, backbone);
-        return backbone;
-    }
-
-    /**
-     * Check if a mountain cluster meets minimum size requirements (2x4 cells).
-     * Uses flood-fill with cardinal neighbors only.
-     * @param {number} startCellX - Starting cell X
-     * @param {number} startCellZ - Starting cell Z
-     * @param {number} seed - World seed
-     * @returns {boolean} True if cluster is valid (>= 2x4 or 4x2)
-     */
-    function isValidMountainCluster(startCellX, startCellZ, seed) {
-        const key = startCellX + ',' + startCellZ;
-        if (clusterValidityCache.has(key)) return clusterValidityCache.get(key);
-
-        const visited = new Set();
-        const queue = [[startCellX, startCellZ]];
-        let minX = startCellX, maxX = startCellX;
-        let minZ = startCellZ, maxZ = startCellZ;
-        let cellCount = 0;
-        const maxCells = 50;  // Limit flood-fill for performance
-
-        while (queue.length > 0 && cellCount < maxCells) {
-            const [cx, cz] = queue.shift();
-            const cellKey = cx + ',' + cz;
-            if (visited.has(cellKey)) continue;
-
-            const backbone = getMountainBackbone(cx, cz, seed);
-            if (backbone < MOUNTAIN_THRESHOLD) continue;
-
-            visited.add(cellKey);
-            cellCount++;
-            minX = Math.min(minX, cx);
-            maxX = Math.max(maxX, cx);
-            minZ = Math.min(minZ, cz);
-            maxZ = Math.max(maxZ, cz);
-
-            // Early exit if already large enough
-            const width = maxX - minX + 1;
-            const height = maxZ - minZ + 1;
-            if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
-                // Mark all visited cells as valid
-                for (const visitedKey of visited) {
-                    clusterValidityCache.set(visitedKey, true);
-                }
-                return true;
-            }
-
-            // Add cardinal neighbors only
-            queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
-        }
-
-        // Check final dimensions
-        const width = maxX - minX + 1;
-        const height = maxZ - minZ + 1;
-        const isValid = (width >= 2 && height >= 4) || (width >= 4 && height >= 2);
-
-        // Cache result for all visited cells
-        for (const visitedKey of visited) {
-            clusterValidityCache.set(visitedKey, isValid);
-        }
-        return isValid;
-    }
-
-    /**
-     * Measure the width of a mountain range at a given cell.
-     * Samples perpendicular to ridge direction.
-     * @param {number} cellX - Cell X coordinate
-     * @param {number} cellZ - Cell Z coordinate
-     * @param {number} seed - World seed
-     * @returns {number} Width in cells (1-16)
-     */
-    function getMountainWidth(cellX, cellZ, seed) {
-        const key = cellX + ',' + cellZ;
-        if (mountainWidthCache.has(key)) return mountainWidthCache.get(key);
-
-        let width = 1;  // Count self
-        const maxDist = 8;  // Max 8 cells in any direction
-
-        // Sample in 4 cardinal directions
-        const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-        for (const [dx, dz] of dirs) {
-            for (let dist = 1; dist <= maxDist; dist++) {
-                const ncx = cellX + dx * dist;
-                const ncz = cellZ + dz * dist;
-                const backbone = getMountainBackbone(ncx, ncz, seed);
-                if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
-                    width++;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        width = Math.min(width, 16);  // Cap at 16
-        mountainWidthCache.set(key, width);
-        return width;
-    }
-
-    /**
-     * Find distance to nearest valid mountain backbone and its width.
-     * Used for determining foothill ring placement.
-     * @param {number} cellX - Cell X coordinate
-     * @param {number} cellZ - Cell Z coordinate
-     * @param {number} seed - World seed
-     * @returns {{distance: number, nearestWidth: number}} Distance (0 if in mountain) and width of nearest mountain
-     */
-    function getDistanceToMountainBackbone(cellX, cellZ, seed) {
-        // Check if this cell is in backbone
-        const backbone = getMountainBackbone(cellX, cellZ, seed);
-        if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(cellX, cellZ, seed)) {
-            return { distance: 0, nearestWidth: getMountainWidth(cellX, cellZ, seed) };
-        }
-
-        // Search outward in rings for nearest valid mountain
-        const maxSearchDist = 6;  // Max foothill depth we'd support
-        for (let dist = 1; dist <= maxSearchDist; dist++) {
-            // Check ring at this distance (cardinal + diagonal)
-            for (let dx = -dist; dx <= dist; dx++) {
-                for (let dz = -dist; dz <= dist; dz++) {
-                    // Only check cells at exactly this distance (ring perimeter)
-                    if (Math.abs(dx) !== dist && Math.abs(dz) !== dist) continue;
-
-                    const ncx = cellX + dx;
-                    const ncz = cellZ + dz;
-                    const nBackbone = getMountainBackbone(ncx, ncz, seed);
-                    if (nBackbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
-                        const nearestWidth = getMountainWidth(ncx, ncz, seed);
-                        // Use Chebyshev distance (max of abs dx, abs dz)
-                        const chebyshevDist = Math.max(Math.abs(dx), Math.abs(dz));
-                        return { distance: chebyshevDist, nearestWidth };
-                    }
-                }
-            }
-        }
-
-        return { distance: Infinity, nearestWidth: 0 };
-    }
-
-    /**
-     * Map mountain range width to amplitude scale.
-     * Narrow ridges = shorter peaks, wide ranges = tallest peaks.
-     * @param {number} width - Range width in cells
-     * @returns {number} Amplitude multiplier (0.4 to 1.0)
-     */
-    function getWidthAmplitudeScale(width) {
-        if (width <= 2) {
-            return 0.4 + (width - 1) * 0.2;  // 1→0.4, 2→0.6
-        } else if (width <= 4) {
-            return 0.6 + (width - 2) * 0.125;  // 3→0.725, 4→0.85
-        } else {
-            return Math.min(1.0, 0.85 + (width - 4) * 0.0375);  // 5→0.8875, 8→1.0
-        }
-    }
-
-    /**
-     * Get raw biome selection without mountain backbone resolution.
+     * Get raw biome selection for weighted biome distribution.
      * Used internally by the biome resolution system.
      * @param {number} cellX - Cell X coordinate
      * @param {number} cellZ - Cell Z coordinate
@@ -20853,11 +20647,8 @@
             if (type === 'init') {
                 // Initialize noise with seed string
                 initNoise(seedStr);
-                // Clear all biome and mountain caches for new seed
+                // Clear biome cache for new seed
                 biomeCellCache.clear();
-                mountainBackboneCache.clear();
-                clusterValidityCache.clear();
-                mountainWidthCache.clear();
                 self.postMessage({ type: 'ready', jobId });
                 return;
             }
@@ -20866,11 +20657,8 @@
                 // Ensure noise is initialized
                 if (!perm || workerSeedStr !== seedStr) {
                     initNoise(seedStr);
-                    // Clear all biome and mountain caches for new seed
+                    // Clear biome cache for new seed
                     biomeCellCache.clear();
-                    mountainBackboneCache.clear();
-                    clusterValidityCache.clear();
-                    mountainWidthCache.clear();
                 }
 
                 const chunkSize = CHUNK_SIZE;
@@ -23016,13 +22804,6 @@
              */
             class WorldPreviewRenderer {
                 /**
-                 * Mountain backbone threshold - cells above this are mountains.
-                 * Must match MOUNTAIN_THRESHOLD in worker and main thread (0.52).
-                 * @type {number}
-                 */
-                static MOUNTAIN_THRESHOLD = 0.52;
-
-                /**
                  * @param {HTMLCanvasElement} canvas - Canvas element.
                  */
                 constructor(canvas) {
@@ -23031,8 +22812,6 @@
                     this.noise = null;
                     this.seed = 0;
                     this.renderTimeout = null;
-                    this.mountainBackboneCache = new Map();
-                    this.clusterValidityCache = new Map();
                 }
                 /**
                  * Initialize with a seed value.
@@ -23041,9 +22820,6 @@
                 init(seed) {
                     this.seed = seed;
                     this.noise = new WorldPreviewNoise(seed);
-                    // Clear caches when seed changes
-                    this.mountainBackboneCache.clear();
-                    this.clusterValidityCache.clear();
                 }
                 /**
                  * Schedule a render with debouncing.
@@ -23065,99 +22841,7 @@
                     return Math.max(-1, Math.min(1, c));
                 }
                 /**
-                 * Get mountain backbone value for a cell.
-                 * Matches getMountainBackbone() in worker and main thread.
-                 * @param {number} cellX - Cell X coordinate.
-                 * @param {number} cellZ - Cell Z coordinate.
-                 * @returns {number} Backbone value 0-1 (higher = more likely mountain).
-                 */
-                getMountainBackbone(cellX, cellZ) {
-                    const key = cellX + ',' + cellZ;
-                    if (this.mountainBackboneCache.has(key)) return this.mountainBackboneCache.get(key);
-
-                    // Seed-based rotation for range direction variety
-                    const rotAngle = ((this.seed % 1000) / 1000) * Math.PI * 0.5;
-                    const cosR = Math.cos(rotAngle);
-                    const sinR = Math.sin(rotAngle);
-                    const rx = cellX * cosR - cellZ * sinR;
-                    const rz = cellX * sinR + cellZ * cosR;
-
-                    // Multi-octave ridge noise for natural-looking elongated ranges
-                    const scale = 0.07;
-                    let backbone = 0;
-                    let amp = 1.0;
-                    let freq = 1.0;
-                    for (let i = 0; i < 3; i++) {
-                        const n = this.noise.noise2D(rx * scale * freq + this.seed * 0.1, rz * scale * freq - this.seed * 0.1);
-                        backbone += (1.0 - Math.abs(n)) * amp;
-                        amp *= 0.5;
-                        freq *= 2.0;
-                    }
-                    backbone /= 1.75;
-
-                    // Add secondary perpendicular variation for width changes along range
-                    const widthVar = this.noise.noise2D(rx * 0.03 - this.seed * 0.2, rz * 0.03 + this.seed * 0.2);
-                    backbone += widthVar * 0.15;
-
-                    backbone = Math.max(0, Math.min(1, backbone));
-                    this.mountainBackboneCache.set(key, backbone);
-                    return backbone;
-                }
-                /**
-                 * Check if a mountain cluster meets minimum size requirements (2x4 cells).
-                 * Matches isValidMountainCluster() in worker and main thread.
-                 * @param {number} startCellX - Starting cell X.
-                 * @param {number} startCellZ - Starting cell Z.
-                 * @returns {boolean} True if cluster is valid.
-                 */
-                isValidMountainCluster(startCellX, startCellZ) {
-                    const key = startCellX + ',' + startCellZ;
-                    if (this.clusterValidityCache.has(key)) return this.clusterValidityCache.get(key);
-
-                    const visited = new Set();
-                    const queue = [[startCellX, startCellZ]];
-                    let minX = startCellX, maxX = startCellX;
-                    let minZ = startCellZ, maxZ = startCellZ;
-                    let cellCount = 0;
-                    const maxCells = 50;
-
-                    while (queue.length > 0 && cellCount < maxCells) {
-                        const [cx, cz] = queue.shift();
-                        const cellKey = cx + ',' + cz;
-                        if (visited.has(cellKey)) continue;
-
-                        const backbone = this.getMountainBackbone(cx, cz);
-                        if (backbone < WorldPreviewRenderer.MOUNTAIN_THRESHOLD) continue;
-
-                        visited.add(cellKey);
-                        cellCount++;
-                        minX = Math.min(minX, cx);
-                        maxX = Math.max(maxX, cx);
-                        minZ = Math.min(minZ, cz);
-                        maxZ = Math.max(maxZ, cz);
-
-                        const width = maxX - minX + 1;
-                        const height = maxZ - minZ + 1;
-                        if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
-                            for (const visitedKey of visited) {
-                                this.clusterValidityCache.set(visitedKey, true);
-                            }
-                            return true;
-                        }
-
-                        // Cardinal neighbors
-                        queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
-                    }
-
-                    // Cluster too small
-                    for (const visitedKey of visited) {
-                        this.clusterValidityCache.set(visitedKey, false);
-                    }
-                    return false;
-                }
-                /**
-                 * Get biome for a cell coordinate using mountain backbone system.
-                 * Mountains are only placed via backbone, not weighted selection.
+                 * Get biome for a cell coordinate using weighted selection.
                  * @param {number} cellX - Cell X.
                  * @param {number} cellZ - Cell Z.
                  * @param {number} biomeSizeMult - Biome size multiplier.
@@ -37145,18 +36829,9 @@ self.onmessage = async (e) => {
                 biomeTable = { cumulative, totalWeight: total };
                 // Rebuild biomeByName map for O(1) lookups
                 rebuildBiomeByNameMap(biomes);
-                // Clear all biome and mountain caches for new seed
+                // Clear biome cache for new seed
                 if (typeof biomeCellCache !== "undefined") {
                     biomeCellCache.clear();
-                }
-                if (typeof mountainBackboneCache !== "undefined") {
-                    mountainBackboneCache.clear();
-                }
-                if (typeof clusterValidityCache !== "undefined") {
-                    clusterValidityCache.clear();
-                }
-                if (typeof mountainWidthCache !== "undefined") {
-                    mountainWidthCache.clear();
                 }
             }
             let biomeTable = null;
@@ -37223,186 +36898,6 @@ self.onmessage = async (e) => {
                     lz = ((gz % cs) + cs) % cs;
                 const mask = getTreeMaskForChunk(cx, cz, seed);
                 return mask[lx + lz * cs] === 1;
-            }
-            // ============================================================
-            // MOUNTAIN RANGE SYSTEM - Ridge-based elongated mountain ranges
-            // ============================================================
-
-            /**
-             * Calculate mountain backbone value using multi-octave ridge noise.
-             * Ridge noise creates elongated linear features ideal for mountain ranges.
-             * @param {number} cellX - Cell X coordinate
-             * @param {number} cellZ - Cell Z coordinate
-             * @param {number} seed - World seed
-             * @returns {number} Backbone value 0-1 (higher = more likely mountain)
-             */
-            function getMountainBackbone(cellX, cellZ, seed) {
-                const key = cellX + ',' + cellZ;
-                if (mountainBackboneCache.has(key)) return mountainBackboneCache.get(key);
-
-                // Seed-based rotation for range direction variety
-                const rotAngle = ((seed % 1000) / 1000) * Math.PI * 0.5;
-                const cosR = Math.cos(rotAngle);
-                const sinR = Math.sin(rotAngle);
-                const rx = cellX * cosR - cellZ * sinR;
-                const rz = cellX * sinR + cellZ * cosR;
-
-                // Multi-octave ridge noise for natural-looking elongated ranges
-                const scale = 0.07;
-                let backbone = 0;
-                let amp = 1.0;
-                let freq = 1.0;
-                for (let i = 0; i < 3; i++) {
-                    const n = noise2D(rx * scale * freq + seed * 0.1, rz * scale * freq - seed * 0.1);
-                    backbone += (1.0 - Math.abs(n)) * amp;
-                    amp *= 0.5;
-                    freq *= 2.0;
-                }
-                backbone /= 1.75;
-
-                const widthVar = noise2D(rx * 0.03 - seed * 0.2, rz * 0.03 + seed * 0.2);
-                backbone += widthVar * 0.15;
-
-                backbone = Math.max(0, Math.min(1, backbone));
-                mountainBackboneCache.set(key, backbone);
-                return backbone;
-            }
-
-            /**
-             * Check if a mountain cluster meets minimum size requirements (2x4 cells).
-             * @param {number} startCellX - Starting cell X
-             * @param {number} startCellZ - Starting cell Z
-             * @param {number} seed - World seed
-             * @returns {boolean} True if cluster is valid
-             */
-            function isValidMountainCluster(startCellX, startCellZ, seed) {
-                const key = startCellX + ',' + startCellZ;
-                if (clusterValidityCache.has(key)) return clusterValidityCache.get(key);
-
-                const visited = new Set();
-                const queue = [[startCellX, startCellZ]];
-                let minX = startCellX, maxX = startCellX;
-                let minZ = startCellZ, maxZ = startCellZ;
-                let cellCount = 0;
-                const maxCells = 50;
-
-                while (queue.length > 0 && cellCount < maxCells) {
-                    const [cx, cz] = queue.shift();
-                    const cellKey = cx + ',' + cz;
-                    if (visited.has(cellKey)) continue;
-
-                    const backbone = getMountainBackbone(cx, cz, seed);
-                    if (backbone < MOUNTAIN_THRESHOLD) continue;
-
-                    visited.add(cellKey);
-                    cellCount++;
-                    minX = Math.min(minX, cx);
-                    maxX = Math.max(maxX, cx);
-                    minZ = Math.min(minZ, cz);
-                    maxZ = Math.max(maxZ, cz);
-
-                    const width = maxX - minX + 1;
-                    const height = maxZ - minZ + 1;
-                    if ((width >= 2 && height >= 4) || (width >= 4 && height >= 2)) {
-                        for (const visitedKey of visited) {
-                            clusterValidityCache.set(visitedKey, true);
-                        }
-                        return true;
-                    }
-
-                    queue.push([cx + 1, cz], [cx - 1, cz], [cx, cz + 1], [cx, cz - 1]);
-                }
-
-                const width = maxX - minX + 1;
-                const height = maxZ - minZ + 1;
-                const isValid = (width >= 2 && height >= 4) || (width >= 4 && height >= 2);
-
-                for (const visitedKey of visited) {
-                    clusterValidityCache.set(visitedKey, isValid);
-                }
-                return isValid;
-            }
-
-            /**
-             * Measure the width of a mountain range at a given cell.
-             * @param {number} cellX - Cell X coordinate
-             * @param {number} cellZ - Cell Z coordinate
-             * @param {number} seed - World seed
-             * @returns {number} Width in cells (1-16)
-             */
-            function getMountainWidth(cellX, cellZ, seed) {
-                const key = cellX + ',' + cellZ;
-                if (mountainWidthCache.has(key)) return mountainWidthCache.get(key);
-
-                let width = 1;
-                const maxDist = 8;
-                const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-
-                for (const [dx, dz] of dirs) {
-                    for (let dist = 1; dist <= maxDist; dist++) {
-                        const ncx = cellX + dx * dist;
-                        const ncz = cellZ + dz * dist;
-                        const backbone = getMountainBackbone(ncx, ncz, seed);
-                        if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
-                            width++;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                width = Math.min(width, 16);
-                mountainWidthCache.set(key, width);
-                return width;
-            }
-
-            /**
-             * Find distance to nearest valid mountain backbone and its width.
-             * @param {number} cellX - Cell X coordinate
-             * @param {number} cellZ - Cell Z coordinate
-             * @param {number} seed - World seed
-             * @returns {{distance: number, nearestWidth: number}}
-             */
-            function getDistanceToMountainBackbone(cellX, cellZ, seed) {
-                const backbone = getMountainBackbone(cellX, cellZ, seed);
-                if (backbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(cellX, cellZ, seed)) {
-                    return { distance: 0, nearestWidth: getMountainWidth(cellX, cellZ, seed) };
-                }
-
-                const maxSearchDist = 6;
-                for (let dist = 1; dist <= maxSearchDist; dist++) {
-                    for (let dx = -dist; dx <= dist; dx++) {
-                        for (let dz = -dist; dz <= dist; dz++) {
-                            if (Math.abs(dx) !== dist && Math.abs(dz) !== dist) continue;
-
-                            const ncx = cellX + dx;
-                            const ncz = cellZ + dz;
-                            const nBackbone = getMountainBackbone(ncx, ncz, seed);
-                            if (nBackbone >= MOUNTAIN_THRESHOLD && isValidMountainCluster(ncx, ncz, seed)) {
-                                const nearestWidth = getMountainWidth(ncx, ncz, seed);
-                                const chebyshevDist = Math.max(Math.abs(dx), Math.abs(dz));
-                                return { distance: chebyshevDist, nearestWidth };
-                            }
-                        }
-                    }
-                }
-
-                return { distance: Infinity, nearestWidth: 0 };
-            }
-
-            /**
-             * Map mountain range width to amplitude scale.
-             * @param {number} width - Range width in cells
-             * @returns {number} Amplitude multiplier (0.4 to 1.0)
-             */
-            function getWidthAmplitudeScale(width) {
-                if (width <= 2) {
-                    return 0.4 + (width - 1) * 0.2;
-                } else if (width <= 4) {
-                    return 0.6 + (width - 2) * 0.125;
-                } else {
-                    return Math.min(1.0, 0.85 + (width - 4) * 0.0375);
-                }
             }
 
             /**
