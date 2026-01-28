@@ -18469,6 +18469,7 @@
             const indexPool = new Uint32ArrayPool();
             const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
             const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
+            const quadSizePool = new Float32ArrayPool(); // Pool for greedy meshing quad size attribute (width, height)
 
             // ============================================================
             // WEB WORKER: Chunk Generation & Meshing (runs in background thread)
@@ -21532,6 +21533,7 @@
                     const normArray = new Float32Array(maxVerts * 3);
                     const uvArray = new Float32Array(maxVerts * 2);
                     const colArray = new Float32Array(maxVerts * 3);
+                    const quadSizeArray = new Float32Array(maxVerts * 2); // For greedy meshing: stores quad width/height
                     const idxArray = new Uint32Array(maxIndices);
 
                     // Create attributes with DynamicDrawUsage for efficient updates
@@ -21539,18 +21541,21 @@
                     const normAttr = new THREE.Float32BufferAttribute(normArray, 3);
                     const uvAttr = new THREE.Float32BufferAttribute(uvArray, 2);
                     const colAttr = new THREE.Float32BufferAttribute(colArray, 3);
+                    const quadSizeAttr = new THREE.Float32BufferAttribute(quadSizeArray, 2); // Quad size for UV tiling
                     const idxAttr = new THREE.Uint32BufferAttribute(idxArray, 1);
 
                     posAttr.setUsage(THREE.DynamicDrawUsage);
                     normAttr.setUsage(THREE.DynamicDrawUsage);
                     uvAttr.setUsage(THREE.DynamicDrawUsage);
                     colAttr.setUsage(THREE.DynamicDrawUsage);
+                    quadSizeAttr.setUsage(THREE.DynamicDrawUsage);
                     idxAttr.setUsage(THREE.DynamicDrawUsage);
 
                     geo.setAttribute('position', posAttr);
                     geo.setAttribute('normal', normAttr);
                     geo.setAttribute('uv', uvAttr);
                     geo.setAttribute('color', colAttr);
+                    geo.setAttribute('quadSize', quadSizeAttr);
                     geo.setIndex(idxAttr);
 
                     // Pre-compute bounding sphere (will be overwritten per-chunk)
@@ -31907,10 +31912,88 @@ self.onmessage = async (e) => {
                 waterMaterialStandard.fog = true;
                 waterMaterialFast.fog = true;
 
-                // --- CYLINDRICAL FOG ---
+                // --- CYLINDRICAL FOG + UV TILING FOR GREEDY MESHING ---
                 // Override fog calculation to use only horizontal (XZ) distance from player.
                 // This prevents fog from changing when looking up/down and keeps ground visible when flying.
+                // Also adds UV tiling support for greedy meshing (merged quads tile textures instead of stretching).
                 function applyCylindricalFog(material) {
+                    material.onBeforeCompile = (shader) => {
+                        // Add tileWidth uniform for UV tiling calculation
+                        shader.uniforms.tileWidth = { value: 1.0 / NUM_TILES };
+
+                        // Add world position varying and quadSize attribute to vertex shader
+                        shader.vertexShader = shader.vertexShader.replace(
+                            '#include <fog_vertex>',
+                            `#include <fog_vertex>
+                            vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;
+                            vQuadSize = quadSize;`
+                        );
+                        shader.vertexShader = shader.vertexShader.replace(
+                            'void main() {',
+                            `attribute vec2 quadSize;
+                            varying vec3 vWorldPositionCyl;
+                            varying vec2 vQuadSize;
+                            void main() {`
+                        );
+
+                        // Add varyings and uniform to fragment shader
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            'void main() {',
+                            `varying vec3 vWorldPositionCyl;
+                            varying vec2 vQuadSize;
+                            uniform float tileWidth;
+                            void main() {`
+                        );
+
+                        // Replace map_fragment with tiled UV version for greedy meshing
+                        // This uses fract() to tile textures across merged quads instead of stretching
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            '#include <map_fragment>',
+                            `#ifdef USE_MAP
+                                // UV tiling for greedy meshing: tile texture across merged quads
+                                // Extract local UV within the tile (0-1 range)
+                                float localU = mod(vMapUv.x, tileWidth) / tileWidth;
+                                float localV = fract(vMapUv.y);
+                                // Tile based on quad size (for 1×1 quads, fract(x*1) = x unchanged)
+                                float tiledU = fract(localU * vQuadSize.x);
+                                float tiledV = fract(localV * vQuadSize.y);
+                                // Convert back to atlas UV space
+                                float tileBase = floor(vMapUv.x / tileWidth) * tileWidth;
+                                vec2 tiledUv = vec2(tileBase + tiledU * tileWidth, tiledV);
+                                // Sample texture with tiled UVs
+                                vec4 sampledDiffuseColor = texture2D(map, tiledUv);
+                                #ifdef DECODE_VIDEO_TEXTURE
+                                    sampledDiffuseColor = vec4(mix(pow(sampledDiffuseColor.rgb * 0.9478672986 + vec3(0.0521327014), vec3(2.4)), sampledDiffuseColor.rgb * 0.0773993808, vec3(lessThanEqual(sampledDiffuseColor.rgb, vec3(0.04045)))), sampledDiffuseColor.w);
+                                #endif
+                                diffuseColor *= sampledDiffuseColor;
+                            #endif`
+                        );
+
+                        // Replace the fog_fragment include with cylindrical fog calculation
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            '#include <fog_fragment>',
+                            `#ifdef USE_FOG
+                                // Cylindrical fog: only use horizontal (XZ) distance
+                                vec2 horizontalDiff = vWorldPositionCyl.xz - cameraPosition.xz;
+                                float fogDepthCyl = length(horizontalDiff);
+                                #ifdef FOG_EXP2
+                                    float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
+                                #else
+                                    // Scale by 1.15 so fog reaches full opacity before fogFar,
+                                    // ensuring chunk edges are completely hidden
+                                    float fogFactor = min(smoothstep(fogNear, fogFar, fogDepthCyl) * 1.15, 1.0);
+                                #endif
+                                gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
+                            #endif`
+                        );
+                    };
+                    // Force shader recompilation
+                    material.needsUpdate = true;
+                }
+
+                // --- CYLINDRICAL FOG FOR WATER (no UV tiling) ---
+                // Water materials don't have the quadSize attribute, so they use the original fog implementation
+                function applyCylindricalFogWater(material) {
                     material.onBeforeCompile = (shader) => {
                         // Add world position varying to vertex shader
                         shader.vertexShader = shader.vertexShader.replace(
@@ -31952,10 +32035,11 @@ self.onmessage = async (e) => {
                     material.needsUpdate = true;
                 }
 
-                // Apply cylindrical fog to all terrain and water materials
+                // Apply cylindrical fog + UV tiling to terrain material
                 applyCylindricalFog(chunkMaterial);
-                applyCylindricalFog(waterMaterialStandard);
-                applyCylindricalFog(waterMaterialFast);
+                // Apply cylindrical fog only (no UV tiling) to water materials (water doesn't use greedy meshing)
+                applyCylindricalFogWater(waterMaterialStandard);
+                applyCylindricalFogWater(waterMaterialFast);
 
                 // Function to switch water material mode and update all water meshes
                 function applyWaterFastMode() {
@@ -38930,6 +39014,23 @@ self.onmessage = async (e) => {
             }
 
             /**
+             * Write quad size for UV tiling in greedy meshing.
+             * For Phase 1, all quads are 1×1 blocks. Future phases will use actual merged quad dimensions.
+             * The shader uses fract(uv * quadSize) to tile textures across merged quads.
+             * @param {Float32Array} qs - Quad size buffer
+             * @param {number} qsIdx - Starting quad size index
+             * @param {number} width - Quad width in blocks (1 for Phase 1)
+             * @param {number} height - Quad height in blocks (1 for Phase 1)
+             */
+            function writeQuadSizeIndexed(qs, qsIdx, width, height) {
+                // 4 vertices × 2 components = 8 writes
+                qs[qsIdx + 0] = width;  qs[qsIdx + 1] = height;  // V1
+                qs[qsIdx + 2] = width;  qs[qsIdx + 3] = height;  // V2
+                qs[qsIdx + 4] = width;  qs[qsIdx + 5] = height;  // V3
+                qs[qsIdx + 6] = width;  qs[qsIdx + 7] = height;  // V4
+            }
+
+            /**
              * Write 6 indices for one face (two triangles).
              * @param {Uint32Array} indices - Index buffer
              * @param {number} iIdx - Starting index offset
@@ -39125,7 +39226,7 @@ self.onmessage = async (e) => {
              * @param {LocalCoord} lightZ - Light sample Z
              * @param {number} faceIdx - Face index for AO caching
              */
-            function addFaceIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx) {
+            function addFaceIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, quadSizeBuffer, qsIdx) {
                 const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
                 writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
                 const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
@@ -39133,6 +39234,8 @@ self.onmessage = async (e) => {
                 writeFaceColorsIndexed(col, cIdx, ao, lightLevel);
                 writeFaceUVsIndexed(uvs, uvIdx, uv);
                 writeFaceIndices(indices, iIdx, vertexCount);
+                // Write quad size for UV tiling (Phase 1: all quads are 1×1)
+                writeQuadSizeIndexed(quadSizeBuffer, qsIdx, 1, 1);
             }
 
             /**
@@ -39162,7 +39265,7 @@ self.onmessage = async (e) => {
             /**
              * Add a simplified face using indexed geometry (for distant LOD chunks).
              */
-            function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly) {
+            function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly, quadSizeBuffer, qsIdx) {
                 const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
                 writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
                 const simplifiedLight = getSimplifiedLight(ly, WORLD_DIMS.chunkHeight) / 15.0;
@@ -39173,6 +39276,8 @@ self.onmessage = async (e) => {
                 col[cIdx+9] = simplifiedLight; col[cIdx+10] = simplifiedLight; col[cIdx+11] = simplifiedLight;
                 writeFaceUVsIndexed(uvs, uvIdx, uv);
                 writeFaceIndices(indices, iIdx, vertexCount);
+                // Write quad size for UV tiling (Phase 1: all quads are 1×1)
+                writeQuadSizeIndexed(quadSizeBuffer, qsIdx, 1, 1);
             }
 
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
@@ -39586,6 +39691,7 @@ self.onmessage = async (e) => {
                     const terrainUvs = uvPool.acquire(maxFaces * 8);
                     const terrainCols = colPool.acquire(maxFaces * 12);
                     const terrainIndices = indexPool.acquire(maxFaces * 6);
+                    const terrainQuadSize = quadSizePool.acquire(maxFaces * 8); // Quad size for UV tiling (2 floats × 4 verts per face)
                     const waterPos = posPool.acquire(maxFaces * 12);
                     const waterNorm = normPool.acquire(maxFaces * 12);
                     const waterUvs = uvPool.acquire(maxFaces * 8);
@@ -39595,7 +39701,8 @@ self.onmessage = async (e) => {
                     const waterThickness = thicknessPool.acquire(maxFaces * 4); // Water thickness per vertex
                     // Indexed geometry counters: vIdx = position/normal offset, cIdx = color offset, uvIdx = UV offset, iIdx = index offset
                     // tVertCount/wVertCount = vertex count for index base calculations
-                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0; // Terrain
+                    // tQsIdx = quadSize offset for terrain (water doesn't use greedy meshing)
+                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0, tQsIdx = 0; // Terrain
                     let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wIIdx = 0, wVertCount = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
@@ -39737,7 +39844,7 @@ self.onmessage = async (e) => {
 
                                             // OPTIMIZATION: Use simplified lighting for distant chunks
                                             if (useDeferredLight) {
-                                                addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
+                                                addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly, terrainQuadSize, tQsIdx);
                                             } else if (isWater) {
                                                 // Calculate water depth (search DOWN to find bottom)
                                                 let waterDepth = 0;
@@ -39765,20 +39872,21 @@ self.onmessage = async (e) => {
                                                         }
                                                     }
                                                 }
-                                                // Indexed water face rendering
+                                                // Indexed water face rendering (no quadSize - water doesn't use greedy meshing)
                                                 addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
                                             } else {
                                                 // Indexed terrain face rendering
-                                                addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
+                                                addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, terrainQuadSize, tQsIdx);
                                             }
                                             // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
+                                            // Terrain also increments quadSize by 8 (2 floats × 4 verts)
                                             vIdx += 12; uvIdx += 8; cIdx += 12;
                                             if (isWater) {
                                                 wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
                                                 wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
                                             } else {
                                                 tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
-                                                tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                                tIIdx += 6; tVertCount += 4; tQsIdx += 8; tFaceCount++; // +8 for quadSize (2 floats × 4 verts)
                                             }
                                         }
                                     }
@@ -39857,6 +39965,7 @@ self.onmessage = async (e) => {
                         const normAttr = terrainGeo.attributes.normal;
                         const uvAttr = terrainGeo.attributes.uv;
                         const colAttr = terrainGeo.attributes.color;
+                        const quadSizeAttr = terrainGeo.attributes.quadSize;
                         const idxAttr = terrainGeo.index;
 
                         // Copy from work buffers to geometry buffers
@@ -39864,6 +39973,7 @@ self.onmessage = async (e) => {
                         normAttr.array.set(terrainNorm.subarray(0, tVIdx));
                         uvAttr.array.set(terrainUvs.subarray(0, tUvIdx));
                         colAttr.array.set(terrainCols.subarray(0, tCIdx));
+                        quadSizeAttr.array.set(terrainQuadSize.subarray(0, tQsIdx));
                         idxAttr.array.set(terrainIndices.subarray(0, tIIdx));
 
                         // Mark attributes as needing GPU upload - only upload the portion we actually filled
@@ -39882,6 +39992,10 @@ self.onmessage = async (e) => {
                         colAttr.clearUpdateRanges();
                         colAttr.addUpdateRange(0, tCIdx);
                         colAttr.needsUpdate = true;
+
+                        quadSizeAttr.clearUpdateRanges();
+                        quadSizeAttr.addUpdateRange(0, tQsIdx);
+                        quadSizeAttr.needsUpdate = true;
 
                         idxAttr.clearUpdateRanges();
                         idxAttr.addUpdateRange(0, tIIdx);
@@ -40054,6 +40168,7 @@ self.onmessage = async (e) => {
                     uvPool.release(terrainUvs);
                     colPool.release(terrainCols);
                     indexPool.release(terrainIndices);
+                    quadSizePool.release(terrainQuadSize);
                     posPool.release(waterPos);
                     normPool.release(waterNorm);
                     uvPool.release(waterUvs);
