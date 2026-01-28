@@ -5071,6 +5071,9 @@
                 frameUpdateInterval: 5,
                 enableFrustumCulling: savedSettings.enableFrustumCulling !== undefined ? savedSettings.enableFrustumCulling : true,
                 enableSectionLOD: savedSettings.enableSectionLOD !== undefined ? savedSettings.enableSectionLOD : true,
+                // Greedy Meshing - merges adjacent faces into larger quads (60-90% fewer faces)
+                greedyMeshingEnabled: savedSettings.greedyMeshingEnabled !== undefined ? savedSettings.greedyMeshingEnabled : true,
+                maxGreedyQuadSize: savedSettings.maxGreedyQuadSize !== undefined ? savedSettings.maxGreedyQuadSize : 16, // Max quad width/height
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -5281,6 +5284,8 @@
                 upperBoundFPS: 50,
                 enableFrustumCulling: true,
                 enableSectionLOD: true,
+                greedyMeshingEnabled: true,    // Merge adjacent faces into larger quads (60-90% fewer faces)
+                maxGreedyQuadSize: 16,         // Max quad width/height (1-16)
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -18257,6 +18262,94 @@
                 faceVertexCacheIndexed.set(key, verts);
                 return verts;
             }
+
+            // --- GREEDY MESHING: Merged face vertex generation with caching ---
+            // Pre-computed merged face vertices cache for common sizes (1-16)
+            // Key format: "nx,ny,nz,w,h" -> Float32Array(12)
+            const mergedVertexCache = new Map();
+
+            /**
+             * Compute merged face vertices for a given normal and size.
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             * @param {number} width - Quad width
+             * @param {number} height - Quad height
+             * @returns {Float32Array} 12 floats (4 vertices × 3 coords)
+             */
+            function computeMergedFaceVertices(nx, ny, nz, width, height) {
+                const v = new Float32Array(12);
+                if (ny > 0) {        // Top face (+Y): X=width, Z=height
+                    v[0] = 0;     v[1] = 1;  v[2] = height;  // V1 back-left
+                    v[3] = width; v[4] = 1;  v[5] = height;  // V2 back-right
+                    v[6] = width; v[7] = 1;  v[8] = 0;       // V3 front-right
+                    v[9] = 0;     v[10] = 1; v[11] = 0;      // V4 front-left
+                } else if (ny < 0) { // Bottom face (-Y): X=width, Z=height
+                    v[0] = 0;     v[1] = 0;  v[2] = 0;       // V1 front-left
+                    v[3] = width; v[4] = 0;  v[5] = 0;       // V2 front-right
+                    v[6] = width; v[7] = 0;  v[8] = height;  // V3 back-right
+                    v[9] = 0;     v[10] = 0; v[11] = height; // V4 back-left
+                } else if (nx > 0) { // Right face (+X): Z=width, Y=height
+                    v[0] = 1;  v[1] = 0;      v[2] = width;  // V1 bottom-back
+                    v[3] = 1;  v[4] = 0;      v[5] = 0;      // V2 bottom-front
+                    v[6] = 1;  v[7] = height; v[8] = 0;      // V3 top-front
+                    v[9] = 1;  v[10] = height; v[11] = width; // V4 top-back
+                } else if (nx < 0) { // Left face (-X): Z=width, Y=height
+                    v[0] = 0;  v[1] = 0;      v[2] = 0;      // V1 bottom-front
+                    v[3] = 0;  v[4] = 0;      v[5] = width;  // V2 bottom-back
+                    v[6] = 0;  v[7] = height; v[8] = width;  // V3 top-back
+                    v[9] = 0;  v[10] = height; v[11] = 0;    // V4 top-front
+                } else if (nz > 0) { // Back face (+Z): X=width, Y=height
+                    v[0] = 0;     v[1] = 0;      v[2] = 1;   // V1 bottom-left
+                    v[3] = width; v[4] = 0;      v[5] = 1;   // V2 bottom-right
+                    v[6] = width; v[7] = height; v[8] = 1;   // V3 top-right
+                    v[9] = 0;     v[10] = height; v[11] = 1; // V4 top-left
+                } else {             // Front face (-Z): X=width (reversed), Y=height
+                    v[0] = width; v[1] = 0;      v[2] = 0;   // V1 bottom-right
+                    v[3] = 0;     v[4] = 0;      v[5] = 0;   // V2 bottom-left
+                    v[6] = 0;     v[7] = height; v[8] = 0;   // V3 top-left
+                    v[9] = width; v[10] = height; v[11] = 0; // V4 top-right
+                }
+                return v;
+            }
+
+            /**
+             * Pre-allocate vertex cache for common quad sizes (1-16 in each dimension).
+             * Called during initialization to eliminate runtime allocations.
+             */
+            function initMergedVertexCache() {
+                const normals = [[0,1,0], [0,-1,0], [1,0,0], [-1,0,0], [0,0,1], [0,0,-1]];
+                for (let w = 1; w <= 16; w++) {
+                    for (let h = 1; h <= 16; h++) {
+                        for (const [nx, ny, nz] of normals) {
+                            const key = `${nx},${ny},${nz},${w},${h}`;
+                            mergedVertexCache.set(key, computeMergedFaceVertices(nx, ny, nz, w, h));
+                        }
+                    }
+                }
+                logDebug(`[GreedyMesh] Pre-cached ${mergedVertexCache.size} vertex configurations`);
+            }
+
+            /**
+             * Get cached merged face vertices for a quad.
+             * Uses pre-computed cache for common sizes (1-16), computes on demand for larger.
+             * @param {number} nx - Normal X component
+             * @param {number} ny - Normal Y component
+             * @param {number} nz - Normal Z component
+             * @param {number} width - Quad width in blocks
+             * @param {number} height - Quad height in blocks
+             * @returns {Float32Array} 12 values (4 vertices × 3 coords)
+             */
+            function getMergedFaceVertices(nx, ny, nz, width, height) {
+                // Use cache for common sizes (covers 99%+ of cases)
+                if (width <= 16 && height <= 16) {
+                    const key = `${nx},${ny},${nz},${width},${height}`;
+                    return mergedVertexCache.get(key);
+                }
+                // Fallback for rare large quads (compute on demand)
+                return computeMergedFaceVertices(nx, ny, nz, width, height);
+            }
+
             // OPTIMIZATION AUDIT: scheduleChunkUpdate
             //   - EVENT-DRIVEN: Called on block changes, not per-frame
             //   - Uses debounce (50ms timeout) to batch rapid updates
@@ -18469,6 +18562,25 @@
             const indexPool = new Uint32ArrayPool();
             const shorePool = new Float32ArrayPool(); // Pool for water shore distance attribute
             const thicknessPool = new Float32ArrayPool(); // Pool for water thickness attribute
+            const quadSizePool = new Float32ArrayPool(); // Pool for greedy meshing quad size attribute (width, height)
+
+            // --- GREEDY MESHING: Reusable work buffers ---
+            // Sized for largest possible slice (16 × 320 for vertical faces)
+            const GREEDY_SLICE_SIZE = 16 * 320;
+            const greedyMergeKeys = new Uint32Array(GREEDY_SLICE_SIZE);  // Merge key per cell (blockId << 8 | AO)
+            const greedyProcessed = new Uint8Array(GREEDY_SLICE_SIZE);   // 1 if cell already merged
+            const greedyAO = new Float32Array(GREEDY_SLICE_SIZE * 4);    // 4 AO values per cell
+            const greedyLight = new Float32Array(GREEDY_SLICE_SIZE);     // Light level per cell
+            const greedyLocalCoords = new Uint16Array(GREEDY_SLICE_SIZE * 3); // Store local x,y,z for each cell
+
+            /**
+             * Clear greedy meshing buffers for a new slice.
+             * @param {number} size - Number of cells in the slice
+             */
+            function clearGreedyBuffers(size) {
+                greedyMergeKeys.fill(0, 0, size);
+                greedyProcessed.fill(0, 0, size);
+            }
 
             // ============================================================
             // WEB WORKER: Chunk Generation & Meshing (runs in background thread)
@@ -21532,6 +21644,7 @@
                     const normArray = new Float32Array(maxVerts * 3);
                     const uvArray = new Float32Array(maxVerts * 2);
                     const colArray = new Float32Array(maxVerts * 3);
+                    const quadSizeArray = new Float32Array(maxVerts * 2); // For greedy meshing: stores quad width/height
                     const idxArray = new Uint32Array(maxIndices);
 
                     // Create attributes with DynamicDrawUsage for efficient updates
@@ -21539,18 +21652,21 @@
                     const normAttr = new THREE.Float32BufferAttribute(normArray, 3);
                     const uvAttr = new THREE.Float32BufferAttribute(uvArray, 2);
                     const colAttr = new THREE.Float32BufferAttribute(colArray, 3);
+                    const quadSizeAttr = new THREE.Float32BufferAttribute(quadSizeArray, 2); // Quad size for UV tiling
                     const idxAttr = new THREE.Uint32BufferAttribute(idxArray, 1);
 
                     posAttr.setUsage(THREE.DynamicDrawUsage);
                     normAttr.setUsage(THREE.DynamicDrawUsage);
                     uvAttr.setUsage(THREE.DynamicDrawUsage);
                     colAttr.setUsage(THREE.DynamicDrawUsage);
+                    quadSizeAttr.setUsage(THREE.DynamicDrawUsage);
                     idxAttr.setUsage(THREE.DynamicDrawUsage);
 
                     geo.setAttribute('position', posAttr);
                     geo.setAttribute('normal', normAttr);
                     geo.setAttribute('uv', uvAttr);
                     geo.setAttribute('color', colAttr);
+                    geo.setAttribute('quadSize', quadSizeAttr);
                     geo.setIndex(idxAttr);
 
                     // Pre-compute bounding sphere (will be overwritten per-chunk)
@@ -30761,8 +30877,69 @@ self.onmessage = async (e) => {
                     console.log(`[Blocks] UV cache built using ${NUM_TILES} atlas tiles (uvStep=${uvStep.toFixed(4)})`);
                     blockOptimizationInitialized = true;
                     initUVLookupTable(); // OPTIMIZATION: Initialize UV lookup table after uvMap is populated
+                    initMergedVertexCache(); // OPTIMIZATION: Pre-compute merged vertex cache for greedy meshing
                 }
             }
+            // --- GREEDY MESHING: Performance statistics ---
+            const greedyMeshStats = {
+                chunksProcessed: 0,
+                totalInputFaces: 0,      // Faces before greedy merging
+                totalOutputFaces: 0,     // Faces after greedy merging
+                totalMeshTimeMs: 0,
+                lastChunkInputFaces: 0,
+                lastChunkOutputFaces: 0,
+                lastChunkMeshTimeMs: 0,
+                reductionRatio: 0,       // Average reduction (0-1)
+
+                reset() {
+                    this.chunksProcessed = 0;
+                    this.totalInputFaces = 0;
+                    this.totalOutputFaces = 0;
+                    this.totalMeshTimeMs = 0;
+                    this.lastChunkInputFaces = 0;
+                    this.lastChunkOutputFaces = 0;
+                    this.lastChunkMeshTimeMs = 0;
+                    this.reductionRatio = 0;
+                },
+
+                record(inputFaces, outputFaces, meshTimeMs) {
+                    this.chunksProcessed++;
+                    this.totalInputFaces += inputFaces;
+                    this.totalOutputFaces += outputFaces;
+                    this.totalMeshTimeMs += meshTimeMs;
+                    this.lastChunkInputFaces = inputFaces;
+                    this.lastChunkOutputFaces = outputFaces;
+                    this.lastChunkMeshTimeMs = meshTimeMs;
+                    if (this.totalInputFaces > 0) {
+                        this.reductionRatio = 1 - (this.totalOutputFaces / this.totalInputFaces);
+                    }
+                },
+
+                getAverages() {
+                    const n = this.chunksProcessed || 1;
+                    return {
+                        avgInputFaces: Math.round(this.totalInputFaces / n),
+                        avgOutputFaces: Math.round(this.totalOutputFaces / n),
+                        avgMeshTimeMs: (this.totalMeshTimeMs / n).toFixed(2),
+                        reductionPercent: (this.reductionRatio * 100).toFixed(1)
+                    };
+                }
+            };
+
+            // Expose for console debugging
+            window.greedyMeshStats = greedyMeshStats;
+            window.printGreedyStats = () => {
+                const avg = greedyMeshStats.getAverages();
+                console.table({
+                    'Chunks Processed': greedyMeshStats.chunksProcessed,
+                    'Avg Input Faces': avg.avgInputFaces,
+                    'Avg Output Faces': avg.avgOutputFaces,
+                    'Reduction': `${avg.reductionPercent}%`,
+                    'Avg Mesh Time': `${avg.avgMeshTimeMs}ms`,
+                    'Last Chunk': `${greedyMeshStats.lastChunkInputFaces} → ${greedyMeshStats.lastChunkOutputFaces} (${greedyMeshStats.lastChunkMeshTimeMs.toFixed(2)}ms)`
+                });
+            };
+
             function initDebugGrid() {
                 initBlockOptimization();
                 debugGroup = new THREE.Group();
@@ -30933,6 +31110,16 @@ self.onmessage = async (e) => {
                     "\nHits: " + cacheStats.hits + " | Misses: " + cacheStats.misses + " (" + cacheStats.hitRate + ")" +
                     "\nSaves: " + cacheStats.saves + " | Read: " + cacheStats.bytesReadMB + "MB | Written: " + cacheStats.bytesWrittenMB + "MB" +
                     (pendingCount > 0 ? "\nAuto-save pending: " + pendingCount + " chunks" : "");
+
+                // Add greedy meshing stats if enabled
+                if (SETTINGS.greedyMeshingEnabled && greedyMeshStats.chunksProcessed > 0) {
+                    const avg = greedyMeshStats.getAverages();
+                    overlay.innerText += "\n--- GREEDY MESH ---" +
+                        "\nChunks: " + greedyMeshStats.chunksProcessed +
+                        " | Reduction: " + avg.reductionPercent + "%" +
+                        "\nAvg: " + avg.avgInputFaces + " → " + avg.avgOutputFaces + " faces" +
+                        "\nLast: " + greedyMeshStats.lastChunkInputFaces + " → " + greedyMeshStats.lastChunkOutputFaces;
+                }
 
                 // Add OPFS (disk storage) status
                 const opfsSupported = supportsOPFS();
@@ -31907,10 +32094,88 @@ self.onmessage = async (e) => {
                 waterMaterialStandard.fog = true;
                 waterMaterialFast.fog = true;
 
-                // --- CYLINDRICAL FOG ---
+                // --- CYLINDRICAL FOG + UV TILING FOR GREEDY MESHING ---
                 // Override fog calculation to use only horizontal (XZ) distance from player.
                 // This prevents fog from changing when looking up/down and keeps ground visible when flying.
+                // Also adds UV tiling support for greedy meshing (merged quads tile textures instead of stretching).
                 function applyCylindricalFog(material) {
+                    material.onBeforeCompile = (shader) => {
+                        // Add tileWidth uniform for UV tiling calculation
+                        shader.uniforms.tileWidth = { value: 1.0 / NUM_TILES };
+
+                        // Add world position varying and quadSize attribute to vertex shader
+                        shader.vertexShader = shader.vertexShader.replace(
+                            '#include <fog_vertex>',
+                            `#include <fog_vertex>
+                            vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;
+                            vQuadSize = quadSize;`
+                        );
+                        shader.vertexShader = shader.vertexShader.replace(
+                            'void main() {',
+                            `attribute vec2 quadSize;
+                            varying vec3 vWorldPositionCyl;
+                            varying vec2 vQuadSize;
+                            void main() {`
+                        );
+
+                        // Add varyings and uniform to fragment shader
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            'void main() {',
+                            `varying vec3 vWorldPositionCyl;
+                            varying vec2 vQuadSize;
+                            uniform float tileWidth;
+                            void main() {`
+                        );
+
+                        // Replace map_fragment with tiled UV version for greedy meshing
+                        // This uses fract() to tile textures across merged quads instead of stretching
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            '#include <map_fragment>',
+                            `#ifdef USE_MAP
+                                // UV tiling for greedy meshing: tile texture across merged quads
+                                // Extract local UV within the tile (0-1 range)
+                                float localU = mod(vMapUv.x, tileWidth) / tileWidth;
+                                float localV = fract(vMapUv.y);
+                                // Tile based on quad size (for 1×1 quads, fract(x*1) = x unchanged)
+                                float tiledU = fract(localU * vQuadSize.x);
+                                float tiledV = fract(localV * vQuadSize.y);
+                                // Convert back to atlas UV space
+                                float tileBase = floor(vMapUv.x / tileWidth) * tileWidth;
+                                vec2 tiledUv = vec2(tileBase + tiledU * tileWidth, tiledV);
+                                // Sample texture with tiled UVs
+                                vec4 sampledDiffuseColor = texture2D(map, tiledUv);
+                                #ifdef DECODE_VIDEO_TEXTURE
+                                    sampledDiffuseColor = vec4(mix(pow(sampledDiffuseColor.rgb * 0.9478672986 + vec3(0.0521327014), vec3(2.4)), sampledDiffuseColor.rgb * 0.0773993808, vec3(lessThanEqual(sampledDiffuseColor.rgb, vec3(0.04045)))), sampledDiffuseColor.w);
+                                #endif
+                                diffuseColor *= sampledDiffuseColor;
+                            #endif`
+                        );
+
+                        // Replace the fog_fragment include with cylindrical fog calculation
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            '#include <fog_fragment>',
+                            `#ifdef USE_FOG
+                                // Cylindrical fog: only use horizontal (XZ) distance
+                                vec2 horizontalDiff = vWorldPositionCyl.xz - cameraPosition.xz;
+                                float fogDepthCyl = length(horizontalDiff);
+                                #ifdef FOG_EXP2
+                                    float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
+                                #else
+                                    // Scale by 1.15 so fog reaches full opacity before fogFar,
+                                    // ensuring chunk edges are completely hidden
+                                    float fogFactor = min(smoothstep(fogNear, fogFar, fogDepthCyl) * 1.15, 1.0);
+                                #endif
+                                gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
+                            #endif`
+                        );
+                    };
+                    // Force shader recompilation
+                    material.needsUpdate = true;
+                }
+
+                // --- CYLINDRICAL FOG FOR WATER (no UV tiling) ---
+                // Water materials don't have the quadSize attribute, so they use the original fog implementation
+                function applyCylindricalFogWater(material) {
                     material.onBeforeCompile = (shader) => {
                         // Add world position varying to vertex shader
                         shader.vertexShader = shader.vertexShader.replace(
@@ -31952,10 +32217,11 @@ self.onmessage = async (e) => {
                     material.needsUpdate = true;
                 }
 
-                // Apply cylindrical fog to all terrain and water materials
+                // Apply cylindrical fog + UV tiling to terrain material
                 applyCylindricalFog(chunkMaterial);
-                applyCylindricalFog(waterMaterialStandard);
-                applyCylindricalFog(waterMaterialFast);
+                // Apply cylindrical fog only (no UV tiling) to water materials (water doesn't use greedy meshing)
+                applyCylindricalFogWater(waterMaterialStandard);
+                applyCylindricalFogWater(waterMaterialFast);
 
                 // Function to switch water material mode and update all water meshes
                 function applyWaterFastMode() {
@@ -38682,6 +38948,67 @@ self.onmessage = async (e) => {
                 _aoResult[3] = ao3;
                 return _aoResult;
             }
+
+            // --- GREEDY MESHING: AO and light quantization for merge key computation ---
+
+            // Pre-compute AO quantization lookup table (0.00 to 1.00 in 0.01 steps)
+            // This eliminates per-call Math.min/floor overhead in hot path
+            const AO_QUANT_LOOKUP = new Uint8Array(101);
+            for (let i = 0; i <= 100; i++) {
+                const ao = i / 100;
+                AO_QUANT_LOOKUP[i] = Math.min(3, Math.max(0, Math.floor((ao - 0.25) * 4)));
+            }
+
+            // Pre-compute light level quantization lookup table (0.00 to 1.00 in 0.01 steps)
+            // Quantizes to 8 levels (3 bits) for better merging while preserving lighting gradients
+            const LIGHT_QUANT_LOOKUP = new Uint8Array(101);
+            for (let i = 0; i <= 100; i++) {
+                const light = i / 100;
+                LIGHT_QUANT_LOOKUP[i] = Math.min(7, Math.floor(light * 8));
+            }
+
+            /**
+             * Quantize light level using lookup table.
+             * @param {number} light - Normalized light level (0-1)
+             * @returns {number} Quantized value (0-7)
+             */
+            function quantizeLight(light) {
+                const idx = Math.round(Math.max(0, Math.min(1, light)) * 100);
+                return LIGHT_QUANT_LOOKUP[idx];
+            }
+
+            /**
+             * Quantize AO value to 4 levels using lookup table.
+             * AO values range from 0.25 (full occlusion) to 1.0 (no occlusion).
+             * @param {number} ao - AO value (0.25 to 1.0)
+             * @returns {number} Quantized value (0-3)
+             */
+            function quantizeAO(ao) {
+                const idx = Math.round(Math.max(0, Math.min(1, ao)) * 100);
+                return AO_QUANT_LOOKUP[idx];
+            }
+
+            /**
+             * Create merge key from block ID, AO values, and light level.
+             * Faces can only merge if merge keys are identical.
+             * This ensures AO gradients and lighting are preserved at block boundaries.
+             * Uses direct lookup table access for maximum performance.
+             * @param {BlockId} blockId - Block type ID
+             * @param {number[]} ao - Array of 4 AO values
+             * @param {number} light - Normalized light level (0-1)
+             * @returns {number} 27-bit merge key: (blockId << 11) | (light << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
+             */
+            function getMergeKey(blockId, ao, light) {
+                // Direct lookup table access (faster than function calls)
+                const idx0 = Math.round(Math.max(0, Math.min(1, ao[0])) * 100);
+                const idx1 = Math.round(Math.max(0, Math.min(1, ao[1])) * 100);
+                const idx2 = Math.round(Math.max(0, Math.min(1, ao[2])) * 100);
+                const idx3 = Math.round(Math.max(0, Math.min(1, ao[3])) * 100);
+                const lightIdx = Math.round(Math.max(0, Math.min(1, light)) * 100);
+                const qLight = LIGHT_QUANT_LOOKUP[lightIdx];
+                return (blockId << 11) | (qLight << 8) | (AO_QUANT_LOOKUP[idx0] << 6) | (AO_QUANT_LOOKUP[idx1] << 4) | (AO_QUANT_LOOKUP[idx2] << 2) | AO_QUANT_LOOKUP[idx3];
+            }
+
             /**
              * Write vertex positions and normals to buffers for a face.
              * Unrolled for performance (6 vertices × 3 components = 18 writes).
@@ -38930,6 +39257,23 @@ self.onmessage = async (e) => {
             }
 
             /**
+             * Write quad size for UV tiling in greedy meshing.
+             * For Phase 1, all quads are 1×1 blocks. Future phases will use actual merged quad dimensions.
+             * The shader uses fract(uv * quadSize) to tile textures across merged quads.
+             * @param {Float32Array} qs - Quad size buffer
+             * @param {number} qsIdx - Starting quad size index
+             * @param {number} width - Quad width in blocks (1 for Phase 1)
+             * @param {number} height - Quad height in blocks (1 for Phase 1)
+             */
+            function writeQuadSizeIndexed(qs, qsIdx, width, height) {
+                // 4 vertices × 2 components = 8 writes
+                qs[qsIdx + 0] = width;  qs[qsIdx + 1] = height;  // V1
+                qs[qsIdx + 2] = width;  qs[qsIdx + 3] = height;  // V2
+                qs[qsIdx + 4] = width;  qs[qsIdx + 5] = height;  // V3
+                qs[qsIdx + 6] = width;  qs[qsIdx + 7] = height;  // V4
+            }
+
+            /**
              * Write 6 indices for one face (two triangles).
              * @param {Uint32Array} indices - Index buffer
              * @param {number} iIdx - Starting index offset
@@ -39125,7 +39469,7 @@ self.onmessage = async (e) => {
              * @param {LocalCoord} lightZ - Light sample Z
              * @param {number} faceIdx - Face index for AO caching
              */
-            function addFaceIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx) {
+            function addFaceIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, quadSizeBuffer, qsIdx) {
                 const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
                 writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
                 const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
@@ -39133,6 +39477,8 @@ self.onmessage = async (e) => {
                 writeFaceColorsIndexed(col, cIdx, ao, lightLevel);
                 writeFaceUVsIndexed(uvs, uvIdx, uv);
                 writeFaceIndices(indices, iIdx, vertexCount);
+                // Write quad size for UV tiling (Phase 1: all quads are 1×1)
+                writeQuadSizeIndexed(quadSizeBuffer, qsIdx, 1, 1);
             }
 
             /**
@@ -39162,7 +39508,7 @@ self.onmessage = async (e) => {
             /**
              * Add a simplified face using indexed geometry (for distant LOD chunks).
              */
-            function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly) {
+            function addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, ly, quadSizeBuffer, qsIdx) {
                 const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
                 writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
                 const simplifiedLight = getSimplifiedLight(ly, WORLD_DIMS.chunkHeight) / 15.0;
@@ -39173,6 +39519,285 @@ self.onmessage = async (e) => {
                 col[cIdx+9] = simplifiedLight; col[cIdx+10] = simplifiedLight; col[cIdx+11] = simplifiedLight;
                 writeFaceUVsIndexed(uvs, uvIdx, uv);
                 writeFaceIndices(indices, iIdx, vertexCount);
+                // Write quad size for UV tiling (Phase 1: all quads are 1×1)
+                writeQuadSizeIndexed(quadSizeBuffer, qsIdx, 1, 1);
+            }
+
+            // --- GREEDY MESHING: Merged quad output function ---
+
+            /**
+             * Write a merged quad to output buffers.
+             * Similar to addFaceIndexed but supports variable quad dimensions for greedy meshing.
+             * @param {GlobalCoord} wx - World X position (corner of merged quad)
+             * @param {GlobalCoord} wy - World Y position
+             * @param {GlobalCoord} wz - World Z position
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             * @param {number[]} uvCoord - UV tile offset [u, v]
+             * @param {number} quadWidth - Merged quad width in blocks
+             * @param {number} quadHeight - Merged quad height in blocks
+             * @param {number[]} ao - Array of 4 AO values
+             * @param {number} lightLevel - Light level (0-1)
+             * @param {Float32Array} pos - Position buffer
+             * @param {Float32Array} norm - Normal buffer
+             * @param {Float32Array} uvs - UV buffer
+             * @param {Float32Array} cols - Color buffer
+             * @param {Float32Array} quadSize - Quad size buffer
+             * @param {Uint32Array} indices - Index buffer
+             * @param {number} vIdx - Position/normal buffer index
+             * @param {number} uvIdx - UV buffer index
+             * @param {number} cIdx - Color buffer index
+             * @param {number} qsIdx - Quad size buffer index
+             * @param {number} iIdx - Index buffer index
+             * @param {number} vertCount - Current vertex count (for index offset)
+             */
+            function addMergedFaceIndexed(
+                wx, wy, wz,
+                nx, ny, nz,
+                uvCoord,
+                quadWidth, quadHeight,
+                ao, lightLevel,
+                pos, norm, uvs, cols, quadSize, indices,
+                vIdx, uvIdx, cIdx, qsIdx, iIdx, vertCount
+            ) {
+                // Get vertices for this quad size
+                const verts = getMergedFaceVertices(nx, ny, nz, quadWidth, quadHeight);
+
+                // Write positions and normals (4 vertices × 3 components)
+                for (let i = 0; i < 4; i++) {
+                    const i3 = i * 3;
+                    pos[vIdx + i3 + 0] = verts[i3 + 0] + wx;
+                    pos[vIdx + i3 + 1] = verts[i3 + 1] + wy;
+                    pos[vIdx + i3 + 2] = verts[i3 + 2] + wz;
+                    norm[vIdx + i3 + 0] = nx;
+                    norm[vIdx + i3 + 1] = ny;
+                    norm[vIdx + i3 + 2] = nz;
+                }
+
+                // Write UVs (shader will tile based on quadSize)
+                const tileW = 1 / NUM_TILES;
+                uvs[uvIdx + 0] = uvCoord[0];           uvs[uvIdx + 1] = 0;
+                uvs[uvIdx + 2] = uvCoord[0] + tileW;   uvs[uvIdx + 3] = 0;
+                uvs[uvIdx + 4] = uvCoord[0] + tileW;   uvs[uvIdx + 5] = 1;
+                uvs[uvIdx + 6] = uvCoord[0];           uvs[uvIdx + 7] = 1;
+
+                // Write quad size for UV tiling
+                quadSize[qsIdx + 0] = quadWidth;  quadSize[qsIdx + 1] = quadHeight;
+                quadSize[qsIdx + 2] = quadWidth;  quadSize[qsIdx + 3] = quadHeight;
+                quadSize[qsIdx + 4] = quadWidth;  quadSize[qsIdx + 5] = quadHeight;
+                quadSize[qsIdx + 6] = quadWidth;  quadSize[qsIdx + 7] = quadHeight;
+
+                // Write colors (AO × light) for 4 vertices
+                const c1 = ao[0] * lightLevel;
+                const c2 = ao[1] * lightLevel;
+                const c3 = ao[2] * lightLevel;
+                const c4 = ao[3] * lightLevel;
+                cols[cIdx + 0] = c1; cols[cIdx + 1] = c1; cols[cIdx + 2] = c1;
+                cols[cIdx + 3] = c2; cols[cIdx + 4] = c2; cols[cIdx + 5] = c2;
+                cols[cIdx + 6] = c3; cols[cIdx + 7] = c3; cols[cIdx + 8] = c3;
+                cols[cIdx + 9] = c4; cols[cIdx + 10] = c4; cols[cIdx + 11] = c4;
+
+                // Write indices (two triangles) with AO diagonal flip
+                // AO diagonal flip prevents "bowtie" artifacts when diagonal corners differ
+                // Standard: triangles 0-1-3 and 1-2-3
+                // Flipped:  triangles 0-1-2 and 0-2-3
+                const flipDiagonal = ao[0] + ao[2] < ao[1] + ao[3];
+                if (flipDiagonal) {
+                    indices[iIdx + 0] = vertCount + 0;
+                    indices[iIdx + 1] = vertCount + 1;
+                    indices[iIdx + 2] = vertCount + 2;
+                    indices[iIdx + 3] = vertCount + 0;
+                    indices[iIdx + 4] = vertCount + 2;
+                    indices[iIdx + 5] = vertCount + 3;
+                } else {
+                    indices[iIdx + 0] = vertCount + 0;
+                    indices[iIdx + 1] = vertCount + 1;
+                    indices[iIdx + 2] = vertCount + 3;
+                    indices[iIdx + 3] = vertCount + 1;
+                    indices[iIdx + 4] = vertCount + 2;
+                    indices[iIdx + 5] = vertCount + 3;
+                }
+            }
+
+            // Scratch array for AO values during greedy meshing
+            const _greedyAOScratch = [0, 0, 0, 0];
+
+            /**
+             * Perform greedy meshing for one face direction within a section.
+             * Processes 2D slices perpendicular to the face normal, merging adjacent faces
+             * with identical block types and AO values into larger quads.
+             * @param {number} faceIdx - Face direction (0-5: Top, Bottom, Right, Left, Back, Front)
+             * @param {number} sectionBaseY - Starting Y of this section
+             * @param {number} sectionEndY - Ending Y of this section
+             * @param {Function} getLocal - Block getter function(lx, ly, lz)
+             * @param {Function} getLocalLight - Light getter function(lx, ly, lz)
+             * @param {number} startX - Chunk world X origin
+             * @param {number} startZ - Chunk world Z origin
+             * @param {Object} buffers - Output buffers {pos, norm, uvs, cols, quadSize, indices}
+             * @param {Object} state - Current indices {vIdx, uvIdx, cIdx, qsIdx, iIdx, vertCount, faceCount, inputFaceCount}
+             * @returns {Object} Updated state
+             */
+            function greedyMeshSection(faceIdx, sectionBaseY, sectionEndY, getLocal, getLocalLight, startX, startZ, buffers, state) {
+                // Initialize inputFaceCount if not present
+                if (state.inputFaceCount === undefined) state.inputFaceCount = 0;
+                const face = FACE_DIRECTIONS[faceIdx];
+                const dx = face[0], dy = face[1], dz = face[2];
+                const nx = face[3], ny = face[4], nz = face[5];
+
+                // Determine slice orientation based on face normal
+                let sliceAxis, uSize, vSize, sliceStart, sliceEnd;
+
+                if (ny !== 0) {
+                    // Top/Bottom: slice perpendicular to Y, iterate Y levels
+                    sliceAxis = 'y';
+                    uSize = 16; vSize = 16;
+                    sliceStart = sectionBaseY;
+                    sliceEnd = sectionEndY;
+                } else if (nx !== 0) {
+                    // Left/Right: slice perpendicular to X, iterate X positions
+                    sliceAxis = 'x';
+                    uSize = 16; vSize = sectionEndY - sectionBaseY;
+                    sliceStart = 0;
+                    sliceEnd = 16;
+                } else {
+                    // Front/Back: slice perpendicular to Z, iterate Z positions
+                    sliceAxis = 'z';
+                    uSize = 16; vSize = sectionEndY - sectionBaseY;
+                    sliceStart = 0;
+                    sliceEnd = 16;
+                }
+
+                const sliceSize = uSize * vSize;
+                if (sliceSize === 0 || sliceSize > GREEDY_SLICE_SIZE) return state;
+
+                // Process each slice
+                for (let s = sliceStart; s < sliceEnd; s++) {
+                    clearGreedyBuffers(sliceSize);
+
+                    // Build visibility mask and merge keys
+                    for (let v = 0; v < vSize; v++) {
+                        for (let u = 0; u < uSize; u++) {
+                            // Convert (s, u, v) to local chunk coords (x, y, z)
+                            let x, y, z;
+                            if (sliceAxis === 'y') {
+                                x = u; y = s; z = v;
+                            } else if (sliceAxis === 'x') {
+                                x = s; y = sectionBaseY + v; z = u;
+                            } else {
+                                x = u; y = sectionBaseY + v; z = s;
+                            }
+
+                            const blockId = getLocal(x, y, z);
+                            if (blockId === AIR || blockId === WATER || blockId === TORCH) continue;
+
+                            // Check visibility - neighbor must be transparent
+                            const neighborId = getLocal(x + dx, y + dy, z + dz);
+                            if (!IS_TRANSPARENT[neighborId]) continue;
+
+                            // Calculate AO
+                            const ao = calculateFaceAO(nx, ny, nz, x, y, z, blockId, getLocal, faceIdx);
+
+                            // Calculate light level from neighboring air block
+                            const lightLevel = getLocalLight(x + dx, y + dy, z + dz) / 15.0;
+
+                            // Store in greedy buffers
+                            const idx = v * uSize + u;
+                            // Include light in merge key for quantized light matching
+                            greedyMergeKeys[idx] = getMergeKey(blockId, ao, lightLevel);
+                            greedyAO[idx * 4 + 0] = ao[0];
+                            greedyAO[idx * 4 + 1] = ao[1];
+                            greedyAO[idx * 4 + 2] = ao[2];
+                            greedyAO[idx * 4 + 3] = ao[3];
+                            greedyLight[idx] = lightLevel;
+                            // Store local coords for world position calculation
+                            greedyLocalCoords[idx * 3 + 0] = x;
+                            greedyLocalCoords[idx * 3 + 1] = y;
+                            greedyLocalCoords[idx * 3 + 2] = z;
+                            // Count this as an input face (before merging)
+                            state.inputFaceCount++;
+                        }
+                    }
+
+                    // Greedy expansion
+                    for (let v = 0; v < vSize; v++) {
+                        for (let u = 0; u < uSize; u++) {
+                            const idx = v * uSize + u;
+                            if (greedyProcessed[idx] || greedyMergeKeys[idx] === 0) continue;
+
+                            const mergeKey = greedyMergeKeys[idx];
+                            const lightLevel = greedyLight[idx];
+                            const maxSize = SETTINGS.maxGreedyQuadSize || 16;
+
+                            // Expand right (u direction)
+                            // Light is now quantized in merge key, so matching keys have compatible light
+                            let width = 1;
+                            while (u + width < uSize && width < maxSize) {
+                                const nextIdx = v * uSize + (u + width);
+                                if (greedyProcessed[nextIdx] || greedyMergeKeys[nextIdx] !== mergeKey) break;
+                                width++;
+                            }
+
+                            // Expand down (v direction)
+                            let height = 1;
+                            expandDown: while (v + height < vSize && height < maxSize) {
+                                for (let du = 0; du < width; du++) {
+                                    const checkIdx = (v + height) * uSize + (u + du);
+                                    if (greedyProcessed[checkIdx] || greedyMergeKeys[checkIdx] !== mergeKey) break expandDown;
+                                }
+                                height++;
+                            }
+
+                            // Mark processed
+                            for (let dv = 0; dv < height; dv++) {
+                                for (let du = 0; du < width; du++) {
+                                    greedyProcessed[(v + dv) * uSize + (u + du)] = 1;
+                                }
+                            }
+
+                            // Get block data for UV lookup
+                            const blockId = mergeKey >> 8;
+                            const uv = getBlockUV(blockId);
+                            const uvCoord = faceIdx === 0 ? uv.top : faceIdx === 1 ? uv.bottom : uv.side;
+
+                            // Calculate world position from stored local coords
+                            const localX = greedyLocalCoords[idx * 3 + 0];
+                            const localY = greedyLocalCoords[idx * 3 + 1];
+                            const localZ = greedyLocalCoords[idx * 3 + 2];
+                            const wx = startX + localX;
+                            const wy = localY - WORLD_DIMS.yOffset;
+                            const wz = startZ + localZ;
+
+                            // Get AO values for this quad
+                            _greedyAOScratch[0] = greedyAO[idx * 4 + 0];
+                            _greedyAOScratch[1] = greedyAO[idx * 4 + 1];
+                            _greedyAOScratch[2] = greedyAO[idx * 4 + 2];
+                            _greedyAOScratch[3] = greedyAO[idx * 4 + 3];
+
+                            // Emit merged quad
+                            addMergedFaceIndexed(
+                                wx, wy, wz,
+                                nx, ny, nz,
+                                uvCoord,
+                                width, height,
+                                _greedyAOScratch, lightLevel,
+                                buffers.pos, buffers.norm, buffers.uvs, buffers.cols, buffers.quadSize, buffers.indices,
+                                state.vIdx, state.uvIdx, state.cIdx, state.qsIdx, state.iIdx, state.vertCount
+                            );
+
+                            // Update state
+                            state.vIdx += 12;
+                            state.uvIdx += 8;
+                            state.cIdx += 12;
+                            state.qsIdx += 8;
+                            state.iIdx += 6;
+                            state.vertCount += 4;
+                            state.faceCount++;
+                        }
+                    }
+                }
+
+                return state;
             }
 
             // Create a 3D torch model for world placement (2x bigger and brighter than handheld)
@@ -39586,6 +40211,7 @@ self.onmessage = async (e) => {
                     const terrainUvs = uvPool.acquire(maxFaces * 8);
                     const terrainCols = colPool.acquire(maxFaces * 12);
                     const terrainIndices = indexPool.acquire(maxFaces * 6);
+                    const terrainQuadSize = quadSizePool.acquire(maxFaces * 8); // Quad size for UV tiling (2 floats × 4 verts per face)
                     const waterPos = posPool.acquire(maxFaces * 12);
                     const waterNorm = normPool.acquire(maxFaces * 12);
                     const waterUvs = uvPool.acquire(maxFaces * 8);
@@ -39595,7 +40221,8 @@ self.onmessage = async (e) => {
                     const waterThickness = thicknessPool.acquire(maxFaces * 4); // Water thickness per vertex
                     // Indexed geometry counters: vIdx = position/normal offset, cIdx = color offset, uvIdx = UV offset, iIdx = index offset
                     // tVertCount/wVertCount = vertex count for index base calculations
-                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0; // Terrain
+                    // tQsIdx = quadSize offset for terrain (water doesn't use greedy meshing)
+                    let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0, tQsIdx = 0; // Terrain
                     let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wIIdx = 0, wVertCount = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0; // Water
                     const startX = cx * WORLD_DIMS.chunkSize;
                     const startZ = cz * WORLD_DIMS.chunkSize;
@@ -39623,6 +40250,7 @@ self.onmessage = async (e) => {
                     const sections = centerData.sections;
                     let sectionsSkipped = 0;
                     let blocksSkipped = 0;
+                    let greedyInputFaces = 0; // Track faces before greedy merging
 
                     // Skip entirely if chunk has no visible sections
                     if (sections) {
@@ -39686,59 +40314,89 @@ self.onmessage = async (e) => {
                         // Track faces generated in this section
                         const sectionFaceCountStart = tFaceCount + wFaceCount;
 
-                        // Process blocks in this section's Y range
-                        for (let y = startY; y < endY; y++) {
-                            const yOffset = y * 256;
-                            for (let z = 0; z < 16; z++) {
-                                const zOffset = z * 16;
-                                for (let x = 0; x < 16; x++) {
-                                    const idx = x + zOffset + yOffset;
-                                    const id = blockData[idx];
-                                    if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
-                                    const wx = startX + x;
-                                    const wy = y - WORLD_DIMS.yOffset;
-                                    const wz = startZ + z;
-                                    const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
-                                    // Determine if this is water
-                                    const isWater = id === WATER;
-                                    // Choose the correct buffers
-                                    const pos = isWater ? waterPos : terrainPos;
-                                    const norm = isWater ? waterNorm : terrainNorm;
-                                    const uvs = isWater ? waterUvs : terrainUvs;
-                                    const cols = isWater ? waterCols : terrainCols;
-                                    let vIdx = isWater ? wVIdx : tVIdx;
-                                    let uvIdx = isWater ? wUvIdx : tUvIdx;
-                                    let cIdx = isWater ? wCIdx : tCIdx;
-                                    // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
-                                    // UV lookup: index 0=top, 1=bottom, 2-5=side
-                                    const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
-                                    for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
-                                        const face = FACE_DIRECTIONS[faceIdx];
-                                        const lx = x + face[0];
-                                        const ly = y + face[1];
-                                        const lz = z + face[2];
-                                        const nx = face[3];
-                                        const ny = face[4];
-                                        const nz = face[5];
-                                        // OPTIMIZATION: Use pre-computed UV values instead of array lookup
-                                        const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
-                                        const nid = getLocal(lx, ly, lz);
-                                        // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                        const draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+                        // --- GREEDY MESHING vs ORIGINAL PER-BLOCK ITERATION ---
+                        // Greedy meshing merges adjacent terrain faces into larger quads (60-90% fewer faces)
+                        // Water is always processed per-block due to special attributes (shore, thickness)
+                        const useGreedyMeshing = SETTINGS.greedyMeshingEnabled && !useDeferredLight;
 
-                                        if (draw) {
-                                            // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
-                                            // But calculate AO from the solid block position (x,y,z), not the neighbor
-                                            // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
-                                            // Get vertex count for index offset calculation
-                                            const vertCount = isWater ? wVertCount : tVertCount;
-                                            const iIdx = isWater ? wIIdx : tIIdx;
-                                            const indices = isWater ? waterIndices : terrainIndices;
+                        if (useGreedyMeshing) {
+                            // --- GREEDY MESHING PATH: Process terrain with merged quads ---
+                            // Create buffer references for greedy meshing
+                            const terrainBuffers = {
+                                pos: terrainPos,
+                                norm: terrainNorm,
+                                uvs: terrainUvs,
+                                cols: terrainCols,
+                                quadSize: terrainQuadSize,
+                                indices: terrainIndices
+                            };
 
-                                            // OPTIMIZATION: Use simplified lighting for distant chunks
-                                            if (useDeferredLight) {
-                                                addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly);
-                                            } else if (isWater) {
+                            // Track state across all 6 face directions
+                            let terrainState = {
+                                vIdx: tVIdx,
+                                uvIdx: tUvIdx,
+                                cIdx: tCIdx,
+                                qsIdx: tQsIdx,
+                                iIdx: tIIdx,
+                                vertCount: tVertCount,
+                                faceCount: tFaceCount,
+                                inputFaceCount: 0 // Track faces before merging for stats
+                            };
+
+                            // Process each face direction with greedy meshing
+                            for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                terrainState = greedyMeshSection(
+                                    faceIdx,
+                                    startY,
+                                    endY,
+                                    getLocal,
+                                    getLocalLight,
+                                    startX,
+                                    startZ,
+                                    terrainBuffers,
+                                    terrainState
+                                );
+                            }
+
+                            // Update counters from state
+                            tVIdx = terrainState.vIdx;
+                            tUvIdx = terrainState.uvIdx;
+                            tCIdx = terrainState.cIdx;
+                            tQsIdx = terrainState.qsIdx;
+                            tIIdx = terrainState.iIdx;
+                            tVertCount = terrainState.vertCount;
+                            tFaceCount = terrainState.faceCount;
+                            greedyInputFaces += terrainState.inputFaceCount; // Accumulate input faces
+
+                            // --- WATER PROCESSING: Still per-block (special attributes) ---
+                            for (let y = startY; y < endY; y++) {
+                                const yOffset = y * 256;
+                                for (let z = 0; z < 16; z++) {
+                                    const zOffset = z * 16;
+                                    for (let x = 0; x < 16; x++) {
+                                        const idx = x + zOffset + yOffset;
+                                        const id = blockData[idx];
+                                        if (id !== WATER) continue; // Only process water in this loop
+
+                                        const wx = startX + x;
+                                        const wy = y - WORLD_DIMS.yOffset;
+                                        const wz = startZ + z;
+                                        const uv = getBlockUV(id);
+                                        const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+
+                                        for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                            const face = FACE_DIRECTIONS[faceIdx];
+                                            const lx = x + face[0];
+                                            const ly = y + face[1];
+                                            const lz = z + face[2];
+                                            const nx = face[3];
+                                            const ny = face[4];
+                                            const nz = face[5];
+                                            const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
+                                            const nid = getLocal(lx, ly, lz);
+
+                                            // Water only draws faces at boundaries (against air or leaves)
+                                            if (nid === AIR || isLeafBlock(nid)) {
                                                 // Calculate water depth (search DOWN to find bottom)
                                                 let waterDepth = 0;
                                                 for (let dy = y - 1; dy >= 0; dy--) {
@@ -39746,7 +40404,7 @@ self.onmessage = async (e) => {
                                                     if (belowId !== WATER) break;
                                                     waterDepth++;
                                                 }
-                                                // Calculate shore distance - check horizontal neighbors for solid blocks
+                                                // Calculate shore distance
                                                 const hasAirAbove = getLocal(x, y + 1, z) === AIR;
                                                 let shoreDist = 4;
                                                 if (hasAirAbove) {
@@ -39766,19 +40424,110 @@ self.onmessage = async (e) => {
                                                     }
                                                 }
                                                 // Indexed water face rendering
-                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
-                                            } else {
-                                                // Indexed terrain face rendering
-                                                addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx);
-                                            }
-                                            // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
-                                            vIdx += 12; uvIdx += 8; cIdx += 12;
-                                            if (isWater) {
-                                                wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
+                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, waterNorm, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                                wVIdx += 12; wUvIdx += 8; wCIdx += 12;
                                                 wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
-                                            } else {
-                                                tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
-                                                tIIdx += 6; tVertCount += 4; tFaceCount++;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // --- ORIGINAL PER-BLOCK PATH: Process all blocks individually ---
+                            for (let y = startY; y < endY; y++) {
+                                const yOffset = y * 256;
+                                for (let z = 0; z < 16; z++) {
+                                    const zOffset = z * 16;
+                                    for (let x = 0; x < 16; x++) {
+                                        const idx = x + zOffset + yOffset;
+                                        const id = blockData[idx];
+                                        if (id === AIR || id === TORCH) continue; // Skip air and torches (torches rendered separately)
+                                        const wx = startX + x;
+                                        const wy = y - WORLD_DIMS.yOffset;
+                                        const wz = startZ + z;
+                                        const uv = getBlockUV(id); // OPTIMIZATION: Use fast UV lookup table
+                                        // Determine if this is water
+                                        const isWater = id === WATER;
+                                        // Choose the correct buffers
+                                        const pos = isWater ? waterPos : terrainPos;
+                                        const norm = isWater ? waterNorm : terrainNorm;
+                                        const uvs = isWater ? waterUvs : terrainUvs;
+                                        const cols = isWater ? waterCols : terrainCols;
+                                        let vIdx = isWater ? wVIdx : tVIdx;
+                                        let uvIdx = isWater ? wUvIdx : tUvIdx;
+                                        let cIdx = isWater ? wCIdx : tCIdx;
+                                        // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
+                                        // UV lookup: index 0=top, 1=bottom, 2-5=side
+                                        const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                        for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                            const face = FACE_DIRECTIONS[faceIdx];
+                                            const lx = x + face[0];
+                                            const ly = y + face[1];
+                                            const lz = z + face[2];
+                                            const nx = face[3];
+                                            const ny = face[4];
+                                            const nz = face[5];
+                                            // OPTIMIZATION: Use pre-computed UV values instead of array lookup
+                                            const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
+                                            const nid = getLocal(lx, ly, lz);
+                                            // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
+                                            const draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+
+                                            if (draw) {
+                                                // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
+                                                // But calculate AO from the solid block position (x,y,z), not the neighbor
+                                                // INDEXED GEOMETRY: 4 vertices + 6 indices per face (33% memory reduction)
+                                                // Get vertex count for index offset calculation
+                                                const vertCount = isWater ? wVertCount : tVertCount;
+                                                const iIdx = isWater ? wIIdx : tIIdx;
+                                                const indices = isWater ? waterIndices : terrainIndices;
+
+                                                // OPTIMIZATION: Use simplified lighting for distant chunks
+                                                if (useDeferredLight) {
+                                                    addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly, terrainQuadSize, tQsIdx);
+                                                } else if (isWater) {
+                                                    // Calculate water depth (search DOWN to find bottom)
+                                                    let waterDepth = 0;
+                                                    for (let dy = y - 1; dy >= 0; dy--) {
+                                                        const belowId = getLocal(x, dy, z);
+                                                        if (belowId !== WATER) break;
+                                                        waterDepth++;
+                                                    }
+                                                    // Calculate shore distance - check horizontal neighbors for solid blocks
+                                                    const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                                    let shoreDist = 4;
+                                                    if (hasAirAbove) {
+                                                        const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                        for (const [dx, dz] of directions) {
+                                                            for (let d = 1; d <= 4; d++) {
+                                                                const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                                if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
+                                                                    shoreDist = Math.min(shoreDist, d);
+                                                                    break;
+                                                                }
+                                                                if (checkId === AIR) {
+                                                                    shoreDist = Math.min(shoreDist, d);
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    // Indexed water face rendering (no quadSize - water doesn't use greedy meshing)
+                                                    addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                                } else {
+                                                    // Indexed terrain face rendering
+                                                    addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, terrainQuadSize, tQsIdx);
+                                                }
+                                                // Indexed increments: 12 pos/norm/col floats, 8 UV floats, 6 indices, 4 vertices per face
+                                                // Terrain also increments quadSize by 8 (2 floats × 4 verts)
+                                                vIdx += 12; uvIdx += 8; cIdx += 12;
+                                                if (isWater) {
+                                                    wVIdx = vIdx; wUvIdx = uvIdx; wCIdx = cIdx;
+                                                    wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
+                                                } else {
+                                                    tVIdx = vIdx; tUvIdx = uvIdx; tCIdx = cIdx;
+                                                    tIIdx += 6; tVertCount += 4; tQsIdx += 8; tFaceCount++; // +8 for quadSize (2 floats × 4 verts)
+                                                }
                                             }
                                         }
                                     }
@@ -39800,6 +40549,11 @@ self.onmessage = async (e) => {
                     }
                     if (sectionsLODSkipped > 0) {
                         perfMetrics.sectionsLODSkipped = (perfMetrics.sectionsLODSkipped || 0) + sectionsLODSkipped;
+                    }
+
+                    // Record greedy meshing stats if greedy meshing was used
+                    if (greedyInputFaces > 0 && SETTINGS.greedyMeshingEnabled) {
+                        greedyMeshStats.record(greedyInputFaces, tFaceCount, 0);
                     }
 
                     // Compute tight bounds once for both terrain and water meshes
@@ -39857,6 +40611,7 @@ self.onmessage = async (e) => {
                         const normAttr = terrainGeo.attributes.normal;
                         const uvAttr = terrainGeo.attributes.uv;
                         const colAttr = terrainGeo.attributes.color;
+                        const quadSizeAttr = terrainGeo.attributes.quadSize;
                         const idxAttr = terrainGeo.index;
 
                         // Copy from work buffers to geometry buffers
@@ -39864,6 +40619,7 @@ self.onmessage = async (e) => {
                         normAttr.array.set(terrainNorm.subarray(0, tVIdx));
                         uvAttr.array.set(terrainUvs.subarray(0, tUvIdx));
                         colAttr.array.set(terrainCols.subarray(0, tCIdx));
+                        quadSizeAttr.array.set(terrainQuadSize.subarray(0, tQsIdx));
                         idxAttr.array.set(terrainIndices.subarray(0, tIIdx));
 
                         // Mark attributes as needing GPU upload - only upload the portion we actually filled
@@ -39882,6 +40638,10 @@ self.onmessage = async (e) => {
                         colAttr.clearUpdateRanges();
                         colAttr.addUpdateRange(0, tCIdx);
                         colAttr.needsUpdate = true;
+
+                        quadSizeAttr.clearUpdateRanges();
+                        quadSizeAttr.addUpdateRange(0, tQsIdx);
+                        quadSizeAttr.needsUpdate = true;
 
                         idxAttr.clearUpdateRanges();
                         idxAttr.addUpdateRange(0, tIIdx);
@@ -40054,6 +40814,7 @@ self.onmessage = async (e) => {
                     uvPool.release(terrainUvs);
                     colPool.release(terrainCols);
                     indexPool.release(terrainIndices);
+                    quadSizePool.release(terrainQuadSize);
                     posPool.release(waterPos);
                     normPool.release(waterNorm);
                     uvPool.release(waterUvs);
