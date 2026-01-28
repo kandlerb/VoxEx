@@ -5073,6 +5073,7 @@
                 enableSectionLOD: savedSettings.enableSectionLOD !== undefined ? savedSettings.enableSectionLOD : true,
                 // Greedy Meshing - merges adjacent faces into larger quads (60-90% fewer faces)
                 greedyMeshingEnabled: savedSettings.greedyMeshingEnabled !== undefined ? savedSettings.greedyMeshingEnabled : true,
+                maxGreedyQuadSize: savedSettings.maxGreedyQuadSize !== undefined ? savedSettings.maxGreedyQuadSize : 16, // Max quad width/height
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
@@ -5284,6 +5285,7 @@
                 enableFrustumCulling: true,
                 enableSectionLOD: true,
                 greedyMeshingEnabled: true,    // Merge adjacent faces into larger quads (60-90% fewer faces)
+                maxGreedyQuadSize: 16,         // Max quad width/height (1-16)
                 // Graphics - Basic
                 AO: true,
                 shadows: true,
@@ -18261,22 +18263,22 @@
                 return verts;
             }
 
-            // --- GREEDY MESHING: Merged face vertex generation ---
-            // Scratch array for merged face vertices (reused to avoid allocations)
-            const _mergedFaceVerts = new Float32Array(12);
+            // --- GREEDY MESHING: Merged face vertex generation with caching ---
+            // Pre-computed merged face vertices cache for common sizes (1-16)
+            // Key format: "nx,ny,nz,w,h" -> Float32Array(12)
+            const mergedVertexCache = new Map();
 
             /**
-             * Generate 4 corner vertices for a merged quad.
-             * Returns positions relative to the quad's world origin (caller adds wx,wy,wz).
-             * @param {number} nx - Normal X component
-             * @param {number} ny - Normal Y component
-             * @param {number} nz - Normal Z component
-             * @param {number} width - Quad width in blocks
-             * @param {number} height - Quad height in blocks
-             * @returns {Float32Array} 12 values (4 vertices × 3 coords)
+             * Compute merged face vertices for a given normal and size.
+             * @param {number} nx - Normal X
+             * @param {number} ny - Normal Y
+             * @param {number} nz - Normal Z
+             * @param {number} width - Quad width
+             * @param {number} height - Quad height
+             * @returns {Float32Array} 12 floats (4 vertices × 3 coords)
              */
-            function getMergedFaceVertices(nx, ny, nz, width, height) {
-                const v = _mergedFaceVerts;
+            function computeMergedFaceVertices(nx, ny, nz, width, height) {
+                const v = new Float32Array(12);
                 if (ny > 0) {        // Top face (+Y): X=width, Z=height
                     v[0] = 0;     v[1] = 1;  v[2] = height;  // V1 back-left
                     v[3] = width; v[4] = 1;  v[5] = height;  // V2 back-right
@@ -18309,6 +18311,43 @@
                     v[9] = width; v[10] = height; v[11] = 0; // V4 top-right
                 }
                 return v;
+            }
+
+            /**
+             * Pre-allocate vertex cache for common quad sizes (1-16 in each dimension).
+             * Called during initialization to eliminate runtime allocations.
+             */
+            function initMergedVertexCache() {
+                const normals = [[0,1,0], [0,-1,0], [1,0,0], [-1,0,0], [0,0,1], [0,0,-1]];
+                for (let w = 1; w <= 16; w++) {
+                    for (let h = 1; h <= 16; h++) {
+                        for (const [nx, ny, nz] of normals) {
+                            const key = `${nx},${ny},${nz},${w},${h}`;
+                            mergedVertexCache.set(key, computeMergedFaceVertices(nx, ny, nz, w, h));
+                        }
+                    }
+                }
+                logDebug(`[GreedyMesh] Pre-cached ${mergedVertexCache.size} vertex configurations`);
+            }
+
+            /**
+             * Get cached merged face vertices for a quad.
+             * Uses pre-computed cache for common sizes (1-16), computes on demand for larger.
+             * @param {number} nx - Normal X component
+             * @param {number} ny - Normal Y component
+             * @param {number} nz - Normal Z component
+             * @param {number} width - Quad width in blocks
+             * @param {number} height - Quad height in blocks
+             * @returns {Float32Array} 12 values (4 vertices × 3 coords)
+             */
+            function getMergedFaceVertices(nx, ny, nz, width, height) {
+                // Use cache for common sizes (covers 99%+ of cases)
+                if (width <= 16 && height <= 16) {
+                    const key = `${nx},${ny},${nz},${width},${height}`;
+                    return mergedVertexCache.get(key);
+                }
+                // Fallback for rare large quads (compute on demand)
+                return computeMergedFaceVertices(nx, ny, nz, width, height);
             }
 
             // OPTIMIZATION AUDIT: scheduleChunkUpdate
@@ -30838,8 +30877,69 @@ self.onmessage = async (e) => {
                     console.log(`[Blocks] UV cache built using ${NUM_TILES} atlas tiles (uvStep=${uvStep.toFixed(4)})`);
                     blockOptimizationInitialized = true;
                     initUVLookupTable(); // OPTIMIZATION: Initialize UV lookup table after uvMap is populated
+                    initMergedVertexCache(); // OPTIMIZATION: Pre-compute merged vertex cache for greedy meshing
                 }
             }
+            // --- GREEDY MESHING: Performance statistics ---
+            const greedyMeshStats = {
+                chunksProcessed: 0,
+                totalInputFaces: 0,      // Faces before greedy merging
+                totalOutputFaces: 0,     // Faces after greedy merging
+                totalMeshTimeMs: 0,
+                lastChunkInputFaces: 0,
+                lastChunkOutputFaces: 0,
+                lastChunkMeshTimeMs: 0,
+                reductionRatio: 0,       // Average reduction (0-1)
+
+                reset() {
+                    this.chunksProcessed = 0;
+                    this.totalInputFaces = 0;
+                    this.totalOutputFaces = 0;
+                    this.totalMeshTimeMs = 0;
+                    this.lastChunkInputFaces = 0;
+                    this.lastChunkOutputFaces = 0;
+                    this.lastChunkMeshTimeMs = 0;
+                    this.reductionRatio = 0;
+                },
+
+                record(inputFaces, outputFaces, meshTimeMs) {
+                    this.chunksProcessed++;
+                    this.totalInputFaces += inputFaces;
+                    this.totalOutputFaces += outputFaces;
+                    this.totalMeshTimeMs += meshTimeMs;
+                    this.lastChunkInputFaces = inputFaces;
+                    this.lastChunkOutputFaces = outputFaces;
+                    this.lastChunkMeshTimeMs = meshTimeMs;
+                    if (this.totalInputFaces > 0) {
+                        this.reductionRatio = 1 - (this.totalOutputFaces / this.totalInputFaces);
+                    }
+                },
+
+                getAverages() {
+                    const n = this.chunksProcessed || 1;
+                    return {
+                        avgInputFaces: Math.round(this.totalInputFaces / n),
+                        avgOutputFaces: Math.round(this.totalOutputFaces / n),
+                        avgMeshTimeMs: (this.totalMeshTimeMs / n).toFixed(2),
+                        reductionPercent: (this.reductionRatio * 100).toFixed(1)
+                    };
+                }
+            };
+
+            // Expose for console debugging
+            window.greedyMeshStats = greedyMeshStats;
+            window.printGreedyStats = () => {
+                const avg = greedyMeshStats.getAverages();
+                console.table({
+                    'Chunks Processed': greedyMeshStats.chunksProcessed,
+                    'Avg Input Faces': avg.avgInputFaces,
+                    'Avg Output Faces': avg.avgOutputFaces,
+                    'Reduction': `${avg.reductionPercent}%`,
+                    'Avg Mesh Time': `${avg.avgMeshTimeMs}ms`,
+                    'Last Chunk': `${greedyMeshStats.lastChunkInputFaces} → ${greedyMeshStats.lastChunkOutputFaces} (${greedyMeshStats.lastChunkMeshTimeMs.toFixed(2)}ms)`
+                });
+            };
+
             function initDebugGrid() {
                 initBlockOptimization();
                 debugGroup = new THREE.Group();
@@ -31010,6 +31110,16 @@ self.onmessage = async (e) => {
                     "\nHits: " + cacheStats.hits + " | Misses: " + cacheStats.misses + " (" + cacheStats.hitRate + ")" +
                     "\nSaves: " + cacheStats.saves + " | Read: " + cacheStats.bytesReadMB + "MB | Written: " + cacheStats.bytesWrittenMB + "MB" +
                     (pendingCount > 0 ? "\nAuto-save pending: " + pendingCount + " chunks" : "");
+
+                // Add greedy meshing stats if enabled
+                if (SETTINGS.greedyMeshingEnabled && greedyMeshStats.chunksProcessed > 0) {
+                    const avg = greedyMeshStats.getAverages();
+                    overlay.innerText += "\n--- GREEDY MESH ---" +
+                        "\nChunks: " + greedyMeshStats.chunksProcessed +
+                        " | Reduction: " + avg.reductionPercent + "%" +
+                        "\nAvg: " + avg.avgInputFaces + " → " + avg.avgOutputFaces + " faces" +
+                        "\nLast: " + greedyMeshStats.lastChunkInputFaces + " → " + greedyMeshStats.lastChunkOutputFaces;
+                }
 
                 // Add OPFS (disk storage) status
                 const opfsSupported = supportsOPFS();
@@ -38839,32 +38949,64 @@ self.onmessage = async (e) => {
                 return _aoResult;
             }
 
-            // --- GREEDY MESHING: AO quantization for merge key computation ---
+            // --- GREEDY MESHING: AO and light quantization for merge key computation ---
+
+            // Pre-compute AO quantization lookup table (0.00 to 1.00 in 0.01 steps)
+            // This eliminates per-call Math.min/floor overhead in hot path
+            const AO_QUANT_LOOKUP = new Uint8Array(101);
+            for (let i = 0; i <= 100; i++) {
+                const ao = i / 100;
+                AO_QUANT_LOOKUP[i] = Math.min(3, Math.max(0, Math.floor((ao - 0.25) * 4)));
+            }
+
+            // Pre-compute light level quantization lookup table (0.00 to 1.00 in 0.01 steps)
+            // Quantizes to 8 levels (3 bits) for better merging while preserving lighting gradients
+            const LIGHT_QUANT_LOOKUP = new Uint8Array(101);
+            for (let i = 0; i <= 100; i++) {
+                const light = i / 100;
+                LIGHT_QUANT_LOOKUP[i] = Math.min(7, Math.floor(light * 8));
+            }
 
             /**
-             * Quantize AO value to 4 levels for merge comparison.
+             * Quantize light level using lookup table.
+             * @param {number} light - Normalized light level (0-1)
+             * @returns {number} Quantized value (0-7)
+             */
+            function quantizeLight(light) {
+                const idx = Math.round(Math.max(0, Math.min(1, light)) * 100);
+                return LIGHT_QUANT_LOOKUP[idx];
+            }
+
+            /**
+             * Quantize AO value to 4 levels using lookup table.
              * AO values range from 0.25 (full occlusion) to 1.0 (no occlusion).
              * @param {number} ao - AO value (0.25 to 1.0)
              * @returns {number} Quantized value (0-3)
              */
             function quantizeAO(ao) {
-                return Math.min(3, Math.floor((ao - 0.25) * 4));
+                const idx = Math.round(Math.max(0, Math.min(1, ao)) * 100);
+                return AO_QUANT_LOOKUP[idx];
             }
 
             /**
-             * Create merge key from block ID and AO values.
+             * Create merge key from block ID, AO values, and light level.
              * Faces can only merge if merge keys are identical.
-             * This ensures AO gradients are preserved at block boundaries.
+             * This ensures AO gradients and lighting are preserved at block boundaries.
+             * Uses direct lookup table access for maximum performance.
              * @param {BlockId} blockId - Block type ID
              * @param {number[]} ao - Array of 4 AO values
-             * @returns {number} 24-bit merge key: (blockId << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
+             * @param {number} light - Normalized light level (0-1)
+             * @returns {number} 27-bit merge key: (blockId << 11) | (light << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
              */
-            function getMergeKey(blockId, ao) {
-                const q0 = quantizeAO(ao[0]);
-                const q1 = quantizeAO(ao[1]);
-                const q2 = quantizeAO(ao[2]);
-                const q3 = quantizeAO(ao[3]);
-                return (blockId << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3;
+            function getMergeKey(blockId, ao, light) {
+                // Direct lookup table access (faster than function calls)
+                const idx0 = Math.round(Math.max(0, Math.min(1, ao[0])) * 100);
+                const idx1 = Math.round(Math.max(0, Math.min(1, ao[1])) * 100);
+                const idx2 = Math.round(Math.max(0, Math.min(1, ao[2])) * 100);
+                const idx3 = Math.round(Math.max(0, Math.min(1, ao[3])) * 100);
+                const lightIdx = Math.round(Math.max(0, Math.min(1, light)) * 100);
+                const qLight = LIGHT_QUANT_LOOKUP[lightIdx];
+                return (blockId << 11) | (qLight << 8) | (AO_QUANT_LOOKUP[idx0] << 6) | (AO_QUANT_LOOKUP[idx1] << 4) | (AO_QUANT_LOOKUP[idx2] << 2) | AO_QUANT_LOOKUP[idx3];
             }
 
             /**
@@ -39456,13 +39598,26 @@ self.onmessage = async (e) => {
                 cols[cIdx + 6] = c3; cols[cIdx + 7] = c3; cols[cIdx + 8] = c3;
                 cols[cIdx + 9] = c4; cols[cIdx + 10] = c4; cols[cIdx + 11] = c4;
 
-                // Write indices (two triangles)
-                indices[iIdx + 0] = vertCount + 0;
-                indices[iIdx + 1] = vertCount + 1;
-                indices[iIdx + 2] = vertCount + 3;
-                indices[iIdx + 3] = vertCount + 1;
-                indices[iIdx + 4] = vertCount + 2;
-                indices[iIdx + 5] = vertCount + 3;
+                // Write indices (two triangles) with AO diagonal flip
+                // AO diagonal flip prevents "bowtie" artifacts when diagonal corners differ
+                // Standard: triangles 0-1-3 and 1-2-3
+                // Flipped:  triangles 0-1-2 and 0-2-3
+                const flipDiagonal = ao[0] + ao[2] < ao[1] + ao[3];
+                if (flipDiagonal) {
+                    indices[iIdx + 0] = vertCount + 0;
+                    indices[iIdx + 1] = vertCount + 1;
+                    indices[iIdx + 2] = vertCount + 2;
+                    indices[iIdx + 3] = vertCount + 0;
+                    indices[iIdx + 4] = vertCount + 2;
+                    indices[iIdx + 5] = vertCount + 3;
+                } else {
+                    indices[iIdx + 0] = vertCount + 0;
+                    indices[iIdx + 1] = vertCount + 1;
+                    indices[iIdx + 2] = vertCount + 3;
+                    indices[iIdx + 3] = vertCount + 1;
+                    indices[iIdx + 4] = vertCount + 2;
+                    indices[iIdx + 5] = vertCount + 3;
+                }
             }
 
             // Scratch array for AO values during greedy meshing
@@ -39480,10 +39635,12 @@ self.onmessage = async (e) => {
              * @param {number} startX - Chunk world X origin
              * @param {number} startZ - Chunk world Z origin
              * @param {Object} buffers - Output buffers {pos, norm, uvs, cols, quadSize, indices}
-             * @param {Object} state - Current indices {vIdx, uvIdx, cIdx, qsIdx, iIdx, vertCount, faceCount}
+             * @param {Object} state - Current indices {vIdx, uvIdx, cIdx, qsIdx, iIdx, vertCount, faceCount, inputFaceCount}
              * @returns {Object} Updated state
              */
             function greedyMeshSection(faceIdx, sectionBaseY, sectionEndY, getLocal, getLocalLight, startX, startZ, buffers, state) {
+                // Initialize inputFaceCount if not present
+                if (state.inputFaceCount === undefined) state.inputFaceCount = 0;
                 const face = FACE_DIRECTIONS[faceIdx];
                 const dx = face[0], dy = face[1], dz = face[2];
                 const nx = face[3], ny = face[4], nz = face[5];
@@ -39546,7 +39703,8 @@ self.onmessage = async (e) => {
 
                             // Store in greedy buffers
                             const idx = v * uSize + u;
-                            greedyMergeKeys[idx] = getMergeKey(blockId, ao);
+                            // Include light in merge key for quantized light matching
+                            greedyMergeKeys[idx] = getMergeKey(blockId, ao, lightLevel);
                             greedyAO[idx * 4 + 0] = ao[0];
                             greedyAO[idx * 4 + 1] = ao[1];
                             greedyAO[idx * 4 + 2] = ao[2];
@@ -39556,6 +39714,8 @@ self.onmessage = async (e) => {
                             greedyLocalCoords[idx * 3 + 0] = x;
                             greedyLocalCoords[idx * 3 + 1] = y;
                             greedyLocalCoords[idx * 3 + 2] = z;
+                            // Count this as an input face (before merging)
+                            state.inputFaceCount++;
                         }
                     }
 
@@ -39567,24 +39727,23 @@ self.onmessage = async (e) => {
 
                             const mergeKey = greedyMergeKeys[idx];
                             const lightLevel = greedyLight[idx];
+                            const maxSize = SETTINGS.maxGreedyQuadSize || 16;
 
                             // Expand right (u direction)
+                            // Light is now quantized in merge key, so matching keys have compatible light
                             let width = 1;
-                            while (u + width < uSize) {
+                            while (u + width < uSize && width < maxSize) {
                                 const nextIdx = v * uSize + (u + width);
                                 if (greedyProcessed[nextIdx] || greedyMergeKeys[nextIdx] !== mergeKey) break;
-                                // Also check light level matches (within tolerance)
-                                if (Math.abs(greedyLight[nextIdx] - lightLevel) > 0.02) break;
                                 width++;
                             }
 
                             // Expand down (v direction)
                             let height = 1;
-                            expandDown: while (v + height < vSize) {
+                            expandDown: while (v + height < vSize && height < maxSize) {
                                 for (let du = 0; du < width; du++) {
                                     const checkIdx = (v + height) * uSize + (u + du);
                                     if (greedyProcessed[checkIdx] || greedyMergeKeys[checkIdx] !== mergeKey) break expandDown;
-                                    if (Math.abs(greedyLight[checkIdx] - lightLevel) > 0.02) break expandDown;
                                 }
                                 height++;
                             }
@@ -40091,6 +40250,7 @@ self.onmessage = async (e) => {
                     const sections = centerData.sections;
                     let sectionsSkipped = 0;
                     let blocksSkipped = 0;
+                    let greedyInputFaces = 0; // Track faces before greedy merging
 
                     // Skip entirely if chunk has no visible sections
                     if (sections) {
@@ -40179,7 +40339,8 @@ self.onmessage = async (e) => {
                                 qsIdx: tQsIdx,
                                 iIdx: tIIdx,
                                 vertCount: tVertCount,
-                                faceCount: tFaceCount
+                                faceCount: tFaceCount,
+                                inputFaceCount: 0 // Track faces before merging for stats
                             };
 
                             // Process each face direction with greedy meshing
@@ -40205,6 +40366,7 @@ self.onmessage = async (e) => {
                             tIIdx = terrainState.iIdx;
                             tVertCount = terrainState.vertCount;
                             tFaceCount = terrainState.faceCount;
+                            greedyInputFaces += terrainState.inputFaceCount; // Accumulate input faces
 
                             // --- WATER PROCESSING: Still per-block (special attributes) ---
                             for (let y = startY; y < endY; y++) {
@@ -40387,6 +40549,11 @@ self.onmessage = async (e) => {
                     }
                     if (sectionsLODSkipped > 0) {
                         perfMetrics.sectionsLODSkipped = (perfMetrics.sectionsLODSkipped || 0) + sectionsLODSkipped;
+                    }
+
+                    // Record greedy meshing stats if greedy meshing was used
+                    if (greedyInputFaces > 0 && SETTINGS.greedyMeshingEnabled) {
+                        greedyMeshStats.record(greedyInputFaces, tFaceCount, 0);
                     }
 
                     // Compute tight bounds once for both terrain and water meshes
