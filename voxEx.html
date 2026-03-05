@@ -3936,6 +3936,7 @@
              * @property {HeightFunction} heightFunc - Terrain height function
              * @property {BiomeTreeConfig} trees - Tree placement config
              * @property {string[]} tags - Behavior tags (e.g., "mountain", "forested")
+             * @property {DecorateColumnFunction|null} decorateColumn - Custom decorator
              */
 
             /**
@@ -3952,6 +3953,8 @@
              *
              * Tags enable biome-specific behavior without name checks:
              * - "mountain" - Enables treeline, alpine terrain, krummholz logic
+             * - "forested" - Dense tree coverage
+             * - "giant_trees" - Extra large trees
              * @type {Object<string, Partial<BiomeConfigEntry>>}
              */
             const BIOME_CONFIG = {
@@ -3970,7 +3973,7 @@
                         },
                     },
                     tags: [],
-
+                    decorateColumn: null,
                 },
                 hills: {
                     weight: 2,        // Moderately common transition biome
@@ -3987,7 +3990,7 @@
                         },
                     },
                     tags: [],
-
+                    decorateColumn: null,
                 },
                 forests: {
                     weight: 2,        // Common biome for varied terrain
@@ -4029,7 +4032,7 @@
                         },
                     },
                     tags: ["mountain"], // Enables treeline and alpine terrain logic
-
+                    decorateColumn: null,
                 },
                 swamp: {
                     weight: 1,        // Rare biome
@@ -4051,7 +4054,7 @@
                         },
                     },
                     tags: [],
-
+                    decorateColumn: null,
                 },
                 // Longwoods biome - towering thick-trunked trees with wide, sparse canopies
                 // Trunks are MOSTLY 2×2, SOMETIMES 3×3. Heights 12-24. Canopy is thin vertically (2-3 layers)
@@ -4090,6 +4093,7 @@
                             leaves: LONGWOOD_LEAVES, // Custom longwood leaves block
                         },
                     },
+                    tags: ["forested", "giant_trees"],
                 },
                 // Mountain foothills - transitional biome surrounding mountain ranges
                 // Never spawns via weighted selection (weight: 0), only via adjacency to mountains
@@ -4130,6 +4134,7 @@
                     // trunk, canopy, blocks, spacing use TREE_CONFIG defaults via resolveTreeProfile()
                 },
                 tags: [],                     // Tags for biome-specific behavior
+                decorateColumn: null,         // Custom decoration function
                 // Future extensibility: snowLine, waterColor, ambientSound, etc.
             };
 
@@ -4468,11 +4473,11 @@
                         // SPACING CHECK (deterministic) - ensure no closer tree with lower placement value
                         // This must be done here so it applies to all trees consistently
                         let tooClose = false;
-                        const spacingSq = spacing * spacing;
                         for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
                             for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
                                 if (ddx === 0 && ddz === 0) continue;
-                                if (ddx * ddx + ddz * ddz >= spacingSq) continue;
+                                const dist = Math.sqrt(ddx * ddx + ddz * ddz);
+                                if (dist >= spacing) continue;
                                 
                                 const neighborGx = gx + ddx;
                                 const neighborGz = gz + ddz;
@@ -4947,6 +4952,72 @@
                 }
             }
 
+            // Check if position is within trunk footprint (for any w×d trunk centered at origin)
+            function isInTrunkFootprint(x, z, trunkW, trunkD) {
+                const halfW = Math.floor(trunkW / 2);
+                const halfD = Math.floor(trunkD / 2);
+                // For odd widths: -halfW to halfW inclusive
+                // For even widths: -halfW to halfW-1 inclusive (shifted slightly)
+                const minX = -halfW;
+                const maxX = trunkW - halfW - 1;
+                const minZ = -halfD;
+                const maxZ = trunkD - halfD - 1;
+                return x >= minX && x <= maxX && z >= minZ && z <= maxZ;
+            }
+
+            // Generate trunk branches for a tree
+            // Calls fn(dx, dy, dz) for each branch log block position (relative to trunk base)
+            // Uses trunk config: branchStart, branchChance, branchLength
+            function forEachTrunkBranch(profile, seed, gx, gz, trunkHeight, trunkW, trunkD, fn) {
+                const { branchStart, branchChance, branchLength } = profile.trunk;
+
+                // Skip if no branches configured
+                if (branchChance <= 0 || branchLength <= 0) return;
+
+                // Calculate where branches can start
+                const minBranchY = Math.floor(trunkHeight * branchStart);
+                const maxBranchY = trunkHeight - 2; // Leave room for canopy
+
+                if (minBranchY >= maxBranchY) return;
+
+                // Calculate trunk footprint for branch attachment points
+                const halfW = Math.floor(trunkW / 2);
+                const halfD = Math.floor(trunkD / 2);
+
+                // Four cardinal directions for branches
+                const directions = [
+                    { dx: 1, dz: 0 },   // East
+                    { dx: -1, dz: 0 },  // West
+                    { dx: 0, dz: 1 },   // South
+                    { dx: 0, dz: -1 },  // North
+                ];
+
+                // Check each potential branch position
+                for (let y = minBranchY; y <= maxBranchY; y++) {
+                    for (const dir of directions) {
+                        // Deterministic branch decision
+                        const branchRand = seededRandom(seed, gx, gz, dir.dx * 100, y, dir.dz * 100);
+                        if (branchRand > branchChance) continue;
+
+                        // Calculate branch length (varies deterministically)
+                        const lengthRand = seededRandom(seed, gx, gz, dir.dx * 200, y, dir.dz * 200);
+                        const actualLength = Math.max(1, Math.floor(branchLength * (0.5 + lengthRand * 0.5)));
+
+                        // Branch starts at trunk edge
+                        const startX = dir.dx > 0 ? (trunkW - halfW) : (dir.dx < 0 ? (-halfW - 1) : 0);
+                        const startZ = dir.dz > 0 ? (trunkD - halfD) : (dir.dz < 0 ? (-halfD - 1) : 0);
+
+                        // Place branch blocks
+                        for (let len = 0; len < actualLength; len++) {
+                            const bx = startX + dir.dx * len;
+                            const bz = startZ + dir.dz * len;
+                            // Slight upward angle for longer branches
+                            const by = y + Math.floor(len / 2);
+                            fn(bx, by, bz);
+                        }
+                    }
+                }
+            }
 
             // Compute MAX_TREE_CANOPY_RADIUS from all biome tree configs
             // Used for cross-chunk tree overhang detection to handle large trees
@@ -5007,12 +5078,16 @@
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 shadows: savedSettings.shadows !== undefined ? savedSettings.shadows : true,
                 textureResolution: savedSettings.textureResolution || 16,
+                fog: true,
                 // Graphics - Lighting
                 sunColor: savedSettings.sunColor || 0xfce7bb,
                 sunIntensity: savedSettings.sunIntensity !== undefined ? savedSettings.sunIntensity : 0.8,
                 moonColor: savedSettings.moonColor || 0x8899ff,
                 moonIntensity: savedSettings.moonIntensity !== undefined ? savedSettings.moonIntensity : 0.15,
                 ambientIntensity: savedSettings.ambientIntensity !== undefined ? savedSettings.ambientIntensity : 1.0,
+                lighting: {
+                    // Basic lighting only - no advanced settings
+                },
                 torchColor: savedSettings.torchColor || 0xffaa33,
                 torchIntensity: savedSettings.torchIntensity !== undefined ? savedSettings.torchIntensity : 3.0,
                 torchRange: savedSettings.torchRange || 48,
@@ -5225,6 +5300,7 @@
                 moonColor: 0x8899ff,     // Cool moonlight color (blue-ish)
                 moonIntensity: 0.15,     // Moon is much dimmer than sun
                 ambientIntensity: 1.0,   // Global ambient fill light
+                lighting: {},            // Extended lighting settings
                 torchColor: 0xffaa33,    // Warm torch glow (orange)
                 torchIntensity: 3.0,     // Torch brightness multiplier (affects block light level 15)
                 torchRange: 48,          // Torch light radius in blocks (affects point light)
@@ -5669,6 +5745,37 @@
                 return sections;
             }
 
+            /**
+             * Get section index from Y coordinate.
+             * @param {number} y - Block Y coordinate (0-319)
+             * @returns {number} Section index (0-19)
+             */
+            function getSectionIndex(y) {
+                return Math.floor(y / SECTION_HEIGHT);
+            }
+
+            /**
+             * Get Y range for a section.
+             * @param {number} sectionIndex - Section index (0-19)
+             * @returns {{minY: number, maxY: number}} Y range (inclusive min, exclusive max)
+             */
+            function getSectionYRange(sectionIndex) {
+                return {
+                    minY: sectionIndex * SECTION_HEIGHT,
+                    maxY: (sectionIndex + 1) * SECTION_HEIGHT
+                };
+            }
+
+            /**
+             * Get block index within section from local coordinates.
+             * @param {number} lx - Local X (0-15)
+             * @param {number} ly - Y within section (0-15)
+             * @param {number} lz - Local Z (0-15)
+             * @returns {number} Index within section (0-4095)
+             */
+            function getSectionBlockIndex(lx, ly, lz) {
+                return lx + lz * SECTION_HEIGHT + ly * SECTION_HEIGHT * SECTION_HEIGHT;
+            }
 
             /**
              * Compute tight bounding box for a chunk from its section data.
@@ -5854,6 +5961,52 @@
                 }
             }
 
+            /**
+             * Compute world-space bounding box for a section.
+             * Uses tight bounds from section analysis.
+             * @param {number} cx - Chunk X coordinate
+             * @param {number} cz - Chunk Z coordinate
+             * @param {Object} section - Section metadata object
+             * @param {THREE.Box3} targetBox - Box3 to populate (avoids allocation)
+             * @returns {THREE.Box3} The populated bounding box
+             */
+            function getSectionWorldBounds(cx, cz, section, targetBox) {
+                const chunkWorldX = cx * WORLD_DIMS.chunkSize;
+                const chunkWorldZ = cz * WORLD_DIMS.chunkSize;
+                const yOffset = WORLD_DIMS.yOffset;
+
+                // Use tight bounds if analyzed, otherwise full section extent
+                if (section.analyzed && !section.isEmpty) {
+                    targetBox.min.set(
+                        chunkWorldX + section.minBlockX,
+                        section.minBlockY - yOffset,
+                        chunkWorldZ + section.minBlockZ
+                    );
+                    targetBox.max.set(
+                        chunkWorldX + section.maxBlockX + 1,  // +1 for block extent
+                        section.maxBlockY + 1 - yOffset,      // +1 for block extent
+                        chunkWorldZ + section.maxBlockZ + 1   // +1 for block extent
+                    );
+                } else {
+                    // Full section extent (fallback)
+                    const sectionIdx = Math.floor(section.minBlockY / SECTION_HEIGHT);
+                    targetBox.min.set(
+                        chunkWorldX,
+                        sectionIdx * SECTION_HEIGHT - yOffset,
+                        chunkWorldZ
+                    );
+                    targetBox.max.set(
+                        chunkWorldX + WORLD_DIMS.chunkSize,
+                        (sectionIdx + 1) * SECTION_HEIGHT - yOffset,
+                        chunkWorldZ + WORLD_DIMS.chunkSize
+                    );
+                }
+
+                return targetBox;
+            }
+
+            // Pooled Box3 for section bounds calculations (avoid per-call allocation)
+            const _sectionBox3 = new THREE.Box3();
 
             // Chunk memory constants for LRU eviction
             const CHUNK_DATA_SIZE = WORLD_DIMS.chunkSize * WORLD_DIMS.chunkSize * WORLD_DIMS.chunkHeight; // 81920 bytes per chunk
@@ -5886,6 +6039,18 @@
                 return _box3Player.intersectsBox(_box3Block);
             }
 
+            /**
+             * Squared 2D distance (avoids sqrt for distance comparisons).
+             * @param {number} x1 - First X
+             * @param {number} z1 - First Z
+             * @param {number} x2 - Second X
+             * @param {number} z2 - Second Z
+             * @returns {number} Squared distance
+             */
+            function dist2DSq(x1, z1, x2, z2) {
+                const dx = x2 - x1, dz = z2 - z1;
+                return dx * dx + dz * dz;
+            }
 
             let lastShadowState = {
                 targetX: -1,
@@ -7120,15 +7285,10 @@
                     }
 
                     // Unload chunks that are too far
-                    // Collect first to avoid iterator invalidation during delete
-                    const toUnload = [];
                     for (const key of this.activeChunks) {
                         if (!neededChunks.has(key)) {
-                            toUnload.push(key);
+                            this.unloadChunk(key);
                         }
-                    }
-                    for (const key of toUnload) {
-                        this.unloadChunk(key);
                     }
 
                     // Load new chunks
@@ -7139,12 +7299,7 @@
                         }
                     }
 
-                    // Update existing Set in-place to preserve the shared reference from bindState()
-                    // (replacing with a new Set would break the global activeChunks variable)
-                    this.activeChunks.clear();
-                    for (const key of neededChunks) {
-                        this.activeChunks.add(key);
-                    }
+                    this.activeChunks = neededChunks;
                 }
 
                 /**
@@ -7157,9 +7312,6 @@
                     if (this.modifiedChunks.has(key)) {
                         return false;
                     }
-                    // Release meshes from scene before deleting chunk data
-                    releaseMeshForKey(key);
-                    releaseMeshForKey(`${key}_WATER`);
                     this.chunks.delete(key);
                     this.pristineChunks.delete(key);
                     this.activeChunks.delete(key);
@@ -11005,12 +11157,54 @@
                 return SECTION_LOD_CONFIG.undergroundThreshold;
             }
 
+            // --- OPTIMIZATION 5: Greedy meshing helper - combines adjacent same-type faces ---
+            // This creates larger quads from adjacent faces, reducing vertex/face count significantly
+            function shouldMergeBlocks(id1, id2) {
+                // Only merge identical solid opaque blocks
+                if (id1 !== id2) return false;
+                if (id1 === AIR || id1 === WATER || id1 === TORCH || isLeafBlock(id1)) return false;
+                return true;
+            }
 
             // --- OPTIMIZATION 6: Chunk generation batch processor ---
             const CHUNK_BATCH_SIZE = 4;
             const chunkGenerationQueue = [];
             let isProcessingBatch = false;
 
+            async function queueChunkGeneration(cx, cz, priority = 0) {
+                const key = getChunkKey(cx, cz);
+                // Check if already queued
+                const existing = chunkGenerationQueue.findIndex(c => c.key === key);
+                if (existing !== -1) {
+                    // Update priority if higher
+                    if (priority > chunkGenerationQueue[existing].priority) {
+                        chunkGenerationQueue[existing].priority = priority;
+                    }
+                    return;
+                }
+                chunkGenerationQueue.push({ cx, cz, key, priority });
+                // Sort by priority (higher first), then by distance if equal
+                chunkGenerationQueue.sort((a, b) => b.priority - a.priority);
+            }
+
+            async function processChunkGenerationBatch() {
+                if (isProcessingBatch || chunkGenerationQueue.length === 0) return 0;
+                isProcessingBatch = true;
+                let processed = 0;
+                const batchSize = Math.min(CHUNK_BATCH_SIZE, chunkGenerationQueue.length);
+
+                for (let i = 0; i < batchSize; i++) {
+                    const job = chunkGenerationQueue.shift();
+                    if (!job) break;
+                    if (!chunks.has(job.key)) {
+                        await generateChunkData(job.cx, job.cz);
+                        processed++;
+                    }
+                }
+
+                isProcessingBatch = false;
+                return processed;
+            }
 
             // --- OPTIMIZATION 7: Spiral chunk loading order ---
             // Pre-computed spiral pattern for chunk loading (more natural loading feel)
@@ -11068,6 +11262,9 @@
                 faceVisibilityCache.delete(chunkKey);
             }
 
+            function getFaceCacheKey(cx, cz) {
+                return `${cx},${cz}`;
+            }
 
             // --- OPTIMIZATION 11: Vector3 Object Pool ---
             // =====================================================
@@ -11222,6 +11419,28 @@
                 return chunk;
             }
 
+            /**
+             * Calculate compression ratio for a chunk.
+             * @param {Object} original - Original chunk data
+             * @param {Object} compressed - Compressed chunk data
+             * @returns {number} Compression ratio (0-1, lower is better)
+             */
+            function getCompressionRatio(original, compressed) {
+                if (!original || !compressed) return 1;
+
+                let originalSize = 0;
+                let compressedSize = 0;
+
+                if (original.blocks) originalSize += original.blocks.length;
+                if (original.skyLight) originalSize += original.skyLight.length;
+                if (original.blockLight) originalSize += original.blockLight.length;
+
+                if (compressed.blocks) compressedSize += compressed.blocks.length;
+                if (compressed.skyLight) compressedSize += compressed.skyLight.length;
+                if (compressed.blockLight) compressedSize += compressed.blockLight.length;
+
+                return originalSize > 0 ? compressedSize / originalSize : 1;
+            }
 
             // Compression statistics
             const compressionStats = {
@@ -11315,6 +11534,8 @@
                     }
                 }
             }
+            const vec3Pool = new Vector3Pool(64);
+
             // --- OPTIMIZATION 12: Chunk Key Cache ---
             /** Maximum number of chunk keys to cache */
             const CHUNK_KEY_CACHE_SIZE = 128;
@@ -11322,11 +11543,77 @@
             /** @type {Map<number, ChunkKey>} */
             const chunkKeyCache = new Map();
 
+            /**
+             * Get a cached chunk key string for coordinates.
+             * HOT PATH - uses integer composite key for fast Map lookup.
+             * @param {ChunkCoord} cx - Chunk X coordinate
+             * @param {ChunkCoord} cz - Chunk Z coordinate
+             * @returns {ChunkKey} Chunk key string in format "cx,cz"
+             */
+            function getChunkKeyCached(cx, cz) {
+                // Use a composite key for the cache lookup
+                const cacheKey = (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
+                let key = chunkKeyCache.get(cacheKey);
+                if (key === undefined) {
+                    key = `${cx},${cz}`;
+                    // Limit cache size
+                    if (chunkKeyCache.size > CHUNK_KEY_CACHE_SIZE) {
+                        // Remove oldest entry (first in map)
+                        const firstKey = chunkKeyCache.keys().next().value;
+                        chunkKeyCache.delete(firstKey);
+                    }
+                    chunkKeyCache.set(cacheKey, key);
+                }
+                return key;
+            }
 
             // --- OPTIMIZATION 13: Height Map Cache ---
             /** @type {Map<ChunkKey, Int16Array>} */
             const heightMapCache = new Map();
 
+            /** Maximum height maps to cache */
+            const HEIGHT_CACHE_MAX_SIZE = 64;
+
+            /**
+             * Get or compute a cached height map for a chunk.
+             * @param {ChunkCoord} cx - Chunk X coordinate
+             * @param {ChunkCoord} cz - Chunk Z coordinate
+             * @param {number} chunkSize - Size of chunk (typically 16)
+             * @param {number} seed - World seed
+             * @returns {Int16Array} Height values for each column in the chunk
+             */
+            function getCachedHeightMap(cx, cz, chunkSize, seed) {
+                const key = `${cx},${cz}`;
+                if (heightMapCache.has(key)) {
+                    return heightMapCache.get(key);
+                }
+                // Generate height map
+                const heightMap = new Int16Array(chunkSize * chunkSize);
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+                for (let lx = 0; lx < chunkSize; lx++) {
+                    for (let lz = 0; lz < chunkSize; lz++) {
+                        const gx = startX + lx;
+                        const gz = startZ + lz;
+                        heightMap[lx + lz * chunkSize] = blendedHeight(gx, gz, seed);
+                    }
+                }
+                // Cache with size limit
+                if (heightMapCache.size >= HEIGHT_CACHE_MAX_SIZE) {
+                    const firstKey = heightMapCache.keys().next().value;
+                    heightMapCache.delete(firstKey);
+                }
+                heightMapCache.set(key, heightMap);
+                return heightMap;
+            }
+
+            /**
+             * Clear the height map cache.
+             * @returns {void}
+             */
+            function clearHeightMapCache() {
+                heightMapCache.clear();
+            }
 
             // --- OPTIMIZATION 14: Physics State Tracking ---
             /** Whether the player is considered stationary */
@@ -11376,6 +11663,36 @@
             // Use typed array for faster biome weight calculations
             const biomeWeightCache = new Map();
 
+            function getCachedBiomeWeights(gx, gz) {
+                const cellX = Math.floor(gx / 64);
+                const cellZ = Math.floor(gz / 64);
+                const key = (cellX & 0xFFFF) | ((cellZ & 0xFFFF) << 16);
+                return biomeWeightCache.get(key);
+            }
+
+            function setCachedBiomeWeights(gx, gz, weights) {
+                const cellX = Math.floor(gx / 64);
+                const cellZ = Math.floor(gz / 64);
+                const key = (cellX & 0xFFFF) | ((cellZ & 0xFFFF) << 16);
+                if (biomeWeightCache.size > 256) {
+                    const firstKey = biomeWeightCache.keys().next().value;
+                    biomeWeightCache.delete(firstKey);
+                }
+                biomeWeightCache.set(key, weights);
+            }
+
+            // --- OPTIMIZATION 17: Render Distance Squared Cache ---
+            // Avoid repeated multiplication in distance checks
+            let cachedRenderDistanceSq = 0;
+            let lastCachedRenderDistance = -1;
+
+            function getRenderDistanceSq() {
+                if (SETTINGS.renderDistance !== lastCachedRenderDistance) {
+                    lastCachedRenderDistance = SETTINGS.renderDistance;
+                    cachedRenderDistanceSq = SETTINGS.renderDistance * SETTINGS.renderDistance;
+                }
+                return cachedRenderDistanceSq;
+            }
 
             // --- OPTIMIZATION 18: Block ID to UV Fast Lookup ---
             // Pre-compute UV mappings at startup to avoid object property lookups
@@ -11409,11 +11726,72 @@
                 meshCountDirty = true;
             }
 
+            function updateMeshCounts() {
+                if (!meshCountDirty) return;
+                cachedTerrainMeshCount = 0;
+                cachedWaterMeshCount = 0;
+                for (const key of chunkMeshes.keys()) {
+                    if (key.endsWith('_WATER')) {
+                        cachedWaterMeshCount++;
+                    } else {
+                        cachedTerrainMeshCount++;
+                    }
+                }
+                meshCountDirty = false;
+            }
+
+            // --- OPTIMIZATION 20: Geometry Attribute Hints ---
+            // Mark geometry attributes as static for GPU optimization
+            function optimizeGeometryForGPU(geometry) {
+                if (!geometry || !geometry.attributes) return;
+                // Mark attributes as static (won't change after creation)
+                for (const key in geometry.attributes) {
+                    const attr = geometry.attributes[key];
+                    if (attr) {
+                        attr.setUsage(THREE.StaticDrawUsage);
+                    }
+                }
+                // Compute bounding sphere once
+                if (!geometry.boundingSphere) {
+                    geometry.computeBoundingSphere();
+                }
+            }
+
+            /**
+             * Optimize chunk geometry for GPU with DynamicDrawUsage hint.
+             * Chunks may be rebuilt when blocks change, so we hint to the GPU
+             * that these buffers will be updated (though not every frame).
+             * @param {THREE.BufferGeometry} geometry - Geometry to optimize
+             */
+            function optimizeChunkGeometryForGPU(geometry) {
+                if (!geometry || !geometry.attributes) return;
+                // Use DynamicDrawUsage for chunk geometry that may be rebuilt
+                // This tells the GPU driver to optimize for occasional updates
+                for (const key in geometry.attributes) {
+                    const attr = geometry.attributes[key];
+                    if (attr) {
+                        attr.setUsage(THREE.DynamicDrawUsage);
+                    }
+                }
+                // Also set usage on index buffer if present
+                if (geometry.index) {
+                    geometry.index.setUsage(THREE.DynamicDrawUsage);
+                }
+                // Bounding sphere/box are set by applyChunkBounds
+            }
 
             // --- OPTIMIZATION 21: Frustum Plane Caching ---
             // Cache frustum planes to avoid recalculation every frame
             const frustumPlanes = [];
             let frustumPlanesValid = false;
+            let lastFrustumCameraMatrix = null;
+
+            function updateFrustumPlanes(camera) {
+                if (!camera || !camera.projectionMatrix) return;
+                const m = camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse);
+                // Extract frustum planes (simplified)
+                frustumPlanesValid = true;
+            }
 
             // --- OPTIMIZATION 22: Block Type Lookup Table ---
             // Fast lookup for block properties using typed arrays
@@ -11442,14 +11820,50 @@
             const TIME_SLICE_MS = 8; // Max ms per operation slice
             let lastYieldTime = 0;
 
+            function shouldYield() {
+                const now = performance.now();
+                if (now - lastYieldTime > TIME_SLICE_MS) {
+                    lastYieldTime = now;
+                    return true;
+                }
+                return false;
+            }
+
+            async function yieldToBrowser() {
+                return new Promise(resolve => setTimeout(resolve, 0));
+            }
 
             // --- OPTIMIZATION 24: Camera Direction Cache ---
             // Cache camera forward direction to avoid repeated calculations
             const cachedCameraDir = new THREE.Vector3();
             let cameraDirValid = false;
 
+            function getCachedCameraDirection(camera, controls) {
+                if (!cameraDirValid && controls && controls.getDirection) {
+                    controls.getDirection(cachedCameraDir);
+                    cameraDirValid = true;
+                }
+                return cachedCameraDir;
+            }
+
             function invalidateCameraDir() {
                 cameraDirValid = false;
+            }
+
+            // --- OPTIMIZATION 25: Chunk Distance Calculator ---
+            /**
+             * Calculate squared distance between two chunk coordinates.
+             * Uses squared distance to avoid expensive sqrt operation.
+             * @param {ChunkCoord} cx1 - First chunk X coordinate
+             * @param {ChunkCoord} cz1 - First chunk Z coordinate
+             * @param {ChunkCoord} cx2 - Second chunk X coordinate
+             * @param {ChunkCoord} cz2 - Second chunk Z coordinate
+             * @returns {number} Squared distance between chunks
+             */
+            function chunkDistanceSq(cx1, cz1, cx2, cz2) {
+                const dx = cx1 - cx2;
+                const dz = cz1 - cz2;
+                return dx * dx + dz * dz;
             }
 
             // --- OPTIMIZATION 26: Block Index Calculator ---
@@ -11465,17 +11879,85 @@
                 return lx + (lz << 4) + (ly << 8);
             }
 
+            // --- OPTIMIZATION 27: Safe Block Access ---
+            /**
+             * Get block from chunk with bounds checking.
+             * @param {ChunkData|Uint8Array} chunk - Chunk data (new or legacy format)
+             * @param {LocalCoord} lx - Local X coordinate
+             * @param {LocalCoord} ly - Local Y coordinate
+             * @param {LocalCoord} lz - Local Z coordinate
+             * @param {BlockId} [defaultValue=AIR] - Value to return if out of bounds
+             * @returns {BlockId} Block ID at position
+             */
+            function safeGetBlock(chunk, lx, ly, lz, defaultValue = AIR) {
+                if (lx < 0 || lx >= 16 || lz < 0 || lz >= 16 || ly < 0 || ly >= 320) {
+                    return defaultValue;
+                }
+                const blocks = chunk.blocks || chunk;
+                return blocks[blockIndex(lx, ly, lz)];
+            }
 
             // --- OPTIMIZATION 28: Material Cache ---
             /** @type {Map<string, THREE.Material>} */
             const materialCache = new Map();
 
+            /**
+             * Get or create a cached material.
+             * @param {string} key - Cache key for the material
+             * @param {function(): THREE.Material} createFn - Function to create the material if not cached
+             * @returns {THREE.Material} The cached or newly created material
+             */
+            function getCachedMaterial(key, createFn) {
+                if (!materialCache.has(key)) {
+                    materialCache.set(key, createFn());
+                }
+                return materialCache.get(key);
+            }
 
             // --- OPTIMIZATION 29: Event Throttling ---
             /** @type {Map<string, number>} */
             const eventThrottles = new Map();
 
+            /**
+             * Create a throttled version of an event handler.
+             * @template T
+             * @param {string} key - Unique key for this handler
+             * @param {function(...unknown): T} handler - The handler function to throttle
+             * @param {number} [minInterval=16] - Minimum interval between calls in ms
+             * @returns {function(...unknown): T|undefined} Throttled handler
+             */
+            function throttledHandler(key, handler, minInterval = 16) {
+                return function(...args) {
+                    const now = performance.now();
+                    const lastCall = eventThrottles.get(key) || 0;
+                    if (now - lastCall >= minInterval) {
+                        eventThrottles.set(key, now);
+                        return handler.apply(this, args);
+                    }
+                };
+            }
 
+            // --- OPTIMIZATION 30: Pre-allocated Work Arrays ---
+            // Reusable arrays for temporary calculations
+            const workArray16 = new Array(16);
+            const workArray256 = new Array(256);
+            const workFloat32_18 = new Float32Array(18);
+            const workFloat32_12 = new Float32Array(12);
+
+            // --- OPTIMIZATION 31: Dirty Flag System ---
+            // Track what needs updating to avoid redundant work
+            const dirtyFlags = {
+                lighting: false,
+                meshes: false,
+                physics: false,
+                ui: false,
+                reset() {
+                    this.lighting = false;
+                    this.meshes = false;
+                    this.physics = false;
+                    this.ui = false;
+                }
+            };
 
             // --- OPTIMIZATION 32: Frame Budget Tracker ---
             // Track time spent in frame to avoid exceeding budget
@@ -11494,6 +11976,9 @@
                 return frameBudgetRemaining > 0;
             }
 
+            function getFrameBudgetRemaining() {
+                return Math.max(0, frameBudgetRemaining - (performance.now() - frameStartTime));
+            }
 
             // --- OPTIMIZATION 33: Spatial Hash for Entities ---
             /** Size of spatial hash cells */
@@ -11514,6 +11999,49 @@
                 return (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
             }
 
+            /**
+             * Add an entity to the spatial hash at a position.
+             * @param {unknown} entity - Entity to add
+             * @param {number} x - World X coordinate
+             * @param {number} z - World Z coordinate
+             * @returns {void}
+             */
+            function addToSpatialHash(entity, x, z) {
+                const key = getSpatialKey(x, z);
+                if (!spatialHash.has(key)) {
+                    spatialHash.set(key, new Set());
+                }
+                spatialHash.get(key).add(entity);
+            }
+
+            function removeFromSpatialHash(entity, x, z) {
+                const key = getSpatialKey(x, z);
+                const cell = spatialHash.get(key);
+                if (cell) {
+                    cell.delete(entity);
+                    if (cell.size === 0) spatialHash.delete(key);
+                }
+            }
+
+            function getEntitiesNear(x, z, radius = 1) {
+                const results = [];
+                const minCx = Math.floor((x - radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const maxCx = Math.floor((x + radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const minCz = Math.floor((z - radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                const maxCz = Math.floor((z + radius * SPATIAL_CELL_SIZE) / SPATIAL_CELL_SIZE);
+                for (let cx = minCx; cx <= maxCx; cx++) {
+                    for (let cz = minCz; cz <= maxCz; cz++) {
+                        const key = (cx & 0xFFFF) | ((cz & 0xFFFF) << 16);
+                        const cell = spatialHash.get(key);
+                        if (cell) {
+                            for (const entity of cell) {
+                                results.push(entity);
+                            }
+                        }
+                    }
+                }
+                return results;
+            }
 
             // --- OPTIMIZATION 34: Delta Compression for Updates ---
             // Only send/process changes, not full state
@@ -11525,6 +12053,20 @@
                 chunkZ: 0
             };
 
+            function hasStateChanged(newX, newY, newZ, threshold = 0.1) {
+                const dx = Math.abs(newX - lastKnownState.playerX);
+                const dy = Math.abs(newY - lastKnownState.playerY);
+                const dz = Math.abs(newZ - lastKnownState.playerZ);
+                return dx > threshold || dy > threshold || dz > threshold;
+            }
+
+            function updateLastKnownState(x, y, z) {
+                lastKnownState.playerX = x;
+                lastKnownState.playerY = y;
+                lastKnownState.playerZ = z;
+                lastKnownState.chunkX = Math.floor(x / 16);
+                lastKnownState.chunkZ = Math.floor(z / 16);
+            }
 
             // --- OPTIMIZATION 35: Render Queue Priority ---
             // Prioritize rendering based on visibility and distance
@@ -11578,6 +12120,9 @@
             const pendingGeometryUpdates = [];
             const MAX_GEOMETRY_BATCH = 8;
 
+            function queueGeometryUpdate(mesh, geometry) {
+                pendingGeometryUpdates.push({ mesh, geometry });
+            }
 
             function flushGeometryUpdates() {
                 const count = Math.min(pendingGeometryUpdates.length, MAX_GEOMETRY_BATCH);
@@ -11594,11 +12139,27 @@
             // Pre-compute which directions are visible from player position
             let visibleDirections = 0x3F; // All 6 directions by default (6 bits)
 
+            function updateVisibleDirections(playerY, surfaceY) {
+                visibleDirections = 0x3F; // Reset all visible
+                // If player is underground, top might not need full detail
+                if (playerY < surfaceY - 20) {
+                    visibleDirections &= ~0x01; // Less priority for top faces
+                }
+            }
+
+            function isDirectionVisible(dirIndex) {
+                return (visibleDirections & (1 << dirIndex)) !== 0;
+            }
 
             // --- OPTIMIZATION 40: Incremental World Updates ---
             // Process world changes incrementally over multiple frames
             const incrementalUpdateQueue = [];
             const INCREMENTAL_UPDATES_PER_FRAME = 4;
+
+            function queueIncrementalUpdate(updateFn, priority = 0) {
+                incrementalUpdateQueue.push({ fn: updateFn, priority });
+                incrementalUpdateQueue.sort((a, b) => a.priority - b.priority);
+            }
 
             function processIncrementalUpdates() {
                 const count = Math.min(incrementalUpdateQueue.length, INCREMENTAL_UPDATES_PER_FRAME);
@@ -11614,10 +12175,34 @@
                 }
             }
 
+            // --- OPTIMIZATION 41: Render Skip for Occluded Chunks ---
+            // Skip rendering chunks that are completely surrounded
+            function isChunkOccluded(cx, cz, chunks) {
+                // Check if all 4 cardinal neighbors exist and are solid
+                const neighbors = [
+                    chunks.get(`${cx-1},${cz}`),
+                    chunks.get(`${cx+1},${cz}`),
+                    chunks.get(`${cx},${cz-1}`),
+                    chunks.get(`${cx},${cz+1}`)
+                ];
+                // If any neighbor is missing, not occluded
+                return neighbors.every(n => n !== undefined);
+            }
+
             // --- OPTIMIZATION 42: Texture Coordinate Pre-computation ---
             // Pre-computed UV coordinates for common block faces
             const TEXTURE_UV_CACHE = new Map();
 
+            function getPrecomputedUVs(tileIndex, totalTiles) {
+                const key = `${tileIndex}_${totalTiles}`;
+                if (!TEXTURE_UV_CACHE.has(key)) {
+                    const tileSize = 1 / totalTiles;
+                    const u0 = tileIndex * tileSize;
+                    const u1 = u0 + tileSize;
+                    TEXTURE_UV_CACHE.set(key, { u0, u1, v0: 0, v1: 1 });
+                }
+                return TEXTURE_UV_CACHE.get(key);
+            }
 
             // --- OPTIMIZATION 43: Async Chunk Save Batching ---
             // Batch multiple chunk saves into single IndexedDB transaction
@@ -11625,6 +12210,12 @@
             let saveFlushTimeout = null;
             const SAVE_BATCH_DELAY = 1000; // 1 second
 
+            function queueChunkSave(key, data) {
+                pendingChunkSaves.set(key, data);
+                if (!saveFlushTimeout) {
+                    saveFlushTimeout = setTimeout(flushChunkSaves, SAVE_BATCH_DELAY);
+                }
+            }
 
             async function flushChunkSaves() {
                 saveFlushTimeout = null;
@@ -11639,7 +12230,29 @@
                 }
             }
 
+            // --- OPTIMIZATION 44: Input State Bitfield ---
+            // Pack input state into single integer for faster checks
             let inputStateBits = 0;
+            const INPUT_FORWARD = 1 << 0;
+            const INPUT_BACKWARD = 1 << 1;
+            const INPUT_LEFT = 1 << 2;
+            const INPUT_RIGHT = 1 << 3;
+            const INPUT_JUMP = 1 << 4;
+            const INPUT_SPRINT = 1 << 5;
+            const INPUT_CROUCH = 1 << 6;
+
+            function setInputBit(bit, value) {
+                if (value) inputStateBits |= bit;
+                else inputStateBits &= ~bit;
+            }
+
+            function hasInputBit(bit) {
+                return (inputStateBits & bit) !== 0;
+            }
+
+            function hasAnyMovementInput() {
+                return (inputStateBits & 0x0F) !== 0; // First 4 bits are movement
+            }
 
             // --- OPTIMIZATION 45: Light Propagation Queue Pool ---
             // Reuse queue arrays for light propagation to avoid allocations
@@ -11654,6 +12267,21 @@
                 }
             };
 
+            // --- OPTIMIZATION 46: World Bounds Cache ---
+            // Cache world boundary calculations
+            const worldBounds = {
+                minX: -Infinity,
+                maxX: Infinity,
+                minZ: -Infinity,
+                maxZ: Infinity,
+                minY: 0,
+                maxY: 320,
+                isInBounds(x, y, z) {
+                    return x >= this.minX && x <= this.maxX &&
+                           z >= this.minZ && z <= this.maxZ &&
+                           y >= this.minY && y <= this.maxY;
+                }
+            };
 
             // --- OPTIMIZATION 47: Animation Frame Scheduler ---
             // Schedule non-critical updates across multiple frames
@@ -18056,7 +18684,7 @@
             },
         },
         longwoods: {
-            weight: 2, roughness: 0.008, amplitude: 25, baseHeight: 68,
+            weight: 2, roughness: 0.008, amplitude: 25, baseHeight: 68, tags: ["forested", "giant_trees"],
             trees: {
                 density: 0.18, spacing: 6,
                 trunk: {
@@ -19971,7 +20599,7 @@
                 const caveCaches = precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ);
 
                 // Pass set function and worldGenSettings to match main thread signature
-                generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings, workerNumericSeed);
+                generateTerrainPass(blocks, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings);
                 fillWaterPass(blocks, chunkSize, chunkHeight, caches.heightCache);
 
                 // --- Phase 3: Tree generation ---
@@ -26017,15 +26645,14 @@
                 });
 
                 // Update all chunk meshes
-                // NOTE: activeChunks contains string keys, not chunk objects — iterate chunkMeshes directly
-                chunkMeshes.forEach((mesh, key) => {
-                    const isWater = key.includes("_WATER");
-                    if (isWater) {
+                activeChunks.forEach((chunk) => {
+                    if (chunk.terrainMesh) {
+                        chunk.terrainMesh.castShadow = shadowsEnabled;
+                        chunk.terrainMesh.receiveShadow = shadowsEnabled;
+                    }
+                    if (chunk.waterMesh) {
                         // Water doesn't cast shadows but can receive them
-                        mesh.receiveShadow = shadowsEnabled;
-                    } else {
-                        mesh.castShadow = shadowsEnabled;
-                        mesh.receiveShadow = shadowsEnabled;
+                        chunk.waterMesh.receiveShadow = shadowsEnabled;
                     }
                 });
 
@@ -29763,6 +30390,7 @@ self.onmessage = async (e) => {
                     SETTINGS.torchRange = DEFAULTS.torchRange;
                     // Ambient
                     SETTINGS.ambientIntensity = DEFAULTS.ambientIntensity;
+                    SETTINGS.lighting = { ...DEFAULTS.lighting };
                     // Volumetric Lighting
                     SETTINGS.volumetricLightingEnabled = DEFAULTS.volumetricLightingEnabled;
                     SETTINGS.volumetricDensity = DEFAULTS.volumetricDensity;
@@ -37403,7 +38031,7 @@ self.onmessage = async (e) => {
                 return { caveCache1, caveCache2, cxDim, cxzStride };
             }
             // Generate terrain and carve caves
-            function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings, seed) {
+            function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings) {
                 const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
                 const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
 
@@ -37452,19 +38080,18 @@ self.onmessage = async (e) => {
                         for (const [dx, dz] of neighborOffsets) {
                             const nx = lx + dx;
                             const nz = lz + dz;
-                            // Sample from cache if in-bounds; otherwise query blendedHeight directly
-                            // so that chunk-edge columns see accurate cross-chunk slope data
-                            const neighborY = (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize)
-                                ? heightCache[nx + nz * chunkSize]
-                                : blendedHeight(startX + nx, startZ + nz, seed);
-                            const slope = worldTopY - neighborY; // Positive = we're higher
-                            const absSlope = Math.abs(slope);
-                            if (absSlope > maxSlope) maxSlope = absSlope;
-                            // Track directional slopes for aspect calculations
-                            if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
-                            if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
-                            if (dx > 0) slopeEast = Math.max(slopeEast, slope);
-                            if (dx < 0) slopeWest = Math.max(slopeWest, slope);
+                            if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
+                                const nIdx = nx + nz * chunkSize;
+                                const neighborY = heightCache[nIdx];
+                                const slope = worldTopY - neighborY; // Positive = we're higher
+                                const absSlope = Math.abs(slope);
+                                if (absSlope > maxSlope) maxSlope = absSlope;
+                                // Track directional slopes for aspect calculations
+                                if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
+                                if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
+                                if (dx > 0) slopeEast = Math.max(slopeEast, slope);
+                                if (dx < 0) slopeWest = Math.max(slopeWest, slope);
+                            }
                         }
 
                         const isCliff = maxSlope >= CLIFF_SLOPE;
@@ -38064,7 +38691,7 @@ self.onmessage = async (e) => {
                     let genState = 0;
 
                     // --- PASS 1: Generate terrain with caves ---
-                    generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, window.worldGenSettings, seed);
+                    generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, window.worldGenSettings);
                     genState |= GEN_PASS.TERRAIN;
 
                     // --- PASS 2: Fill water ---
