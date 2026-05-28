@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VoxEx Terrain Debugger</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',monospace;background:#1a1a1a;color:#eee;padding:20px}
+h1{color:#4caf50;margin-bottom:4px}
+.subtitle{color:#888;margin-bottom:16px;font-size:14px}
+.controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px;background:#222;padding:10px 14px;border-radius:8px}
+.controls label{font-size:13px;color:#aaa}
+.controls input,.controls select{background:#333;color:#eee;border:1px solid #555;padding:4px 8px;border-radius:4px;font-size:13px;width:110px}
+.controls button{background:#4caf50;color:#fff;border:none;padding:8px 16px;border-radius:4px;font-size:13px;cursor:pointer}
+.controls button:hover{background:#66bb6a}
+#main-canvas{border:1px solid #444;border-radius:4px;cursor:crosshair;display:block;margin-bottom:12px}
+#cross-canvas{border:1px solid #444;border-radius:4px;display:block;margin-bottom:12px}
+.info-bar{background:#222;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;min-height:40px;line-height:1.6}
+.info-bar b{color:#4caf50}
+.info-bar .val{color:#81c784}
+.legend{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.legend-item{display:flex;align-items:center;gap:4px;font-size:11px;color:#bbb;background:#222;padding:3px 8px;border-radius:4px}
+.legend-swatch{width:12px;height:12px;border:1px solid #555;border-radius:2px}
+.stats-bar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+.stat-chip{background:#222;padding:4px 10px;border-radius:4px;font-size:12px;color:#aaa}
+.stat-chip span{color:#eee;font-weight:bold}
+</style>
+</head>
+<body>
+<h1>VoxEx Terrain Debugger</h1>
+<p class="subtitle">Shaded relief surface view + cross-section. Click the terrain to inspect columns.</p>
+
+<div class="controls">
+    <label>Seed: <input id="seed-input" value="test_seed_42"></label>
+    <label>Center X: <input id="cx-input" type="number" value="0" step="32"></label>
+    <label>Center Z: <input id="cz-input" type="number" value="0" step="32"></label>
+    <label>Size: <select id="size-select"><option value="128">128</option><option value="192" selected>192</option><option value="256">256</option></select></label>
+    <button onclick="generate()">Generate</button>
+</div>
+<div class="legend" id="legend"></div>
+<div class="stats-bar" id="stats"></div>
+<div class="info-bar" id="info">Click terrain to inspect a column.</div>
+
+<canvas id="main-canvas"></canvas>
+<canvas id="cross-canvas"></canvas>
+
+<script>
+// ============================================================
+// CONSTANTS
+// ============================================================
+const AIR=0,GRASS=1,DIRT=2,STONE=3,WOOD=4,LOG=5,LEAVES=6,BEDROCK=7,SAND=8,WATER=9,TORCH=10,SNOW=11,GRAVEL=12,LONGWOOD_LOG=13,LONGWOOD_LEAVES=14;
+const BIOME_CELL_SIZE=64;
+const WORLD_DIMS={chunkSize:16,chunkHeight:320,yOffset:0,seaLevel:60};
+
+const BLOCK_RGB={[GRASS]:[76,175,80],[DIRT]:[121,85,72],[STONE]:[158,158,158],[BEDROCK]:[26,26,26],[SAND]:[230,214,172],[WATER]:[33,150,243],[SNOW]:[245,245,245],[GRAVEL]:[117,117,117],[LOG]:[93,64,55],[LEAVES]:[46,125,50],[LONGWOOD_LOG]:[61,42,31],[LONGWOOD_LEAVES]:[27,94,32]};
+const BLOCK_NAMES={[AIR]:"Air",[GRASS]:"Grass",[DIRT]:"Dirt",[STONE]:"Stone",[BEDROCK]:"Bedrock",[SAND]:"Sand",[WATER]:"Water",[SNOW]:"Snow",[GRAVEL]:"Gravel",[LOG]:"Log",[LEAVES]:"Leaves"};
+const BIOME_COLORS={plains:"#7cb342",hills:"#9ccc65",forests:"#2E7D32",mountains:"#78909c",mountain_foothills:"#8d6e63",swamp:"#5d4037",longwoods:"#1B5E20"};
+
+// ============================================================
+// NOISE (exact copy from voxEx.html worker)
+// ============================================================
+class SeededRandom{constructor(seed){if(typeof seed==="string"){let h=0xdeadbeef;for(let i=0;i<seed.length;i++){h=Math.imul(h^seed.charCodeAt(i),2654435761);h=(h^(h>>>16))>>>0;}this.seed=h;}else{this.seed=seed>>>0;}}next(){let t=(this.seed+=0x6d2b79f5);t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;}}
+let perm=null,workerNumericSeed=null;
+const FADE_LUT=new Float32Array(256);for(let i=0;i<256;i++){const t=i/255;FADE_LUT[i]=t*t*t*(t*(t*6-15)+10);}
+function fadeFast(t){return FADE_LUT[Math.min(255,Math.max(0,(t*255)|0))];}
+const lerp=(t,a,b)=>a+t*(b-a), lerpValue=(a,b,t)=>a+t*(b-a);
+const grad=(h,x,y)=>{const u=h<8?x:y;const v=h<4?y:(h===12||h===14?x:0);return((h&1)===0?u:-u)+((h&2)===0?v:-v);};
+const grad3D=(hash,x,y,z)=>{const h=hash&15;const u=h<8?x:y;const v=h<4?y:(h===12||h===14?x:z);return((h&1)===0?u:-u)+((h&2)===0?v:-v);};
+function initNoise(seedStr){perm=new Uint8Array(512);const p=new Uint8Array(256);for(let i=0;i<256;i++)p[i]=i;const rng=new SeededRandom(seedStr);workerNumericSeed=rng.next();for(let i=0;i<256;i++){const r=Math.floor(rng.next()*(256-i))+i;[p[i],p[r]]=[p[r],p[i]];perm[i]=perm[i+256]=p[i];}}
+function noise2D(x,y){const X=Math.floor(x)&255,Y=Math.floor(y)&255;x-=Math.floor(x);y-=Math.floor(y);const u=fadeFast(x),v=fadeFast(y);const A=perm[X]+Y,B=perm[X+1]+Y;return lerp(v,lerp(u,grad(perm[A],x,y),grad(perm[B],x-1,y)),lerp(u,grad(perm[A+1],x,y-1),grad(perm[B+1],x-1,y-1)));}
+function fbm2D(x,z,o=4,p=0.5,l=2.0){let t=0,f=1,a=1,m=0;for(let i=0;i<o;i++){t+=noise2D(x*f,z*f)*a;m+=a;a*=p;f*=l;}return t/m;}
+function fbmWithDomainWarp(x,z,o,p,l){const ws=0.03;return fbm2D(x+fbm2D(x*ws,z*ws,3,0.5,2)*20,z+fbm2D((x+100)*ws,(z+100)*ws,3,0.5,2)*20,o,p,l);}
+
+// ============================================================
+// BIOMES + HEIGHT (exact from voxEx.html)
+// ============================================================
+// MUST match voxEx.html BIOME_CONFIG exactly
+const BIOME_CONFIG={plains:{weight:2,baseHeight:62,amplitude:8,roughness:0.005,tags:[]},hills:{weight:2,baseHeight:65,amplitude:40,roughness:0.01,tags:[]},forests:{weight:2,baseHeight:62,amplitude:15,roughness:0.008,tags:["forested"]},mountains:{weight:0.5,baseHeight:64,amplitude:180,roughness:0.003,tags:["mountain"]},swamp:{weight:1,baseHeight:58,amplitude:6,roughness:0.008,tags:[]},longwoods:{weight:2,baseHeight:62,amplitude:12,roughness:0.006,tags:["giant_trees"]},mountain_foothills:{weight:0,baseHeight:70,amplitude:55,roughness:0.006,tags:["mountain"]}};
+const BIOME_NAMES=Object.keys(BIOME_CONFIG),BIOME_WEIGHTS=BIOME_NAMES.map(n=>BIOME_CONFIG[n].weight),TOTAL_BIOME_WEIGHT=BIOME_WEIGHTS.reduce((a,b)=>a+b,0);
+const biomeCellCache=new Map();
+const _BIOME_CDF_TABLE=[[0,0],[0.252,0.01],[0.299,0.05],[0.354,0.10],[0.394,0.15],[0.429,0.20],[0.440,0.25],[0.452,0.30],[0.457,0.35],[0.477,0.40],[0.4997,0.45],[0.5003,0.55],[0.523,0.60],[0.543,0.65],[0.548,0.70],[0.560,0.75],[0.571,0.80],[0.605,0.85],[0.646,0.90],[0.700,0.95],[0.748,0.99],[1,1]];
+function uniformBiomeRoll(v){const n=(v+1)*0.5;for(let i=1;i<_BIOME_CDF_TABLE.length;i++){if(n<=_BIOME_CDF_TABLE[i][0]){const[x0,y0]=_BIOME_CDF_TABLE[i-1],[x1,y1]=_BIOME_CDF_TABLE[i];return y0+(y1-y0)*(n-x0)/(x1-x0);}}return 1;}
+function getRawBiomeCellValue(cx,cz){const n=uniformBiomeRoll(noise2D(cx*0.1+1000,cz*0.1+1000));let acc=0,sel=BIOME_NAMES[0];for(let i=0;i<BIOME_NAMES.length;i++){const name=BIOME_NAMES[i];if(name==='mountain_foothills')continue;acc+=BIOME_WEIGHTS[i]/TOTAL_BIOME_WEIGHT;if(n<=acc){sel=name;break;}}return{name:sel,...BIOME_CONFIG[sel]};}
+function getBiomeCellValue(cx,cz){const key=cx+','+cz;if(biomeCellCache.has(key))return biomeCellCache.get(key);const raw=getRawBiomeCellValue(cx,cz);if(raw.name==='mountains'){biomeCellCache.set(key,raw);return raw;}const MAX_FOOTHILL_RINGS=1;let nearest=Infinity;const _FH=[[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];for(let i=0;i<8;i++){if(getRawBiomeCellValue(cx+_FH[i][0],cz+_FH[i][1]).name==='mountains'){nearest=1;break;}}if(nearest<=MAX_FOOTHILL_RINGS){const t=(nearest-0.5)/MAX_FOOTHILL_RINGS;const rf=Math.max(0.05,1-t*t);const fh={...BIOME_CONFIG.mountain_foothills,name:'mountain_foothills',_foothillRing:nearest,_maxFoothillRing:MAX_FOOTHILL_RINGS,_ringFactor:rf};biomeCellCache.set(key,fh);return fh;}biomeCellCache.set(key,raw);return raw;}
+function getBiomeParams(gx,gz){const seed=workerNumericSeed;const rwX=noise2D(gx*0.003+seed*0.13,gz*0.003-seed*0.07)+noise2D(gx*0.012+seed*0.31,gz*0.012-seed*0.17)*0.5;const rwZ=noise2D(gx*0.003-seed*0.19,gz*0.003+seed*0.11)+noise2D(gx*0.012-seed*0.43,gz*0.012+seed*0.29)*0.5;const wX=rwX,wZ=rwZ;return getBiomeCellValue(Math.floor(gx/BIOME_CELL_SIZE+wX),Math.floor(gz/BIOME_CELL_SIZE+wZ));}
+
+function continentalHeight(gx,gz,seed){return Math.max(-1,Math.min(1,fbmWithDomainWarp(gx*0.002,gz*0.002,4,0.5,2)*0.7+fbm2D(gx*0.004+seed*3.17,gz*0.004-seed*5.41,3,0.6,1.8)*0.3+0.3));}
+function defaultHeightFunc(gx,gz,b,seed){return b.baseHeight+fbm2D(gx*b.roughness,gz*b.roughness,4,0.5,2)*b.amplitude;}
+function hillsHeightFunc(gx,gz,b,seed){let n=Math.abs(noise2D(gx*b.roughness,gz*b.roughness));return b.baseHeight+n*n*b.amplitude;}
+function plainsHeightFunc(gx,gz,b,seed){return b.baseHeight+(noise2D(gx*0.003,gz*0.003)+noise2D(gx*0.05,gz*0.05)*0.1)*b.amplitude;}
+function foothillsHeightFunc(gx,gz,b,seed){const rf=b._ringFactor??1;const mb=BIOME_CONFIG.mountains;const mH=mountainsHeightFunc(gx,gz,mb,seed);const pb=(BIOME_CONFIG.plains&&BIOME_CONFIG.plains.baseHeight)??62;const eb=pb+(b.baseHeight-pb)*rf;const baseH=eb+noise2D(gx*0.005+seed*3,gz*0.005-seed*3)*15;const mw=rf*0.9;return Math.min(Math.max(baseH+(mH-mb.baseHeight)*mw,pb-10),250);}
+function mountainsHeightFunc(gx,gz,b,seed){const wX=gx+noise2D(gx*0.0015+seed,gz*0.0015)*80,wZ=gz+noise2D(gx*0.0015+100,gz*0.0015+seed)*80;const rn=noise2D(gx*0.0006+seed*0.3,gz*0.0006-seed*0.3),rn2=noise2D(gx*0.001+seed*0.7,gz*0.001+seed*0.2);const rs=0.15+Math.pow((rn+1)*0.5,0.8)*0.55+Math.pow((rn2+1)*0.5,1.2)*0.30;const rx=wX*b.roughness,rz=wZ*b.roughness;let ridgeSum=0,amp=1,freq=1;for(let i=0;i<6;i++){let n=1-Math.abs(noise2D(rx*freq+seed*10,rz*freq+seed*10));n=Math.pow(n,i<2?1.6:1.4);ridgeSum+=n*amp;freq*=2;amp*=0.52;}ridgeSum/=1.9;if(ridgeSum>0.5)ridgeSum+=Math.pow((ridgeSum-0.5)*2,3)*0.4;if(ridgeSum>0.9)ridgeSum+=(ridgeSum-0.9)*1.5;const jf=0.08,j1=1-Math.abs(noise2D(gx*jf+seed*30,gz*jf-seed*30)),j2=1-Math.abs(noise2D(gx*jf*2.3-seed*17,gz*jf*2.3+seed*13));const jagged=(Math.pow(j1,1.8)*0.12+Math.pow(j2,2.2)*0.08)*(0.4+ridgeSum*0.6);const vn=noise2D(gx*0.003+seed*5,gz*0.003-seed*5),vn2=noise2D(gx*0.006-seed*2,gz*0.006+seed*2);const vc=Math.max(0,-vn*0.5-vn2*0.3)*0.35;const sn=noise2D(gx*0.008+seed*8,gz*0.008-seed*8),sf=sn>0.6?(sn-0.6)*0.5:0;const ptn=noise2D(gx*0.004+seed*12,gz*0.004-seed*12);let pb=0;if(ptn>0.3&&ridgeSum>0.55){const sp=noise2D(gx*0.02+seed*15,gz*0.02-seed*15);if(sp>0.45)pb=Math.pow((sp-0.45)*1.8,2.5)*0.35;}else if(ptn<-0.3&&ridgeSum>0.5)pb=ridgeSum*0.1;const en=noise2D(gx*0.08+seed*3,gz*0.08-seed*3),en2=noise2D(gx*0.15-seed*4,gz*0.15+seed*4),en3=noise2D(gx*0.25+seed*7,gz*0.25-seed*7);const ea=(Math.abs(en)*0.05+Math.abs(en2)*0.03+Math.abs(en3)*0.02)*(0.4+ridgeSum*0.6);const gn=1-Math.abs(noise2D(gx*0.025+seed*25,gz*0.025-seed*25)),gc=gn>0.85?(gn-0.85)*0.15:0;const rc1=1-Math.abs(noise2D(gx*0.004+seed*40,gz*0.004-seed*40)),rc2=1-Math.abs(noise2D(gx*0.008-seed*25,gz*0.008+seed*35));const rc=Math.pow(rc1,2)*0.12*ridgeSum+Math.pow(rc2,2.5)*0.08*ridgeSum;/* cell-edge falloff removed: per-cell neighbour lookup created step discontinuities at cell boundaries. Foothill ring system handles the mountain->lowland taper continuously. */let th=(ridgeSum-vc-sf+pb+ea+jagged+rc-gc)*rs;th=(noise2D(gx*0.002,gz*0.002)+1)*0.5*0.04+th*0.96;return Math.min(Math.max(b.baseHeight+th*b.amplitude*(b._amplitudeScale??1),b.baseHeight-10),285);}
+const HEIGHT_FUNCS={plains:plainsHeightFunc,hills:hillsHeightFunc,forests:defaultHeightFunc,mountains:mountainsHeightFunc,mountain_foothills:foothillsHeightFunc,swamp:defaultHeightFunc,longwoods:defaultHeightFunc};
+function getOceanFactor(gx,gz,seed){const on=noise2D(gx*0.0008+seed*1.5,gz*0.0008-seed*0.8),cn=noise2D(gx*0.004+seed*2.1,gz*0.004+seed*1.3),dn=noise2D(gx*0.02-seed*0.5,gz*0.02+seed*0.9)*0.1;const c=on+cn*0.3+dn;if(c<-0.3)return 0;if(c<-0.1){let t=(c+0.3)/0.2;return t*t*(3-2*t);}return 1;}
+function getOceanDepth(of,gx,gz,seed){return 20+(noise2D(gx*0.008+seed*0.9,gz*0.008-seed*0.6)+1)*0.5*15*(1-of);}
+function getBiomeHeightAtCell(cx,cz,gx,gz,seed,cf){const b=getBiomeCellValue(cx,cz);const hf=HEIGHT_FUNCS[b.name]||defaultHeightFunc;let h=hf(gx,gz,b,seed);const t=(cf+1)*0.5;h=b.baseHeight+(h-b.baseHeight)*(0.3+t*0.7);h+=Math.max(0,cf-0.15)*10;return h;}
+function blendedHeight(gx,gz,seed){const c=continentalHeight(gx,gz,seed);const gs=BIOME_CELL_SIZE;const rwX=noise2D(gx*0.003+seed*0.13,gz*0.003-seed*0.07)+noise2D(gx*0.012+seed*0.31,gz*0.012-seed*0.17)*0.5;const rwZ=noise2D(gx*0.003-seed*0.19,gz*0.003+seed*0.11)+noise2D(gx*0.012-seed*0.43,gz*0.012+seed*0.29)*0.5;const wX=rwX,wZ=rwZ;const u=gx/gs-0.5+wX,v=gz/gs-0.5+wZ;const x0=Math.floor(u),z0=Math.floor(v);const wx=u-x0,wz=v-z0;const sx=wx*wx*(3-2*wx),sz=wz*wz*(3-2*wz);const h00=getBiomeHeightAtCell(x0,z0,gx,gz,seed,c),h10=getBiomeHeightAtCell(x0+1,z0,gx,gz,seed,c),h01=getBiomeHeightAtCell(x0,z0+1,gx,gz,seed,c),h11=getBiomeHeightAtCell(x0+1,z0+1,gx,gz,seed,c);let fh=lerpValue(lerpValue(h00,h10,sx),lerpValue(h01,h11,sx),sz);/* peak rescue removed: discontinuous Math.max threshold caused 16-18 block jumps when warp slid the bilinear cell window */const of=getOceanFactor(gx,gz,seed);if(of<1){const bank=of*of*(3-2*of);fh=lerpValue(WORLD_DIMS.seaLevel-getOceanDepth(of,gx,gz,seed),fh,bank);}return Math.floor(fh);}
+
+// ============================================================
+// SURFACE BLOCK LOGIC (exact from generateTerrainPass)
+// ============================================================
+function getSurfaceBlock(gx, gz, worldTopY, biome, neighborHeights) {
+    const isMountain = biome?.tags?.includes("mountain");
+    const maxSlope = neighborHeights.reduce((mx, nh) => Math.max(mx, Math.abs(worldTopY - nh)), 0);
+    let slopeNorth = 0, slopeSouth = 0;
+    if (neighborHeights.length >= 4) { slopeNorth = worldTopY - neighborHeights[2]; slopeSouth = worldTopY - neighborHeights[3]; }
+    const isCliff = maxSlope >= 8, isSteep = maxSlope >= 5, isModerate = maxSlope >= 3;
+    const northFacing = slopeNorth > slopeSouth + 1, isExposedRidge = slopeNorth > 2 && slopeSouth > 2;
+    const surfaceNoise = noise2D(gx * 0.1, gz * 0.1), patchNoise = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
+    const detailNoise = noise2D(gx * 0.2 + 200, gz * 0.2 + 200), screeNoise = noise2D(gx * 0.08 + 300, gz * 0.08 + 300);
+    let id = GRASS;
+    if (worldTopY < WORLD_DIMS.seaLevel + 2 && worldTopY >= WORLD_DIMS.seaLevel - 1) id = SAND;
+    else if (isMountain || worldTopY >= 85) {
+        if (worldTopY >= 190) { if (isCliff) id = STONE; else if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL; else if (isExposedRidge && detailNoise > 0.4) id = STONE; else id = SNOW; }
+        else if (worldTopY >= 160) { if (isCliff) id = STONE; else if (northFacing && !isSteep && patchNoise > 0.2) id = SNOW; else if (!isModerate && patchNoise > 0.5) id = SNOW; else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL; else id = surfaceNoise > 0.3 ? STONE : GRAVEL; }
+        else if (worldTopY >= 140) { if (isCliff) id = STONE; else if (isModerate && screeNoise > 0) id = GRAVEL; else if (northFacing && !isSteep && patchNoise > 0.6) id = SNOW; else id = surfaceNoise > 0.2 ? STONE : GRAVEL; }
+        else if (worldTopY >= 110 || isCliff) { if (isCliff) id = STONE; else if (!isModerate && detailNoise > 0.6) id = STONE; else if (isModerate) id = screeNoise > 0 ? GRAVEL : STONE; else { const r = surfaceNoise + detailNoise * 0.5; id = r > 0.4 ? STONE : r > -0.2 ? GRAVEL : STONE; } }
+        else if (worldTopY >= 85) { if (isCliff) id = STONE; else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL; else if (!isModerate) { if (patchNoise > 0.3) id = GRASS; else if (patchNoise > -0.2) id = DIRT; else id = surfaceNoise > 0 ? STONE : GRAVEL; } else { if (patchNoise > 0.5) id = GRASS; else if (patchNoise > 0) id = DIRT; else id = GRAVEL; } }
+        else { if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL; else if (isModerate) { if (patchNoise > -0.3) id = GRASS; else id = DIRT; } else { if (detailNoise > 0.7) id = STONE; else if (patchNoise > -0.4) id = GRASS; else id = DIRT; } }
+    } else {
+        if (isSteep) id = surfaceNoise > 0.5 ? STONE : DIRT;
+        else if (detailNoise > 0.8) id = STONE;
+        else id = GRASS;
+    }
+    if (id === GRASS && worldTopY < WORLD_DIMS.seaLevel) id = DIRT;
+    return id;
+}
+
+// ============================================================
+// RENDERING
+// ============================================================
+const SCALE = 3; // pixels per block on main view
+let data = null; // { size, startX, startZ, heights, surfaces, biomes, seed }
+
+function generate() {
+    const seedStr = document.getElementById('seed-input').value;
+    const centerX = parseInt(document.getElementById('cx-input').value) || 0;
+    const centerZ = parseInt(document.getElementById('cz-input').value) || 0;
+    const size = parseInt(document.getElementById('size-select').value);
+
+    biomeCellCache.clear();
+    initNoise(seedStr);
+    const seed = workerNumericSeed;
+    const startX = centerX - (size >> 1), startZ = centerZ - (size >> 1);
+
+    const heights = new Int16Array(size * size);
+    const surfaces = new Uint8Array(size * size);
+    const biomes = new Array(size * size);
+    let minH = Infinity, maxH = -Infinity;
+    const blockCounts = {};
+
+    // Pass 1: heights + biomes
+    for (let z = 0; z < size; z++) for (let x = 0; x < size; x++) {
+        const idx = x + z * size, gx = startX + x, gz = startZ + z;
+        heights[idx] = blendedHeight(gx, gz, seed);
+        biomes[idx] = getBiomeParams(gx, gz);
+        if (heights[idx] < minH) minH = heights[idx];
+        if (heights[idx] > maxH) maxH = heights[idx];
+    }
+    // Pass 2: surface blocks (needs neighbor heights for slope)
+    for (let z = 0; z < size; z++) for (let x = 0; x < size; x++) {
+        const idx = x + z * size, gx = startX + x, gz = startZ + z;
+        const nh = [];
+        for (const [dx, dz] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+            const ni = (x+dx) + (z+dz) * size;
+            nh.push(ni >= 0 && ni < size*size && x+dx >= 0 && x+dx < size && z+dz >= 0 && z+dz < size ? heights[ni] : heights[idx]);
+        }
+        surfaces[idx] = getSurfaceBlock(gx, gz, heights[idx], biomes[idx], nh);
+        blockCounts[surfaces[idx]] = (blockCounts[surfaces[idx]] || 0) + 1;
+    }
+
+    data = { size, startX, startZ, heights, surfaces, biomes, seed, minH, maxH };
+
+    // Stats
+    const statsEl = document.getElementById('stats');
+    const total = size * size;
+    statsEl.innerHTML = `<div class="stat-chip">Height: <span>${minH}–${maxH}</span></div><div class="stat-chip">Sea: <span>${WORLD_DIMS.seaLevel}</span></div>` +
+        Object.entries(blockCounts).sort((a,b)=>b[1]-a[1]).map(([bid,count])=>`<div class="stat-chip">${BLOCK_NAMES[bid]||bid}: <span>${(count/total*100).toFixed(1)}%</span></div>`).join('');
+
+    // Legend
+    document.getElementById('legend').innerHTML = Object.entries(BLOCK_RGB)
+        .filter(([id]) => blockCounts[id])
+        .map(([id,[r,g,b]])=>`<div class="legend-item"><div class="legend-swatch" style="background:rgb(${r},${g},${b})"></div>${BLOCK_NAMES[id]||id}</div>`).join('');
+
+    renderMainView();
+    renderCrossSection(Math.floor(size / 2));
+}
+
+function renderMainView() {
+    if (!data) return;
+    const { size, heights, surfaces, biomes, minH, maxH } = data;
+    const canvas = document.getElementById('main-canvas');
+    canvas.width = size * SCALE;
+    canvas.height = size * SCALE;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(size, size);
+    const d = img.data;
+
+    for (let z = 0; z < size; z++) for (let x = 0; x < size; x++) {
+        const idx = x + z * size;
+        const h = heights[idx];
+        const block = surfaces[idx];
+        const i = idx * 4;
+
+        // Base color from block type
+        let rgb = BLOCK_RGB[block] || [255, 0, 255];
+        let [r, g, b] = rgb;
+
+        // Height-based shading (simulate light from NW)
+        const hN = z > 0 ? heights[x + (z-1) * size] : h;
+        const hW = x > 0 ? heights[(x-1) + z * size] : h;
+        const slopeShade = ((h - hN) + (h - hW)) * 4; // NW illumination
+        const heightBright = 0.6 + ((h - minH) / (maxH - minH || 1)) * 0.4;
+
+        r = Math.min(255, Math.max(0, r * heightBright + slopeShade));
+        g = Math.min(255, Math.max(0, g * heightBright + slopeShade));
+        b = Math.min(255, Math.max(0, b * heightBright + slopeShade));
+
+        // Water: blend with depth
+        if (h < WORLD_DIMS.seaLevel) {
+            const waterDepth = WORLD_DIMS.seaLevel - h;
+            const waterAlpha = Math.min(0.9, waterDepth / 30);
+            r = r * (1 - waterAlpha) + 25 * waterAlpha;
+            g = g * (1 - waterAlpha) + 100 * waterAlpha;
+            b = b * (1 - waterAlpha) + 200 * waterAlpha;
+        }
+
+        d[i] = r; d[i+1] = g; d[i+2] = b; d[i+3] = 255;
+    }
+
+    // Scale up with nearest neighbor
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = size; tempCanvas.height = size;
+    tempCanvas.getContext('2d').putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(tempCanvas, 0, 0, size * SCALE, size * SCALE);
+
+    canvas.onclick = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = Math.floor((e.clientX - rect.left) / SCALE);
+        const z = Math.floor((e.clientY - rect.top) / SCALE);
+        if (x >= 0 && x < size && z >= 0 && z < size) {
+            renderCrossSection(z);
+            showColumnInfo(x, z);
+            // Draw selection crosshair
+            renderMainView();
+            const ctx2 = canvas.getContext('2d');
+            ctx2.strokeStyle = '#ff0'; ctx2.lineWidth = 1;
+            ctx2.strokeRect(x * SCALE, z * SCALE, SCALE, SCALE);
+            // Horizontal line for cross-section
+            ctx2.strokeStyle = 'rgba(255,255,0,0.3)'; ctx2.lineWidth = 1;
+            ctx2.beginPath(); ctx2.moveTo(0, z * SCALE + SCALE/2); ctx2.lineTo(size * SCALE, z * SCALE + SCALE/2); ctx2.stroke();
+        }
+    };
+}
+
+function renderCrossSection(sliceZ) {
+    if (!data) return;
+    const { size, startX, startZ, heights, surfaces } = data;
+    const canvas = document.getElementById('cross-canvas');
+    const yScale = 2; // Vertical exaggeration
+    // Find visible Y range for this slice
+    let sliceMin = Infinity, sliceMax = -Infinity;
+    for (let x = 0; x < size; x++) { const h = heights[x + sliceZ * size]; sliceMin = Math.min(sliceMin, h); sliceMax = Math.max(sliceMax, h); }
+    const padBot = 15, padTop = 10;
+    const viewMin = Math.max(0, sliceMin - padBot);
+    const viewMax = Math.min(320, sliceMax + padTop);
+    const viewH = viewMax - viewMin;
+    canvas.width = size * SCALE;
+    canvas.height = viewH * yScale;
+    const ctx = canvas.getContext('2d');
+
+    // Sky gradient
+    const skyGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    skyGrad.addColorStop(0, '#87CEEB'); skyGrad.addColorStop(1, '#b0d4e8');
+    ctx.fillStyle = skyGrad;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    for (let x = 0; x < size; x++) {
+        const idx = x + sliceZ * size;
+        const h = heights[idx];
+        const surfBlock = surfaces[idx];
+
+        for (let y = viewMin; y <= Math.min(viewMax, h); y++) {
+            const canvasY = (viewMax - y) * yScale;
+            const depth = h - y;
+            let rgb;
+            if (y <= 0) rgb = BLOCK_RGB[BEDROCK];
+            else if (depth === 0) rgb = BLOCK_RGB[surfBlock] || [255,0,255];
+            else if (depth < 4) rgb = BLOCK_RGB[DIRT];
+            else rgb = BLOCK_RGB[STONE];
+
+            // Darken subsurface slightly
+            let [r, g, b] = rgb;
+            if (depth > 0) { const dim = Math.max(0.5, 1 - depth * 0.02); r *= dim; g *= dim; b *= dim; }
+
+            ctx.fillStyle = `rgb(${r|0},${g|0},${b|0})`;
+            ctx.fillRect(x * SCALE, canvasY, SCALE, yScale);
+        }
+
+        // Water column
+        if (h < WORLD_DIMS.seaLevel) {
+            for (let y = h + 1; y <= WORLD_DIMS.seaLevel; y++) {
+                if (y >= viewMin && y <= viewMax) {
+                    const canvasY = (viewMax - y) * yScale;
+                    const waterDepth = WORLD_DIMS.seaLevel - y;
+                    ctx.fillStyle = `rgba(33,150,243,${0.3 + waterDepth/40*0.5})`;
+                    ctx.fillRect(x * SCALE, canvasY, SCALE, yScale);
+                }
+            }
+        }
+    }
+
+    // Sea level line
+    if (WORLD_DIMS.seaLevel >= viewMin && WORLD_DIMS.seaLevel <= viewMax) {
+        const slY = (viewMax - WORLD_DIMS.seaLevel) * yScale;
+        ctx.strokeStyle = '#2196F3'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+        ctx.beginPath(); ctx.moveTo(0, slY); ctx.lineTo(canvas.width, slY); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = '#2196F3'; ctx.font = '11px monospace'; ctx.fillText(`sea level (${WORLD_DIMS.seaLevel})`, 4, slY - 3);
+    }
+
+    // Y-axis labels
+    ctx.fillStyle = '#aaa'; ctx.font = '10px monospace';
+    for (let y = Math.ceil(viewMin / 10) * 10; y <= viewMax; y += 10) {
+        const cy = (viewMax - y) * yScale;
+        ctx.fillText(y.toString(), 2, cy + 4);
+        ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(25, cy); ctx.lineTo(canvas.width, cy); ctx.stroke();
+    }
+
+    // Label
+    ctx.fillStyle = '#aaa'; ctx.font = '12px monospace';
+    ctx.fillText(`Cross-section at Z=${startZ + sliceZ}`, canvas.width - 220, 14);
+}
+
+function showColumnInfo(x, z) {
+    if (!data) return;
+    const { size, startX, startZ, heights, surfaces, biomes } = data;
+    const idx = x + z * size;
+    const gx = startX + x, gz = startZ + z;
+    const h = heights[idx], block = surfaces[idx], biome = biomes[idx];
+    const sn = noise2D(gx * 0.1, gz * 0.1), pn = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
+    const dn = noise2D(gx * 0.2 + 200, gz * 0.2 + 200);
+    // Determine slope
+    const nh = [[-1,0],[1,0],[0,-1],[0,1]].map(([dx,dz])=>{const ni=(x+dx)+(z+dz)*size;return ni>=0&&ni<size*size&&x+dx>=0&&x+dx<size&&z+dz>=0&&z+dz<size?heights[ni]:h;});
+    const maxSlope = nh.reduce((mx,v)=>Math.max(mx,Math.abs(h-v)),0);
+    const slopeLabel = maxSlope >= 8 ? 'CLIFF' : maxSlope >= 5 ? 'STEEP' : maxSlope >= 3 ? 'MODERATE' : 'gentle';
+
+    const rgb = BLOCK_RGB[block] || [128,128,128];
+    document.getElementById('info').innerHTML =
+        `<b>Column (${gx}, ${gz})</b> &nbsp; Height: <span class="val">${h}</span> &nbsp; ` +
+        `Surface: <span style="color:rgb(${rgb.join(',')})">${BLOCK_NAMES[block]}</span> &nbsp; ` +
+        `Biome: <span style="color:${BIOME_COLORS[biome.name]}">${biome.name}</span> &nbsp; ` +
+        `Slope: <span class="val">${maxSlope} (${slopeLabel})</span><br>` +
+        `surfaceNoise=<span class="val">${sn.toFixed(3)}</span> &nbsp; ` +
+        `patchNoise=<span class="val">${pn.toFixed(3)}</span> &nbsp; ` +
+        `detailNoise=<span class="val">${dn.toFixed(3)}</span> &nbsp; ` +
+        `isMountain=<span class="val">${biome.tags?.includes("mountain")}</span> &nbsp; ` +
+        `elevation zone: <span class="val">${h>=190?'SNOW':h>=160?'SNOW_PATCHES':h>=140?'HIGH_ROCK':h>=110?'ROCK':h>=85?'ALPINE':'LOWLAND'}</span>`;
+}
+
+window.addEventListener('load', generate);
+</script>
+</body>
+</html>
