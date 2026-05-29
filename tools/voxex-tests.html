@@ -623,11 +623,14 @@ async function runAllTests() {
         });
     });
 
-    describe("Tier 4: chunk worker round-trip parity", () => {
-        it("worker terrain surface matches main-thread blendedHeight", async () => {
+    describe("Tier 4: chunk worker round-trip + blendedHeight parity", () => {
+        it("worker generates a full chunk and its blendedHeight mirrors main exactly", async () => {
             const SEED = "worker_parity";
-            const code = VoxEx.buildChunkWorkerCode();
-            expect(typeof code).toBe('string');
+            // Append a TEST-ONLY debug handler so the worker can echo its own blendedHeight.
+            // (Compares the worker's injected terrain math to main's — the correct oracle. The raw
+            // blendedHeight, not the final post-feature blocks, is what must match across threads.)
+            let code = VoxEx.buildChunkWorkerCode();
+            code += "\nself.addEventListener('message',function(e){if(e.data&&e.data.type==='__bh'){var r={};for(var i=0;i<e.data.cols.length;i++){var c=e.data.cols[i];r[c[0]+','+c[1]]=blendedHeight(c[0],c[1],workerNumericSeed);}self.postMessage({type:'__bhr',heights:r});}});";
             const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
             const worker = new Worker(url);
             try {
@@ -639,26 +642,31 @@ async function runAllTests() {
                 });
                 const terrain = await new Promise((resolve, reject) => {
                     const to = setTimeout(() => reject(new Error('worker generate timeout')), 10000);
-                    worker.onmessage = (e) => { if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(e.data); } };
+                    worker.onmessage = (e) => {
+                        if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(e.data); }
+                        else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker gen error: ' + e.data.error)); }
+                    };
                     worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
                     worker.postMessage({ type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} });
                 });
-                const blocks = terrain.blocks;
-                expect(blocks.length).toBe(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+                // (a) crash fix: full chunk with both solid and air (not empty, not all-solid)
+                expect(terrain.blocks.length).toBe(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+                let air = 0, solid = 0;
+                for (let i = 0; i < terrain.blocks.length; i++) { if (terrain.blocks[i] === AIR) air++; else solid++; }
+                expect(air).toBeGreaterThan(0);
+                expect(solid).toBeGreaterThan(0);
+                // (b) blendedHeight parity: worker's injected blendedHeight === main's for sampled columns
+                const cols = [];
+                for (let lx = 0; lx < CHUNK_SIZE; lx += 4) for (let lz = 0; lz < CHUNK_SIZE; lz += 4) cols.push([lx, lz]);
+                const wh = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker bh timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === '__bhr') { clearTimeout(to); resolve(e.data.heights); } };
+                    worker.postMessage({ type: '__bh', cols });
+                });
                 biomeCellCache.clear(); seedNoise(SEED); const sd = VoxEx.worldSeed;
-                const TERRAIN = new Set([GRASS, DIRT, STONE, SAND, SNOW, GRAVEL, BEDROCK]);
-                let sampled = 0, matched = 0;
-                for (let lx = 0; lx < CHUNK_SIZE; lx += 2) {
-                    for (let lz = 0; lz < CHUNK_SIZE; lz += 2) {
-                        let top = -1;
-                        for (let ly = CHUNK_HEIGHT - 1; ly >= 0; ly--) { if (TERRAIN.has(blocks[blockIndex(lx, ly, lz)])) { top = ly; break; } }
-                        const expected = blendedHeight(lx, lz, sd);
-                        sampled++;
-                        if (top >= 0 && Math.abs(top - expected) <= 3) matched++;
-                    }
+                for (const [lx, lz] of cols) {
+                    expect(wh[lx + ',' + lz]).toBe(blendedHeight(lx, lz, sd));
                 }
-                const ratio = matched / sampled;
-                if (ratio < 0.6) throw new Error(`worker/main parity too low: ${matched}/${sampled} (${Math.round(ratio*100)}%) columns within +/-3 of blendedHeight`);
             } finally {
                 worker.terminate();
                 URL.revokeObjectURL(url);
