@@ -674,6 +674,46 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: IndexedDB chunk persistence round-trip", () => {
+        function idbRoundtrip(key, value) {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open('voxex_test_db', 1);
+                req.onupgradeneeded = () => { req.result.createObjectStore('chunks'); };
+                req.onerror = () => reject(req.error || new Error('idb open failed'));
+                req.onsuccess = () => {
+                    const db = req.result;
+                    const wtx = db.transaction('chunks', 'readwrite');
+                    wtx.objectStore('chunks').put(value, key);
+                    wtx.onerror = () => { db.close(); reject(wtx.error || new Error('idb write failed')); };
+                    wtx.oncomplete = () => {
+                        const rtx = db.transaction('chunks', 'readonly');
+                        const getReq = rtx.objectStore('chunks').get(key);
+                        getReq.onsuccess = () => { const v = getReq.result; db.close(); resolve(v); };
+                        getReq.onerror = () => { db.close(); reject(getReq.error || new Error('idb read failed')); };
+                    };
+                };
+            });
+        }
+        it("compressed chunk survives write/read byte-for-byte", async () => {
+            const n = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+            const blocks = new Uint8Array(n);
+            // structured terrain: bedrock floor, stone body, some air
+            for (let lx = 0; lx < CHUNK_SIZE; lx++) for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+                blocks[blockIndex(lx, 0, lz)] = BEDROCK;
+                for (let ly = 1; ly < 50; ly++) blocks[blockIndex(lx, ly, lz)] = STONE;
+            }
+            const comp = compressChunkData({ blocks, sections: createSectionData() });
+            const stored = await idbRoundtrip('c:0,0', comp);
+            expect(stored).toBeDefined();
+            const back = decompressChunkData(stored);
+            // byte-for-byte over a strided sweep + key boundaries
+            for (let i = 0; i < n; i += 257) expect(back.blocks[i]).toBe(blocks[i]);
+            expect(back.blocks[blockIndex(0, 0, 0)]).toBe(BEDROCK);
+            expect(back.blocks[blockIndex(5, 25, 5)]).toBe(STONE);
+            expect(back.blocks[blockIndex(5, 200, 5)]).toBe(AIR);
+        });
+    });
+
     await runRegistered();
     renderResults();
     renderTerrainVisualizations();
