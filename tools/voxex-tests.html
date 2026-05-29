@@ -623,6 +623,49 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: chunk worker round-trip parity", () => {
+        it("worker terrain surface matches main-thread blendedHeight", async () => {
+            const SEED = "worker_parity";
+            const code = VoxEx.buildChunkWorkerCode();
+            expect(typeof code).toBe('string');
+            const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            try {
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker init timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === 'ready') { clearTimeout(to); resolve(); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'init', jobId: 1, seedStr: SEED });
+                });
+                const terrain = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker generate timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(e.data); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} });
+                });
+                const blocks = terrain.blocks;
+                expect(blocks.length).toBe(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+                biomeCellCache.clear(); seedNoise(SEED); const sd = VoxEx.worldSeed;
+                const TERRAIN = new Set([GRASS, DIRT, STONE, SAND, SNOW, GRAVEL, BEDROCK]);
+                let sampled = 0, matched = 0;
+                for (let lx = 0; lx < CHUNK_SIZE; lx += 2) {
+                    for (let lz = 0; lz < CHUNK_SIZE; lz += 2) {
+                        let top = -1;
+                        for (let ly = CHUNK_HEIGHT - 1; ly >= 0; ly--) { if (TERRAIN.has(blocks[blockIndex(lx, ly, lz)])) { top = ly; break; } }
+                        const expected = blendedHeight(lx, lz, sd);
+                        sampled++;
+                        if (top >= 0 && Math.abs(top - expected) <= 3) matched++;
+                    }
+                }
+                const ratio = matched / sampled;
+                if (ratio < 0.6) throw new Error(`worker/main parity too low: ${matched}/${sampled} (${Math.round(ratio*100)}%) columns within +/-3 of blendedHeight`);
+            } finally {
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            }
+        });
+    });
+
     await runRegistered();
     renderResults();
     renderTerrainVisualizations();
