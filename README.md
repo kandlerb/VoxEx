@@ -25,7 +25,8 @@ VoxEx/
 │   ├── KeyFrame_editor.html
 │   ├── terrain-parameter-editor.html
 │   ├── voxelEditor.html
-│   └── voxex-sound-formula.html
+│   ├── voxex-sound-formula.html
+│   └── voxex-tests.html          # Test suite — runs against the real voxEx.html code via a ?test=1 seam
 └── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
 
@@ -142,6 +143,20 @@ Three.js is loaded from CDN via import map:
 }
 </script>
 ```
+
+### Running the Tests
+
+The automated test suite (`tools/voxex-tests.html`) loads the real `voxEx.html` in a hidden iframe via a `?test=1` seam that exposes `window.VoxEx`. It runs ~193 tests covering bootstrap, terrain, lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, a live chunk-worker round-trip, and an IndexedDB persistence round-trip.
+
+Because the suite uses Workers and IndexedDB it **must** be served over a local web server — `file://` will not work.
+
+1. Serve the repo root with any local server:
+   - **VS Code**: Live Server extension
+   - **Node**: `npx http-server`
+2. Open `http://localhost:<port>/tools/voxex-tests.html`
+3. The page loads `../voxEx.html?test=1` in a hidden iframe and reports a pass/fail summary.
+
+The `?test=1` seam is inert in normal use — the game boots as usual without it.
 
 ### Contributing
 

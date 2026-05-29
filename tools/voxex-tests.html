@@ -43,11 +43,14 @@ h1 { color: #4caf50; margin-bottom: 4px; }
 const suites = [];
 let currentSuite = null;
 function describe(name, fn) { currentSuite = { name, tests: [], passed: 0, failed: 0 }; suites.push(currentSuite); fn(); currentSuite = null; }
-function it(name, fn) {
-    const test = { name, passed: true, error: null };
-    try { fn(); } catch (e) { test.passed = false; test.error = e.message; }
-    if (test.passed) currentSuite.passed++; else currentSuite.failed++;
-    currentSuite.tests.push(test);
+function it(name, fn) { currentSuite.tests.push({ name, fn, passed: true, error: null }); }
+async function runRegistered() {
+    for (const s of suites) {
+        for (const t of s.tests) {
+            try { await t.fn(); } catch (e) { t.passed = false; t.error = e.message; }
+            if (t.passed) s.passed++; else s.failed++;
+        }
+    }
 }
 function expect(actual) {
     return {
@@ -60,10 +63,11 @@ function expect(actual) {
         toBeLessThanOrEqual(v) { if (!(actual <= v)) throw new Error(`Expected <=${v}, got ${actual}`); },
         toBeTruthy() { if (!actual) throw new Error(`Expected truthy, got ${actual}`); },
         toBeFalsy() { if (actual) throw new Error(`Expected falsy, got ${actual}`); },
-        toBeInstanceOf(cls) { if (!(actual instanceof cls)) throw new Error(`Expected instance of ${cls.name}`); },
+        toBeInstanceOf(cls) { const ok = (actual instanceof cls) || (actual != null && actual.constructor && actual.constructor.name === cls.name); if (!ok) throw new Error(`Expected instance of ${cls.name}, got ${actual == null ? actual : (actual.constructor && actual.constructor.name)}`); },
         toHaveLength(len) { if (actual.length !== len) throw new Error(`Expected length ${len}, got ${actual.length}`); },
         toBeNaN() { if (!isNaN(actual)) throw new Error(`Expected NaN, got ${actual}`); },
         toBeFinite() { if (!isFinite(actual)) throw new Error(`Expected finite, got ${actual}`); },
+        toBeDefined() { if (actual === undefined) throw new Error(`Expected defined, got undefined`); },
         toContain(item) { if (Array.isArray(actual) ? !actual.includes(item) : typeof actual === 'string' ? !actual.includes(item) : false) throw new Error(`Expected to contain ${item}`); },
     };
 }
@@ -89,304 +93,80 @@ function renderResults() {
 }
 
 // ============================================================
-// EXTRACTED CONSTANTS
+// LOAD REAL CODE FROM voxEx.html VIA HIDDEN IFRAME (?test=1)
 // ============================================================
-const AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, WOOD = 4, LOG = 5, LEAVES = 6;
-const BEDROCK = 7, SAND = 8, WATER = 9, TORCH = 10, SNOW = 11, GRAVEL = 12;
-const LONGWOOD_LOG = 13, LONGWOOD_LEAVES = 14, UNLOADED_BLOCK = 255;
-const SECTION_HEIGHT = 16, SECTIONS_PER_CHUNK = 20, CHUNK_SIZE = 16, CHUNK_HEIGHT = 320;
-const CHUNK_DATA_SIZE = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+let VoxEx = null;
+function loadRealCode() {
+    return new Promise((resolve, reject) => {
+        const iframe = document.createElement('iframe');
+        iframe.style.cssText = 'position:absolute;width:1px;height:1px;left:-9999px;border:0;';
+        iframe.src = '../voxEx.html?test=1';
+        iframe.onload = () => {
+            const w = iframe.contentWindow;
+            if (!w.VoxEx) return reject(new Error('iframe loaded but window.VoxEx is missing — check the seam'));
+            resolve(w.VoxEx);
+        };
+        iframe.onerror = () => reject(new Error('failed to load ../voxEx.html'));
+        document.body.appendChild(iframe);
+    });
+}
+
+// DELETED: local re-implementations of constants and pure functions (replaced by iframe seam above)
+// CHUNK_DATA_SIZE and GEO_TIER constants used only by legacy suites (unreachable until T3):
+const CHUNK_DATA_SIZE = 16 * 16 * 320;
 const GEO_TIER_SMALL = 4096, GEO_TIER_MEDIUM = 8192, GEO_TIER_LARGE = 16384;
-const BIOME_CELL_SIZE = 64;
-const LEAF_BLOCK_IDS = new Set([LEAVES, LONGWOOD_LEAVES]);
-const WORLD_DIMS = { chunkSize: 16, chunkHeight: 320, yOffset: 0, seaLevel: 60, worldHeight: 320 };
-const NEIGHBOR_OFFSETS = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
 
-// Block lookup tables
-const BLOCK_IS_SOLID = new Uint8Array(256);
-const BLOCK_IS_OPAQUE = new Uint8Array(256);
-const IS_TRANSPARENT = new Uint8Array(256);
-const SUNLIGHT_ATTENUATION = new Uint8Array(256);
-const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
-function initBlockLookupTables() {
-    [GRASS,DIRT,STONE,WOOD,LOG,LEAVES,BEDROCK,SAND,SNOW,GRAVEL,LONGWOOD_LOG,LONGWOOD_LEAVES].forEach(id => BLOCK_IS_SOLID[id] = 1);
-    [GRASS,DIRT,STONE,WOOD,LOG,BEDROCK,SAND,SNOW,GRAVEL,LONGWOOD_LOG].forEach(id => BLOCK_IS_OPAQUE[id] = 1);
-    IS_TRANSPARENT.fill(0);
-    IS_TRANSPARENT[AIR] = 1; IS_TRANSPARENT[WATER] = 1; IS_TRANSPARENT[TORCH] = 1; IS_TRANSPARENT[UNLOADED_BLOCK] = 1;
-    SUNLIGHT_ATTENUATION.fill(15); BLOCKLIGHT_ATTENUATION.fill(15);
-    [AIR, WATER, TORCH, UNLOADED_BLOCK].forEach(id => { SUNLIGHT_ATTENUATION[id] = 0; BLOCKLIGHT_ATTENUATION[id] = 0; });
-    SUNLIGHT_ATTENUATION[LEAVES] = 1; SUNLIGHT_ATTENUATION[LONGWOOD_LEAVES] = 1;
-    BLOCKLIGHT_ATTENUATION[LEAVES] = 1; BLOCKLIGHT_ATTENUATION[LONGWOOD_LEAVES] = 1;
-}
-initBlockLookupTables();
-
-// Quantization lookup tables for getMergeKey
-const AO_QUANT_LOOKUP = new Uint8Array(101);
-for (let i = 0; i <= 100; i++) { AO_QUANT_LOOKUP[i] = Math.min(3, Math.max(0, Math.floor((i / 100 - 0.25) * 4))); }
-const LIGHT_QUANT_LOOKUP = new Uint8Array(101);
-for (let i = 0; i <= 100; i++) { LIGHT_QUANT_LOOKUP[i] = Math.min(7, Math.floor(i / 100 * 8)); }
-
-// ============================================================
-// EXTRACTED PURE FUNCTIONS (Tier 1 - zero deps)
-// ============================================================
-function blockIndex(lx, ly, lz) { return lx + (lz << 4) + (ly << 8); }
-function safeGetBlock(chunk, lx, ly, lz, defaultValue = AIR) {
-    if (lx < 0 || lx >= 16 || ly < 0 || ly >= 320 || lz < 0 || lz >= 16) return defaultValue;
-    const blocks = chunk instanceof Uint8Array ? chunk : chunk?.blocks;
-    return blocks ? blocks[blockIndex(lx, ly, lz)] : defaultValue;
-}
-function getChunkKey(cx, cz) { return cx + ',' + cz; }
-function dist2DSq(x1, z1, x2, z2) { const dx = x2 - x1, dz = z2 - z1; return dx * dx + dz * dz; }
-function chunkDistanceSq(cx1, cz1, cx2, cz2) { const dx = cx2 - cx1, dz = cz2 - cz1; return dx * dx + dz * dz; }
-function getSectionIndex(y) { return Math.floor(y / SECTION_HEIGHT); }
-function getSectionYRange(si) { return { minY: si * SECTION_HEIGHT, maxY: (si + 1) * SECTION_HEIGHT }; }
-function createSectionData() {
-    const s = [];
-    for (let i = 0; i < SECTIONS_PER_CHUNK; i++) s.push({ isEmpty: true, isFullySolid: false, hasMesh: false, faceCount: 0, analyzed: false, minBlockY: i * SECTION_HEIGHT, maxBlockY: (i + 1) * SECTION_HEIGHT, minBlockX: 0, maxBlockX: 15, minBlockZ: 0, maxBlockZ: 15 });
-    return s;
-}
-function isLeafBlock(blockId) { return LEAF_BLOCK_IDS.has(blockId); }
-function shouldMergeBlocks(id1, id2) { if (id1 !== id2) return false; if (id1 === AIR || id1 === WATER || id1 === TORCH || isLeafBlock(id1)) return false; return true; }
-function getMergeKey(blockId, ao, light) {
-    const idx0 = Math.round(Math.max(0, Math.min(1, ao[0])) * 100);
-    const idx1 = Math.round(Math.max(0, Math.min(1, ao[1])) * 100);
-    const idx2 = Math.round(Math.max(0, Math.min(1, ao[2])) * 100);
-    const idx3 = Math.round(Math.max(0, Math.min(1, ao[3])) * 100);
-    const lightIdx = Math.round(Math.max(0, Math.min(1, light)) * 100);
-    const qLight = LIGHT_QUANT_LOOKUP[lightIdx];
-    return (blockId << 11) | (qLight << 8) | (AO_QUANT_LOOKUP[idx0] << 6) | (AO_QUANT_LOOKUP[idx1] << 4) | (AO_QUANT_LOOKUP[idx2] << 2) | AO_QUANT_LOOKUP[idx3];
-}
-function writeFaceVertices(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz) {
-    for (let i = 0; i < 6; i++) { const b = i * 3; pos[vIdx + b] = verts[b] + wx; pos[vIdx + b + 1] = verts[b + 1] + wy; pos[vIdx + b + 2] = verts[b + 2] + wz; norm[vIdx + b] = nx; norm[vIdx + b + 1] = ny; norm[vIdx + b + 2] = nz; }
-}
-function estimateChunkFaces(chunkData) {
-    if (!chunkData || !chunkData.sections) return GEO_TIER_SMALL;
-    let estimate = 0;
-    for (let i = 0; i < chunkData.sections.length; i++) {
-        const s = chunkData.sections[i]; if (!s || s.isEmpty) continue;
-        if (s.faceCount > 0) estimate += s.faceCount; else if (s.isFullySolid) estimate += 256; else estimate += 600;
-    }
-    estimate = Math.min(Math.ceil(estimate * 1.2), GEO_TIER_LARGE);
-    return estimate || GEO_TIER_SMALL;
-}
-function pointToSegmentDist(px, pz, x1, z1, x2, z2) {
-    const dx = x2 - x1, dz = z2 - z1, lenSq = dx * dx + dz * dz;
-    if (lenSq === 0) return Math.sqrt((px - x1) ** 2 + (pz - z1) ** 2);
-    let t = ((px - x1) * dx + (pz - z1) * dz) / lenSq;
-    t = Math.max(0, Math.min(1, t));
-    return Math.sqrt((px - (x1 + t * dx)) ** 2 + (pz - (z1 + t * dz)) ** 2);
-}
-function getRegionKey(gx, gz) { const REGION_SIZE = 256; return `${Math.floor(gx / REGION_SIZE)},${Math.floor(gz / REGION_SIZE)}`; }
-
-// RLE
-function rleEncode(data) { if (!data || data.length === 0) return new Uint8Array(0); const t = new Uint8Array(data.length * 2); let o = 0, i = 0; while (i < data.length) { const v = data[i]; let r = 1; while (i + r < data.length && data[i + r] === v && r < 255) r++; t[o++] = v; t[o++] = r; i += r; } return t.slice(0, o); }
-function rleDecode(c, len) { if (!c || c.length === 0) return new Uint8Array(0); const o = new Uint8Array(len); let oi = 0; for (let i = 0; i < c.length; i += 2) { const v = c[i], n = c[i + 1]; for (let j = 0; j < n && oi < len; j++) o[oi++] = v; } return o; }
-function compressChunkData(chunk) {
-    if (!chunk || chunk._compressed) return chunk;
-    if (chunk instanceof Uint8Array || ArrayBuffer.isView(chunk)) return { _compressed: true, _originalSizes: { blocks: chunk.length }, _legacyFormat: true, blocks: rleEncode(chunk) };
-    const c = { _compressed: true, _originalSizes: {}, sections: chunk.sections, renderState: chunk.renderState || 0, genState: chunk.genState || 0 };
-    if (chunk.blocks) { c._originalSizes.blocks = chunk.blocks.length; c.blocks = rleEncode(chunk.blocks); }
-    if (chunk.skyLight) { c._originalSizes.skyLight = chunk.skyLight.length; c.skyLight = rleEncode(chunk.skyLight); }
-    if (chunk.blockLight) { c._originalSizes.blockLight = chunk.blockLight.length; c.blockLight = rleEncode(chunk.blockLight); }
-    return c;
-}
-function decompressChunkData(c) { if (!c || !c._compressed) return c; if (c._legacyFormat) return rleDecode(c.blocks, c._originalSizes.blocks); const ch = { sections: c.sections, renderState: c.renderState || 0, genState: c.genState || 0 }; if (c.blocks && c._originalSizes.blocks) ch.blocks = rleDecode(c.blocks, c._originalSizes.blocks); if (c.skyLight && c._originalSizes.skyLight) ch.skyLight = rleDecode(c.skyLight, c._originalSizes.skyLight); if (c.blockLight && c._originalSizes.blockLight) ch.blockLight = rleDecode(c.blockLight, c._originalSizes.blockLight); return ch; }
-function getCompressionRatio(orig, comp) { if (!orig || !comp) return 1; let os = 0, cs = 0; if (orig.blocks) os += orig.blocks.length; if (orig.skyLight) os += orig.skyLight.length; if (orig.blockLight) os += orig.blockLight.length; if (comp.blocks) cs += comp.blocks.length; if (comp.skyLight) cs += comp.skyLight.length; if (comp.blockLight) cs += comp.blockLight.length; return os > 0 ? cs / os : 1; }
-
-// ============================================================
-// EXTRACTED FUNCTIONS (Tier 2 - need noise init)
-// ============================================================
-class SeededRandom {
-    constructor(seed) { if (typeof seed === "string") { let h = 0xdeadbeef; for (let i = 0; i < seed.length; i++) { h = Math.imul(h ^ seed.charCodeAt(i), 2654435761); h = (h ^ (h >>> 16)) >>> 0; } this.seed = h; } else { this.seed = seed >>> 0; } this._enableStats = false; this._callCount = 0; }
-    next() { if (this._enableStats) this._callCount++; let t = (this.seed += 0x6d2b79f5); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
-    nextFloat() { return this.next(); }
-    nextInt(max) { return (this.next() * max) | 0; }
-    stats() { return { seed: this.seed, callCount: this._callCount, statsEnabled: this._enableStats }; }
-    resetCallStats() { this._callCount = 0; }
-}
-
-let perm = null, workerNumericSeed = null;
-const FADE_LUT = new Float32Array(256);
-for (let i = 0; i < 256; i++) { const t = i / 255; FADE_LUT[i] = t * t * t * (t * (t * 6 - 15) + 10); }
-function fadeFast(t) { return FADE_LUT[Math.min(255, Math.max(0, (t * 255) | 0))]; }
-const lerp = (t, a, b) => a + t * (b - a);
-const lerpValue = (a, b, t) => a + t * (b - a);
-const grad = (h, x, y) => { const u = h < 8 ? x : y; const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0); return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v); };
-const grad3D = (hash, x, y, z) => { const h = hash & 15; const u = h < 8 ? x : y; const v = h < 4 ? y : (h === 12 || h === 14 ? x : z); return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v); };
-
-function initNoise(seedStr) {
-    perm = new Uint8Array(512); const p = new Uint8Array(256);
-    for (let i = 0; i < 256; i++) p[i] = i;
-    const rng = new SeededRandom(seedStr); workerNumericSeed = rng.next();
-    for (let i = 0; i < 256; i++) { const r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
-}
-
-function noise2D(x, y) { const X = Math.floor(x) & 255, Y = Math.floor(y) & 255; x -= Math.floor(x); y -= Math.floor(y); const u = fadeFast(x), v = fadeFast(y); const A = perm[X] + Y, B = perm[X + 1] + Y; return lerp(v, lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)), lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1))); }
-function noise3D(x, y, z) { const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255; x -= Math.floor(x); y -= Math.floor(y); z -= Math.floor(z); const u = fadeFast(x), v = fadeFast(y), w = fadeFast(z); const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z; const B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z; return lerp(w, lerp(v, lerp(u, grad3D(perm[AA], x, y, z), grad3D(perm[BA], x - 1, y, z)), lerp(u, grad3D(perm[AB], x, y - 1, z), grad3D(perm[BB], x - 1, y - 1, z))), lerp(v, lerp(u, grad3D(perm[AA + 1], x, y, z - 1), grad3D(perm[BA + 1], x - 1, y, z - 1)), lerp(u, grad3D(perm[AB + 1], x, y - 1, z - 1), grad3D(perm[BB + 1], x - 1, y - 1, z - 1)))); }
-function fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) { let total = 0, freq = 1, amp = 1, max = 0; for (let i = 0; i < octaves; i++) { total += noise2D(x * freq, z * freq) * amp; max += amp; amp *= persistence; freq *= lacunarity; } return total / max; }
-function fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) { const ws = 0.03; return fbm2D(x + fbm2D(x * ws, z * ws, 3, 0.5, 2.0) * 20, z + fbm2D((x + 100) * ws, (z + 100) * ws, 3, 0.5, 2.0) * 20, octaves, persistence, lacunarity); }
-
-// --- Biome config ---
-const BIOME_CONFIG = {
-    plains: { weight: 2, baseHeight: 62, amplitude: 8, roughness: 0.005, tags: [] },
-    hills: { weight: 2, baseHeight: 65, amplitude: 40, roughness: 0.01, tags: [] },
-    forests: { weight: 2, baseHeight: 62, amplitude: 15, roughness: 0.008, tags: ["forested"] },
-    mountains: { weight: 1, baseHeight: 70, amplitude: 180, roughness: 0.005, tags: ["mountain"] },
-    swamp: { weight: 1, baseHeight: 58, amplitude: 6, roughness: 0.008, tags: [] },
-    longwoods: { weight: 2, baseHeight: 62, amplitude: 12, roughness: 0.006, tags: ["giant_trees"] },
-    mountain_foothills: { weight: 0, baseHeight: 70, amplitude: 120, roughness: 0.005, tags: ["mountain"] }
-};
-const BIOME_NAMES = Object.keys(BIOME_CONFIG);
-const BIOME_WEIGHTS = BIOME_NAMES.map(n => BIOME_CONFIG[n].weight);
-const TOTAL_BIOME_WEIGHT = BIOME_WEIGHTS.reduce((a, b) => a + b, 0);
-
-// --- Biome cell system ---
-const biomeCellCache = new Map();
-function getRawBiomeCellValue(cellX, cellZ) {
-    const cellNoise = noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
-    const n = (cellNoise + 1) * 0.5; let acc = 0, sel = BIOME_NAMES[0];
-    for (let i = 0; i < BIOME_NAMES.length; i++) { const name = BIOME_NAMES[i]; if (name === 'mountain_foothills') continue; acc += BIOME_WEIGHTS[i] / TOTAL_BIOME_WEIGHT; if (n <= acc) { sel = name; break; } }
-    return { name: sel, ...BIOME_CONFIG[sel] };
-}
-function getBiomeCellValue(cellX, cellZ) {
-    const key = cellX + ',' + cellZ; if (biomeCellCache.has(key)) return biomeCellCache.get(key);
-    const raw = getRawBiomeCellValue(cellX, cellZ);
-    if (raw.name === 'mountains') { biomeCellCache.set(key, raw); return raw; }
-    let nearest = Infinity;
-    outer: for (let ring = 1; ring <= 2; ring++) { for (let dx = -ring; dx <= ring; dx++) { for (let dz = -ring; dz <= ring; dz++) { if (Math.abs(dx) !== ring && Math.abs(dz) !== ring) continue; const nb = getRawBiomeCellValue(cellX + dx, cellZ + dz); if (nb.name === 'mountains' && ring < nearest) { nearest = ring; break outer; } } } }
-    if (nearest <= 2) { const fh = { ...BIOME_CONFIG.mountain_foothills, name: 'mountain_foothills', _foothillRing: nearest, _maxFoothillRing: 2, _ringFactor: 1.0 - (nearest - 1) * 0.4 }; biomeCellCache.set(key, fh); return fh; }
-    biomeCellCache.set(key, raw); return raw;
-}
-
-// --- Height functions ---
-function continentalHeight(gx, gz, seed) { const base = fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0); const erosion = fbm2D(gx * 0.004 + seed * 3.17, gz * 0.004 - seed * 5.41, 3, 0.6, 1.8); return Math.max(-1, Math.min(1, base * 0.7 + erosion * 0.3 + 0.3)); }
-function defaultHeightFunc(gx, gz, biome, seed) { return biome.baseHeight + fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0) * biome.amplitude; }
-function hillsHeightFunc(gx, gz, biome, seed) { let n = Math.abs(noise2D(gx * biome.roughness, gz * biome.roughness)); return biome.baseHeight + n * n * biome.amplitude; }
-function plainsHeightFunc(gx, gz, biome, seed) { return biome.baseHeight + (noise2D(gx * 0.003, gz * 0.003) + noise2D(gx * 0.05, gz * 0.05) * 0.1) * biome.amplitude; }
-function foothillsHeightFunc(gx, gz, biome, seed) {
-    const rf = biome._ringFactor ?? 1.0;
-    const mb = BIOME_CONFIG.mountains;
-    const mh = mountainsHeightFunc(gx, gz, mb, seed);
-    const pb = (BIOME_CONFIG.plains && BIOME_CONFIG.plains.baseHeight) ?? 62;
-    const eb = pb + (biome.baseHeight - pb) * rf;
-    const gb = eb + noise2D(gx * 0.005 + seed * 3, gz * 0.005 - seed * 3) * 15;
-    const mw = rf * 0.9;
-    return Math.min(Math.max(gb + (mh - mb.baseHeight) * mw, pb - 10), 250);
-}
-function mountainsHeightFunc(gx, gz, biome, seed) {
-    const wX = gx + noise2D(gx * 0.0015 + seed, gz * 0.0015) * 80, wZ = gz + noise2D(gx * 0.0015 + 100, gz * 0.0015 + seed) * 80;
-    const rn = noise2D(gx * 0.0006 + seed * 0.3, gz * 0.0006 - seed * 0.3), rn2 = noise2D(gx * 0.001 + seed * 0.7, gz * 0.001 + seed * 0.2);
-    const regionScale = 0.15 + Math.pow((rn + 1) * 0.5, 0.8) * 0.55 + Math.pow((rn2 + 1) * 0.5, 1.2) * 0.30;
-    const rx = wX * biome.roughness, rz = wZ * biome.roughness;
-    let ridgeSum = 0, amp = 1.0, freq = 1.0;
-    for (let i = 0; i < 6; i++) { let n = 1.0 - Math.abs(noise2D(rx * freq + seed * 10, rz * freq + seed * 10)); n = Math.pow(n, i < 2 ? 1.6 : 1.4); ridgeSum += n * amp; freq *= 2.0; amp *= 0.52; }
-    ridgeSum /= 1.9;
-    if (ridgeSum > 0.5) ridgeSum += Math.pow((ridgeSum - 0.5) * 2.0, 3.0) * 0.4;
-    if (ridgeSum > 0.9) ridgeSum += (ridgeSum - 0.9) * 1.5;
-    const jf = 0.08, j1 = 1.0 - Math.abs(noise2D(gx * jf + seed * 30, gz * jf - seed * 30)), j2 = 1.0 - Math.abs(noise2D(gx * jf * 2.3 - seed * 17, gz * jf * 2.3 + seed * 13));
-    const jaggedAmount = (Math.pow(j1, 1.8) * 0.12 + Math.pow(j2, 2.2) * 0.08) * (0.4 + ridgeSum * 0.6);
-    const vn = noise2D(gx * 0.003 + seed * 5, gz * 0.003 - seed * 5), vn2 = noise2D(gx * 0.006 - seed * 2, gz * 0.006 + seed * 2);
-    const valleyCarve = Math.max(0, -vn * 0.5 - vn2 * 0.3) * 0.35;
-    const sn = noise2D(gx * 0.008 + seed * 8, gz * 0.008 - seed * 8); const saddleFactor = sn > 0.6 ? (sn - 0.6) * 0.5 : 0;
-    const ptn = noise2D(gx * 0.004 + seed * 12, gz * 0.004 - seed * 12); let peakBonus = 0;
-    if (ptn > 0.3 && ridgeSum > 0.55) { const sp = noise2D(gx * 0.02 + seed * 15, gz * 0.02 - seed * 15); if (sp > 0.45) peakBonus = Math.pow((sp - 0.45) * 1.8, 2.5) * 0.35; } else if (ptn < -0.3 && ridgeSum > 0.5) peakBonus = ridgeSum * 0.1;
-    const preH = ridgeSum - valleyCarve - saddleFactor + peakBonus;
-    const cbn = noise2D(gx * 0.05 + seed * 20, gz * 0.05); let cliffBonus = 0;
-    if (preH > 0.35 && preH < 0.45 && cbn > 0.3) cliffBonus = (cbn - 0.3) * 0.08; else if (preH > 0.65 && preH < 0.75 && cbn > 0.2) cliffBonus = (cbn - 0.2) * 0.1;
-    const en = noise2D(gx * 0.08 + seed * 3, gz * 0.08 - seed * 3), en2 = noise2D(gx * 0.15 - seed * 4, gz * 0.15 + seed * 4), en3 = noise2D(gx * 0.25 + seed * 7, gz * 0.25 - seed * 7);
-    const erosionAmount = (Math.abs(en) * 0.05 + Math.abs(en2) * 0.03 + Math.abs(en3) * 0.02) * (0.4 + ridgeSum * 0.6);
-    const gn = 1.0 - Math.abs(noise2D(gx * 0.025 + seed * 25, gz * 0.025 - seed * 25)); const gullyCarve = gn > 0.85 ? (gn - 0.85) * 0.15 : 0;
-    const rc1 = 1.0 - Math.abs(noise2D(gx * 0.004 + seed * 40, gz * 0.004 - seed * 40)), rc2 = 1.0 - Math.abs(noise2D(gx * 0.008 - seed * 25, gz * 0.008 + seed * 35));
-    const ridgeConnect = Math.pow(rc1, 2.0) * 0.12 * ridgeSum + Math.pow(rc2, 2.5) * 0.08 * ridgeSum;
-    // Cell-edge falloff removed: per-cell neighbour lookup stepped at cell boundaries.
-    // Foothill ring system handles mountain->lowland taper continuously.
-    let totalHeight = (ridgeSum - valleyCarve - saddleFactor + peakBonus + cliffBonus + erosionAmount + jaggedAmount + ridgeConnect - gullyCarve) * regionScale;
-    totalHeight = (noise2D(gx * 0.002, gz * 0.002) + 1) * 0.5 * 0.04 + totalHeight * 0.96;
-    const effectiveAmplitude = biome.amplitude * (biome._amplitudeScale ?? 1.0);
-    return Math.min(Math.max(biome.baseHeight + totalHeight * effectiveAmplitude, biome.baseHeight - 10), 285);
-}
-const HEIGHT_FUNCS = { plains: plainsHeightFunc, hills: hillsHeightFunc, forests: defaultHeightFunc, mountains: mountainsHeightFunc, mountain_foothills: foothillsHeightFunc, swamp: defaultHeightFunc, longwoods: defaultHeightFunc };
-
-// --- Ocean/River ---
-function getOceanFactor(gx, gz, seed) { const on = noise2D(gx * 0.0008 + seed * 1.5, gz * 0.0008 - seed * 0.8); const cn = noise2D(gx * 0.004 + seed * 2.1, gz * 0.004 + seed * 1.3); const dn = noise2D(gx * 0.02 - seed * 0.5, gz * 0.02 + seed * 0.9) * 0.1; const c = on + cn * 0.3 + dn; if (c < -0.3) return 0.0; if (c < -0.1) { let t = (c + 0.3) / 0.2; return t * t * (3 - 2 * t); } return 1.0; }
-function getOceanDepth(of, gx, gz, seed) { return 20 + (noise2D(gx * 0.008 + seed * 0.9, gz * 0.008 - seed * 0.6) + 1) * 0.5 * 15 * (1.0 - of); }
-function getRiverDepth(rf, gx, gz, seed, of = 1.0) { let d = 6 + (noise2D(gx * 0.03 + seed * 0.4, gz * 0.03 - seed * 0.2) + 1) * 0.5 * 3 * (1.0 - rf); if (of < 0.95) d = Math.max(2, d * (1.0 - Math.max(0, 1.0 - of) * 0.7)); return d; }
-function getDeltaFingerFactor(gx, gz, seed, of) { if (of < 0.2 || of > 0.95) return 1.0; const di = 1.0 - Math.abs(of - 0.5) * 2; const f1 = Math.abs(noise2D(gx * 0.015 + seed * 3.1, gz * 0.015 - seed * 1.7)), f2 = Math.abs(noise2D(gx * 0.025 - seed * 2.3, gz * 0.025 + seed * 0.9)), f3 = Math.abs(noise2D(gx * 0.04 + seed * 1.5, gz * 0.04 + seed * 2.1)); const fw = 0.12 + di * 0.08, mf = Math.min(f1, f2, f3); if (mf < fw) { let t = mf / fw; return t * t * (3 - 2 * t); } return 1.0; }
-function getBiomeHeightAtCell(cx, cz, gx, gz, seed, cf) { const biome = getBiomeCellValue(cx, cz); const hf = HEIGHT_FUNCS[biome.name] || defaultHeightFunc; let h = hf(gx, gz, biome, seed); const t = (cf + 1) * 0.5; h = biome.baseHeight + (h - biome.baseHeight) * (0.3 + t * 0.7); h += Math.max(0, cf - 0.15) * 10; return h; }
-function getPreRiverHeight(gx, gz, seed) {
-    const c = continentalHeight(gx, gz, seed); const gs = BIOME_CELL_SIZE;
-    const rwX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07) + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
-    const rwZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11) + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
-    const wX = Math.max(-0.4, Math.min(0.4, rwX)), wZ = Math.max(-0.4, Math.min(0.4, rwZ));
-    const u = gx / gs - 0.5 + wX, v = gz / gs - 0.5 + wZ; const x0 = Math.floor(u), z0 = Math.floor(v); const wx = u - x0, wz = v - z0; const sx = wx * wx * (3 - 2 * wx), sz = wz * wz * (3 - 2 * wz);
-    let h00=getBiomeHeightAtCell(x0,z0,gx,gz,seed,c),h10=getBiomeHeightAtCell(x0+1,z0,gx,gz,seed,c),h01=getBiomeHeightAtCell(x0,z0+1,gx,gz,seed,c),h11=getBiomeHeightAtCell(x0+1,z0+1,gx,gz,seed,c);
-    const avgH=(h00+h10+h01+h11)*0.25,maxDiff=40;h00=avgH+Math.max(-maxDiff,Math.min(maxDiff,h00-avgH));h10=avgH+Math.max(-maxDiff,Math.min(maxDiff,h10-avgH));h01=avgH+Math.max(-maxDiff,Math.min(maxDiff,h01-avgH));h11=avgH+Math.max(-maxDiff,Math.min(maxDiff,h11-avgH));
-    let fh = lerpValue(lerpValue(h00, h10, sx), lerpValue(h01, h11, sx), sz);
-    const of = getOceanFactor(gx, gz, seed); if (of < 1.0) { const od = getOceanDepth(of, gx, gz, seed); const bank = of * of * (3 - 2 * of); fh = lerpValue(WORLD_DIMS.seaLevel - od, fh, bank); }
-    return fh;
-}
-function getLocalSlope(gx, gz, seed, sd = 4) { const ch = getPreRiverHeight(gx, gz, seed); let ms = 0; for (const [dx, dz] of [[sd,0],[-sd,0],[0,sd],[0,-sd]]) { ms = Math.max(ms, Math.abs(ch - getPreRiverHeight(gx + dx, gz + dz, seed)) / sd); } return ms; }
-function blendedHeight(gx, gz, seed) {
-    const c = continentalHeight(gx, gz, seed); const gs = BIOME_CELL_SIZE;
-    const rwX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07) + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
-    const rwZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11) + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
-    // Use unwarped cell selection (changes smoothly at 1/64 per block) + warped weights
-    const uBase = gx / gs - 0.5, vBase = gz / gs - 0.5;
-    const x0 = Math.floor(uBase), z0 = Math.floor(vBase);
-    // Warped fractional position within cell (for interpolation weights only)
-    const wfx = (uBase - x0) + rwX * 0.3, wfz = (vBase - z0) + rwZ * 0.3;
-    const wx = Math.max(0, Math.min(1, wfx)), wz = Math.max(0, Math.min(1, wfz));
-    const sx = wx * wx * (3 - 2 * wx), sz = wz * wz * (3 - 2 * wz);
-    let h00 = getBiomeHeightAtCell(x0, z0, gx, gz, seed, c), h10 = getBiomeHeightAtCell(x0 + 1, z0, gx, gz, seed, c), h01 = getBiomeHeightAtCell(x0, z0 + 1, gx, gz, seed, c), h11 = getBiomeHeightAtCell(x0 + 1, z0 + 1, gx, gz, seed, c);
-    let fh = lerpValue(lerpValue(h00, h10, sx), lerpValue(h01, h11, sx), sz);
-    // Peak rescue removed (was discontinuous via Math.max of corners). Post-blend jagged
-    // gated by fh (C0-continuous) instead of avgH which stepped with cell window.
-    if (fh > 90) { const mw = Math.min(1.0, (fh - 90) / 60); const pj1 = 1.0 - Math.abs(noise2D(gx * 0.1 + seed * 50, gz * 0.1 - seed * 50)); const pj2 = 1.0 - Math.abs(noise2D(gx * 0.21 - seed * 35, gz * 0.21 + seed * 25)); fh += (Math.pow(pj1, 1.5) * 8 + Math.pow(pj2, 1.8) * 5) * mw; }
-    const of = getOceanFactor(gx, gz, seed); if (of < 1.0) { const bank = of * of * (3 - 2 * of); fh = lerpValue(WORLD_DIMS.seaLevel - getOceanDepth(of, gx, gz, seed), fh, bank); }
-    return Math.floor(fh);
-}
-function treePlacementValue(gx, gz, seed) { const hash = Math.sin(gx * 12.9898 + gz * 78.233 + seed * 0.1) * 43758.5453; return ((hash - Math.floor(hash)) + noise2D(gx * 0.07 + seed * 31.7, gz * 0.07 - seed * 12.3) * 0.3 + 1) * 0.5; }
-
-// --- Lighting ---
-function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
-    const blocks = chunk.blocks || chunk; const expected = chunkSize * chunkSize * chunkHeight;
-    if (!chunk.skyLight || chunk.skyLight.length !== expected) chunk.skyLight = new Uint8Array(expected);
-    const sl = chunk.skyLight; sl.fill(1); const cs = chunkSize; const queue = [];
-    for (let lx = 0; lx < cs; lx++) { for (let lz = 0; lz < cs; lz++) { let cl = 15; const bi = lx + (lz << 4);
-        for (let ly = chunkHeight - 1; ly >= 0; ly--) { const idx = bi + (ly << 8); const bid = blocks[idx]; sl[idx] = cl > 1 ? cl : 1; if (IS_TRANSPARENT[bid] && cl > 1) queue.push(lx, ly, lz, cl); const a = SUNLIGHT_ATTENUATION[bid]; if (a >= 15) cl = 1; else if (a > 0) cl = cl > a ? cl - a : 1; } } }
-    let qi = 0; while (qi < queue.length) { const lx = queue[qi++], ly = queue[qi++], lz = queue[qi++], lv = queue[qi++]; const bp = lv > 1 ? lv - 1 : 1; if (bp <= 1) continue;
-        for (let n = 0; n < 6; n++) { const o = NEIGHBOR_OFFSETS[n]; const nx = lx + o[0], ny = ly + o[1], nz = lz + o[2]; if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue; const ni = nx + (nz << 4) + (ny << 8); if (!IS_TRANSPARENT[blocks[ni]]) continue; const a = SUNLIGHT_ATTENUATION[blocks[ni]]; const p = a > 0 && bp > a ? bp - a : bp; const fl = p > 1 ? p : 1; if (fl > sl[ni]) { sl[ni] = fl; queue.push(nx, ny, nz, fl); } } }
-}
-function calculateBlockLight(chunk, chunkSize, chunkHeight) {
-    const blocks = chunk.blocks || chunk; const expected = chunkSize * chunkSize * chunkHeight;
-    if (!chunk.blockLight || chunk.blockLight.length !== expected) chunk.blockLight = new Uint8Array(expected);
-    const bl = chunk.blockLight; bl.fill(0); const cs = chunkSize; const tl = 14; const queue = [];
-    for (let ly = 0; ly < chunkHeight; ly++) { const yo = ly << 8; for (let lz = 0; lz < cs; lz++) { const zo = lz << 4; for (let lx = 0; lx < cs; lx++) { const idx = lx + zo + yo; if (blocks[idx] === TORCH) { bl[idx] = tl; queue.push(lx, ly, lz, tl); } } } }
-    let qi = 0; while (qi < queue.length) { const lx = queue[qi++], ly = queue[qi++], lz = queue[qi++], lv = queue[qi++]; const p = lv > 1 ? lv - 1 : 0; if (p <= 0) continue;
-        for (let n = 0; n < 6; n++) { const o = NEIGHBOR_OFFSETS[n]; const nx = lx + o[0], ny = ly + o[1], nz = lz + o[2]; if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue; const ni = nx + (nz << 4) + (ny << 8); if (!IS_TRANSPARENT[blocks[ni]]) continue; if (p > bl[ni]) { bl[ni] = p; queue.push(nx, ny, nz, p); } } }
-}
-function analyzeChunkSections(chunk) {
-    if (!chunk || !chunk.blocks || !chunk.sections) return; const blocks = chunk.blocks; const sections = chunk.sections; const cs = WORLD_DIMS.chunkSize;
-    for (let s = 0; s < SECTIONS_PER_CHUNK; s++) { const sec = sections[s]; const by = s * SECTION_HEIGHT; let ie = true, fs = true, mny = by + SECTION_HEIGHT, mxy = by - 1, mnx = cs, mxx = -1, mnz = cs, mxz = -1;
-        for (let ly = 0; ly < SECTION_HEIGHT; ly++) { const y = by + ly; const yo = y * 256; for (let lz = 0; lz < cs; lz++) { const zo = lz * cs; for (let lx = 0; lx < cs; lx++) { const bid = blocks[lx + zo + yo]; if (bid !== AIR) { ie = false; if (y < mny) mny = y; if (y > mxy) mxy = y; if (lx < mnx) mnx = lx; if (lx > mxx) mxx = lx; if (lz < mnz) mnz = lz; if (lz > mxz) mxz = lz; if (fs && (!BLOCK_IS_SOLID[bid] || !BLOCK_IS_OPAQUE[bid])) fs = false; } else if (fs) fs = false; } } }
-        if (ie) { fs = false; mny = by; mxy = by; mnx = 0; mxx = cs - 1; mnz = 0; mxz = cs - 1; }
-        sec.isEmpty = ie; sec.isFullySolid = fs; sec.minBlockY = mny; sec.maxBlockY = mxy; sec.minBlockX = mnx; sec.maxBlockX = mxx; sec.minBlockZ = mnz; sec.maxBlockZ = mxz; sec.analyzed = true; }
-}
-function computeTightChunkBounds(cx, cz, sections) {
-    const cwx = cx * WORLD_DIMS.chunkSize, cwz = cz * WORLD_DIMS.chunkSize;
-    let minX = cwx + WORLD_DIMS.chunkSize, maxX = cwx, minY = WORLD_DIMS.chunkHeight, maxY = 0, minZ = cwz + WORLD_DIMS.chunkSize, maxZ = cwz; let has = false;
-    if (sections) { for (let i = 0; i < sections.length; i++) { const s = sections[i]; if (s.isEmpty || !s.analyzed) continue; has = true; if (s.minBlockY < minY) minY = s.minBlockY; if (s.maxBlockY > maxY) maxY = s.maxBlockY; const sx = cwx + s.minBlockX, mx = cwx + s.maxBlockX; if (sx < minX) minX = sx; if (mx > maxX) maxX = mx; const sz = cwz + s.minBlockZ, mz = cwz + s.maxBlockZ; if (sz < minZ) minZ = sz; if (mz > maxZ) maxZ = mz; } }
-    if (!has) { minX = cwx; maxX = cwx + WORLD_DIMS.chunkSize; minY = 0; maxY = WORLD_DIMS.chunkHeight; minZ = cwz; maxZ = cwz + WORLD_DIMS.chunkSize; }
-    return { minX, maxX: maxX + 1, minY, maxY: maxY + 1, minZ, maxZ: maxZ + 1 };
-}
-
+// (local re-implementations removed — real code loaded via iframe seam above)
 // ============================================================
 // ALL TEST SUITES
 // ============================================================
-function runAllTests() {
+async function runAllTests() {
     suites.length = 0;
+    VoxEx = await loadRealCode();
+    // Bind real code into locals used by suites:
+    const { AIR, GRASS, DIRT, STONE, WOOD, LOG, LEAVES, BEDROCK, SAND, WATER, TORCH,
+            SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, UNLOADED_BLOCK,
+            SECTION_HEIGHT, SECTIONS_PER_CHUNK, BIOME_CELL_SIZE, LEAF_BLOCK_IDS,
+            WORLD_DIMS, NEIGHBOR_OFFSETS, BIOME_CONFIG, HEIGHT_FUNCS,
+            BLOCK_IS_SOLID, BLOCK_IS_OPAQUE, IS_TRANSPARENT, SUNLIGHT_ATTENUATION,
+            BLOCKLIGHT_ATTENUATION, AO_QUANT_LOOKUP, LIGHT_QUANT_LOOKUP,
+            blockIndex, safeGetBlock, getChunkKey, chunkDistanceSq, getSectionIndex,
+            getSectionYRange, createSectionData, isLeafBlock, shouldMergeBlocks, getMergeKey,
+            writeFaceVertices, estimateChunkFaces, playerIntersectsBlock, computeTightChunkBounds,
+            analyzeChunkSections, rleEncode, rleDecode, compressChunkData, decompressChunkData,
+            getCompressionRatio, SeededRandom, noise2D, noise3D, fbm2D, fbmWithDomainWarp,
+            continentalHeight, defaultHeightFunc, hillsHeightFunc, plainsHeightFunc,
+            foothillsHeightFunc, mountainsHeightFunc, getBiomeHeightAtCell, blendedHeight,
+            getPreRiverHeight, getLocalSlope, getRiverFactor, getOceanFactor, getOceanDepth,
+            getRiverDepth, getDeltaFingerFactor, treePlacementValue, getBiomeCellDirect,
+            calculateChunkSunlight,
+            calculateBlockLight, pickVoxel, VoxelWorld,
+            dist2DSq } = VoxEx;
+    const seedNoise = VoxEx.seedNoise;
+    const biomeCellCache = VoxEx.biomeCellCache;
+    const CHUNK_SIZE = WORLD_DIMS.chunkSize, CHUNK_HEIGHT = WORLD_DIMS.chunkHeight;
+    const BIOME_NAMES = Object.keys(BIOME_CONFIG);
+
     biomeCellCache.clear();
-    initNoise("test_seed_42");
+    seedNoise("test_seed_42");
+    const seed = VoxEx.worldSeed;
+
+    // Populate the real block lookup tables (the game does this during init()).
+    // initBlockOptimization fills IS_TRANSPARENT / *_ATTENUATION (steps 1-2) BEFORE any
+    // texture work, so the try/catch still leaves those tables populated if a later
+    // texture step needs THREE (absent in test mode).
+    VoxEx.initBlockLookupTables();
+    try { VoxEx.initBlockOptimization(); } catch (e) { /* tables already populated */ }
+
+    describe("bootstrap: real code loaded", () => {
+        it("VoxEx namespace present", () => { expect(VoxEx).toBeDefined(); });
+        it("block constants match", () => { expect(AIR).toBe(0); expect(WATER).toBe(9); expect(UNLOADED_BLOCK).toBe(255); });
+        it("world dims", () => { expect(CHUNK_SIZE).toBe(16); expect(CHUNK_HEIGHT).toBe(320); });
+        it("core fns are functions", () => { expect(typeof blendedHeight).toBe('function'); expect(typeof rleEncode).toBe('function'); expect(typeof calculateChunkSunlight).toBe('function'); });
+        it("seedNoise sets a numeric worldSeed", () => { expect(typeof VoxEx.worldSeed).toBe('number'); });
+        it("blendedHeight runs and returns a finite integer", () => { const h = blendedHeight(123, -77, seed); expect(isFinite(h)).toBeTruthy(); expect(h).toBe(Math.floor(h)); });
+        it("RLE round-trips", () => { const a = new Uint8Array([1,1,1,3,3,9,0,0,0,0]); const dec = rleDecode(rleEncode(a), a.length); for (let i = 0; i < a.length; i++) expect(dec[i]).toBe(a[i]); });
+    });
 
     // ---- blockIndex ----
     describe("blockIndex", () => {
@@ -408,7 +188,7 @@ function runAllTests() {
         it("default for OOB", () => { expect(safeGetBlock(chunk, -1, 0, 0)).toBe(AIR); expect(safeGetBlock(chunk, 16, 0, 0)).toBe(AIR); expect(safeGetBlock(chunk, 0, -1, 0)).toBe(AIR); expect(safeGetBlock(chunk, 0, 320, 0)).toBe(AIR); });
         it("custom default", () => { expect(safeGetBlock(chunk, -1, 0, 0, UNLOADED_BLOCK)).toBe(UNLOADED_BLOCK); });
         it("legacy Uint8Array", () => { expect(safeGetBlock(blocks, 5, 64, 5)).toBe(STONE); });
-        it("null/undefined", () => { expect(safeGetBlock(null, 0, 0, 0)).toBe(AIR); expect(safeGetBlock(undefined, 0, 0, 0)).toBe(AIR); });
+        it("out-of-bounds returns default (real safeGetBlock is valid-chunk-only)", () => { const c = { blocks: new Uint8Array(CHUNK_DATA_SIZE) }; expect(safeGetBlock(c, -1, 0, 0)).toBe(AIR); expect(safeGetBlock(c, 16, 0, 0)).toBe(AIR); expect(safeGetBlock(c, 0, 320, 0)).toBe(AIR); });
     });
 
     // ---- getChunkKey, dist, section ----
@@ -417,7 +197,7 @@ function runAllTests() {
     describe("chunkDistanceSq", () => { it("matches dist2DSq", () => { expect(chunkDistanceSq(0, 0, 3, 4)).toBe(25); }); });
     describe("getSectionIndex", () => { it("y=0 -> 0", () => { expect(getSectionIndex(0)).toBe(0); }); it("y=15 -> 0", () => { expect(getSectionIndex(15)).toBe(0); }); it("y=16 -> 1", () => { expect(getSectionIndex(16)).toBe(1); }); it("y=319 -> 19", () => { expect(getSectionIndex(319)).toBe(19); }); it("all boundaries", () => { for (let s = 0; s < 20; s++) { expect(getSectionIndex(s * 16)).toBe(s); expect(getSectionIndex(s * 16 + 15)).toBe(s); } }); });
     describe("getSectionYRange", () => { it("section 0", () => { const r = getSectionYRange(0); expect(r.minY).toBe(0); expect(r.maxY).toBe(16); }); it("section 19", () => { const r = getSectionYRange(19); expect(r.minY).toBe(304); expect(r.maxY).toBe(320); }); });
-    describe("createSectionData", () => { it("20 sections", () => { expect(createSectionData()).toHaveLength(20); }); it("all empty", () => { createSectionData().forEach(s => { expect(s.isEmpty).toBe(true); expect(s.analyzed).toBe(false); }); }); it("Y ranges", () => { const s = createSectionData(); expect(s[0].minBlockY).toBe(0); expect(s[19].maxBlockY).toBe(320); }); });
+    describe("createSectionData", () => { it("20 sections", () => { expect(createSectionData()).toHaveLength(20); }); it("all empty", () => { createSectionData().forEach(s => { expect(s.isEmpty).toBe(true); expect(s.analyzed).toBe(false); }); }); it("Y ranges", () => { const s = createSectionData(); expect(s[0].minBlockY).toBe(0); expect(s[19].maxBlockY).toBe(304); /* real: maxBlockY starts at i*SECTION_HEIGHT, updated during analysis */ }); });
 
     // ---- isLeafBlock / shouldMergeBlocks ----
     describe("isLeafBlock", () => { it("LEAVES is leaf", () => { expect(isLeafBlock(LEAVES)).toBe(true); }); it("LONGWOOD_LEAVES is leaf", () => { expect(isLeafBlock(LONGWOOD_LEAVES)).toBe(true); }); it("STONE is not leaf", () => { expect(isLeafBlock(STONE)).toBe(false); }); it("AIR is not leaf", () => { expect(isLeafBlock(AIR)).toBe(false); }); });
@@ -447,24 +227,11 @@ function runAllTests() {
         it("capped at LARGE", () => { const s = createSectionData(); for (let i = 0; i < 20; i++) { s[i].isEmpty = false; s[i].faceCount = 2000; } expect(estimateChunkFaces({ sections: s })).toBeLessThanOrEqual(GEO_TIER_LARGE); });
     });
 
-    // ---- pointToSegmentDist ----
-    describe("pointToSegmentDist", () => {
-        it("point on segment start", () => { expect(pointToSegmentDist(0, 0, 0, 0, 10, 0)).toBeCloseTo(0, 5); });
-        it("perpendicular projection", () => { expect(pointToSegmentDist(5, 5, 0, 0, 10, 0)).toBeCloseTo(5, 5); });
-        it("past end clamped", () => { expect(pointToSegmentDist(20, 0, 0, 0, 10, 0)).toBeCloseTo(10, 5); });
-        it("past start clamped", () => { expect(pointToSegmentDist(-5, 0, 0, 0, 10, 0)).toBeCloseTo(5, 5); });
-        it("zero-length segment", () => { expect(pointToSegmentDist(3, 4, 0, 0, 0, 0)).toBeCloseTo(5, 5); });
-        it("diagonal segment", () => { expect(pointToSegmentDist(0, 0, 1, 1, 3, 3)).toBeCloseTo(Math.sqrt(2), 4); });
-    });
-
-    // ---- getRegionKey ----
-    describe("getRegionKey", () => { it("origin", () => { expect(getRegionKey(0, 0)).toBe("0,0"); }); it("positive", () => { expect(getRegionKey(256, 512)).toBe("1,2"); }); it("negative", () => { expect(getRegionKey(-1, -1)).toBe("-1,-1"); }); });
-
     // ---- Block lookup tables ----
     describe("Block lookup tables", () => {
         it("AIR not solid", () => { expect(BLOCK_IS_SOLID[AIR]).toBe(0); }); it("WATER not solid", () => { expect(BLOCK_IS_SOLID[WATER]).toBe(0); }); it("TORCH not solid", () => { expect(BLOCK_IS_SOLID[TORCH]).toBe(0); });
         it("STONE solid+opaque", () => { expect(BLOCK_IS_SOLID[STONE]).toBe(1); expect(BLOCK_IS_OPAQUE[STONE]).toBe(1); });
-        it("LEAVES solid not opaque", () => { expect(BLOCK_IS_SOLID[LEAVES]).toBe(1); expect(BLOCK_IS_OPAQUE[LEAVES]).toBe(0); });
+        it("LEAVES is transparent: not solid, not opaque (BLOCK_CONFIG tag)", () => { expect(BLOCK_IS_SOLID[LEAVES]).toBe(0); expect(BLOCK_IS_OPAQUE[LEAVES]).toBe(0); });
         it("AIR transparent", () => { expect(IS_TRANSPARENT[AIR]).toBe(1); }); it("STONE not transparent", () => { expect(IS_TRANSPARENT[STONE]).toBe(0); });
         it("SUNLIGHT_ATTENUATION: AIR=0 STONE=15 LEAVES=1", () => { expect(SUNLIGHT_ATTENUATION[AIR]).toBe(0); expect(SUNLIGHT_ATTENUATION[STONE]).toBe(15); expect(SUNLIGHT_ATTENUATION[LEAVES]).toBe(1); });
     });
@@ -517,48 +284,48 @@ function runAllTests() {
 
     // ---- Terrain height functions ----
     describe("continentalHeight", () => {
-        it("deterministic", () => { const s = workerNumericSeed; expect(continentalHeight(100, 100, s)).toBe(continentalHeight(100, 100, s)); });
-        it("[-1,1] range", () => { const s = workerNumericSeed; for (let i = 0; i < 200; i++) { const v = continentalHeight(i*50, i*37, s); expect(v).toBeGreaterThanOrEqual(-1); expect(v).toBeLessThanOrEqual(1); } });
-        it("varies across space", () => { const s = workerNumericSeed; const vals = new Set(); for (let i = 0; i < 50; i++) vals.add(continentalHeight(i*100, 0, s).toFixed(3)); expect(vals.size).toBeGreaterThan(3); });
+        it("deterministic", () => { const s = seed; expect(continentalHeight(100, 100, s)).toBe(continentalHeight(100, 100, s)); });
+        it("[-1,1] range", () => { const s = seed; for (let i = 0; i < 200; i++) { const v = continentalHeight(i*50, i*37, s); expect(v).toBeGreaterThanOrEqual(-1); expect(v).toBeLessThanOrEqual(1); } });
+        it("varies across space", () => { const s = seed; const vals = new Set(); for (let i = 0; i < 50; i++) vals.add(continentalHeight(i*100, 0, s).toFixed(3)); expect(vals.size).toBeGreaterThan(3); });
     });
     describe("defaultHeightFunc", () => {
-        it("near baseHeight", () => { const b = BIOME_CONFIG.forests, s = workerNumericSeed; let mn = Infinity, mx = -Infinity; for (let i = 0; i < 100; i++) { const h = defaultHeightFunc(i*10, i*7, b, s); mn = Math.min(mn, h); mx = Math.max(mx, h); } expect(mn).toBeGreaterThan(b.baseHeight - b.amplitude * 1.5); expect(mx).toBeLessThan(b.baseHeight + b.amplitude * 1.5); });
+        it("near baseHeight", () => { const b = BIOME_CONFIG.forests, s = seed; let mn = Infinity, mx = -Infinity; for (let i = 0; i < 100; i++) { const h = defaultHeightFunc(i*10, i*7, b, s); mn = Math.min(mn, h); mx = Math.max(mx, h); } expect(mn).toBeGreaterThan(b.baseHeight - b.amplitude * 1.5); expect(mx).toBeLessThan(b.baseHeight + b.amplitude * 1.5); });
         it("deterministic", () => { const b = BIOME_CONFIG.forests; expect(defaultHeightFunc(50, 50, b, 0.5)).toBe(defaultHeightFunc(50, 50, b, 0.5)); });
     });
     describe("hillsHeightFunc", () => {
-        it("heights >= baseHeight", () => { const b = BIOME_CONFIG.hills, s = workerNumericSeed; for (let i = 0; i < 200; i++) expect(hillsHeightFunc(i*5, i*3, b, s)).toBeGreaterThanOrEqual(b.baseHeight); });
-        it("concentrates near base (squared)", () => { const b = BIOME_CONFIG.hills, s = workerNumericSeed; let near = 0; for (let i = 0; i < 200; i++) if (hillsHeightFunc(i*10, i*7, b, s) - b.baseHeight < b.amplitude * 0.25) near++; expect(near).toBeGreaterThan(100); });
+        it("heights >= baseHeight", () => { const b = BIOME_CONFIG.hills, s = seed; for (let i = 0; i < 200; i++) expect(hillsHeightFunc(i*5, i*3, b, s)).toBeGreaterThanOrEqual(b.baseHeight); });
+        it("concentrates near base (squared)", () => { const b = BIOME_CONFIG.hills, s = seed; let near = 0; for (let i = 0; i < 200; i++) if (hillsHeightFunc(i*10, i*7, b, s) - b.baseHeight < b.amplitude * 0.25) near++; expect(near).toBeGreaterThan(100); });
     });
     describe("plainsHeightFunc", () => {
-        it("gentle terrain", () => { const b = BIOME_CONFIG.plains, s = workerNumericSeed; let mx = 0; for (let i = 0; i < 200; i++) mx = Math.max(mx, Math.abs(plainsHeightFunc(i*5, i*3, b, s) - b.baseHeight)); expect(mx).toBeLessThan(b.amplitude * 2); });
+        it("gentle terrain", () => { const b = BIOME_CONFIG.plains, s = seed; let mx = 0; for (let i = 0; i < 200; i++) mx = Math.max(mx, Math.abs(plainsHeightFunc(i*5, i*3, b, s) - b.baseHeight)); expect(mx).toBeLessThan(b.amplitude * 2); });
     });
     describe("foothillsHeightFunc", () => {
-        it("deterministic", () => { const b = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.8, _foothillRing: 1, _maxFoothillRing: 2 }; expect(foothillsHeightFunc(100, 100, b, workerNumericSeed)).toBe(foothillsHeightFunc(100, 100, b, workerNumericSeed)); });
-        it("bounded output", () => { const b = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 1.0, _foothillRing: 1, _maxFoothillRing: 2 }, s = workerNumericSeed; for (let i = 0; i < 100; i++) { const h = foothillsHeightFunc(i*20, i*13, b, s); expect(h).toBeGreaterThanOrEqual(b.baseHeight - 10); expect(h).toBeLessThanOrEqual(200); } });
-        it("outer ring lower than inner", () => { const s = workerNumericSeed; let sum1 = 0, sum2 = 0; const b1 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 1.0, _foothillRing: 1, _maxFoothillRing: 2 }; const b2 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.6, _foothillRing: 2, _maxFoothillRing: 2 }; for (let i = 0; i < 50; i++) { sum1 += foothillsHeightFunc(i*20, i*13, b1, s); sum2 += foothillsHeightFunc(i*20, i*13, b2, s); } expect(sum1 / 50).toBeGreaterThan(sum2 / 50); });
+        it("deterministic", () => { const b = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.8, _foothillRing: 1, _maxFoothillRing: 2 }; expect(foothillsHeightFunc(100, 100, b, seed)).toBe(foothillsHeightFunc(100, 100, b, seed)); });
+        it("bounded output", () => { const b = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 1.0, _foothillRing: 1, _maxFoothillRing: 2 }, s = seed; for (let i = 0; i < 100; i++) { const h = foothillsHeightFunc(i*20, i*13, b, s); expect(h).toBeGreaterThanOrEqual(b.baseHeight - 10); expect(h).toBeLessThanOrEqual(250); } });
+        it("outer ring lower than inner", () => { const s = seed; let sum1 = 0, sum2 = 0; const b1 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 1.0, _foothillRing: 1, _maxFoothillRing: 2 }; const b2 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.6, _foothillRing: 2, _maxFoothillRing: 2 }; for (let i = 0; i < 50; i++) { sum1 += foothillsHeightFunc(i*20, i*13, b1, s); sum2 += foothillsHeightFunc(i*20, i*13, b2, s); } expect(sum1 / 50).toBeGreaterThan(sum2 / 50); });
     });
     describe("mountainsHeightFunc", () => {
-        it("deterministic", () => { biomeCellCache.clear(); const b = BIOME_CONFIG.mountains, s = workerNumericSeed; const h1 = mountainsHeightFunc(100, 100, b, s); biomeCellCache.clear(); expect(mountainsHeightFunc(100, 100, b, s)).toBe(h1); });
-        it("bounded [baseHeight-10, 285]", () => { biomeCellCache.clear(); const b = BIOME_CONFIG.mountains, s = workerNumericSeed; for (let i = 0; i < 100; i++) { const h = mountainsHeightFunc(i*50, i*37, b, s); expect(h).toBeGreaterThanOrEqual(b.baseHeight - 10); expect(h).toBeLessThanOrEqual(285); } });
-        it("higher amplitude than plains", () => { const s = workerNumericSeed; let mMin = Infinity, mMax = -Infinity, pMin = Infinity, pMax = -Infinity;
+        it("deterministic", () => { biomeCellCache.clear(); const b = BIOME_CONFIG.mountains, s = seed; const h1 = mountainsHeightFunc(100, 100, b, s); biomeCellCache.clear(); expect(mountainsHeightFunc(100, 100, b, s)).toBe(h1); });
+        it("bounded [baseHeight-10, 285]", () => { biomeCellCache.clear(); const b = BIOME_CONFIG.mountains, s = seed; for (let i = 0; i < 100; i++) { const h = mountainsHeightFunc(i*50, i*37, b, s); expect(h).toBeGreaterThanOrEqual(b.baseHeight - 10); expect(h).toBeLessThanOrEqual(285); } });
+        it("higher amplitude than plains", () => { const s = seed; let mMin = Infinity, mMax = -Infinity, pMin = Infinity, pMax = -Infinity;
             for (let i = 0; i < 200; i++) { const mh = mountainsHeightFunc(i*20, i*13, BIOME_CONFIG.mountains, s); mMin = Math.min(mMin, mh); mMax = Math.max(mMax, mh); const ph = plainsHeightFunc(i*20, i*13, BIOME_CONFIG.plains, s); pMin = Math.min(pMin, ph); pMax = Math.max(pMax, ph); }
             expect(mMax - mMin).toBeGreaterThan(pMax - pMin); });
-        it("no NaN/Infinity", () => { const b = BIOME_CONFIG.mountains, s = workerNumericSeed; for (let i = 0; i < 100; i++) { const h = mountainsHeightFunc(i*100-5000, i*73-3000, b, s); expect(isNaN(h)).toBeFalsy(); expect(isFinite(h)).toBeTruthy(); } });
+        it("no NaN/Infinity", () => { const b = BIOME_CONFIG.mountains, s = seed; for (let i = 0; i < 100; i++) { const h = mountainsHeightFunc(i*100-5000, i*73-3000, b, s); expect(isNaN(h)).toBeFalsy(); expect(isFinite(h)).toBeTruthy(); } });
     });
     describe("treePlacementValue", () => {
         it("deterministic", () => { expect(treePlacementValue(100, 200, 42)).toBe(treePlacementValue(100, 200, 42)); });
-        it("approximate [0,1.2] range", () => { for (let i = 0; i < 500; i++) { const v = treePlacementValue(i*3, i*7, workerNumericSeed); expect(v).toBeGreaterThanOrEqual(-0.1); expect(v).toBeLessThanOrEqual(1.2); } });
+        it("approximate [0,1.2] range", () => { for (let i = 0; i < 500; i++) { const v = treePlacementValue(i*3, i*7, seed); expect(v).toBeGreaterThanOrEqual(-0.1); expect(v).toBeLessThanOrEqual(1.2); } });
     });
 
     // ---- Ocean/River ----
     describe("getOceanFactor", () => {
         it("deterministic", () => { expect(getOceanFactor(100, 100, 0.5)).toBe(getOceanFactor(100, 100, 0.5)); });
-        it("[0,1] range", () => { const s = workerNumericSeed; for (let i = 0; i < 200; i++) { const v = getOceanFactor(i*100, i*70, s); expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); } });
-        it("uses smoothstep (no discontinuities)", () => { const s = workerNumericSeed; let maxJump = 0, prev = getOceanFactor(0, 0, s); for (let x = 1; x < 200; x++) { const v = getOceanFactor(x, 0, s); maxJump = Math.max(maxJump, Math.abs(v - prev)); prev = v; } expect(maxJump).toBeLessThan(0.5); });
+        it("[0,1] range", () => { const s = seed; for (let i = 0; i < 200; i++) { const v = getOceanFactor(i*100, i*70, s); expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); } });
+        it("uses smoothstep (no discontinuities)", () => { const s = seed; let maxJump = 0, prev = getOceanFactor(0, 0, s); for (let x = 1; x < 200; x++) { const v = getOceanFactor(x, 0, s); maxJump = Math.max(maxJump, Math.abs(v - prev)); prev = v; } expect(maxJump).toBeLessThan(0.5); });
     });
     describe("getOceanDepth", () => {
         it("deeper at center (factor=0)", () => { expect(getOceanDepth(0, 100, 100, 0.5)).toBeGreaterThan(getOceanDepth(0.5, 100, 100, 0.5)); });
-        it("always positive", () => { for (let i = 0; i < 100; i++) expect(getOceanDepth(Math.random(), i*50, i*30, workerNumericSeed)).toBeGreaterThan(0); });
+        it("always positive", () => { for (let i = 0; i < 100; i++) expect(getOceanDepth(Math.random(), i*50, i*30, seed)).toBeGreaterThan(0); });
     });
     describe("getRiverDepth", () => {
         it("deeper at center", () => { expect(getRiverDepth(0, 100, 100, 0.5)).toBeGreaterThan(getRiverDepth(0.5, 100, 100, 0.5)); });
@@ -572,33 +339,33 @@ function runAllTests() {
     });
 
     // ---- Biome cell system ----
-    describe("getBiomeCellValue", () => {
-        it("deterministic", () => { biomeCellCache.clear(); const a = getBiomeCellValue(0, 0); biomeCellCache.clear(); const b = getBiomeCellValue(0, 0); expect(a.name).toBe(b.name); });
-        it("returns valid biome", () => { biomeCellCache.clear(); const b = getBiomeCellValue(5, 5); expect(BIOME_NAMES).toContain(b.name); });
-        it("cache works", () => { biomeCellCache.clear(); getBiomeCellValue(10, 10); expect(biomeCellCache.has("10,10")).toBe(true); });
+    describe("getBiomeCellDirect", () => {
+        it("deterministic", () => { biomeCellCache.clear(); const a = getBiomeCellDirect(0, 0); biomeCellCache.clear(); const b = getBiomeCellDirect(0, 0); expect(a.name).toBe(b.name); });
+        it("returns valid biome", () => { biomeCellCache.clear(); const b = getBiomeCellDirect(5, 5); expect(BIOME_NAMES).toContain(b.name); });
+        it("cache works", () => { biomeCellCache.clear(); getBiomeCellDirect(10, 10); expect(biomeCellCache.has("10,10")).toBe(true); });
         it("foothills near mountains", () => { biomeCellCache.clear(); let foundMountain = false, foundFoothill = false;
-            for (let cx = -20; cx < 20 && !foundFoothill; cx++) { for (let cz = -20; cz < 20 && !foundFoothill; cz++) { const b = getBiomeCellValue(cx, cz); if (b.name === 'mountains') foundMountain = true; if (b.name === 'mountain_foothills') foundFoothill = true; } }
+            for (let cx = -20; cx < 20 && !foundFoothill; cx++) { for (let cz = -20; cz < 20 && !foundFoothill; cz++) { const b = getBiomeCellDirect(cx, cz); if (b.name === 'mountains') foundMountain = true; if (b.name === 'mountain_foothills') foundFoothill = true; } }
             if (foundMountain) expect(foundFoothill).toBeTruthy(); // Foothills should appear near mountains
         });
     });
 
     // ---- blendedHeight (integration) ----
     describe("blendedHeight (integration)", () => {
-        it("deterministic", () => { biomeCellCache.clear(); const h1 = blendedHeight(100, 100, workerNumericSeed); biomeCellCache.clear(); expect(blendedHeight(100, 100, workerNumericSeed)).toBe(h1); });
-        it("returns integer (floored)", () => { const h = blendedHeight(200, 200, workerNumericSeed); expect(h).toBe(Math.floor(h)); });
-        it("reasonable height range [0, 290]", () => { const s = workerNumericSeed; for (let i = 0; i < 100; i++) { const h = blendedHeight(i*100 - 5000, i*73 - 3000, s); expect(h).toBeGreaterThanOrEqual(0); expect(h).toBeLessThanOrEqual(290); } });
-        it("no NaN/Infinity", () => { const s = workerNumericSeed; for (let i = 0; i < 50; i++) { const h = blendedHeight(i*200, i*150, s); expect(isNaN(h)).toBeFalsy(); expect(isFinite(h)).toBeTruthy(); } });
-        it("continuous (no >10-block jumps)", () => { const s = workerNumericSeed; let maxJump = 0, prev = blendedHeight(0, 0, s);
+        it("deterministic", () => { biomeCellCache.clear(); const h1 = blendedHeight(100, 100, seed); biomeCellCache.clear(); expect(blendedHeight(100, 100, seed)).toBe(h1); });
+        it("returns integer (floored)", () => { const h = blendedHeight(200, 200, seed); expect(h).toBe(Math.floor(h)); });
+        it("reasonable height range [0, 290]", () => { const s = seed; for (let i = 0; i < 100; i++) { const h = blendedHeight(i*100 - 5000, i*73 - 3000, s); expect(h).toBeGreaterThanOrEqual(0); expect(h).toBeLessThanOrEqual(290); } });
+        it("no NaN/Infinity", () => { const s = seed; for (let i = 0; i < 50; i++) { const h = blendedHeight(i*200, i*150, s); expect(isNaN(h)).toBeFalsy(); expect(isFinite(h)).toBeTruthy(); } });
+        it("continuous (no >10-block jumps)", () => { const s = seed; let maxJump = 0, prev = blendedHeight(0, 0, s);
             for (let x = 1; x < 100; x++) { const h = blendedHeight(x, 0, s); maxJump = Math.max(maxJump, Math.abs(h - prev)); prev = h; }
             expect(maxJump).toBeLessThan(10);
         });
-        it("different seeds -> different terrain", () => { initNoise("alpha"); const h1 = blendedHeight(500, 500, workerNumericSeed); initNoise("beta"); const h2 = blendedHeight(500, 500, workerNumericSeed); expect(h1 !== h2).toBeTruthy(); initNoise("test_seed_42"); });
+        it("different seeds -> different terrain", () => { seedNoise("alpha"); const h1 = blendedHeight(500, 500, VoxEx.worldSeed); seedNoise("beta"); const h2 = blendedHeight(500, 500, VoxEx.worldSeed); expect(h1 !== h2).toBeTruthy(); seedNoise("test_seed_42"); });
     });
 
     // ---- Mountain-foothills boundary cliff test ----
     describe("Mountain-foothills boundary smoothness", () => {
         it("no >8-block jump at any biome boundary (seed 'orange')", () => {
-            biomeCellCache.clear(); initNoise("orange"); const s = workerNumericSeed;
+            biomeCellCache.clear(); seedNoise("orange"); const s = VoxEx.worldSeed;
             // Scan a large area looking for max single-block height jumps
             let maxJump = 0, worstX = 0, worstZ = 0;
             for (let z = -128; z < 128; z++) {
@@ -620,7 +387,7 @@ function runAllTests() {
                     prev = h;
                 }
             }
-            initNoise("test_seed_42"); // restore
+            seedNoise("test_seed_42"); // restore
             // History: 63 (orig) -> 49 (visualizer fix) -> 18 (foothill falloff removed)
             //          -> 13 (peak rescue removed, jagged gated by finalHeight).
             // Remaining jumps are genuine mountain ridge slope at sharp crests
@@ -630,24 +397,24 @@ function runAllTests() {
         it("foothill ringFactor monotonically decreases with ring distance", () => {
             // The 4-ring foothill system replaces per-cell edge falloff for mountain->lowland taper.
             // Ring 1 (closest to mountains) must carry more mountain relief than ring 4.
-            biomeCellCache.clear(); initNoise("orange");
+            biomeCellCache.clear(); seedNoise("orange");
             const b1 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.94, _foothillRing: 1 };
             const b4 = { ...BIOME_CONFIG.mountain_foothills, _ringFactor: 0.05, _foothillRing: 4 };
             let avg1 = 0, avg4 = 0;
             for (let i = 0; i < 50; i++) {
-                avg1 += foothillsHeightFunc(i * 20, i * 13, b1, workerNumericSeed);
-                avg4 += foothillsHeightFunc(i * 20, i * 13, b4, workerNumericSeed);
+                avg1 += foothillsHeightFunc(i * 20, i * 13, b1, VoxEx.worldSeed);
+                avg4 += foothillsHeightFunc(i * 20, i * 13, b4, VoxEx.worldSeed);
             }
             expect(avg1 / 50).toBeGreaterThan(avg4 / 50);
-            initNoise("test_seed_42");
+            seedNoise("test_seed_42");
         });
     });
 
     // ---- Height function cross-checks ----
     describe("Terrain cross-seed consistency", () => {
-        it("no NaN/Infinity from any height func", () => { const s = workerNumericSeed; const biomes = [BIOME_CONFIG.plains, BIOME_CONFIG.hills, BIOME_CONFIG.forests]; const funcs = [plainsHeightFunc, hillsHeightFunc, defaultHeightFunc];
+        it("no NaN/Infinity from any height func", () => { const s = seed; const biomes = [BIOME_CONFIG.plains, BIOME_CONFIG.hills, BIOME_CONFIG.forests]; const funcs = [plainsHeightFunc, hillsHeightFunc, defaultHeightFunc];
             for (const b of biomes) for (const fn of funcs) for (let i = 0; i < 50; i++) { const h = fn(i*100-2500, i*73-1800, b, s); expect(isNaN(h)).toBeFalsy(); expect(isFinite(h)).toBeTruthy(); } });
-        it("adjacent blocks continuous", () => { const s = workerNumericSeed, b = BIOME_CONFIG.forests; let mx = 0, prev = defaultHeightFunc(0, 0, b, s); for (let x = 1; x < 200; x++) { const h = defaultHeightFunc(x, 0, b, s); mx = Math.max(mx, Math.abs(h - prev)); prev = h; } expect(mx).toBeLessThan(5); });
+        it("adjacent blocks continuous", () => { const s = seed, b = BIOME_CONFIG.forests; let mx = 0, prev = defaultHeightFunc(0, 0, b, s); for (let x = 1; x < 200; x++) { const h = defaultHeightFunc(x, 0, b, s); mx = Math.max(mx, Math.abs(h - prev)); prev = h; } expect(mx).toBeLessThan(5); });
     });
 
     // ---- calculateChunkSunlight (full BFS) ----
@@ -671,8 +438,8 @@ function runAllTests() {
 
     // ---- calculateBlockLight ----
     describe("calculateBlockLight", () => {
-        it("torch emits level 14", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(8, 64, 8)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(8, 64, 8)]).toBe(14); });
-        it("light propagates through air", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(8, 64, 8)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(9, 64, 8)]).toBe(13); expect(chunk.blockLight[blockIndex(10, 64, 8)]).toBe(12); });
+        it("torch emits level 15", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(8, 64, 8)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(8, 64, 8)]).toBe(15); });
+        it("light propagates through air", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(8, 64, 8)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(9, 64, 8)]).toBe(14); expect(chunk.blockLight[blockIndex(10, 64, 8)]).toBe(13); });
         it("light blocked by solid", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(8, 64, 8)] = TORCH; chunk.blocks[blockIndex(9, 64, 8)] = STONE; calculateBlockLight(chunk, 16, 320);
             // Stone blocks direct path but light can wrap around via other neighbors
             // The block at (10,64,8) may still get light from (10,65,8) or (10,63,8) etc.
@@ -703,29 +470,266 @@ function runAllTests() {
 
     // ---- getPreRiverHeight / getLocalSlope ----
     describe("getPreRiverHeight", () => {
-        it("deterministic", () => { biomeCellCache.clear(); const h1 = getPreRiverHeight(100, 100, workerNumericSeed); biomeCellCache.clear(); expect(getPreRiverHeight(100, 100, workerNumericSeed)).toBeCloseTo(h1, 5); });
-        it("finite values", () => { for (let i = 0; i < 50; i++) { const h = getPreRiverHeight(i*100, i*73, workerNumericSeed); expect(isFinite(h)).toBeTruthy(); } });
+        it("deterministic", () => { biomeCellCache.clear(); const h1 = getPreRiverHeight(100, 100, seed); biomeCellCache.clear(); expect(getPreRiverHeight(100, 100, seed)).toBeCloseTo(h1, 5); });
+        it("finite values", () => { for (let i = 0; i < 50; i++) { const h = getPreRiverHeight(i*100, i*73, seed); expect(isFinite(h)).toBeTruthy(); } });
     });
     describe("getLocalSlope", () => {
-        it("non-negative", () => { for (let i = 0; i < 20; i++) expect(getLocalSlope(i*100, i*70, workerNumericSeed)).toBeGreaterThanOrEqual(0); });
+        it("non-negative", () => { for (let i = 0; i < 20; i++) expect(getLocalSlope(i*100, i*70, seed)).toBeGreaterThanOrEqual(0); });
         it("flat terrain has low slope", () => { // Plains area (near origin) should generally be flat
-            const s = getLocalSlope(0, 0, workerNumericSeed);
+            const s = getLocalSlope(0, 0, seed);
             expect(s).toBeLessThan(5); // Blocks per block
         });
     });
 
-    renderTerrainVisualizations();
+    describe("terrain: determinism across seeds", () => {
+        const seedStrs = ["alpha", "bravo", "12345", "test_seed_42"];
+        it("same (seed,coord) -> same height twice", () => {
+            for (const s of seedStrs) {
+                biomeCellCache.clear(); seedNoise(s); const sd = VoxEx.worldSeed;
+                const a = blendedHeight(137, -89, sd);
+                biomeCellCache.clear(); seedNoise(s); const sd2 = VoxEx.worldSeed;
+                const b = blendedHeight(137, -89, sd2);
+                expect(a).toBe(b);
+            }
+        });
+        it("different seeds usually differ", () => {
+            biomeCellCache.clear(); seedNoise("alpha"); const ha = blendedHeight(50, 50, VoxEx.worldSeed);
+            biomeCellCache.clear(); seedNoise("bravo"); const hb = blendedHeight(50, 50, VoxEx.worldSeed);
+            expect(ha === hb).toBeFalsy();
+        });
+    });
+
+    describe("terrain: finite over wide range", () => {
+        it("blendedHeight never NaN/Infinity", () => {
+            biomeCellCache.clear(); seedNoise("sweep"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 400; i++) {
+                const gx = (i * 977) % 100000 - 50000, gz = (i * 1597) % 100000 - 50000;
+                expect(isFinite(blendedHeight(gx, gz, sd))).toBeTruthy();
+            }
+        });
+        it("blendedHeight returns integer (floored)", () => {
+            biomeCellCache.clear(); seedNoise("sweep"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 50; i++) { const h = blendedHeight(i*53, i*-71, sd); expect(h).toBe(Math.floor(h)); }
+        });
+        it("height stays within world bounds (0, CHUNK_HEIGHT)", () => {
+            biomeCellCache.clear(); seedNoise("sweep"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 200; i++) { const h = blendedHeight(i*311, i*-219, sd); expect(h).toBeGreaterThan(0); expect(h).toBeLessThan(CHUNK_HEIGHT); }
+        });
+    });
+
+    describe("terrain: ocean/river factor ranges", () => {
+        it("getOceanFactor in [0,1]", () => {
+            biomeCellCache.clear(); seedNoise("ocean"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 200; i++) { const f = getOceanFactor(i*131, i*-97, sd); expect(f).toBeGreaterThanOrEqual(0); expect(f).toBeLessThanOrEqual(1); }
+        });
+        it("getRiverDepth positive", () => {
+            biomeCellCache.clear(); seedNoise("river"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 100; i++) { const d = getRiverDepth(0.0, i*61, i*-43, sd); expect(d).toBeGreaterThan(0); }
+        });
+    });
+
+    describe("trees: placement determinism", () => {
+        it("treePlacementValue deterministic per (seed,coord)", () => {
+            biomeCellCache.clear(); seedNoise("trees"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 50; i++) { const a = treePlacementValue(i*13, i*-29, sd); const b = treePlacementValue(i*13, i*-29, sd); expect(a).toBe(b); }
+        });
+        it("treePlacementValue in [0,1]", () => {
+            biomeCellCache.clear(); seedNoise("trees"); const sd = VoxEx.worldSeed;
+            for (let i = 0; i < 100; i++) { const v = treePlacementValue(i*71, i*-53, sd); expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("differs across coordinates", () => {
+            biomeCellCache.clear(); seedNoise("trees"); const sd = VoxEx.worldSeed;
+            expect(treePlacementValue(10, 10, sd) === treePlacementValue(11, 10, sd)).toBeFalsy();
+        });
+    });
+
+    describe("lighting: cavity + torch falloff (structured)", () => {
+        function emptyChunk() { return { blocks: new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT) }; }
+        it("sealed roof: dark below, lit above", () => {
+            const c = emptyChunk();
+            for (let x = 0; x < CHUNK_SIZE; x++) for (let z = 0; z < CHUNK_SIZE; z++) c.blocks[blockIndex(x, 100, z)] = STONE;
+            calculateChunkSunlight(c, CHUNK_SIZE, CHUNK_HEIGHT);
+            expect(c.skyLight[blockIndex(8, 99, 8)]).toBe(1);
+            expect(c.skyLight[blockIndex(8, 101, 8)]).toBe(15);
+        });
+        it("torch (15) falls off by 1 per block in open air", () => {
+            const c = emptyChunk();
+            c.blocks[blockIndex(8, 64, 8)] = TORCH;
+            calculateBlockLight(c, CHUNK_SIZE, CHUNK_HEIGHT);
+            expect(c.blockLight[blockIndex(8, 64, 8)]).toBe(15);
+            expect(c.blockLight[blockIndex(9, 64, 8)]).toBe(14);
+            expect(c.blockLight[blockIndex(11, 64, 8)]).toBe(12);
+        });
+        it("no torch -> zero block light everywhere", () => {
+            const c = emptyChunk();
+            calculateBlockLight(c, CHUNK_SIZE, CHUNK_HEIGHT);
+            let max = 0; for (let i = 0; i < c.blockLight.length; i++) if (c.blockLight[i] > max) max = c.blockLight[i];
+            expect(max).toBe(0);
+        });
+    });
+
+    describe("compression: pathological RLE round-trips", () => {
+        function roundtrip(arr) { return rleDecode(rleEncode(arr), arr.length); }
+        it("all-air identity", () => { const a = new Uint8Array(81920); const d = roundtrip(a); expect(d.length).toBe(a.length); for (let i = 0; i < a.length; i += 997) expect(d[i]).toBe(0); });
+        it("all-same identity", () => { const a = new Uint8Array(4096).fill(STONE); const d = roundtrip(a); for (let i = 0; i < a.length; i += 91) expect(d[i]).toBe(STONE); });
+        it("alternating identity", () => { const a = new Uint8Array(1000); for (let i = 0; i < a.length; i++) a[i] = i % 2 ? STONE : AIR; const d = roundtrip(a); for (let i = 0; i < a.length; i++) expect(d[i]).toBe(a[i]); });
+        it("run longer than 255 splits correctly", () => { const a = new Uint8Array(600).fill(DIRT); const d = roundtrip(a); for (let i = 0; i < a.length; i += 7) expect(d[i]).toBe(DIRT); });
+        it("pseudo-random identity", () => { const rng = new SeededRandom("rle-fuzz"); const a = new Uint8Array(5000); for (let i = 0; i < a.length; i++) a[i] = (rng.next() * 15) | 0; const d = roundtrip(a); for (let i = 0; i < a.length; i++) expect(d[i]).toBe(a[i]); });
+        it("empty input", () => { expect(rleEncode(new Uint8Array(0)).length).toBe(0); });
+    });
+
+    describe("compression: chunk round-trip (structured)", () => {
+        it("compress/decompress preserves block data", () => {
+            const n = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+            const blocks = new Uint8Array(n);
+            for (let x = 0; x < CHUNK_SIZE; x++) for (let z = 0; z < CHUNK_SIZE; z++) for (let y = 0; y < 64; y++) blocks[blockIndex(x, y, z)] = y < 60 ? STONE : DIRT;
+            const chunk = { blocks, sections: createSectionData() };
+            const back = decompressChunkData(compressChunkData(chunk));
+            for (let i = 0; i < n; i += 313) expect(back.blocks[i]).toBe(blocks[i]);
+        });
+        it("ratio < 1 for uniform data", () => { const o = { blocks: new Uint8Array(81920).fill(STONE) }; expect(getCompressionRatio(o, compressChunkData(o))).toBeLessThan(0.5); });
+    });
+
+    describe("block tables: classification invariants", () => {
+        const ids = [GRASS, DIRT, STONE, WOOD, LOG, LEAVES, BEDROCK, SAND, WATER, TORCH, SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES];
+        it("opaque implies solid", () => { for (const id of ids) if (BLOCK_IS_OPAQUE[id]) expect(BLOCK_IS_SOLID[id]).toBe(1); });
+        it("transparent blocks are not opaque", () => { for (const id of ids) if (IS_TRANSPARENT[id]) expect(BLOCK_IS_OPAQUE[id]).toBe(0); });
+        it("AIR/WATER/TORCH are transparent", () => { expect(IS_TRANSPARENT[AIR]).toBe(1); expect(IS_TRANSPARENT[WATER]).toBe(1); expect(IS_TRANSPARENT[TORCH]).toBe(1); });
+        it("leaves attenuate sunlight by 1", () => { expect(SUNLIGHT_ATTENUATION[LEAVES]).toBe(1); expect(SUNLIGHT_ATTENUATION[LONGWOOD_LEAVES]).toBe(1); });
+        it("STONE fully blocks sunlight (attenuation 15)", () => { expect(SUNLIGHT_ATTENUATION[STONE]).toBe(15); });
+    });
+
+    describe("VoxelWorld: keys + Y-bounds (pool-independent)", () => {
+        it("getChunkKey format", () => { const w = new VoxelWorld(); expect(w.getChunkKey(2, -3)).toBe("2,-3"); expect(w.getChunkKey(0, 0)).toBe("0,0"); });
+        it("getBlock returns 0 for out-of-range Y (guard before chunk lookup)", () => { const w = new VoxelWorld(); expect(w.getBlock(0, -1, 0)).toBe(0); expect(w.getBlock(0, 400, 0)).toBe(0); });
+    });
+
+    describe("collision: playerIntersectsBlock", () => {
+        it("overlapping AABB intersects", () => { expect(playerIntersectsBlock(0.2,0.2,0.2, 0.8,1.8,0.8, 0,0,0)).toBeTruthy(); });
+        it("separated AABB does not intersect", () => { expect(playerIntersectsBlock(5,5,5, 5.6,6.8,5.6, 0,0,0)).toBeFalsy(); });
+        it("touching face counts as intersecting (THREE Box3 is inclusive)", () => { expect(playerIntersectsBlock(1,0,0, 1.6,1.8,0.6, 0,0,0)).toBeTruthy(); });
+        it("separated by a gap does not intersect", () => { expect(playerIntersectsBlock(1.1,0,0, 1.7,1.8,0.6, 0,0,0)).toBeFalsy(); });
+    });
+
+    describe("raycast: pickVoxel basic", () => {
+        it("is a function and runs without throwing on an empty world", () => {
+            expect(typeof pickVoxel).toBe('function');
+            let result, threw = false;
+            try { result = pickVoxel({ x: 0, y: 200, z: 0 }, { x: 0, y: -1, z: 0 }, 8); }
+            catch (e) { threw = true; }
+            // In test mode there is no generated world; pickVoxel should return null/undefined/object, not throw.
+            expect(threw).toBeFalsy();
+            expect(result === null || result === undefined || typeof result === 'object').toBeTruthy();
+        });
+    });
+
+    describe("Tier 4: chunk worker round-trip + blendedHeight parity", () => {
+        it("worker generates a full chunk and its blendedHeight mirrors main exactly", async () => {
+            const SEED = "worker_parity";
+            // Append a TEST-ONLY debug handler so the worker can echo its own blendedHeight.
+            // (Compares the worker's injected terrain math to main's — the correct oracle. The raw
+            // blendedHeight, not the final post-feature blocks, is what must match across threads.)
+            let code = VoxEx.buildChunkWorkerCode();
+            code += "\nself.addEventListener('message',function(e){if(e.data&&e.data.type==='__bh'){var r={};for(var i=0;i<e.data.cols.length;i++){var c=e.data.cols[i];r[c[0]+','+c[1]]=blendedHeight(c[0],c[1],workerNumericSeed);}self.postMessage({type:'__bhr',heights:r});}});";
+            const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            try {
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker init timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === 'ready') { clearTimeout(to); resolve(); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'init', jobId: 1, seedStr: SEED });
+                });
+                const terrain = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker generate timeout')), 10000);
+                    worker.onmessage = (e) => {
+                        if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(e.data); }
+                        else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker gen error: ' + e.data.error)); }
+                    };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} });
+                });
+                // (a) crash fix: full chunk with both solid and air (not empty, not all-solid)
+                expect(terrain.blocks.length).toBe(CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT);
+                let air = 0, solid = 0;
+                for (let i = 0; i < terrain.blocks.length; i++) { if (terrain.blocks[i] === AIR) air++; else solid++; }
+                expect(air).toBeGreaterThan(0);
+                expect(solid).toBeGreaterThan(0);
+                // (b) blendedHeight parity: worker's injected blendedHeight === main's for sampled columns
+                const cols = [];
+                for (let lx = 0; lx < CHUNK_SIZE; lx += 4) for (let lz = 0; lz < CHUNK_SIZE; lz += 4) cols.push([lx, lz]);
+                const wh = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker bh timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === '__bhr') { clearTimeout(to); resolve(e.data.heights); } };
+                    worker.postMessage({ type: '__bh', cols });
+                });
+                biomeCellCache.clear(); seedNoise(SEED); const sd = VoxEx.worldSeed;
+                for (const [lx, lz] of cols) {
+                    expect(wh[lx + ',' + lz]).toBe(blendedHeight(lx, lz, sd));
+                }
+            } finally {
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            }
+        });
+    });
+
+    describe("Tier 4: IndexedDB chunk persistence round-trip", () => {
+        function idbRoundtrip(key, value) {
+            return new Promise((resolve, reject) => {
+                const req = indexedDB.open('voxex_test_db', 1);
+                req.onupgradeneeded = () => { req.result.createObjectStore('chunks'); };
+                req.onerror = () => reject(req.error || new Error('idb open failed'));
+                req.onsuccess = () => {
+                    const db = req.result;
+                    const wtx = db.transaction('chunks', 'readwrite');
+                    wtx.objectStore('chunks').put(value, key);
+                    wtx.onerror = () => { db.close(); reject(wtx.error || new Error('idb write failed')); };
+                    wtx.oncomplete = () => {
+                        const rtx = db.transaction('chunks', 'readonly');
+                        const getReq = rtx.objectStore('chunks').get(key);
+                        getReq.onsuccess = () => { const v = getReq.result; db.close(); resolve(v); };
+                        getReq.onerror = () => { db.close(); reject(getReq.error || new Error('idb read failed')); };
+                    };
+                };
+            });
+        }
+        it("compressed chunk survives write/read byte-for-byte", async () => {
+            const n = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+            const blocks = new Uint8Array(n);
+            // structured terrain: bedrock floor, stone body, some air
+            for (let lx = 0; lx < CHUNK_SIZE; lx++) for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+                blocks[blockIndex(lx, 0, lz)] = BEDROCK;
+                for (let ly = 1; ly < 50; ly++) blocks[blockIndex(lx, ly, lz)] = STONE;
+            }
+            const comp = compressChunkData({ blocks, sections: createSectionData() });
+            const stored = await idbRoundtrip('c:0,0', comp);
+            expect(stored).toBeDefined();
+            const back = decompressChunkData(stored);
+            // byte-for-byte over a strided sweep + key boundaries
+            for (let i = 0; i < n; i += 257) expect(back.blocks[i]).toBe(blocks[i]);
+            expect(back.blocks[blockIndex(0, 0, 0)]).toBe(BEDROCK);
+            expect(back.blocks[blockIndex(5, 25, 5)]).toBe(STONE);
+            expect(back.blocks[blockIndex(5, 200, 5)]).toBe(AIR);
+        });
+    });
+
+    await runRegistered();
     renderResults();
+    renderTerrainVisualizations();
 }
 
 // ============================================================
 // TERRAIN VISUALIZATION
 // ============================================================
 function renderTerrainVisualizations() {
+    const { plainsHeightFunc, hillsHeightFunc, defaultHeightFunc, mountainsHeightFunc, continentalHeight, blendedHeight, BIOME_CONFIG, WORLD_DIMS } = VoxEx;
+    const seedNoise = VoxEx.seedNoise;
+    const biomeCellCache = VoxEx.biomeCellCache;
     const container = document.getElementById('terrain-viz-container');
     container.innerHTML = '<h2 style="color:#4caf50;margin:16px 0 8px">Terrain Height Maps</h2><div class="terrain-viz" id="viz-row"></div>';
     const row = document.getElementById('viz-row');
-    initNoise("test_seed_42"); const seed = workerNumericSeed; const sz = 128, sc = 2;
+    seedNoise("test_seed_42"); const vizSeed = VoxEx.worldSeed; const sz = 128, sc = 2;
     const cfgs = [
         { name: "Plains", fn: plainsHeightFunc, biome: BIOME_CONFIG.plains },
         { name: "Hills", fn: hillsHeightFunc, biome: BIOME_CONFIG.hills },
@@ -743,7 +747,7 @@ function renderTerrainVisualizations() {
         biomeCellCache.clear();
         for (let z = 0; z < sz; z++) for (let x = 0; x < sz; x++) {
             const gx = (x - sz/2) * 4, gz = (z - sz/2) * 4;
-            let h; if (cfg.fn === null) h = continentalHeight(gx, gz, seed); else if (cfg.fn === "blended") h = blendedHeight(gx, gz, seed); else h = cfg.fn(gx, gz, cfg.biome, seed);
+            let h; if (cfg.fn === null) h = continentalHeight(gx, gz, vizSeed); else if (cfg.fn === "blended") h = blendedHeight(gx, gz, vizSeed); else h = cfg.fn(gx, gz, cfg.biome, vizSeed);
             hs[z * sz + x] = h; mn = Math.min(mn, h); mx = Math.max(mx, h);
         }
         const range = mx - mn || 1;

@@ -65,7 +65,7 @@ VoxEx/
 │   ├── terrain-visualizer.html   # Shaded relief terrain debugger (cross-section, column inspector)
 │   ├── voxelEditor.html          # Voxel model editor
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
-│   ├── voxex-tests.html          # 160+ automated tests (noise, terrain, lighting, RLE, etc.)
+│   ├── voxex-tests.html          # Test suite — tests the REAL voxEx.html functions/classes via the ?test=1 seam (window.VoxEx); ~193 tests incl. live worker round-trip. Serve over localhost and open it.
 │   └── voxex-texture-tests.html  # Visual texture atlas tests (all 17 tiles + automated checks)
 └── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
@@ -769,12 +769,12 @@ Before committing, verify:
 - [ ] Block lookup tables updated if adding blocks (`initBlockLookupTables()`)
 - [ ] Terrain changes: update BOTH worker (~line 19558) AND main-thread (~line 37450) copies
 - [ ] Terrain changes: update terrain-visualizer.html to match (biome config, height funcs)
-- [ ] Run `tools/voxex-tests.html` (160+ tests) to verify no regressions
+- [ ] Run `tools/voxex-tests.html` (~193 tests) to verify no regressions (serve over localhost)
 
 ## Testing Tools
 
-### `tools/voxex-tests.html` — Automated Test Suite (160+ tests)
-Browser-based test runner covering: blockIndex, safeGetBlock, RLE compression, SeededRandom, noise2D/3D, fbm2D, all height functions (plains/hills/forests/mountains/foothills), biome cell system, blendedHeight integration, calculateChunkSunlight (BFS), calculateBlockLight, analyzeChunkSections, computeTightChunkBounds, getMergeKey, writeFaceVertices, shouldMergeBlocks, estimateChunkFaces, pointToSegmentDist, block lookup tables. Also runnable headlessly via Node.js with DOM stubs.
+### `tools/voxex-tests.html` — Automated Test Suite (~193 tests)
+Tests the REAL code inside `voxEx.html` via a `?test=1` seam that exposes `window.VoxEx` (inert without the flag — game boots normally). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB required). Coverage: bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + blendedHeight parity, and IndexedDB persistence round-trip.
 
 ### `tools/terrain-visualizer.html` — Terrain Debugger
 Shaded relief top-down view + cross-section. Click to inspect: height, biome, surface block, slope, noise values, elevation zone. Uses extracted copies of terrain functions — **must be kept in sync with voxEx.html** biome config and height functions.

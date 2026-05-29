@@ -20012,12 +20012,18 @@
                     plainsHeightFunc,
                     foothillsHeightFunc,
                     mountainsHeightFunc,
+                    getRawBiomeParams,
+                    getRawBiomeCellDirect,
+                    getBiomeCellDirect,
                     getBiomeHeightAtCell,
                     blendedHeight,
+                    getPreRiverHeight,
+                    getLocalSlope,
                     getRiverFactor,
                     getOceanFactor,
                     getRiverDepth,
-                    getOceanDepth
+                    getOceanDepth,
+                    getDeltaFingerFactor
                 ];
 
                 // Build injected code string with proper indentation for worker
@@ -20033,6 +20039,15 @@
                 // Done here so main is the single source of truth for the empirical CDF.
                 injectedCode += '    const _BIOME_CDF_TABLE = ' + JSON.stringify(_BIOME_CDF_TABLE) + ';\n';
                 injectedCode += '    ' + uniformBiomeRoll.toString() + '\n\n';
+
+                // Inject biome data structures so the injected biome-cell functions (getRawBiomeParams,
+                // getRawBiomeCellDirect, getBiomeCellDirect) resolve the same data the main thread uses.
+                // worldConfig.seed reads workerNumericSeed (set per-generate); biomeFrequency is baked.
+                injectedCode += '    const __biomes = ' + JSON.stringify(buildBiomesFromConfig()) + ';\n';
+                injectedCode += '    const biomes = __biomes;\n';
+                injectedCode += '    const biomeByName = new Map(__biomes.map(function(b){ return [b.name, b]; }));\n';
+                injectedCode += '    let biomeTable; (function(){ let total = 0; const cumulative = []; for (const b of __biomes) { if (b.name === "mountain_foothills") continue; total += b.weight; cumulative.push({ biome: b, threshold: total }); } biomeTable = { cumulative, totalWeight: total }; })();\n';
+                injectedCode += '    const worldConfig = { get seed() { return workerNumericSeed; }, biomeFrequency: ' + JSON.stringify(worldConfig.biomeFrequency) + ' };\n\n';
 
                 // Inject each function's source code
                 for (const fn of terrainFuncs) {
@@ -21455,6 +21470,17 @@
                 const warp = noise2D(gx * 0.05 + seed * 7.31, gz * 0.05 - seed * 3.17) * 0.3;
                 const combined = base + warp;
                 return combined - Math.floor(combined);
+            }
+
+            // Seed the main-thread Perlin noise from a SeededRandom instance.
+            // Single source of truth for main-thread noise seeding: called by initGameEngine
+            // and exposed via the ?test=1 seam. Mirrors the worker initNoise() shuffle order so
+            // main-thread terrain matches worker output for the same seed.
+            function seedMainThreadNoise(rng) {
+                worldConfig.seed = rng.next();
+                for (let i = 0; i < 256; i++) p[i] = i; // reset to identity so re-seeding is idempotent (game seeds once; the ?test=1 seam re-seeds repeatedly)
+                for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
+                return worldConfig.seed;
             }
 
             // --- UI INITIALIZATION ---
@@ -24889,9 +24915,7 @@
                 // If we didn't just load a save, set up the RNG now
                 if (!loadedPlayerState) {
                     rng = new SeededRandom(seedStr);
-                    worldConfig.seed = rng.next();
-                    // Rebuild biome table
-                    for (let i = 0; i < 256; i++) { let r = Math.floor(rng.next() * (256 - i)) + i; [p[i], p[r]] = [p[r], p[i]]; perm[i] = perm[i + 256] = p[i]; }
+                    seedMainThreadNoise(rng);
                 }
                 await init(); // Initialize Three.js FIRST (creates scene, materials, controls)
                 // Initialize worker pool for chunk generation
@@ -42207,6 +42231,61 @@ self.onmessage = async (e) => {
                         Math.floor(window.innerHeight * pixelRatio * scale)
                     );
                 }
+            }
+
+            // SEAM-RECONCILE: initNoise, workerNumericSeed, CHUNK_SIZE, CHUNK_HEIGHT are
+            //   worker-template-only (declared inside CHUNK_WORKER_CODE; no module-scope binding).
+            //   Tests seed main-thread noise via seedNoise() (which calls seedMainThreadNoise)
+            //   and read the numeric result via worldSeed. Chunk dims come from WORLD_DIMS.
+            // ============================================================
+            // TEST SEAM — inert unless the page URL contains ?test=1.
+            // Exposes the canonical pipeline functions/classes/constants so
+            // tools/voxex-tests.html can test the REAL code (not copies).
+            // Mutable module state is exposed via getters.
+            // ============================================================
+            if (typeof location !== 'undefined' && location.search.indexOf('test=1') !== -1) {
+                window.__VOXEX_TEST_MODE__ = true;
+                window.VoxEx = {
+                    // --- constants ---
+                    AIR, GRASS, DIRT, STONE, WOOD, LOG, LEAVES, BEDROCK, SAND, WATER,
+                    TORCH, SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, UNLOADED_BLOCK,
+                    SECTION_HEIGHT, SECTIONS_PER_CHUNK,
+                    BIOME_CELL_SIZE, LEAF_BLOCK_IDS, WORLD_DIMS, NEIGHBOR_OFFSETS,
+                    BIOME_CONFIG, HEIGHT_FUNCS,
+                    BLOCK_IS_SOLID, BLOCK_IS_OPAQUE, IS_TRANSPARENT,
+                    SUNLIGHT_ATTENUATION, BLOCKLIGHT_ATTENUATION,
+                    AO_QUANT_LOOKUP, LIGHT_QUANT_LOOKUP,
+                    // --- geometry / chunk helpers ---
+                    blockIndex, safeGetBlock, getChunkKey, chunkDistanceSq, dist2DSq,
+                    getSectionIndex, getSectionYRange, createSectionData,
+                    isLeafBlock, shouldMergeBlocks, getMergeKey, writeFaceVertices,
+                    estimateChunkFaces, playerIntersectsBlock,
+                    computeTightChunkBounds, analyzeChunkSections,
+                    // --- compression ---
+                    rleEncode, rleDecode, compressChunkData, decompressChunkData,
+                    getCompressionRatio,
+                    // --- noise / rng ---
+                    SeededRandom, noise2D, noise3D, fbm2D, fbmWithDomainWarp,
+                    // --- terrain / biome ---
+                    continentalHeight, defaultHeightFunc, hillsHeightFunc,
+                    plainsHeightFunc, foothillsHeightFunc, mountainsHeightFunc,
+                    getBiomeHeightAtCell, blendedHeight, getPreRiverHeight,
+                    getLocalSlope, getRiverFactor, getOceanFactor, getOceanDepth,
+                    getRiverDepth, getDeltaFingerFactor, treePlacementValue,
+                    getBiomeCellDirect,
+                    // --- lighting ---
+                    calculateChunkSunlight, calculateBlockLight,
+                    // --- table init (data-driven from BLOCK_CONFIG) ---
+                    initBlockLookupTables, initBlockOptimization,
+                    // --- raycast / classes ---
+                    pickVoxel, VoxelWorld,
+                    // --- worker ---
+                    buildChunkWorkerCode,
+                    // --- seeding + mutable module state ---
+                    seedNoise: function(seedStr) { return seedMainThreadNoise(new SeededRandom(seedStr)); },
+                    get worldSeed() { return worldConfig.seed; },
+                    get biomeCellCache() { return biomeCellCache; },
+                };
             }
         </script>
     </body>
