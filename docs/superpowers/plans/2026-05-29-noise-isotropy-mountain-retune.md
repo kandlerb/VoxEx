@@ -277,17 +277,37 @@ From the output, take `xStep.mean` across the five seeds. Record the **maximum**
 Fill in the block below (replace the dashes with the measured numbers) and commit. This block is the source of truth for the gate constants in Task 5.
 
 ```
-### Baseline (pre-mask) — RECORD HERE
+### Baseline (pre-mask) — RECORDED 2026-05-29 (current reverted/buggy noise)
 seed          asym   Xmean  Zmean  Xp99  Zp99  X>3%   Z>3%   peakP99 peakMax
-alpha         ----   ----   ----   ----  ----  ----   ----   ----    ----
-bravo         ----   ----   ----   ----  ----  ----   ----   ----    ----
-12345         ----   ----   ----   ----  ----  ----   ----   ----    ----
-test_seed_42  ----   ----   ----   ----  ----  ----   ----   ----    ----
-ridgetest     ----   ----   ----   ----  ----  ----   ----   ----    ----
+alpha         2.13   1.141  2.428  6     12    7.7    28.7   285     285
+bravo         2.16   0.929  2.003  5     10    3.4    19.7   285     285
+12345         1.73   1.312  2.271  6     10    7.9    22.3   285     285
+test_seed_42  1.67   1.213  2.028  6     8     5.8    17.6   285     285
+ridgetest     1.82   1.378  2.514  6     10    8.0    27.4   285     285
 
-OLD_X_CEILING (max xStep.mean across seeds) = ----
-OLD_X_P99_CEILING (max xStep.p99 across seeds) = ----
+OLD_X_CEILING      (max xStep.mean across seeds) = 1.378
+OLD_X_P99_CEILING  (max xStep.p99  across seeds) = 6
+OLD_X_OVER3_CEILING(max xStep.pctOver3, %)       = 8.0
 ```
+
+#### Reconciliation note (IMPORTANT — corrects finding #14's framing)
+
+Finding #14 documented "6–18× jaggier along Z" and "raw noise2D X=0.005 vs Z=0.076 (~15×)".
+On a consistent finite-difference instrument the **current** reverted code measures:
+- raw `noise2D` mean-step asymmetry ≈ **2.5×** (f=0.1: X=0.027, Z=0.069);
+- `mountainsHeightFunc` **mean**-step asymmetry ≈ **1.7–2.2×** (floored == unfloored).
+
+The "6–18×" was a **tail/large-jump count**, not a mean (the finding's own "28 X-jumps vs 1216
+Z-jumps" is a count of large steps). The tail asymmetry IS large: ~18–29% of Z steps exceed 3
+blocks vs ~3–8% along X (the visible "dropping along Z"). The bug doesn't make X perfectly flat
+because bilinear interpolation still mixes the ±y corner gradients along X. **Methodology is
+unaffected** — we anchor to the old-X profile and tune both axes to/below it; absolute ratio is
+irrelevant.
+
+Also notable: **peakP99 == peakMax == 285 for every seed** — mountains saturate at the
+`Math.min(rawHeight, 285)` clamp (voxEx.html:36557). ≥1% of columns are flat-topped at the ceiling
+(amplitude 180 + baseHeight 64 + peak-amplification overshoots the clamp). The re-tune should
+reduce this saturation as a side effect of softening peak amplification.
 
 - [ ] **Step 4: Commit**
 
