@@ -309,6 +309,20 @@ Also notable: **peakP99 == peakMax == 285 for every seed** — mountains saturat
 (amplitude 180 + baseHeight 64 + peak-amplification overshoots the clamp). The re-tune should
 reduce this saturation as a side effect of softening peak amplification.
 
+#### Post-mask (pre-tune) — RECORDED 2026-05-29 (after `h &= 15` on both grad copies; suite 193/193)
+```
+seed          asym   Xmean  Zmean  Xp99  Zp99  X>3%   Z>3%   peakMax
+alpha         1.05   1.995  2.089  9     9     17.5   18.8   285
+bravo         1.00   2.148  2.143  9     9     20.7   20.6   285
+12345         1.05   1.947  2.053  9     9     15.8   17.7   285
+test_seed_42  1.03   1.850  1.910  8     8     14.4   15.5   285
+ridgetest     0.99   1.769  1.743  10    9     11.8   11.2   285
+```
+Isotropy achieved (asym ≈ 1). The mask pulled X UP (mean 1.1–1.4 → 1.8–2.1) and Z slightly down;
+**both axes now exceed the old-X ceiling** (mean 1.378 / p99 6 / over3 8%). Re-tune target: cut
+both axes' mean step ~35% and over3 ~½ to reach the old-X profile, holding asym ≈ 1. Peaks still
+clamp-saturate at 285.
+
 - [ ] **Step 4: Commit**
 
 ```bash
