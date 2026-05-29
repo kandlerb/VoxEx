@@ -10,6 +10,28 @@
 
 ---
 
+## AMENDMENT 2026-05-29 (during execution — noise-seeding reconciliation)
+
+Reconciliation (Task 1) revealed the main thread has **no callable `initNoise` and no `workerNumericSeed`** at module scope — those exist only inside the `CHUNK_WORKER_CODE` worker template string. The main-thread Perlin `perm` (module-scope, voxEx.html:21395) is seeded **inline inside `initGameEngine`** (voxEx.html:~24890-24895): `rng = new SeededRandom(seedStr); worldConfig.seed = rng.next();` then a Fisher-Yates shuffle of `perm`. `worldConfig` (module-scope, 18238) holds the numeric seed in `worldConfig.seed`.
+
+**Resolution (single source of truth, no copied logic):**
+1. Extract that inline seeding into a module-scope function `seedMainThreadNoise(rng)` that sets `worldConfig.seed = rng.next()`, shuffles `perm` via the SAME `rng`, and returns `worldConfig.seed`. Place it near the noise block (after voxEx.html:~21458).
+2. In `initGameEngine`, replace the inline lines with `rng = new SeededRandom(seedStr); seedMainThreadNoise(rng);` — behavior-identical (same global `rng`, advanced identically).
+3. Seam exports (instead of `initNoise`/`workerNumericSeed`):
+   - `seedNoise: function(seedStr) { return seedMainThreadNoise(new SeededRandom(seedStr)); }`
+   - `get worldSeed() { return worldConfig.seed; }`
+   These use a throwaway rng so tests never perturb the global `rng`.
+
+**Consequences for all later tasks (apply mentally when reading the code blocks below):**
+- `initNoise("X")`  →  `seedNoise("X")`
+- `VoxEx.workerNumericSeed`  →  `VoxEx.worldSeed`; `const seed = VoxEx.worldSeed;`
+- `CHUNK_SIZE` / `CHUNK_HEIGHT` are NOT exported; the harness derives them: `const CHUNK_SIZE = WORLD_DIMS.chunkSize, CHUNK_HEIGHT = WORLD_DIMS.chunkHeight;` (16 / 320).
+- Seam constants list drops `CHUNK_SIZE, CHUNK_HEIGHT`; noise list drops `initNoise`; getters become `worldSeed` + `biomeCellCache`; add the `seedNoise` function.
+
+The worker's seeding (worker `initNoise`) uses the identical shuffle order, so main-thread `seedNoise(s)` produces terrain consistent with the worker for the same seed string — which is what the Tier 4 parity test relies on.
+
+---
+
 ## Key Facts (verified against current source)
 
 - The seam must live in the **same lexical scope as `blendedHeight`** (voxEx.html:36224) and `buildChunkWorkerCode` (voxEx.html:20006). That scope is the main module IIFE. The current file tail (`onWindowResize`, voxEx.html:~42190) is in that scope, so the seam goes just before the closing `</script>` at the end of the module.
@@ -782,4 +804,15 @@ git commit -m "Finalize real-code test suite; document seam and findings"
 
 ## Findings
 
-_(Populated during execution — (b)-class discrepancies where real `voxEx.html` behavior diverges from a test's expectation. Each entry: test name • expected vs actual • voxEx.html line. Do not change game logic to resolve these without user approval.)_
+### T3 re-point triage (Tier 1)
+
+All resolved as stale-test adjustments (the old suite tested re-implemented COPIES that had drifted from the real code). No game-logic changes were made.
+
+1. **Block lookup tables uninitialized in test mode.** The real tables (`BLOCK_IS_SOLID/OPAQUE` via `initBlockLookupTables()` @voxEx.html:11831; `IS_TRANSPARENT`/`*_ATTENUATION` via `initBlockOptimization()` @voxEx.html:29925) are populated during the game's `init()`, which doesn't run in test mode. Fix: harness calls both (the latter in try/catch — its table setup runs before any texture work). This was the root cause of ~9 of the 15 initial failures (block tables, sunlight attenuation, blocklight propagation, fully-solid section detection).
+2. **`safeGetBlock` is valid-chunk-only by design** (@voxEx.html:11922 does `chunk.blocks || chunk` with no null guard). Old test expected null-tolerance. Test now verifies out-of-bounds coords return the default.
+3. **`createSectionData` initializes `maxBlockY = i*SECTION_HEIGHT`** (@voxEx.html:5756), updated during analysis — not `(i+1)*SECTION_HEIGHT`. Test expectation corrected (304, not 320).
+4. **`foothillsHeightFunc` caps at 250** (@voxEx.html:36567 `Math.min(..., 250)`), not 200. Test bound corrected.
+5. **Torch block-light level is 15** via `getTorchBlockLightLevel()` (@voxEx.html ~36975), not 14. Test expectations corrected (emit 15; propagation 14, 13).
+6. **`LEAVES` is tagged `["transparent","leaves"]`** in `BLOCK_CONFIG`, so `BLOCK_IS_SOLID[LEAVES]=0` and `BLOCK_IS_OPAQUE[LEAVES]=0`. Old test assumed leaves were solid. Test now asserts the real classification. NOTE (informational, not a test bug): if leaf-block player collision is expected, confirm it is handled by a path other than `BLOCK_IS_SOLID` — out of scope for this testing work.
+7. **Cross-realm `instanceof`.** The harness loads real code in an iframe (separate JS realm); typed arrays/objects returned by real functions are not `instanceof` the parent page's constructors. The `toBeInstanceOf` matcher was made realm-tolerant (constructor-name comparison).
+8. **Dropped two suites** (`getRegionKey`, `pointToSegmentDist`): these functions have no module-scope definition in voxEx.html (they were test-only re-implementations). Removed rather than test copies.
