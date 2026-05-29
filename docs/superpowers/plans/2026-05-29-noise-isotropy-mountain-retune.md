@@ -323,6 +323,24 @@ Isotropy achieved (asym ≈ 1). The mask pulled X UP (mean 1.1–1.4 → 1.8–2
 both axes' mean step ~35% and over3 ~½ to reach the old-X profile, holding asym ≈ 1. Peaks still
 clamp-saturate at 285.
 
+#### Post-tune (pass 1) — RECORDED 2026-05-29 (suite 193/193; meets all gates)
+Knobs changed in `mountainsHeightFunc`: ridge sharpness 1.6/1.4→1.3/1.2; peak-amp `^3.0*0.4`→`^2.0*0.18`;
+ultra-peak `*1.5`→`*0.5`; spire peakBonus `*0.35`→`*0.15`; jagged `0.12/0.08`→`0.07/0.05`;
+erosion `0.05/0.03/0.02`→`0.03/0.02/0.012`. Amplitude (180) and clamp (285) untouched.
+```
+seed          asym   Xmean  Zmean  Xp99  Zp99  X>3%  Z>3%  peakMean  peakMax
+alpha         1.05   1.310  1.372  5     5     4.2   4.8   194       269
+bravo         1.02   1.188  1.209  4     4     2.4   2.5   192       248
+12345         1.06   1.246  1.316  4     5     3.1   3.9   194       278
+test_seed_42  1.03   0.999  1.031  4     4     1.2   1.2   162       234
+ridgetest     0.99   1.124  1.113  4     4     2.7   2.5   166       247
+```
+All gates met: mean ≤ 1.378 (OLD_X_CEILING), p99 ≤ 6, over3 ≤ 8%, asym ∈ [0.7,1.4], peakMax < 320.
+Peak clamp-saturation (was 285 for all) ELIMINATED (peakMax 234–278). Roughness landed gently
+BELOW old-X. Cross-sections (harness panel) confirm X/Z now match in character, rounded peaks,
+broad valleys, no spikes/walls, macro relief preserved (≈84–101 over a 512-block slice; full-field
+peaks 234–278 above ≈140 foothills). Pending user in-game sign-off (Task 7).
+
 - [ ] **Step 4: Commit**
 
 ```bash
