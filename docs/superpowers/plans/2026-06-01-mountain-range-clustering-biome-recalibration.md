@@ -49,7 +49,9 @@ Find the line `function getRawBiomeParams(gx, gz) {` (≈36236). Insert directly
             // coherent ranges. Constants tuned in Task 5; also baked into the
             // chunk worker by buildChunkWorkerCode().
             const MOUNTAIN_REGION_FREQ = 0.0015;
-            const MOUNTAIN_REGION_THRESHOLD = 0.6;
+            // noise2D at this frequency ranges ~[-0.79, 0.81] (p90 ≈ 0.34); a threshold
+            // of ~0.34 yields ~10% coverage. (0.6 would yield <1% — verified.) Tuned in Task 5.
+            const MOUNTAIN_REGION_THRESHOLD = 0.34;
             function isMountainRegion(gx, gz) {
                 const seed = worldConfig.seed;
                 const wx = noise2D(gx * 0.002 + seed * 5, gz * 0.002) * 60;
@@ -307,11 +309,11 @@ git commit -m "Recalibrate biome CDF table for corrected isotropic noise (5 non-
 - Modify: `voxEx.html` — `MOUNTAIN_REGION_FREQ`, `MOUNTAIN_REGION_THRESHOLD` (the two constants from Task 1). ONLY these.
 
 This is the empirical loop. After each change, re-measure with the Task 4 Step 3 command and the range-metrics command (Task 3 Step 4). Targets (from the spec's acceptance gates):
-- mountain prevalence ~[8%,13%] across seeds → `MOUNTAIN_REGION_THRESHOLD` (raise to reduce %, lower to increase).
+- mountain prevalence ~[8%,13%] across seeds → `MOUNTAIN_REGION_THRESHOLD` (raise to reduce %, lower to increase). Starts at 0.34 (~10%); the usable band is roughly 0.25 (≈17%) to 0.45 (≈5%).
 - median cluster size ≥ 3 cells → `MOUNTAIN_REGION_FREQ` (lower freq = bigger ranges = larger clusters).
 - notch count inside mountain regions ≈ 0 (≥90% below the scattered baseline).
 
-- [ ] **Step 1: Measure with default constants (0.0015 / 0.6)**
+- [ ] **Step 1: Measure with default constants (FREQ 0.0015 / THRESHOLD 0.34)**
 ```bash
 node /c/Users/kandl/AppData/Local/Temp/cdp-eval.cjs "http://localhost:8080/tools/voxex-tests.html" "new Promise(r=>{const t=setInterval(()=>{if(window.rangeMetrics){clearInterval(t);r(['alpha','bravo','12345','test_seed_42','ridgetest'].map(s=>window.rangeMetrics(s)));}},300);})"
 ```
@@ -451,3 +453,9 @@ git commit -m "Docs: mountain-range clustering + biome recalibration; finding #1
 - `_BIOME_CDF_TABLE` is single-source on main; the worker `JSON.stringify`s it — do NOT hand-edit a worker copy.
 - The region mask is sampled at cell centers (because `getRawBiomeParams` is always called via `getRawBiomeCellDirect` with cell-center coords) — that's why low `FREQ` yields contiguous multi-cell ranges.
 - Do not touch `mountainsHeightFunc`, the `& 15` mask, `blendedHeight`, `foothillsHeightFunc`. The notch fix is structural (clustering), not a height-formula change.
+
+## Pre-implementation review findings (2026-06-01)
+
+- **Threshold corrected:** `MOUNTAIN_REGION_THRESHOLD` starts at **0.34**, not 0.6 — `noise2D` at the region frequency ranges ~[-0.79, 0.81] (p90 ≈ 0.34), so 0.6 would give <1% mountains. Verified empirically.
+- **Legacy biome class (note, no action):** there is an unused class biome path at `voxEx.html:~6470–6938` (`getRawBiome`/`getBiomeAt`) explicitly annotated "not called". It is NOT the generation path (generation uses module-scope `blendedHeight`/`getBiomeParams`). The restructure does not touch it.
+- **Worker surface-tag path (conditional follow-up, NOT a prerequisite):** the worker has a *separate* hardcoded biome family — `getBiomeParams`→`getBiomeCellValue`→`getRawBiomeCellValue` (`voxEx.html:~19006–19106`) — that builds the worker's `biomeCache`, feeding only the `isMountain` **surface tag** in `generateTerrainPass`. The **height/notch path is unaffected**: worker `heightCache` routes through the *injected* family (`blendedHeight`→`getBiomeHeightAtCell`→`getBiomeCellDirect`→`getRawBiomeParams`), which this plan modifies and the Tier-4 height-parity test guards. After clustering, the worker `isMountain` *surface tag* (Value path) will not track mask-placed mountains — but `isMountain` is a minor input to surface block choice (dominated by `SNOW_LINE`/`ROCK_LINE`/`ALPINE_LINE`/slope thresholds), so visible impact is likely small. **Assess at the R6 in-game check.** If surface artifacts appear (e.g. mask-mountains lacking rocky surface), the small follow-up is to gate the worker's `getRawBiomeCellValue` on `isMountainRegion` too (or point the worker's `getBiomeParams` at the injected `getBiomeCellDirect`). Do NOT pre-emptively refactor the worker biome code — let the in-game check decide.

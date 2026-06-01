@@ -76,7 +76,7 @@ function isMountainRegion(gx, gz) {
 Two module-scope constants, tuned via the harness then in-game:
 - `MOUNTAIN_REGION_FREQ` (start ~0.0015) — range size. Low enough that adjacent 64-block cell
   centers are correlated (`64 × freq ≈ 0.1`), producing contiguous multi-cell ranges.
-- `MOUNTAIN_REGION_THRESHOLD` (start ~0.6) — tuned so ~10% of cells are mountains.
+- `MOUNTAIN_REGION_THRESHOLD` (start ~0.34) — tuned so ~10% of cells are mountains. (`noise2D` at the region frequency ranges ~[-0.79, 0.81], p90 ≈ 0.34; verified — 0.6 would give <1%.)
 
 ### 2. Biome selection restructure
 
