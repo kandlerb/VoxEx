@@ -382,16 +382,20 @@ Insert inside `runAllTests`:
         });
     });
 
+    // Gate thresholds bracket the R5 achieved-and-user-approved metrics (FREQ 0.0015 /
+    // THRESHOLD 0.34): prevalence 8.6–13.8%, median cluster 27–51, notches 1–4. Bands
+    // give margin while still catching a regression to the scattered baseline
+    // (which had ~38–88 notches and cluster size 1).
     await describe("biome: mountain ranges + distribution (post-restructure)", () => {
         const seeds = ["alpha", "bravo", "12345", "test_seed_42", "ridgetest"];
-        it("mountain prevalence in [8%,13%]", () => {
-            for (const s of seeds) { const m = rangeMetrics(s); expect(m.mtnPct).toBeGreaterThanOrEqual(8); expect(m.mtnPct).toBeLessThanOrEqual(13); }
+        it("mountain prevalence in [7%,15%]", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); expect(m.mtnPct).toBeGreaterThanOrEqual(7); expect(m.mtnPct).toBeLessThanOrEqual(15); }
         });
-        it("mountains cluster into ranges (median cluster >= 3)", () => {
-            for (const s of seeds) { const m = rangeMetrics(s); if (m.clusters > 0) expect(m.medianCluster).toBeGreaterThanOrEqual(3); }
+        it("mountains cluster into ranges (median cluster >= 5, not scattered singles)", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); if (m.clusters > 0) expect(m.medianCluster).toBeGreaterThanOrEqual(5); }
         });
-        it("no interior notches amid mountains (<= 2 per seed)", () => {
-            for (const s of seeds) { const m = rangeMetrics(s); expect(m.notches).toBeLessThanOrEqual(2); }
+        it("interior notches collapsed (<= 6 per seed; scattered baseline was 38-88)", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); expect(m.notches).toBeLessThanOrEqual(6); }
         });
         it("non-mountain biome distribution near configured weights", () => {
             const { getBiomeCellDirect, seedNoise, biomeCellCache } = VoxEx;
@@ -402,7 +406,9 @@ Insert inside `runAllTests`:
         });
     });
 ```
-(The `notches <= 2` and `medianCluster >= 3` thresholds reflect the Task 5 converged result; adjust to the recorded values if tuning settled elsewhere — but only after the user sign-off in Task 5, never to force a pass.)
+(The thresholds — prevalence [7,15], medianCluster ≥5, notches ≤6 — bracket the R5 achieved-and-user-approved metrics with margin. They are honest regression gates, NOT loosened to force a pass: the scattered pre-restructure baseline had ~38–88 notches and cluster size 1, which these gates reject.)
+
+R5 outcome (recorded): converged at the **default** constants `MOUNTAIN_REGION_FREQ = 0.0015`, `MOUNTAIN_REGION_THRESHOLD = 0.34` — no code change needed (the R1 defaults, chosen from the noise distribution, validated well). Range metrics (rangeMetrics R=64): prevalence 8.6–13.8%, median cluster 27–51, max 78–162, notches 1–4. User approved the region map + in-game look ("looks right — lock it") at the R5 checkpoint, which also serves as the R6 in-game sign-off.
 
 - [ ] **Step 2: Full suite green**
 ```bash
