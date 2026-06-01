@@ -233,6 +233,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3946). Tags enable biome-specific
 - 4 rings of foothills (256 blocks total) with quadratic decay: `ringFactor = max(0.05, 1 - (ring/4)²)`
 - Ring 1 ≈ 94% mountain shape, Ring 2 ≈ 75%, Ring 3 ≈ 44%, Ring 4 ≈ 5%
 - `mountainWeight = ringFactor * 0.9` controls how much mountain relief passes through
+- **Mountain placement:** mountains are placed by a low-frequency domain-warped region mask (`isMountainRegion`, voxEx.html) so they cluster into coherent ranges, NOT by the per-cell weighted roll (which distributes the other 5 biomes via a noise-calibrated CDF, `_BIOME_CDF_TABLE`). This keeps mountain ranges contiguous and avoids plains/foothill notches between scattered peaks.
 
 ## Key Systems Explained
 

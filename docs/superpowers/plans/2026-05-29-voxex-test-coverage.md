@@ -837,3 +837,20 @@ All resolved as stale-test adjustments (the old suite tested re-implemented COPI
     - **Fix (commit `91ecef5`, then reverted by `430372a`):** add `const h = hash & 15;` to both 2D `grad` copies (worker + main, identically). Verified it WORKS: after the fix the X/Z asymmetry ratio dropped from 6–18× to ~0.7–2× and the suite stayed 193/193 green (worker↔main parity preserved).
     - **Why reverted:** the fix is correct, but the mountain generator (`mountainsHeightFunc`: amplitude 180, cubed peak-amplification, ridge sharpness) was implicitly tuned against the BROKEN anisotropic noise — the bug made one axis nearly flat, so ridges read as smooth ridgelines. With correct isotropic noise the full ruggedness applies to both axes → extreme spires/near-vertical walls. It also seams existing saved worlds (stored old-noise chunks beside newly-generated corrected-noise chunks). Reverting restored known-good terrain.
     - **To apply properly later:** re-introduce the `& 15` mask in both 2D `grad`s (the one-line fix is preserved in git history at `91ecef5`), AND re-tune `mountainsHeightFunc` (lower amplitude/peak-amplification/sharpness, measuring jump magnitudes via the harness) so isotropic mountains look right. New worlds only — accept seams on pre-existing saves. This is a deliberate creative-tuning effort, not a mechanical fix.
+
+### Finding #14 follow-up (2026-06-01) — APPLIED PROPERLY + downstream restructure
+
+The `& 15` mask was re-applied for good (both 2D `grad` copies), and `mountainsHeightFunc` re-tuned
+for isotropic noise (tamer ranges; metrics gated). Applying the correct noise revealed it was
+**load-bearing** for the biome system:
+- **Mountain notches:** with isotropic noise, mountains (scattered single biome cells at default
+  `biomeFrequency=0.5`) produced plains/foothill chunks dropping to ~y60 between peaks. Fixed
+  structurally by placing mountains via a low-frequency domain-warped region mask
+  (`isMountainRegion`) so they cluster into coherent ranges; foothills then apron only the range
+  perimeter. Notches collapsed from ~38–88 (scattered) to 1–4 per seed.
+- **Biome CDF miscalibration:** `_BIOME_CDF_TABLE` was fit to the old noise's value distribution;
+  under corrected noise, forests generated at ~2.5% vs configured ~22%. Recalibrated against the
+  corrected noise (forests back to ~22%); mountains removed from the weighted roll (now mask-placed).
+
+Worker↔main parity preserved; full suite 200/200; user-approved in-game. See
+`docs/superpowers/plans/2026-06-01-mountain-range-clustering-biome-recalibration.md`.
