@@ -35,6 +35,7 @@ h1 { color: #4caf50; margin-bottom: 4px; }
 <div id="summary"></div>
 <div id="results"></div>
 <div id="terrain-viz-container"></div>
+<div id="mountain-tuning-panel" style="margin-top:16px"></div>
 
 <script>
 // ============================================================
@@ -410,6 +411,41 @@ async function runAllTests() {
         });
     });
 
+    await describe("mountains: isotropy preserved (re-tune gate)", () => {
+        // OLD_X_CEILING = 1.378, OLD_X_P99_CEILING = 6 (from the noise-isotropy plan, Task 2 baseline).
+        const OLD_X_CEILING = 1.378, OLD_X_P99_CEILING = 6;
+        const seeds = ["alpha", "bravo", "12345", "test_seed_42", "ridgetest"];
+        it("X/Z step asymmetry within [0.7,1.4]", () => {
+            for (const s of seeds) { const m = mountainMetrics(s); expect(m.asymmetry).toBeGreaterThan(0.7); expect(m.asymmetry).toBeLessThan(1.4); }
+        });
+        it("both axes mean step <= old-X ceiling", () => {
+            for (const s of seeds) { const m = mountainMetrics(s); expect(m.xStep.mean).toBeLessThanOrEqual(OLD_X_CEILING); expect(m.zStep.mean).toBeLessThanOrEqual(OLD_X_CEILING); }
+        });
+        it("both axes p99 step <= old-X p99 ceiling", () => {
+            for (const s of seeds) { const m = mountainMetrics(s); expect(m.xStep.p99).toBeLessThanOrEqual(OLD_X_P99_CEILING); expect(m.zStep.p99).toBeLessThanOrEqual(OLD_X_P99_CEILING); }
+        });
+    });
+
+    await describe("biome: mountain ranges + distribution (post-restructure)", () => {
+        const seeds = ["alpha", "bravo", "12345", "test_seed_42", "ridgetest"];
+        it("mountain prevalence in [7%,15%]", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); expect(m.mtnPct).toBeGreaterThanOrEqual(7); expect(m.mtnPct).toBeLessThanOrEqual(15); }
+        });
+        it("mountains cluster into ranges (median cluster >= 5, not scattered singles)", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); if (m.clusters > 0) expect(m.medianCluster).toBeGreaterThanOrEqual(5); }
+        });
+        it("interior notches collapsed (<= 6 per seed; scattered baseline was 38-88)", () => {
+            for (const s of seeds) { const m = rangeMetrics(s); expect(m.notches).toBeLessThanOrEqual(6); }
+        });
+        it("non-mountain biome distribution near configured weights (forests recovered)", () => {
+            const { getBiomeCellDirect, seedNoise, biomeCellCache } = VoxEx;
+            const c = {}; let tot = 0;
+            for (const s of seeds) { seedNoise(s); biomeCellCache.clear(); for (let cz=0; cz<120; cz++) for (let cx=0; cx<120; cx++) { const n = getBiomeCellDirect(cx,cz).name; if (n==='mountains'||n==='mountain_foothills') continue; c[n]=(c[n]||0)+1; tot++; } }
+            const forestsPct = (c['forests']||0)/tot*100;
+            expect(forestsPct).toBeGreaterThan(15); // was ~2.5% pre-recalibration; target ~22%
+        });
+    });
+
     // ---- Height function cross-checks ----
     describe("Terrain cross-seed consistency", () => {
         it("no NaN/Infinity from any height func", () => { const s = seed; const biomes = [BIOME_CONFIG.plains, BIOME_CONFIG.hills, BIOME_CONFIG.forests]; const funcs = [plainsHeightFunc, hillsHeightFunc, defaultHeightFunc];
@@ -717,6 +753,7 @@ async function runAllTests() {
     await runRegistered();
     renderResults();
     renderTerrainVisualizations();
+    renderMountainTuning();
 }
 
 // ============================================================
@@ -762,6 +799,128 @@ function renderTerrainVisualizations() {
         const label = document.createElement('div'); label.className = 'terrain-label'; label.textContent = `${cfg.name} (${mn.toFixed(1)} - ${mx.toFixed(1)})`;
         wrapper.appendChild(canvas); wrapper.appendChild(label); row.appendChild(wrapper);
     }
+}
+
+// ============================================================
+// MOUNTAIN TUNING METRICS
+// ============================================================
+// Real-code mountain metrics via the ?test=1 seam. Floors heights to match
+// in-game block steps (blendedHeight floors; the player sees integer columns).
+// Returns per-axis single-block step stats, peak stats, and the X/Z asymmetry
+// ratio (mean Z step / mean X step). Pure: re-seeds with a throwaway rng.
+function mountainMetrics(seedStr, N = 384) {
+    const { mountainsHeightFunc, BIOME_CONFIG, seedNoise } = VoxEx;
+    seedNoise(seedStr);
+    const sd = VoxEx.worldSeed;
+    const biome = BIOME_CONFIG.mountains;
+    const H = (gx, gz) => Math.floor(mountainsHeightFunc(gx, gz, biome, sd));
+    const xSteps = [], zSteps = [], peaks = [];
+    for (let gz = 0; gz < N; gz += 8) {           // X-axis steps along rows
+        let prev = H(0, gz);
+        for (let gx = 1; gx < N; gx++) { const h = H(gx, gz); xSteps.push(Math.abs(h - prev)); peaks.push(h); prev = h; }
+    }
+    for (let gx = 0; gx < N; gx += 8) {           // Z-axis steps along columns
+        let prev = H(gx, 0);
+        for (let gz = 1; gz < N; gz++) { const h = H(gx, gz); zSteps.push(Math.abs(h - prev)); prev = h; }
+    }
+    const stats = (arr) => {
+        const s = arr.slice().sort((a, b) => a - b);
+        const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+        return { mean, p99: s[Math.floor(s.length * 0.99)], max: s[s.length - 1], pctOver3: arr.filter(v => v > 3).length / arr.length };
+    };
+    const x = stats(xSteps), z = stats(zSteps);
+    const ps = peaks.slice().sort((a, b) => a - b);
+    return { seed: seedStr, xStep: x, zStep: z, asymmetry: z.mean / (x.mean || 1), peakP99: ps[Math.floor(ps.length * 0.99)], peakMax: ps[ps.length - 1] };
+}
+window.mountainMetrics = mountainMetrics;   // expose for headless cdp-eval
+
+function rangeMetrics(seedStr, R = 64) {
+    const { getBiomeCellDirect, blendedHeight, seedNoise, biomeCellCache, BIOME_CELL_SIZE } = VoxEx;
+    seedNoise(seedStr); const sd = VoxEx.worldSeed; biomeCellCache.clear();
+    const g = [];
+    for (let cz = 0; cz < R; cz++) { const row = []; for (let cx = 0; cx < R; cx++) row.push(getBiomeCellDirect(cx, cz).name); g.push(row); }
+    let mtn = 0; for (let z = 0; z < R; z++) for (let x = 0; x < R; x++) if (g[z][x] === 'mountains') mtn++;
+    // cluster sizes via flood fill (4-connected)
+    const seen = Array.from({ length: R }, () => new Array(R).fill(false));
+    const sizes = [];
+    for (let z = 0; z < R; z++) for (let x = 0; x < R; x++) {
+        if (g[z][x] === 'mountains' && !seen[z][x]) {
+            let n = 0; const st = [[x, z]]; seen[z][x] = true;
+            while (st.length) { const [cx, cz] = st.pop(); n++; for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) { const nx = cx+dx, nz = cz+dz; if (nx>=0&&nz>=0&&nx<R&&nz<R&&g[nz][nx]==='mountains'&&!seen[nz][nx]) { seen[nz][nx]=true; st.push([nx,nz]); } } }
+            sizes.push(n);
+        }
+    }
+    sizes.sort((a, b) => a - b);
+    const median = sizes.length ? sizes[Math.floor(sizes.length/2)] : 0;
+    // notch count: scan transects, count high(>150)->low(<78 within 160 of a high)->high(within 160)
+    let notches = 0;
+    for (let f = 0; f < R*BIOME_CELL_SIZE; f += 96) {
+        for (let axis = 0; axis < 2; axis++) {
+            let prevHi = -1;
+            for (let t = 0; t < 3000; t += 4) {
+                const gx = axis === 0 ? t : f, gz = axis === 0 ? f : t;
+                const h = blendedHeight(gx, gz, sd);
+                if (h > 150) prevHi = t;
+                else if (h < 78 && prevHi >= 0 && (t - prevHi) < 160) {
+                    let ahead = false; for (let u = t; u < t+160; u += 4) { const gx2 = axis===0?u:f, gz2 = axis===0?f:u; if (blendedHeight(gx2,gz2,sd) > 150) { ahead = true; break; } }
+                    if (ahead) { notches++; prevHi = -1; }
+                }
+            }
+        }
+    }
+    return { seed: seedStr, mtnPct: +(mtn/(R*R)*100).toFixed(1), clusters: sizes.length, medianCluster: median, maxCluster: sizes[sizes.length-1] || 0, notches };
+}
+window.rangeMetrics = rangeMetrics;
+
+function renderMountainCrossSection(seedStr, mount) {
+    const { mountainsHeightFunc, BIOME_CONFIG, seedNoise } = VoxEx;
+    seedNoise(seedStr); const sd = VoxEx.worldSeed; const biome = BIOME_CONFIG.mountains;
+    const W = 512, Hpx = 200;
+    const xs = [], zs = [];
+    for (let i = 0; i < W; i++) { xs.push(mountainsHeightFunc(i, 0, biome, sd)); zs.push(mountainsHeightFunc(0, i, biome, sd)); }
+    const all = xs.concat(zs); const mn = Math.min(...all), mx = Math.max(...all), rng = (mx - mn) || 1;
+    for (const [label, arr, color] of [["X profile", xs, "#4caf50"], ["Z profile", zs, "#ff9800"]]) {
+        const c = document.createElement('canvas'); c.width = W; c.height = Hpx; c.style.cssText = 'border:1px solid #444;border-radius:4px;margin:4px';
+        const g = c.getContext('2d'); g.fillStyle = '#111'; g.fillRect(0, 0, W, Hpx);
+        g.strokeStyle = color; g.beginPath();
+        for (let i = 0; i < W; i++) { const y = Hpx - ((arr[i] - mn) / rng) * (Hpx - 10) - 5; if (i === 0) g.moveTo(i, y); else g.lineTo(i, y); }
+        g.stroke();
+        g.fillStyle = '#ccc'; g.font = '12px monospace'; g.fillText(`${label} (seed ${seedStr}, ${mn.toFixed(0)}-${mx.toFixed(0)})`, 6, 14);
+        mount.appendChild(c);
+    }
+}
+
+function renderMountainTuning() {
+    const panel = document.getElementById('mountain-tuning-panel');
+    panel.innerHTML = '<h2 style="color:#4caf50;margin:16px 0 8px">Mountain Tuning Metrics</h2>';
+    const seeds = ["alpha", "bravo", "12345", "test_seed_42", "ridgetest"];
+    const rows = seeds.map(s => mountainMetrics(s));
+    const pre = document.createElement('pre');
+    pre.style.cssText = 'background:#1a1a1a;color:#bdf;padding:10px;border-radius:6px;font-size:12px;overflow:auto';
+    pre.textContent = rows.map(m =>
+        `${m.seed.padEnd(14)} asym=${m.asymmetry.toFixed(2)}  Xmean=${m.xStep.mean.toFixed(3)} Zmean=${m.zStep.mean.toFixed(3)}  ` +
+        `Xp99=${m.xStep.p99} Zp99=${m.zStep.p99}  X>3=${(m.xStep.pctOver3*100).toFixed(1)}% Z>3=${(m.zStep.pctOver3*100).toFixed(1)}%  ` +
+        `peakP99=${m.peakP99} peakMax=${m.peakMax}`).join('\n');
+    panel.appendChild(pre);
+    const cs = document.createElement('div'); cs.style.cssText = 'display:flex;flex-wrap:wrap;margin-top:8px';
+    renderMountainCrossSection("test_seed_42", cs); renderMountainCrossSection("ridgetest", cs);
+    panel.appendChild(cs);
+    const rpre = document.createElement('pre');
+    rpre.style.cssText = 'background:#1a1a1a;color:#fd8;padding:10px;border-radius:6px;font-size:12px;overflow:auto;margin-top:8px';
+    rpre.textContent = '— Range coherence —\n' + ["alpha","bravo","12345","test_seed_42","ridgetest"].map(s => {
+        const m = rangeMetrics(s);
+        return `${s.padEnd(14)} mtn=${m.mtnPct}%  clusters=${m.clusters} medianSize=${m.medianCluster} maxSize=${m.maxCluster}  notches=${m.notches}`;
+    }).join('\n');
+    panel.appendChild(rpre);
+    (function(){
+        const { isMountainRegion, seedNoise, BIOME_CELL_SIZE } = VoxEx; seedNoise("ridgetest"); const sd = VoxEx.worldSeed;
+        const R = 96, c = document.createElement('canvas'); c.width = R; c.height = R; c.style.cssText = 'image-rendering:pixelated;width:'+(R*3)+'px;height:'+(R*3)+'px;border:1px solid #444;margin-top:8px';
+        const gg = c.getContext('2d'); const img = gg.createImageData(R, R);
+        for (let z = 0; z < R; z++) for (let x = 0; x < R; x++) { const on = isMountainRegion(x*BIOME_CELL_SIZE+32, z*BIOME_CELL_SIZE+32); const i = (z*R+x)*4; img.data[i]=on?150:30; img.data[i+1]=on?150:60; img.data[i+2]=on?150:30; img.data[i+3]=255; }
+        gg.putImageData(img, 0, 0);
+        const lbl = document.createElement('div'); lbl.style.cssText='color:#aaa;font-size:11px'; lbl.textContent='Mountain regions (ridgetest, 96×96 cells)';
+        panel.appendChild(lbl); panel.appendChild(c);
+    })();
 }
 
 window.addEventListener('load', runAllTests);

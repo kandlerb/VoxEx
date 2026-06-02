@@ -18924,6 +18924,7 @@
     const lerp = (t, a, b) => a + t * (b - a);
 
     const grad = (h, x, y) => {
+        h &= 15;
         const u = h < 8 ? x : y;
         const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
         return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
@@ -20023,7 +20024,8 @@
                     getOceanFactor,
                     getRiverDepth,
                     getOceanDepth,
-                    getDeltaFingerFactor
+                    getDeltaFingerFactor,
+                    isMountainRegion
                 ];
 
                 // Build injected code string with proper indentation for worker
@@ -20046,8 +20048,10 @@
                 injectedCode += '    const __biomes = ' + JSON.stringify(buildBiomesFromConfig()) + ';\n';
                 injectedCode += '    const biomes = __biomes;\n';
                 injectedCode += '    const biomeByName = new Map(__biomes.map(function(b){ return [b.name, b]; }));\n';
-                injectedCode += '    let biomeTable; (function(){ let total = 0; const cumulative = []; for (const b of __biomes) { if (b.name === "mountain_foothills") continue; total += b.weight; cumulative.push({ biome: b, threshold: total }); } biomeTable = { cumulative, totalWeight: total }; })();\n';
+                injectedCode += '    let biomeTable; (function(){ let total = 0; const cumulative = []; for (const b of __biomes) { if (b.name === "mountain_foothills" || b.name === "mountains") continue; total += b.weight; cumulative.push({ biome: b, threshold: total }); } biomeTable = { cumulative, totalWeight: total }; })();\n';
                 injectedCode += '    const worldConfig = { get seed() { return workerNumericSeed; }, biomeFrequency: ' + JSON.stringify(worldConfig.biomeFrequency) + ' };\n\n';
+                injectedCode += '    const MOUNTAIN_REGION_FREQ = ' + JSON.stringify(MOUNTAIN_REGION_FREQ) + ';\n';
+                injectedCode += '    const MOUNTAIN_REGION_THRESHOLD = ' + JSON.stringify(MOUNTAIN_REGION_THRESHOLD) + ';\n\n';
 
                 // Inject each function's source code
                 for (const fn of terrainFuncs) {
@@ -21414,6 +21418,7 @@
             // lerpValue: same as THREE.MathUtils.lerp(a, b, t) - for terrain functions that can be injected into workers
             const lerpValue = (a, b, t) => a + t * (b - a);
             const grad = (h, x, y) => {
+                h &= 15;
                 const u = h < 8 ? x : y, v = h < 4 ? y : h === 12 || h === 14 ? x : 0;
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
             };
@@ -36017,7 +36022,7 @@ self.onmessage = async (e) => {
                 // Only exclude mountain_foothills (weight 0, transitional biome)
                 const cumulative = [];
                 for (const b of biomes) {
-                    if (b.name === 'mountain_foothills') continue;
+                    if (b.name === 'mountain_foothills' || b.name === 'mountains') continue;
                     total += b.weight;
                     cumulative.push({ biome: b, threshold: total });
                 }
@@ -36206,18 +36211,17 @@ self.onmessage = async (e) => {
                 const cellZ = Math.floor(v);
                 return getBiomeCellDirect(cellX, cellZ);
             }
-            // Empirical CDF inverse: maps the biome-selection noise (centred sharply at 0.5
-            // — 45-55th percentile sits in 0.4997-0.5003, a ~10% mass spike at the median)
-            // to a uniform distribution in [0, 1] so weighted biome selection respects
-            // configured weights. Without this, biomes at the bin extremes (plains: [0, 0.2],
-            // longwoods: [0.8, 1.0]) almost never spawn. Table from tools/_debug_noise2.js.
+            // Recalibrated 2026-06-01 for the corrected isotropic noise (replaces the old-noise table).
+            // Empirical CDF inverse: maps the biome-selection noise to a uniform distribution in [0, 1]
+            // so weighted biome selection respects configured weights. Sampled at cell centers over
+            // 8 seeds × 200×200 cells using the corrected isotropic noise (5 non-mountain biomes).
             const _BIOME_CDF_TABLE = [
-                [0.0000, 0.000], [0.2520, 0.010], [0.2988, 0.050], [0.3536, 0.100],
-                [0.3941, 0.150], [0.4290, 0.200], [0.4403, 0.250], [0.4524, 0.300],
-                [0.4572, 0.350], [0.4772, 0.400], [0.4997, 0.450], [0.5003, 0.550],
-                [0.5231, 0.600], [0.5429, 0.650], [0.5476, 0.700], [0.5599, 0.750],
-                [0.5710, 0.800], [0.6054, 0.850], [0.6458, 0.900], [0.7002, 0.950],
-                [0.7480, 0.990], [1.0000, 1.000]
+                [0.1954, 0.000], [0.2263, 0.010], [0.2757, 0.050], [0.3319, 0.100],
+                [0.3642, 0.150], [0.3846, 0.200], [0.4004, 0.250], [0.4275, 0.300],
+                [0.4392, 0.350], [0.4631, 0.400], [0.4830, 0.450], [0.5168, 0.550],
+                [0.5431, 0.600], [0.5575, 0.650], [0.5760, 0.700], [0.5989, 0.750],
+                [0.6170, 0.800], [0.6349, 0.850], [0.6609, 0.900], [0.7022, 0.950],
+                [0.7776, 0.990], [0.8253, 1.000]
             ];
             function uniformBiomeRoll(noiseVal) {
                 const n = (noiseVal + 1) * 0.5;
@@ -36231,7 +36235,24 @@ self.onmessage = async (e) => {
                 return 1.0;
             }
 
+            // Mountains are placed by a low-frequency, domain-warped REGION MASK
+            // (not the per-cell weighted roll) so mountain cells cluster into
+            // coherent ranges. Constants tuned later; also baked into the chunk
+            // worker by buildChunkWorkerCode() (a separate task).
+            const MOUNTAIN_REGION_FREQ = 0.0015;
+            // noise2D at this frequency ranges ~[-0.79, 0.81] (p90 ≈ 0.34); a
+            // threshold of ~0.34 yields ~10% coverage. (0.6 would yield <1%.)
+            const MOUNTAIN_REGION_THRESHOLD = 0.34;
+            function isMountainRegion(gx, gz) {
+                const seed = worldConfig.seed;
+                const wx = noise2D(gx * 0.002 + seed * 5, gz * 0.002) * 60;
+                const wz = noise2D(gx * 0.002 + 100, gz * 0.002 + seed * 5) * 60;
+                const m = noise2D((gx + wx) * MOUNTAIN_REGION_FREQ + seed * 0.9,
+                                  (gz + wz) * MOUNTAIN_REGION_FREQ - seed * 0.4);
+                return m > MOUNTAIN_REGION_THRESHOLD;
+            }
             function getRawBiomeParams(gx, gz) {
+                if (isMountainRegion(gx, gz)) return biomeByName.get('mountains');
                 const { seed, biomeFrequency } = worldConfig;
                 const noiseVal = noise2D(gx * biomeFrequency + seed * 0.37, gz * biomeFrequency - seed * 0.71);
                 const t = uniformBiomeRoll(noiseVal);
@@ -36451,7 +36472,7 @@ self.onmessage = async (e) => {
                 for (let i = 0; i < 6; i++) {
                     let n = 1.0 - Math.abs(noise2D(rx * freq + seed * 10, rz * freq + seed * 10));
                     // Higher sharpness exponents for narrower, pointier ridges
-                    const sharpness = i < 2 ? 1.6 : 1.4;
+                    const sharpness = i < 2 ? 1.3 : 1.2;
                     n = Math.pow(n, sharpness);
                     ridgeSum += n * amp;
                     freq *= 2.0;
@@ -36462,11 +36483,11 @@ self.onmessage = async (e) => {
                 // --- PEAK AMPLIFICATION ---
                 // Aggressive peak boost - lower threshold, steeper curve for true sharp peaks
                 if (ridgeSum > 0.5) {
-                    ridgeSum += Math.pow((ridgeSum - 0.5) * 2.0, 3.0) * 0.4;
+                    ridgeSum += Math.pow((ridgeSum - 0.5) * 2.0, 2.0) * 0.18;
                 }
                 // Ultra-peak boost for the very highest convergence points
                 if (ridgeSum > 0.9) {
-                    ridgeSum += (ridgeSum - 0.9) * 1.5;
+                    ridgeSum += (ridgeSum - 0.9) * 0.5;
                 }
 
                 // --- 4. JAGGED DETAIL ---
@@ -36477,7 +36498,7 @@ self.onmessage = async (e) => {
                 const jagged1 = 1.0 - Math.abs(noise2D(gx * jaggedFreq + seed * 30, gz * jaggedFreq - seed * 30));
                 const jagged2 = 1.0 - Math.abs(noise2D(gx * jaggedFreq * 2.3 - seed * 17, gz * jaggedFreq * 2.3 + seed * 13));
                 // Jaggedness scales with altitude - higher areas are more jagged
-                const jaggedAmount = (Math.pow(jagged1, 1.8) * 0.12 + Math.pow(jagged2, 2.2) * 0.08) *
+                const jaggedAmount = (Math.pow(jagged1, 1.8) * 0.07 + Math.pow(jagged2, 2.2) * 0.05) *
                                     (0.4 + ridgeSum * 0.6);
 
                 // --- 5. VALLEY CARVING ---
@@ -36498,7 +36519,7 @@ self.onmessage = async (e) => {
                     // Sharp spire peaks - lower threshold, more aggressive
                     const spireNoise = noise2D(gx * 0.02 + seed * 15, gz * 0.02 - seed * 15);
                     if (spireNoise > 0.45) {
-                        peakBonus = Math.pow((spireNoise - 0.45) * 1.8, 2.5) * 0.35;
+                        peakBonus = Math.pow((spireNoise - 0.45) * 1.8, 2.5) * 0.15;
                     }
                 } else if (peakTypeNoise < -0.3 && ridgeSum > 0.5) {
                     peakBonus = ridgeSum * 0.1;
@@ -36519,8 +36540,8 @@ self.onmessage = async (e) => {
                 const erosionNoise = noise2D(gx * 0.08 + seed * 3, gz * 0.08 - seed * 3);
                 const erosionNoise2 = noise2D(gx * 0.15 - seed * 4, gz * 0.15 + seed * 4);
                 const erosionNoise3 = noise2D(gx * 0.25 + seed * 7, gz * 0.25 - seed * 7);
-                const erosionAmount = (Math.abs(erosionNoise) * 0.05 + Math.abs(erosionNoise2) * 0.03 +
-                                      Math.abs(erosionNoise3) * 0.02) * (0.4 + ridgeSum * 0.6);
+                const erosionAmount = (Math.abs(erosionNoise) * 0.03 + Math.abs(erosionNoise2) * 0.02 +
+                                      Math.abs(erosionNoise3) * 0.012) * (0.4 + ridgeSum * 0.6);
 
                 // --- 10. GULLIES ---
                 const gullyNoise = 1.0 - Math.abs(noise2D(gx * 0.025 + seed * 25, gz * 0.025 - seed * 25));
@@ -42273,6 +42294,7 @@ self.onmessage = async (e) => {
                     getLocalSlope, getRiverFactor, getOceanFactor, getOceanDepth,
                     getRiverDepth, getDeltaFingerFactor, treePlacementValue,
                     getBiomeCellDirect,
+                    isMountainRegion,
                     // --- lighting ---
                     calculateChunkSunlight, calculateBlockLight,
                     // --- table init (data-driven from BLOCK_CONFIG) ---
