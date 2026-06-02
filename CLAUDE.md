@@ -217,7 +217,7 @@ VoxEx/
 | **Longwoods** | 2 | Giant 2x2/3x3 trunk trees, heights 12-24, wide sparse canopies |
 | **Mountain Foothills** | auto | Transition zone (4-ring Chebyshev distance, quadratic decay, mountain-derived noise) |
 
-Biomes are configured in `BIOME_CONFIG` (~line 3946). Tags enable biome-specific behavior:
+Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific behavior:
 - `"mountain"` — enables treeline and alpine terrain
 - `"forested"` — high tree density
 - `"giant_trees"` — uses multi-block trunks
@@ -360,35 +360,35 @@ Biomes are configured in `BIOME_CONFIG` (~line 3946). Tags enable biome-specific
 
 | Class | ~Line | Purpose |
 |-------|-------|---------|
-| `SettingsManager` | 6104 | Settings persistence, listeners, profiles |
-| `InputManager` | 6251 | Keyboard/mouse input, pointer lock, bitmask flags |
-| `TerrainGenerator` | 6430 | Terrain/biome generation, noise, height functions |
-| `VoxelWorld` | 6997 | World management, chunk loading/unloading, block access |
-| `ChunkDataPool` | 7554 | Object pooling for chunk data structures |
-| `ChunkMesher` | 8477 | Geometry mesh building with face culling and AO |
-| `RenderEngine` | 8595 | Three.js rendering pipeline, camera, lighting, shadows |
-| `AudioManager` | 8896 | Procedural sound synthesis and playback |
-| `EntityManager` | 9236 | Zombie spawning, lifecycle, pooling |
-| `Mob` | 9424 | Base entity class (position, velocity, physics) |
-| `Zombie` | 9486 | Zombie AI state machine (wander/chase/attack) |
-| `PlayerController` | 9730 | Player movement, physics, collision, swimming |
-| `UIManager` | 10083 | HUD, hotbar, inventory, menus, toast notifications |
-| `VoxExGame` | 10662 | Main game orchestrator, render loop, frame budget |
-| `Uint8ArrayPool` | 11036 | Pool for Uint8Array objects |
-| `Vector3Pool` | 11457 | Pool for Three.js Vector3 objects |
-| `ChunkNeighborCache` | 12306 | Optimized neighbor chunk lookups |
-| `PerformanceMonitor` | 12916 | FPS tracking, frame timing, circular buffer |
-| `ParticleSystem` | ~15000 | Particle effects with pooling and custom square shader |
-| `SeededRandom` | 18381 | Deterministic PRNG for world generation |
-| `Float32ArrayPool` | 18441 | Pool for Float32Array objects |
-| `Uint32ArrayPool` | 18525 | Pool for Uint32Array objects |
-| `ChunkWorkerPool` | 21010 | Web Worker pool for off-thread terrain gen and meshing |
-| `GeometryBufferPool` | 21579 | Tiered GPU buffer pooling (small/medium/large) |
-| `MemoryBudgetManager` | 21947 | Memory monitoring, auto-scaling, emergency unload |
-| `WorldPreviewNoise` | 22629 | Seeded Perlin noise for terrain preview |
-| `WorldPreviewRenderer` | 22725 | Real-time terrain preview during world creation |
-| `SunlightTask` | 26045 | Async sunlight propagation with pressure-based bailout |
-| `ChunkDiskStorage` | 27220 | OPFS disk cache with inline worker backend |
+| `SettingsManager` | 6134 | Settings persistence, listeners, profiles |
+| `InputManager` | 6281 | Keyboard/mouse input, pointer lock, bitmask flags |
+| `TerrainGenerator` | 6460 | Terrain/biome generation, noise, height functions |
+| `VoxelWorld` | 7027 | World management, chunk loading/unloading, block access |
+| `ChunkDataPool` | 7584 | Object pooling for chunk data structures |
+| `ChunkMesher` | 8507 | Geometry mesh building with face culling and AO |
+| `RenderEngine` | 8625 | Three.js rendering pipeline, camera, lighting, shadows |
+| `AudioManager` | 8926 | Procedural sound synthesis and playback |
+| `EntityManager` | 9266 | Zombie spawning, lifecycle, pooling |
+| `Mob` | 9454 | Base entity class (position, velocity, physics) |
+| `Zombie` | 9516 | Zombie AI state machine (wander/chase/attack) |
+| `PlayerController` | 9760 | Player movement, physics, collision, swimming |
+| `UIManager` | 10132 | HUD, hotbar, inventory, menus, toast notifications |
+| `VoxExGame` | 10703 | Main game orchestrator, render loop, frame budget |
+| `Uint8ArrayPool` | 11066 | Pool for Uint8Array objects |
+| `Vector3Pool` | 11487 | Pool for Three.js Vector3 objects |
+| `ChunkNeighborCache` | 12336 | Optimized neighbor chunk lookups |
+| `PerformanceMonitor` | 12946 | FPS tracking, frame timing, circular buffer |
+| `ParticleSystem` | 15640 | Particle effects with pooling and custom square shader |
+| `SeededRandom` | 18415 | Deterministic PRNG for world generation (worker copy at 18874; nested `SeededRNG` at 30334) |
+| `Float32ArrayPool` | 18475 | Pool for Float32Array objects |
+| `Uint32ArrayPool` | 18559 | Pool for Uint32Array objects |
+| `ChunkWorkerPool` | 20132 | Web Worker pool for off-thread terrain gen and meshing |
+| `GeometryBufferPool` | 20701 | Tiered GPU buffer pooling (small/medium/large) |
+| `MemoryBudgetManager` | 21069 | Memory monitoring, auto-scaling, emergency unload |
+| `WorldPreviewNoise` | 21763 | Seeded Perlin noise for terrain preview |
+| `WorldPreviewRenderer` | 21859 | Real-time terrain preview during world creation |
+| `SunlightTask` | 25187 | Async sunlight propagation with pressure-based bailout |
+| `ChunkDiskStorage` | 26359 | OPFS disk cache with inline worker backend |
 
 ## Key Constants
 
@@ -455,15 +455,15 @@ Biomes are configured in `BIOME_CONFIG` (~line 3946). Tags enable biome-specific
 
 ### When Modifying `voxEx.html`:
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, and JavaScript
-2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 3514) and add texture generation in `initTextures`. Current count: **17**
-3. **Block Config**: Add new blocks to `BLOCK_CONFIG` array (~line 3533). The system auto-derives inventory, textures, and transparency. Also update `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`, `IS_TRANSPARENT`, and attenuation lookup tables via `initBlockLookupTables()`
-4. **Biome Config**: Add new biomes to `BIOME_CONFIG` (~line 3946). Missing fields inherit from `BIOME_DEFAULTS`. Add a height function to `HEIGHT_FUNCS` lookup table
-5. **Settings**: Add default in `DEFAULTS` (~line 5254), wire into `SETTINGS` (~line 5037), add DOM binding in settings UI section (~line 25000+), call `saveSettings()`
+2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 3552) and add texture generation in `initTextures`. Current count: **17**
+3. **Block Config**: Add new blocks to `BLOCK_CONFIG` array (~line 3580). The system auto-derives inventory, textures, and transparency. Also update `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`, `IS_TRANSPARENT`, and attenuation lookup tables via `initBlockLookupTables()` (~line 11831)
+4. **Biome Config**: Add new biomes to `BIOME_CONFIG` (~line 3987). Missing fields inherit from `BIOME_DEFAULTS`. Add a height function to `HEIGHT_FUNCS` lookup table
+5. **Settings**: Add default in `DEFAULTS` (~line 5284), wire into `SETTINGS` (~line 5067), add DOM binding in settings UI section (event-listener wiring ~line 28800+), call `saveSettings()`
 6. **UI Overlay**: UI elements toggled via `controls.lock`/`unlock` events
 7. **Light System**: When changing blocks, always call `updateSunlightAt()` and `updateBlockLightAt()` to update lighting. Use `SunlightTask` for async propagation
 8. **Chunk Format**: Use `chunk.blocks`, `chunk.skyLight`, `chunk.blockLight` (with backward compatibility checks)
 9. **Voxel Aesthetic**: Use BoxGeometry only — no spheres, cylinders, or curved geometry
-10. **Worker Parity**: If changing terrain generation, also update `buildChunkWorkerCode()` which injects functions into workers via `Function.toString()`
+10. **Worker Parity**: Terrain functions are now SINGLE-SOURCE on the main thread (`continentalHeight`/`mountainsHeightFunc`/`getRiverFactor`/`getBiomeCellDirect`/`isMountainRegion`, ~line 36269–36693). `buildChunkWorkerCode()` (~line 20007) injects their `Function.toString()` source into the worker between the `/* __TERRAIN_FUNCS_START__ */` … `/* __TERRAIN_FUNCS_END__ */` markers (~line 19552). Edit ONLY the main-thread sources — the worker copy is generated, not hand-maintained. The injection loop is at ~line 20059–20107; the markers MUST stay intact or the worker throws on first terrain call.
 
 ### Common Search Patterns
 - **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`, `SETTINGS_PROFILES`
@@ -528,7 +528,7 @@ These rules ensure maintainable, performant JavaScript in the single-file archit
 
 ### JSDoc Documentation Standards
 
-The codebase uses JSDoc type definitions (~line 3347). All public functions require JSDoc.
+The codebase uses JSDoc type definitions (~line 3387). All public functions require JSDoc.
 
 **Core Type Definitions:**
 ```javascript
@@ -549,7 +549,7 @@ The codebase uses JSDoc type definitions (~line 3347). All public functions requ
 /** @typedef {Object} BlockConfigEntry */
 ```
 
-**Tree/Biome Type Definitions** (~line 3782+):
+**Tree/Biome Type Definitions** (~line 3829+):
 ```javascript
 /** @typedef {Object} NoiseConfig */
 /** @typedef {Object} WorldConfig */
@@ -716,8 +716,8 @@ These rules tell Claude Code how to work on this repo without breaking things.
   - Quickly search the file for that name; **do not** redeclare an existing identifier in the same scope
   - Avoid confusing shadowing of important globals (e.g. `scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`)
 - When adding or changing settings:
-  - Add a sane default in `DEFAULTS` (~line 5254), wire it into `SETTINGS` (~line 5037)
-  - Add DOM binding in the settings UI section (~line 25000+)
+  - Add a sane default in `DEFAULTS` (~line 5284), wire it into `SETTINGS` (~line 5067)
+  - Add DOM binding in the settings UI section (event-listener wiring ~line 28800+)
   - Ensure it round-trips via the save/load system
   - Make sure any new DOM IDs used in JS exist in the HTML
 - Avoid heavy, deeply nested loops in hot paths (render loop, movement, chunk meshing):
@@ -768,7 +768,7 @@ Before committing, verify:
 - [ ] Atlas has 17 tiles (update `NUM_TILES` if adding blocks)
 - [ ] Worker parity: terrain changes reflected in `buildChunkWorkerCode()`
 - [ ] Block lookup tables updated if adding blocks (`initBlockLookupTables()`)
-- [ ] Terrain changes: update BOTH worker (~line 19558) AND main-thread (~line 37450) copies
+- [ ] Terrain changes: edit ONLY the main-thread terrain functions (~line 36269–36693); the worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — do not hand-edit a worker copy, and keep the markers intact
 - [ ] Terrain changes: update terrain-visualizer.html to match (biome config, height funcs)
 - [ ] Run `tools/voxex-tests.html` (~193 tests) to verify no regressions (serve over localhost)
 
