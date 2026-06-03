@@ -710,6 +710,71 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: worker biome-resolver parity (no tree-gen cache pollution)", () => {
+        // Regression for the worker-vs-main height-cliff bug: the worker once carried a
+        // divergent static biome selector (getRawBiomeCellValue/getBiomeCellValue) that shared
+        // biomeCellCache with the injected getBiomeCellDirect; tree-gen wrote its mismatched biome
+        // into the cache for NEIGHBOR cells before those chunks' blendedHeight read them.
+        it("buildChunkWorkerCode has no divergent worker-local biome selector", () => {
+            const code = VoxEx.buildChunkWorkerCode();
+            expect(/function\s+getRawBiomeCellValue/.test(code)).toBeFalsy();
+            expect(/function\s+getBiomeCellValue\b/.test(code)).toBeFalsy();
+            // biome resolution must route through the injected getBiomeCellDirect chain
+            expect(/function\s+getBiomeParams/.test(code)).toBeTruthy();
+            expect(code.includes('getBiomeCellDirect')).toBeTruthy();
+        });
+
+        it("worker getBiomeParams + blendedHeight match main across a chunk AND its 8 neighbors after a full generate", async () => {
+            const SEED = "biome_parity";
+            let code = VoxEx.buildChunkWorkerCode();
+            // TEST-ONLY: echo the worker's getBiomeParams biome name + blendedHeight (both read the
+            // worker's biomeCellCache, so this surfaces any tree-gen pollution left in it).
+            code += "\nself.addEventListener('message',function(e){if(e.data&&e.data.type==='__bp'){var r={};for(var i=0;i<e.data.cols.length;i++){var c=e.data.cols[i];r[c[0]+','+c[1]]={biome:getBiomeParams(c[0],c[1]).name,h:blendedHeight(c[0],c[1],workerNumericSeed)};}self.postMessage({type:'__bpr',data:r});}});";
+            const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            try {
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker init timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === 'ready') { clearTimeout(to); resolve(); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'init', jobId: 1, seedStr: SEED });
+                });
+                // Generate (0,0): runs precalc + tree-gen (tree-gen queries neighbor cells via getBiomeParams).
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker generate timeout')), 10000);
+                    worker.onmessage = (e) => {
+                        if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(); }
+                        else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker gen error: ' + e.data.error)); }
+                    };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} });
+                });
+                // Columns spanning (0,0) AND its 8 neighbors — neighbor cells are the ones a divergent
+                // tree-gen selector would have polluted before a later chunk's blendedHeight read them.
+                const cols = [];
+                for (let gx = -20; gx <= 35; gx += 5) for (let gz = -20; gz <= 35; gz += 5) cols.push([gx, gz]);
+                const wd = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker bp timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === '__bpr') { clearTimeout(to); resolve(e.data.data); } };
+                    worker.postMessage({ type: '__bp', cols });
+                });
+                seedNoise(SEED); const sd = VoxEx.worldSeed;
+                for (const [gx, gz] of cols) {
+                    biomeCellCache.clear();
+                    const mainBiome = VoxEx.getBiomeParams(gx, gz).name;
+                    biomeCellCache.clear();
+                    const mainH = blendedHeight(gx, gz, sd);
+                    const w = wd[gx + ',' + gz];
+                    expect(w.biome).toBe(mainBiome); // biome SELECTION parity
+                    expect(w.h).toBe(mainH);         // height parity (no biome-cache pollution)
+                }
+            } finally {
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            }
+        });
+    });
+
     describe("Tier 4: IndexedDB chunk persistence round-trip", () => {
         function idbRoundtrip(key, value) {
             return new Promise((resolve, reject) => {

@@ -18993,118 +18993,17 @@
     const BIOME_CELL_SIZE = 64;
     const biomeCellCache = new Map();
 
-    /**
-     * Get raw biome selection for weighted biome distribution.
-     * Used internally by the biome resolution system.
-     * @param {number} cellX - Cell X coordinate
-     * @param {number} cellZ - Cell Z coordinate
-     * @returns {Object} Raw biome config (excluding mountains from weighted selection)
-     */
-    // _BIOME_CDF_TABLE + uniformBiomeRoll are injected by buildChunkWorkerCode() so
-    // main is the single source of truth. The static body below is a placeholder.
-
-    function getRawBiomeCellValue(cellX, cellZ) {
-        // Deterministic biome selection based on cell position
-        const cellNoise = noise2D(cellX * 0.1 + 1000, cellZ * 0.1 + 1000);
-        const normalizedNoise = uniformBiomeRoll(cellNoise);
-
-        // Use weighted selection for all biomes (including mountains)
-        // Only exclude mountain_foothills (weight 0, transitional biome)
-        let accumulated = 0;
-        let selectedBiome = BIOME_NAMES[0];
-
-        for (let i = 0; i < BIOME_NAMES.length; i++) {
-            const name = BIOME_NAMES[i];
-            if (name === 'mountain_foothills') continue;
-
-            accumulated += BIOME_WEIGHTS[i] / TOTAL_BIOME_WEIGHT;
-            if (normalizedNoise <= accumulated) {
-                selectedBiome = name;
-                break;
-            }
-        }
-
-        return { name: selectedBiome, ...BIOME_CONFIG[selectedBiome] };
-    }
-
-    /**
-     * Get resolved biome for a cell using weighted selection.
-     * Mountains are selected via weights like other biomes.
-     * Non-mountain cells adjacent to mountains become foothills.
-     * @param {number} cellX - Cell X coordinate
-     * @param {number} cellZ - Cell Z coordinate
-     * @returns {Object} Resolved biome config
-     */
-    function getBiomeCellValue(cellX, cellZ) {
-        const key = cellX + ',' + cellZ;
-        if (biomeCellCache.has(key)) return biomeCellCache.get(key);
-
-        // Get the weighted biome selection for this cell
-        const rawBiome = getRawBiomeCellValue(cellX, cellZ);
-
-        // If this cell is mountains, just return it
-        if (rawBiome.name === 'mountains') {
-            biomeCellCache.set(key, rawBiome);
-            return rawBiome;
-        }
-
-        // Check if we're adjacent to mountains (check raw biomes to avoid recursion).
-        // Single foothill ring (64-block radius) — direct 8-neighbour check.
-        const MAX_FOOTHILL_RINGS = 1;
-        let nearestMountainRing = Infinity;
-        const _FH_NEIGHBORS = [
-            [-1,-1], [0,-1], [1,-1],
-            [-1, 0],         [1, 0],
-            [-1, 1], [0, 1], [1, 1]
-        ];
-        for (let i = 0; i < 8; i++) {
-            const dx = _FH_NEIGHBORS[i][0], dz = _FH_NEIGHBORS[i][1];
-            if (getRawBiomeCellValue(cellX + dx, cellZ + dz).name === 'mountains') {
-                nearestMountainRing = 1;
-                break;
-            }
-        }
-
-        // If we're within foothill range, convert to mountain_foothills
-        if (nearestMountainRing <= MAX_FOOTHILL_RINGS) {
-            const foothillsConfig = BIOME_CONFIG['mountain_foothills'];
-            // Ring factor with quadratic decay using ring-CENTRE distance (ring-0.5)/N
-            // so the single-ring case (N=1) gives a sensible rf=0.75 instead of the
-            // boundary value of 0. For N=2: ring1=0.94, ring2=0.44.
-            const t = (nearestMountainRing - 0.5) / MAX_FOOTHILL_RINGS;
-            const ringFactor = Math.max(0.05, 1.0 - t * t);
-            const result = {
-                name: 'mountain_foothills',
-                ...foothillsConfig,
-                _foothillRing: nearestMountainRing,
-                _maxFoothillRing: MAX_FOOTHILL_RINGS,
-                _ringFactor: ringFactor
-            };
-            biomeCellCache.set(key, result);
-            return result;
-        }
-
-        // No mountains nearby, use the weighted selection
-        biomeCellCache.set(key, rawBiome);
-        return rawBiome;
-    }
-
-    function getBiomeParams(gx, gz) {
-        // Two-octave domain warping for organic biome boundaries (matches main thread)
-        const gridScale = BIOME_CELL_SIZE;
-        const seed = workerNumericSeed;
-        const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
-                    + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
-        const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
-                    + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
-        const u = gx / gridScale - 0.5 + warpX;
-        const v = gz / gridScale - 0.5 + warpZ;
-        // Use Math.floor to match blendedHeight() interpolation strategy
-        // This avoids discontinuities at biome boundaries
-        const cellX = Math.floor(u);
-        const cellZ = Math.floor(v);
-        return getBiomeCellValue(cellX, cellZ);
-    }
+    // ============================================================
+    // BIOME RESOLUTION (single source of truth)
+    // getBiomeParams / getBiomeCellDirect / getRawBiomeCellDirect / getRawBiomeParams are
+    // INJECTED from the main thread by buildChunkWorkerCode() (Function.toString). A previous
+    // worker-static selector (getRawBiomeCellValue/getBiomeCellValue/getBiomeParams) used a
+    // DIFFERENT algorithm (cell-index noise, weighted-incl-mountains) yet shared this same
+    // biomeCellCache; tree-gen wrote its mismatched biome into the cache for neighbour cells
+    // before the injected blendedHeight read them, producing per-chunk height cliffs. Removed so
+    // there is ONE resolver and ONE writer to biomeCellCache. Do NOT reintroduce a worker-local
+    // biome selector — route all worker biome lookups through the injected getBiomeParams.
+    // ============================================================
 
     // ============================================================
     // TREE GENERATION SYSTEM - MUST MATCH MAIN THREAD EXACTLY!
@@ -20016,6 +19915,7 @@
                     getRawBiomeParams,
                     getRawBiomeCellDirect,
                     getBiomeCellDirect,
+                    getBiomeParams,
                     getBiomeHeightAtCell,
                     blendedHeight,
                     getPreRiverHeight,
@@ -20037,7 +19937,7 @@
                 // Inject lerpValue helper (needed by several functions)
                 injectedCode += '    const lerpValue = (a, b, t) => a + t * (b - a);\n\n';
 
-                // Inject biome CDF table + uniform roll (used by getRawBiomeCellValue).
+                // Inject biome CDF table + uniform roll (used by getRawBiomeParams).
                 // Done here so main is the single source of truth for the empirical CDF.
                 injectedCode += '    const _BIOME_CDF_TABLE = ' + JSON.stringify(_BIOME_CDF_TABLE) + ';\n';
                 injectedCode += '    ' + uniformBiomeRoll.toString() + '\n\n';
@@ -42293,7 +42193,7 @@ self.onmessage = async (e) => {
                     getBiomeHeightAtCell, blendedHeight, getPreRiverHeight,
                     getLocalSlope, getRiverFactor, getOceanFactor, getOceanDepth,
                     getRiverDepth, getDeltaFingerFactor, treePlacementValue,
-                    getBiomeCellDirect,
+                    getBiomeCellDirect, getBiomeParams,
                     isMountainRegion,
                     // --- lighting ---
                     calculateChunkSunlight, calculateBlockLight,
