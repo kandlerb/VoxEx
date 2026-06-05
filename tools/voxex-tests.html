@@ -715,6 +715,22 @@ async function runAllTests() {
         // divergent static biome selector (getRawBiomeCellValue/getBiomeCellValue) that shared
         // biomeCellCache with the injected getBiomeCellDirect; tree-gen wrote its mismatched biome
         // into the cache for NEIGHBOR cells before those chunks' blendedHeight read them.
+
+        // Promise-wrap one worker request: post `msg`, resolve with the message whose
+        // type === okType; reject on a worker 'error' message, onerror, or timeout.
+        function workerRequest(worker, msg, okType, timeoutMs = 10000) {
+            return new Promise((resolve, reject) => {
+                const to = setTimeout(() => reject(new Error('worker ' + okType + ' timeout')), timeoutMs);
+                worker.onmessage = (e) => {
+                    if (!e.data) return;
+                    if (e.data.type === okType) { clearTimeout(to); resolve(e.data); }
+                    else if (e.data.type === 'error') { clearTimeout(to); reject(new Error('worker error: ' + e.data.error)); }
+                };
+                worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                worker.postMessage(msg);
+            });
+        }
+
         it("buildChunkWorkerCode has no divergent worker-local biome selector", () => {
             const code = VoxEx.buildChunkWorkerCode();
             expect(/function\s+getRawBiomeCellValue/.test(code)).toBeFalsy();
@@ -733,31 +749,14 @@ async function runAllTests() {
             const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
             const worker = new Worker(url);
             try {
-                await new Promise((resolve, reject) => {
-                    const to = setTimeout(() => reject(new Error('worker init timeout')), 10000);
-                    worker.onmessage = (e) => { if (e.data && e.data.type === 'ready') { clearTimeout(to); resolve(); } };
-                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
-                    worker.postMessage({ type: 'init', jobId: 1, seedStr: SEED });
-                });
+                await workerRequest(worker, { type: 'init', jobId: 1, seedStr: SEED }, 'ready');
                 // Generate (0,0): runs precalc + tree-gen (tree-gen queries neighbor cells via getBiomeParams).
-                await new Promise((resolve, reject) => {
-                    const to = setTimeout(() => reject(new Error('worker generate timeout')), 10000);
-                    worker.onmessage = (e) => {
-                        if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(); }
-                        else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker gen error: ' + e.data.error)); }
-                    };
-                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
-                    worker.postMessage({ type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} });
-                });
+                await workerRequest(worker, { type: 'generate', jobId: 2, cx: 0, cz: 0, seedStr: SEED, worldGenSettings: {} }, 'terrain');
                 // Columns spanning (0,0) AND its 8 neighbors — neighbor cells are the ones a divergent
                 // tree-gen selector would have polluted before a later chunk's blendedHeight read them.
                 const cols = [];
                 for (let gx = -20; gx <= 35; gx += 5) for (let gz = -20; gz <= 35; gz += 5) cols.push([gx, gz]);
-                const wd = await new Promise((resolve, reject) => {
-                    const to = setTimeout(() => reject(new Error('worker bp timeout')), 10000);
-                    worker.onmessage = (e) => { if (e.data && e.data.type === '__bpr') { clearTimeout(to); resolve(e.data.data); } };
-                    worker.postMessage({ type: '__bp', cols });
-                });
+                const wd = (await workerRequest(worker, { type: '__bp', cols }, '__bpr')).data;
                 seedNoise(SEED); const sd = VoxEx.worldSeed;
                 for (const [gx, gz] of cols) {
                     biomeCellCache.clear();
