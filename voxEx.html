@@ -6087,6 +6087,7 @@
                 targetY: -1,
                 targetZ: -1,
                 sunAngle: -1,
+                lastSunShadowMs: -1, // performance.now() of last sun-driven shadow refresh (decoupled from movement)
             };
             import * as THREE from "three";
             import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
@@ -12872,6 +12873,10 @@
             let shadowMapDirty = true; // Start dirty for initial render
             let lastShadowAngle = 0; // Track sun angle for throttled updates
             let lastShadowRenderRadius = 0; // Track render radius for frustum resizing
+            // Sun-driven shadow refresh cadence — decoupled from player movement so the sun's
+            // shadows sweep over time while standing still (not only when the player moves).
+            const SUN_SHADOW_REFRESH_MS = 140; // ~7 Hz cap: smooth at all day lengths, never per-frame, stays under the rate already paid while walking
+            const SUN_SHADOW_MIN_ANGLE = 1e-5; // Skip the refresh when the day/night cycle hasn't actually advanced (e.g. paused)
             /**
              * Marks the shadow map as needing an update on the next frame.
              * Call this when chunks change, blocks are modified, or sun angle changes significantly.
@@ -40693,9 +40698,18 @@ self.onmessage = async (e) => {
                         Math.abs(snapTargetX - lastShadowState.targetX) > posThreshold ||
                         Math.abs(snapTargetY - lastShadowState.targetY) > posThreshold ||
                         Math.abs(snapTargetZ - lastShadowState.targetZ) > posThreshold;
-                    // OPTIMIZATION: ~5 degrees (0.087 radians) threshold for sun angle changes
-                    // Reduces shadow updates during slow day/night transitions
-                    const angleChanged = Math.abs(sunAngle - lastShadowState.sunAngle) > 0.087;
+                    // SUN-DRIVEN SHADOW REFRESH — decoupled from player movement.
+                    // dayNightTime advances every frame (see top of updateDayNight), so the
+                    // sun's shadows must refresh on a fixed throttle, NOT only when the player
+                    // moves. The previous 5deg (0.087 rad) threshold here is what made shadows
+                    // look "frozen until you move": standing still it took ~7-22s (depending on
+                    // dayLength) to cross 5deg, while moving forced an instant catch-up via
+                    // posChanged. Now: a fixed time cadence (perf-bounded, never per-frame —
+                    // renderer.shadowMap.autoUpdate stays false), gated on the cycle having
+                    // actually advanced so a paused cycle costs nothing.
+                    const angleChanged =
+                        (shadowStartMs - lastShadowState.lastSunShadowMs) >= SUN_SHADOW_REFRESH_MS &&
+                        Math.abs(sunAngle - lastShadowState.sunAngle) > SUN_SHADOW_MIN_ANGLE;
                     if (posChanged || angleChanged) {
                         // 3. Sun direction from angle
                         const diskH = Math.sin(sunAngle);
@@ -40729,6 +40743,7 @@ self.onmessage = async (e) => {
                         lastShadowState.targetY = snapTargetY;
                         lastShadowState.targetZ = snapTargetZ;
                         lastShadowState.sunAngle = sunAngle;
+                        lastShadowState.lastSunShadowMs = shadowStartMs;
                         // Mark shadows dirty for next render frame
                         markShadowsDirty();
                     }
