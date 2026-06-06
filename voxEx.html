@@ -2249,12 +2249,23 @@
                         <input type="checkbox" id="shadows-toggle" />
                     </div>
                     <div class="setting-item">
-                        <label for="shadow-quality-select">Shadow Quality</label>
+                        <label for="blocky-shadows-toggle">Blocky Shadows (pixelated, snapped to block grid)</label>
+                        <input type="checkbox" id="blocky-shadows-toggle" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="blocky-shadow-offset-input">Blocky Shadow Offset (texels; raise if acne, lower if contact gap)</label>
+                        <input type="number" id="blocky-shadow-offset-input" min="0" max="3" step="0.25" value="0.5" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="blocky-shadow-slope-input">Blocky Shadow Grazing Fix (0&ndash;1; raise if low-sun edge stripes, lower if contact gap)</label>
+                        <input type="number" id="blocky-shadow-slope-input" min="0" max="1" step="0.1" value="0" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="shadow-quality-select">Shadow Render Distance</label>
                         <select id="shadow-quality-select">
-                            <option value="512">Low (512px)</option>
-                            <option value="1024">Medium (1024px)</option>
-                            <option value="2048">High (2048px)</option>
-                            <option value="4096">Ultra (4096px)</option>
+                            <option value="64">64 blocks (default)</option>
+                            <option value="128">128 blocks</option>
+                            <option value="256">256 blocks (high-end)</option>
                         </select>
                     </div>
                     <div class="setting-item">
@@ -5154,9 +5165,13 @@
                 // World
                 dayLength: savedSettings.dayLength || 360,
                 // Shader
-                shadowQuality: savedSettings.shadowQuality || 2048,
+                shadowRenderDistance: savedSettings.shadowRenderDistance || 64,
                 shadowBias: savedSettings.shadowBias !== undefined ? savedSettings.shadowBias : 0.0001,
                 shadowRadius: savedSettings.shadowRadius !== undefined ? savedSettings.shadowRadius : 0,
+                blockyShadows: savedSettings.blockyShadows !== undefined ? savedSettings.blockyShadows : true,
+                blockyShadowOffset: savedSettings.blockyShadowOffset !== undefined ? savedSettings.blockyShadowOffset : 0.5,
+                blockyShadowDepthBias: savedSettings.blockyShadowDepthBias !== undefined ? savedSettings.blockyShadowDepthBias : 0.0,
+                blockyShadowSlopeScale: savedSettings.blockyShadowSlopeScale !== undefined ? savedSettings.blockyShadowSlopeScale : 0.0,
                 antialiasing: savedSettings.antialiasing !== undefined ? savedSettings.antialiasing : true,
                 pixelRatio: savedSettings.pixelRatio !== undefined ? savedSettings.pixelRatio : 1.0,
                 // Zombie Scare Effects
@@ -5366,10 +5381,14 @@
                 // World
                 dayLength: 1200,
                 // Shader
-                shadowQuality: 2048,
+                shadowRenderDistance: 64, // Shadow coverage radius in blocks (64/128/256); derives shadow map size at a locked 1/16-block texel
                 shadowMapType: 'medium', // 'low' = BasicShadowMap, 'medium' = PCFShadowMap, 'high' = PCFSoftShadowMap
                 shadowBias: 0.0001,
                 shadowRadius: 0,
+                blockyShadows: true,     // Snap terrain sun/moon shadow to the 1/16-block grid for hard, pixelated edges (Minecraft "blocky_shadows")
+                blockyShadowOffset: 0.5, // Blocky normal-bias offset in 1/16-block texels (anti-acne at boundary angles; too high -> peter-pan). Live-tunable.
+                blockyShadowDepthBias: 0.0, // Blocky secondary depth bias (normalized depth; negative = anti-acne at grazing sun). Advanced, no UI.
+                blockyShadowSlopeScale: 0.0, // Grazing slope scale [0..1]: restores the normal-offset depth-push at low sun to kill leading-edge stripe acne. 0=off (no change). ~0.7 = strong; raises peter-pan at extreme grazing.
                 antialiasing: true,
                 pixelRatio: 1.0,
                 // Zombie Scare Effects
@@ -5507,7 +5526,7 @@
                     waterRefractionEnabled: false,
                     giEnabled: false,
                     antialiasing: false,
-                    shadowQuality: 1024,
+                    shadowRenderDistance: 64,
                     volumetricSamples: 4,
                 },
                 balanced: {
@@ -5524,7 +5543,7 @@
                     waterRefractionEnabled: true,
                     giEnabled: false,
                     antialiasing: true,
-                    shadowQuality: 2048,
+                    shadowRenderDistance: 64,
                     volumetricSamples: 8,
                 },
                 quality: {
@@ -5541,7 +5560,7 @@
                     waterRefractionEnabled: true,
                     giEnabled: true,
                     antialiasing: true,
-                    shadowQuality: 4096,
+                    shadowRenderDistance: 128,
                     volumetricSamples: 16,
                 },
             };
@@ -5629,10 +5648,16 @@
                 // Graphics - Basic
                 const aoToggle = document.getElementById("ao-toggle");
                 const shadowsToggle = document.getElementById("shadows-toggle");
+                const blockyShadowsToggle = document.getElementById("blocky-shadows-toggle");
+                const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
+                const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const shadowQualitySelect = document.getElementById("shadow-quality-select");
                 if (aoToggle) aoToggle.checked = SETTINGS.AO;
                 if (shadowsToggle) shadowsToggle.checked = SETTINGS.shadows;
-                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowQuality;
+                if (blockyShadowsToggle) blockyShadowsToggle.checked = SETTINGS.blockyShadows;
+                if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
+                if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
+                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowRenderDistance;
                 // Graphics - Water
                 const waterFastToggle = document.getElementById("water-fast-toggle");
                 const waterColorInput = document.getElementById("water-color");
@@ -12872,7 +12897,6 @@
             // Shadow optimization: manual update control
             let shadowMapDirty = true; // Start dirty for initial render
             let lastShadowAngle = 0; // Track sun angle for throttled updates
-            let lastShadowRenderRadius = 0; // Track render radius for frustum resizing
             // Sun-driven shadow refresh cadence — decoupled from player movement so the sun's
             // shadows sweep over time while standing still (not only when the player moves).
             const SUN_SHADOW_REFRESH_MS = 140; // ~7 Hz cap: smooth at all day lengths, never per-frame, stays under the rate already paid while walking
@@ -12884,40 +12908,65 @@
             function markShadowsDirty() {
                 shadowMapDirty = true;
             }
+            // --- Shadow Render Distance: single source of truth for sun/moon coverage AND map size ---
+            // World-units-per-texel is LOCKED to 1/16 block at every tier because frustum = 2*radius
+            // and mapSize = 32*radius  =>  texel = (2*radius)/(32*radius) = 1/16. Picking the radius
+            // fully determines the map size; they can never drift out of the clean ratio. This replaces
+            // the old render-distance-scaled frustum, whose world-units-per-texel ballooned to ~0.14–0.5
+            // and produced the animated "light sliver" contact-gap artifact at block bases.
+            const SHADOW_RENDER_DISTANCES = [64, 128, 256]; // discrete coverage radii in blocks
+            /** Resolved {radius, mapSize} after the hardware clamp; set by applyShadowRenderDistance(). */
+            let shadowConfig = { radius: 64, mapSize: 2048 };
             /**
-             * Updates shadow camera frustum to match the current render distance.
-             * Called when render distance changes to keep shadows properly sized.
-             * @param {number} renderRadius - Current render radius in chunks.
+             * Derives a hardware-safe shadow coverage radius + map size, locked to a 1/16-block texel.
+             * Clamps DOWN (radius and map shrink together, preserving the 1/16 ratio) until the map fits
+             * the GPU's max texture size, so allocation never fails on low-end/mobile hardware and the
+             * clean texel ratio is never broken (e.g. a 4096-cap GPU running the 256 tier falls back to
+             * the 128 tier's 128/4096 pair, never a broken 256/4096 combo).
+             * @param {number} desiredRadius - Requested coverage radius in blocks (64/128/256).
+             * @param {number} maxTextureSize - GPU MAX_TEXTURE_SIZE (renderer.capabilities.maxTextureSize).
+             * @returns {{radius: number, mapSize: number}} Safe pair; texel is always 1/16 block.
              */
-            function updateShadowFrustumSize(renderRadius) {
+            function deriveShadowConfig(desiredRadius, maxTextureSize) {
+                const cap = (typeof maxTextureSize === 'number' && maxTextureSize >= 256) ? maxTextureSize : 2048;
+                let radius = SHADOW_RENDER_DISTANCES.includes(desiredRadius) ? desiredRadius : 64;
+                let mapSize = radius * 32; // 64->2048, 128->4096, 256->8192 (texel locked to 1/16 block)
+                while (mapSize > cap && radius > 8) {
+                    radius = Math.floor(radius / 2);
+                    mapSize = radius * 32;
+                }
+                return { radius, mapSize };
+            }
+            /**
+             * Applies SETTINGS.shadowRenderDistance — the SINGLE source of truth for the sun + moon
+             * shadow camera frustum AND shadow map size. frustum = 2*radius and mapSize = 32*radius keep
+             * world-units-per-texel locked to 1/16 block at every tier; the map size is hardware-clamped
+             * via deriveShadowConfig(). Reallocates the shadow map and marks shadows dirty so a runtime
+             * change resizes and re-renders cleanly without a reload. Does NOT touch bias/normalBias.
+             */
+            function applyShadowRenderDistance() {
                 if (!sun || !moon) return;
-                // Calculate shadow coverage to match render distance
-                // Add 1 chunk padding to avoid shadow pop-in at edges
-                const shadowRadius = (renderRadius + 1) * 16; // WORLD_DIMS.chunkSize = 16
-                const shadowDiameter = shadowRadius * 2;
-                // Update sun shadow camera
-                if (sun.shadow && sun.shadow.camera) {
-                    sun.shadow.camera.left = -shadowRadius;
-                    sun.shadow.camera.right = shadowRadius;
-                    sun.shadow.camera.top = shadowRadius;
-                    sun.shadow.camera.bottom = -shadowRadius;
-                    sun.shadow.camera.near = 0.5;
-                    sun.shadow.camera.far = shadowRadius * 3;
-                    sun.shadow.camera.updateProjectionMatrix();
+                const maxTex = (renderer && renderer.capabilities && renderer.capabilities.maxTextureSize) || 2048;
+                shadowConfig = deriveShadowConfig(SETTINGS.shadowRenderDistance, maxTex);
+                const r = shadowConfig.radius;
+                // Orthographic depth bracket. The light sits SUN_OFFSET (=100, see day/night sun
+                // positioning ~updateDayNight) from the target along the light dir. near is negative so
+                // sun-side casters aren't clipped at low sun; far is generous for tall casters.
+                const near = -r;
+                const far = 100 + r * 3;
+                for (const light of [sun, moon]) {
+                    if (!light.shadow || !light.shadow.camera) continue;
+                    light.shadow.mapSize.set(shadowConfig.mapSize, shadowConfig.mapSize);
+                    const cam = light.shadow.camera;
+                    cam.left = -r; cam.right = r; cam.top = r; cam.bottom = -r;
+                    cam.near = near; cam.far = far;
+                    cam.updateProjectionMatrix();
+                    // Force reallocation at the new size (no-op on first init when map is null).
+                    light.shadow.map?.dispose();
+                    light.shadow.map = null;
                 }
-                // Update moon shadow camera
-                if (moon.shadow && moon.shadow.camera) {
-                    moon.shadow.camera.left = -shadowRadius;
-                    moon.shadow.camera.right = shadowRadius;
-                    moon.shadow.camera.top = shadowRadius;
-                    moon.shadow.camera.bottom = -shadowRadius;
-                    moon.shadow.camera.near = 0.5;
-                    moon.shadow.camera.far = shadowRadius * 3;
-                    moon.shadow.camera.updateProjectionMatrix();
-                }
-                lastShadowRenderRadius = renderRadius;
                 markShadowsDirty();
-                logDebug(`[Shadows] Frustum resized for render distance ${renderRadius} (${shadowDiameter} units)`);
+                logDebug(`[Shadows] Render distance ${r} blocks -> frustum ${r * 2}, map ${shadowConfig.mapSize}^2 (texel 1/16 block, maxTex ${maxTex})`);
             }
             let moveForward = false;
             let moveBackward = false;
@@ -23205,6 +23254,8 @@
                 if (!profile) return;
                 for (const [key, value] of Object.entries(profile)) { if (SETTINGS.hasOwnProperty(key)) SETTINGS[key] = value; }
                 syncSettingsToUI();
+                // Profiles can change Shadow Render Distance — resize/reallocate the shadow map live.
+                if (isGameActive()) applyShadowRenderDistance();
                 activeProfileName = profileName;
                 localStorage.setItem('voxex_active_profile', profileName);
                 document.querySelectorAll('.profile-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.profile === profileName));
@@ -23273,10 +23324,16 @@
                 // Graphics - Basic
                 const aoToggle = document.getElementById("ao-toggle");
                 const shadowsToggle = document.getElementById("shadows-toggle");
+                const blockyShadowsToggle = document.getElementById("blocky-shadows-toggle");
+                const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
+                const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 if (aoToggle) aoToggle.checked = SETTINGS.AO;
                 if (shadowsToggle) shadowsToggle.checked = SETTINGS.shadows;
+                if (blockyShadowsToggle) blockyShadowsToggle.checked = SETTINGS.blockyShadows;
+                if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
+                if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
                 if (textureResSelect) textureResSelect.value = SETTINGS.textureResolution;
                 if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
 
@@ -23300,7 +23357,7 @@
                 if (torchIntensityInput) torchIntensityInput.value = SETTINGS.torchIntensity;
                 if (torchRangeInput) torchRangeInput.value = SETTINGS.torchRange;
                 if (ambientIntensityInput) ambientIntensityInput.value = SETTINGS.ambientIntensity;
-                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowQuality;
+                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowRenderDistance;
                 if (shadowBiasInput) shadowBiasInput.value = SETTINGS.shadowBias;
                 if (shadowRadiusInput) shadowRadiusInput.value = SETTINGS.shadowRadius;
 
@@ -23763,6 +23820,9 @@
                 // === GRAPHICS - BASIC ===
                 const aoToggle = document.getElementById("ao-toggle");
                 const shadowsToggle = document.getElementById("shadows-toggle");
+                const blockyShadowsToggle = document.getElementById("blocky-shadows-toggle");
+                const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
+                const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 const reloadNotice = document.getElementById("reload-notice");
@@ -23777,6 +23837,37 @@
                     SETTINGS.shadows = shadowsToggle.checked;
                     saveSettings();
                     if (isGameActive() && window.applyShadowSettings) window.applyShadowSettings();
+                });
+
+                blockyShadowsToggle?.addEventListener("change", () => {
+                    SETTINGS.blockyShadows = blockyShadowsToggle.checked;
+                    saveSettings();
+                    // onBeforeCompile reads SETTINGS.blockyShadows at compile time; needsUpdate re-runs it,
+                    // turning the terrain shadow snap on/off live (no reload).
+                    if (chunkMaterial) chunkMaterial.needsUpdate = true;
+                    markShadowsDirty();
+                });
+
+                blockyShadowOffsetInput?.addEventListener("change", () => {
+                    const val = parseFloat(blockyShadowOffsetInput.value);
+                    if (!isNaN(val)) {
+                        SETTINGS.blockyShadowOffset = val;
+                        saveSettings();
+                        // Re-bake the normal-bias offset literal into the chunk shader (recompile on change).
+                        if (chunkMaterial) chunkMaterial.needsUpdate = true;
+                        markShadowsDirty();
+                    }
+                });
+
+                blockyShadowSlopeInput?.addEventListener("change", () => {
+                    const val = parseFloat(blockyShadowSlopeInput.value);
+                    if (!isNaN(val)) {
+                        SETTINGS.blockyShadowSlopeScale = val;
+                        saveSettings();
+                        // Re-bake the grazing slope-scale literal into the chunk shader (recompile on change).
+                        if (chunkMaterial) chunkMaterial.needsUpdate = true;
+                        markShadowsDirty();
+                    }
                 });
 
                 textureResSelect?.addEventListener("change", () => {
@@ -23869,24 +23960,10 @@
                 });
 
                 shadowQualitySelect?.addEventListener("change", () => {
-                    SETTINGS.shadowQuality = parseInt(shadowQualitySelect.value);
+                    SETTINGS.shadowRenderDistance = parseInt(shadowQualitySelect.value);
                     saveSettings();
-                    if (isGameActive()) {
-                        if (window.sun?.shadow) {
-                            window.sun.shadow.mapSize.width = SETTINGS.shadowQuality;
-                            window.sun.shadow.mapSize.height = SETTINGS.shadowQuality;
-                            window.sun.shadow.map?.dispose();
-                            window.sun.shadow.map = null;
-                        }
-                        if (window.moon?.shadow) {
-                            window.moon.shadow.mapSize.width = SETTINGS.shadowQuality;
-                            window.moon.shadow.mapSize.height = SETTINGS.shadowQuality;
-                            window.moon.shadow.map?.dispose();
-                            window.moon.shadow.map = null;
-                        }
-                    }
-                    const shaderReloadNotice = document.getElementById("shader-reload-notice");
-                    if (shaderReloadNotice) shaderReloadNotice.style.display = "block";
+                    // Resize frustum + reallocate the shadow map live (no reload needed).
+                    if (isGameActive()) applyShadowRenderDistance();
                 });
 
                 shadowBiasInput?.addEventListener("change", () => {
@@ -27537,50 +27614,23 @@ self.onmessage = async (e) => {
                 camera.layers.enable(1); // View model layer (torch, etc.)
                 ambLight = new THREE.AmbientLight(0xffffff, SETTINGS.ambientIntensity); // Very dark for underground atmosphere
                 scene.add(ambLight);
-                // Shadow configuration for pixel-perfect texel alignment
-                // Shadows snap to the same grid as block textures (PIXELS_PER_TILE = 16)
-                const PIXELS_PER_TILE = SETTINGS.textureResolution; // 16x16 texture pixels
-                const SHADOW_COVERAGE_RADIUS = 128; // blocks (covers max render distance)
-                // Calculate shadow map size so each texel = 1 texture pixel in world space
-                // Each texture pixel = 1/PIXELS_PER_TILE world units = 1/16
-                // Shadow map size = (coverage diameter) / (texel size) = (radius * 2) * PIXELS_PER_TILE
-                const sunShadowMapSize = SHADOW_COVERAGE_RADIUS * 2 * PIXELS_PER_TILE; // 4096
-                const moonShadowMapSize = Math.floor(sunShadowMapSize / 2); // 2048 - half resolution for nighttime
-                const torchShadowMapSize = Math.floor(sunShadowMapSize / 4); // 1024 - quarter resolution for local light
-                // Shadow frustum size in world units
-                const sunShadowViewSize = SHADOW_COVERAGE_RADIUS * 2; // 256 world units diameter
-                //Sun Lighting with pixel-perfect shadow configuration
+                // Torch shadow map is a fixed local point-light size. The sun/moon shadow camera
+                // frustum AND map size are owned by applyShadowRenderDistance() (the single source of
+                // truth), applied below once the renderer exists so it can hardware-clamp the map size.
+                const torchShadowMapSize = 1024; // local point-light shadow resolution
+                //Sun Lighting — frustum + map size applied by applyShadowRenderDistance() after renderer init
                 sun = new THREE.DirectionalLight(SETTINGS.sunColor, 1);
                 sun.castShadow = SETTINGS.shadows;
-                sun.shadow.mapSize.set(SETTINGS.shadowQuality, SETTINGS.shadowQuality);
                 sun.shadow.bias = SETTINGS.shadowBias;
                 sun.shadow.normalBias = 0.01; // Small normal bias for smoother edges
                 sun.shadow.radius = SETTINGS.shadowRadius;
-                // Configure sun shadow camera for texel-locked shadows
-                // Frustum size ensures: texelWorldSize = frustumWidth / mapWidth = 256 / 4096 = 1/16
-                sun.shadow.camera.left = -sunShadowViewSize / 2;
-                sun.shadow.camera.right = sunShadowViewSize / 2;
-                sun.shadow.camera.top = sunShadowViewSize / 2;
-                sun.shadow.camera.bottom = -sunShadowViewSize / 2;
-                sun.shadow.camera.near = 0.001;
-                sun.shadow.camera.far = 200;
-                sun.shadow.camera.updateProjectionMatrix();
                 scene.add(sun);
-                //Moon Lighting (shares sun's shadow configuration for consistency)
+                //Moon Lighting (shares the sun's shadow render-distance config for consistency)
                 moon = new THREE.DirectionalLight(SETTINGS.moonColor, 0.2);
                 moon.castShadow = SETTINGS.shadows;
-                moon.shadow.mapSize.set(SETTINGS.shadowQuality, SETTINGS.shadowQuality);
                 moon.shadow.bias = SETTINGS.shadowBias;
                 moon.shadow.normalBias = 0.02; // Match sun normal bias
                 moon.shadow.radius = SETTINGS.shadowRadius;
-                // Moon uses same frustum as sun for consistent texel-locking
-                moon.shadow.camera.left = -sunShadowViewSize / 2;
-                moon.shadow.camera.right = sunShadowViewSize / 2;
-                moon.shadow.camera.top = sunShadowViewSize / 2;
-                moon.shadow.camera.bottom = -sunShadowViewSize / 2;
-                moon.shadow.camera.near = 0.001;
-                moon.shadow.camera.far = 200;
-                moon.shadow.camera.updateProjectionMatrix();
                 scene.add(moon);
                 // Torch Lighting (PointLight with optimized shadow settings)
                 torchLight = new THREE.PointLight(SETTINGS.torchColor, 0, SETTINGS.torchRange, 0.8);
@@ -27690,6 +27740,9 @@ self.onmessage = async (e) => {
                 };
                 renderer.shadowMap.type = shadowMapTypes[SETTINGS.shadowMapType] ?? THREE.PCFShadowMap;
                 logDebug(`[Renderer] Initialized with high-performance mode, shadowMapType: ${SETTINGS.shadowMapType}`);
+                // Apply Shadow Render Distance now that the renderer exists: single source of truth for
+                // sun+moon frustum AND map size (texel locked to 1/16 block), hardware-clamped to the GPU.
+                applyShadowRenderDistance();
                 refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
 
@@ -28263,11 +28316,17 @@ self.onmessage = async (e) => {
                 // Settings Elements
                 const aoToggle = document.getElementById("ao-toggle");
                 const shadowsToggle = document.getElementById("shadows-toggle");
+                const blockyShadowsToggle = document.getElementById("blocky-shadows-toggle");
+                const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
+                const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const reloadNotice = document.getElementById("reload-notice");
                 // Init UI state
                 if (aoToggle) aoToggle.checked = SETTINGS.AO;
                 if (shadowsToggle) shadowsToggle.checked = SETTINGS.shadows;
+                if (blockyShadowsToggle) blockyShadowsToggle.checked = SETTINGS.blockyShadows;
+                if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
+                if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
                 if (textureResSelect) textureResSelect.value = SETTINGS.textureResolution;
                 const dynamicDistToggle = document.getElementById("dynamic-dist-toggle");
                 const renderDistSlider = document.getElementById("render-dist-slider");
@@ -28803,7 +28862,7 @@ self.onmessage = async (e) => {
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 const pixelRatioSlider = document.getElementById("pixel-ratio-slider");
                 const pixelRatioVal = document.getElementById("pixel-ratio-val");
-                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowQuality;
+                if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowRenderDistance;
                 if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
                 if (pixelRatioSlider && pixelRatioVal) { pixelRatioSlider.value = SETTINGS.pixelRatio; pixelRatioVal.textContent = SETTINGS.pixelRatio.toFixed(1); }
                 // EVENT HANDLERS - Performance
@@ -29302,13 +29361,10 @@ self.onmessage = async (e) => {
                 document.getElementById("btn-time-dusk")?.addEventListener("click", () => { dayNightTime = 0.6; }); // Dusk
                 document.getElementById("btn-time-midnight")?.addEventListener("click", () => { dayNightTime = 0.85; }); // Midnight
                 // EVENT HANDLERS - Graphics > Lighting / Renderer
-                shadowQualitySelect?.addEventListener("change", () => { SETTINGS.shadowQuality = parseInt(shadowQualitySelect.value);
+                shadowQualitySelect?.addEventListener("change", () => { SETTINGS.shadowRenderDistance = parseInt(shadowQualitySelect.value);
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
-                    // Apply shadow quality immediately
-                    if (sun && sun.shadow) { sun.shadow.mapSize.width = SETTINGS.shadowQuality; sun.shadow.mapSize.height = SETTINGS.shadowQuality; sun.shadow.map?.dispose(); sun.shadow.map = null; }
-                    if (moon && moon.shadow) { moon.shadow.mapSize.width = SETTINGS.shadowQuality; moon.shadow.mapSize.height = SETTINGS.shadowQuality; moon.shadow.map?.dispose(); moon.shadow.map = null; }
-                    const shaderReloadNotice = document.getElementById("shader-reload-notice");
-                    if (shaderReloadNotice) shaderReloadNotice.style.display = "block";
+                    // Resize frustum + reallocate the shadow map live (no reload needed).
+                    applyShadowRenderDistance();
                 });
                 antialiasingToggle?.addEventListener("change", () => { SETTINGS.antialiasing = antialiasingToggle.checked;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
@@ -29389,7 +29445,7 @@ self.onmessage = async (e) => {
                     // World
                     if (dayLengthInput) { dayLengthInput.value = SETTINGS.dayLength; }
                     // Lighting / Renderer
-                    if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowQuality;
+                    if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowRenderDistance;
                     if (shadowBiasInput) shadowBiasInput.value = SETTINGS.shadowBias;
                     if (shadowRadiusInput) shadowRadiusInput.value = SETTINGS.shadowRadius;
                     if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
@@ -29478,7 +29534,7 @@ self.onmessage = async (e) => {
                 document.getElementById("btn-reset-graphics-lighting")?.addEventListener("click", () => {
                     // Shadows
                     SETTINGS.shadows = DEFAULTS.shadows;
-                    SETTINGS.shadowQuality = DEFAULTS.shadowQuality;
+                    SETTINGS.shadowRenderDistance = DEFAULTS.shadowRenderDistance;
                     SETTINGS.shadowBias = DEFAULTS.shadowBias;
                     SETTINGS.shadowRadius = DEFAULTS.shadowRadius;
                     // Sun/Moon/Torch
@@ -29520,23 +29576,18 @@ self.onmessage = async (e) => {
                     SETTINGS.specularRoughness = DEFAULTS.specularRoughness;
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
-                    // Apply shadow settings immediately
+                    // Apply shadow settings immediately. bias/radius unchanged here (intentionally — the
+                    // positive bias masks the contact edge); map size + frustum go through the single
+                    // source of truth, which also disposes/reallocates the map and marks shadows dirty.
                     if (sun && sun.shadow) {
-                        sun.shadow.mapSize.width = SETTINGS.shadowQuality;
-                        sun.shadow.mapSize.height = SETTINGS.shadowQuality;
                         sun.shadow.bias = SETTINGS.shadowBias;
                         sun.shadow.radius = SETTINGS.shadowRadius;
-                        sun.shadow.map?.dispose();
-                        sun.shadow.map = null;
                     }
                     if (moon && moon.shadow) {
-                        moon.shadow.mapSize.width = SETTINGS.shadowQuality;
-                        moon.shadow.mapSize.height = SETTINGS.shadowQuality;
                         moon.shadow.bias = SETTINGS.shadowBias;
                         moon.shadow.radius = SETTINGS.shadowRadius;
-                        moon.shadow.map?.dispose();
-                        moon.shadow.map = null;
                     }
+                    applyShadowRenderDistance();
                     // Apply specular/lighting materials
                     if (window.updateLightingMaterials) window.updateLightingMaterials();
                     rebuildSkylightForActiveChunks();
@@ -31227,6 +31278,84 @@ self.onmessage = async (e) => {
                             uniform float tileWidth;
                             void main() {`
                         );
+
+                        // --- BLOCKY TERRAIN SHADOWS (Minecraft "blocky_shadows", texel_size 16) ---
+                        // Snap the directional sun/moon shadow lookup to the 1/16-block WORLD grid so
+                        // shadow edges land on block texture pixels (terrain-only: this hook is applied
+                        // to chunkMaterial only). The stock camera-snap aligns the shadow-map texel grid
+                        // in POSITION but its axes are tilted by the sun direction, so an in-shader
+                        // world-space quantization is required for true block-pixel alignment.
+                        // Gated by SETTINGS.blockyShadows; if OFF (or the THREE token is missing on a
+                        // version change) the stock soft shadow is left byte-identical.
+                        if (SETTINGS.blockyShadows) {
+                            // BLOCKY NORMAL-BIAS OFFSET. Cell-center world snapping dropped THREE's stock
+                            // normal-bias offset (worldPosition + objectNormal*shadowNormalBias), so at
+                            // boundary-crossing sun angles the hard tap self-shadows (caster-top acne +
+                            // receiver fringe). Restore it in world space: offset the snapped sample along
+                            // the surface normal toward the light. TIGHTROPE: too small -> acne persists;
+                            // too large -> peter-panning (contact gap). Tunable via SETTINGS.blockyShadowOffset
+                            // (texels). Worst case is LOW sun. Secondary grazing lever = blockyShadowDepthBias.
+                            shader.vertexShader = shader.vertexShader.replace(
+                                'vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;',
+                                `vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;
+                            vWorldNormalCyl = normalize(mat3(modelMatrix) * normal);`
+                            );
+                            shader.vertexShader = shader.vertexShader.replace(
+                                'varying vec3 vWorldPositionCyl;',
+                                `varying vec3 vWorldPositionCyl;
+                            varying vec3 vWorldNormalCyl;`
+                            );
+                            // Bake the offset (texels -> world units) and the secondary depth bias as GLSL
+                            // float literals. toFixed(6) guarantees a decimal point (a bare "0" int literal
+                            // would fail to compile); guard against NaN/empty settings.
+                            const _offTexels = (typeof SETTINGS.blockyShadowOffset === 'number' && isFinite(SETTINGS.blockyShadowOffset)) ? SETTINGS.blockyShadowOffset : 0.5;
+                            const _offWorld = (_offTexels / 16).toFixed(6);
+                            const _depthBiasVal = (typeof SETTINGS.blockyShadowDepthBias === 'number' && isFinite(SETTINGS.blockyShadowDepthBias)) ? SETTINGS.blockyShadowDepthBias : 0.0;
+                            const _depthBias = _depthBiasVal.toFixed(6);
+                            // GRAZING SLOPE SCALE [0..1]: at low sun the depth map undersamples (one texel stretches
+                            // ~1/sin(elev) along the ground) and the normal offset's depth-push (∝ sin(elev)) vanishes,
+                            // so self-shadow acne reappears as a striped band at the leading edge. Scaling the normal
+                            // offset by ~1/NdotL restores a constant depth-push at grazing. 0 = off (no change at any
+                            // angle); 1 = fully restore. Raises peter-pan at extreme grazing — the tunable tradeoff.
+                            const _slopeVal = (typeof SETTINGS.blockyShadowSlopeScale === 'number' && isFinite(SETTINGS.blockyShadowSlopeScale)) ? Math.min(1, Math.max(0, SETTINGS.blockyShadowSlopeScale)) : 0.0;
+                            const _slope = _slopeVal.toFixed(6);
+                            // THREE declares directionalShadowMatrix in the vertex stage only. Redeclare it in
+                            // the fragment stage (same name -> same uploaded value). blockyGetShadow = hard
+                            // single-tap (getShadow's signature) for binary edges; it uses the blocky depth
+                            // bias (default 0, anti-acne = negative) NOT the soft-mode +bias (acne under a hard tap).
+                            if (shader.fragmentShader.indexOf('uniform mat4 directionalShadowMatrix[') === -1) {
+                                shader.fragmentShader = shader.fragmentShader.replace(
+                                    'void main() {',
+                                    `#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+                                    varying vec3 vWorldNormalCyl;
+                                    uniform mat4 directionalShadowMatrix[ NUM_DIR_LIGHT_SHADOWS ];
+                                    float blockyGetShadow( sampler2D shadowMap, vec2 shadowMapSize, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
+                                        shadowCoord.xyz /= shadowCoord.w;
+                                        shadowCoord.z += ${_depthBias};
+                                        bool inFrustum = shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 && shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0;
+                                        bool frustumTest = inFrustum && shadowCoord.z <= 1.0;
+                                        if ( frustumTest ) { return texture2DCompare( shadowMap, shadowCoord.xy, shadowCoord.z ); }
+                                        return 1.0;
+                                    }
+                                    #endif
+                                    void main() {`
+                                );
+                            }
+                            // Inline THREE's own lights_fragment_begin: (1) snap the per-fragment directional
+                            // shadow coordinate to 1/16-block world cells and offset it along the world normal
+                            // by the blocky normal-bias, (2) swap getShadow -> blockyGetShadow. Fallback-safe.
+                            const _lfb = THREE.ShaderChunk.lights_fragment_begin;
+                            const _coordTok = 'vDirectionalShadowCoord[ i ]';
+                            if (_lfb && _lfb.indexOf(_coordTok) !== -1) {
+                                // Offset is scaled by mix(1, 1/NdotL, slope): grazing-restored depth-push when slope>0,
+                                // identical to the plain offset when slope=0 or NdotL=1. NdotL = dot(geometryNormal,
+                                // directLight.direction) is the frame-invariant cosine (both view-space; dot is invariant),
+                                // valid to scale the WORLD-space normal push. Both are in scope here (post getDirectionalLightInfo).
+                                const _snapCoord = '( directionalShadowMatrix[ i ] * vec4( ( ( floor( vWorldPositionCyl * 16.0 ) + 0.5 ) / 16.0 ) + vWorldNormalCyl * ( ' + _offWorld + ' * mix( 1.0, 1.0 / max( dot( geometryNormal, directLight.direction ), 0.15 ), ' + _slope + ' ) ), 1.0 ) )';
+                                const _lfbBlocky = _lfb.split(_coordTok).join(_snapCoord).split('getShadow(').join('blockyGetShadow(');
+                                shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_begin>', _lfbBlocky);
+                            }
+                        }
 
                         // Replace map_fragment with tiled UV version for greedy meshing
                         // This uses fract() to tile textures across merged quads instead of stretching
@@ -40090,10 +40219,9 @@ self.onmessage = async (e) => {
                 }
                 chunkSystemState.lastUpdateSkipped = false;
 
-                // --- 1b. Update shadow frustum when render distance changes ---
-                if (renderDistanceChanged || currentRenderRadius !== lastShadowRenderRadius) {
-                    updateShadowFrustumSize(currentRenderRadius);
-                }
+                // --- 1b. Shadow frustum is decoupled from render distance ---
+                // It's a fixed coverage radius owned by applyShadowRenderDistance() (the single source
+                // of truth; see SHADOW_RENDER_DISTANCES), so render-distance changes no longer resize it.
 
                 // --- 3. Calculate Player Position ---
                 const pPos = getPlayerWorldPosition();
@@ -40684,7 +40812,7 @@ self.onmessage = async (e) => {
                     const shadowCam = sun.shadow.camera;
                     const mapWidth = sun.shadow.mapSize.x;
                     const frustumWidth = shadowCam.right - shadowCam.left;
-                    const texelWorldSize = frustumWidth / mapWidth; // 256/2048 = 0.125
+                    const texelWorldSize = frustumWidth / mapWidth; // reads the LIVE frustum/map; locked to 1/16 block (0.0625) by applyShadowRenderDistance
                     // 1. Snap camera position to texel grid
                     const snapTargetX = Math.round(camPos.x / texelWorldSize) * texelWorldSize;
                     const snapTargetY = Math.round(camPos.y / texelWorldSize) * texelWorldSize;
@@ -40716,24 +40844,40 @@ self.onmessage = async (e) => {
                         const diskX = Math.cos(sunAngle);
                         const sunOffset = 100;
                         shadowLightDir.set(diskX, diskH, 0).normalize();
-                        // SIMPLIFIED PIXEL-PERFECT SHADOWS
-                        // Snap both target AND sun to texelWorldSize - guaranteed alignment
-                        // Target snapped to texel grid
-                        shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
-                        // Sun position: target + offset, then snap to SAME grid
+                        // PIXEL-PERFECT SHADOWS — light-space camera texel-snap, SOFT MODE ONLY.
+                        // Snapping the shadow camera + sun to the world texel grid stabilizes the soft
+                        // shadow against player-movement swim and the original corner-gap. But under BLOCKY
+                        // shadows the per-fragment in-shader WORLD snap already defines the shadow
+                        // resolution, so this snap is redundant — and because it rounds the sun position in
+                        // WORLD axes while the depth-map texel grid is LIGHT-space (rotating with the sun),
+                        // it injects a sub-texel lateral wobble as the sun rotates. The blocky hard per-texel
+                        // edge amplifies that wobble into a visible out-and-back (it was smoothed away by
+                        // PCF in soft mode). So when blocky is ON, the camera follows the sun smoothly with
+                        // NO rounding; soft mode keeps the snap exactly as before (no regression).
+                        const snapCamera = !SETTINGS.blockyShadows;
+                        if (snapCamera) {
+                            shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
+                        } else {
+                            shadowTargetPos.set(camPos.x, camPos.y, camPos.z);
+                        }
+                        // Sun position: target + offset, snapped to the SAME grid (soft mode only)
                         shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, sunOffset);
-                        shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                        shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                        shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                        if (snapCamera) {
+                            shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
+                            shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
+                            shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                        }
                         sun.target.position.copy(shadowTargetPos);
                         sun.position.copy(shadowDesiredPos);
                         sun.target.updateMatrixWorld();
                         sun.updateMatrixWorld();
-                        // Moon: same texelWorldSize snapping
+                        // Moon: same treatment
                         shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, -sunOffset);
-                        shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                        shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                        shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                        if (snapCamera) {
+                            shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
+                            shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
+                            shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
+                        }
                         moon.target.position.copy(shadowTargetPos);
                         moon.position.copy(shadowDesiredPos);
                         moon.target.updateMatrixWorld();
@@ -42330,6 +42474,8 @@ self.onmessage = async (e) => {
                     pickVoxel, VoxelWorld,
                     // --- worker ---
                     buildChunkWorkerCode,
+                    // --- shadows (single source of truth: frustum=2r, map=32r => texel locked to 1/16 block) ---
+                    SHADOW_RENDER_DISTANCES, deriveShadowConfig,
                     // --- seeding + mutable module state ---
                     seedNoise: function(seedStr) { return seedMainThreadNoise(new SeededRandom(seedStr)); },
                     get worldSeed() { return worldConfig.seed; },
