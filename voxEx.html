@@ -27736,8 +27736,12 @@ self.onmessage = async (e) => {
                 torchLight.shadow.mapSize.set(torchShadowMapSize, torchShadowMapSize);
                 torchLight.shadow.camera.near = 0.1;
                 torchLight.shadow.camera.far = SETTINGS.torchRange;
-                torchLight.shadow.bias = -0.0001; // Prevent shadow acne
-                torchLight.shadow.normalBias = 0.02; // Smoother torch shadows
+                // NOTE: shadow.normalBias is applied in each receiving material's VERTEX stage
+                // using the normal attribute — chunk meshes no longer carry one (flatShading
+                // optimization), so normalBias only helps mobs/props now. Terrain anti-acne for
+                // the torch relies on the depth bias below (slightly strengthened to compensate).
+                torchLight.shadow.bias = -0.0005; // Prevent shadow acne (covers terrain, which gets no normalBias)
+                torchLight.shadow.normalBias = 0.02; // Smoother torch shadows (mobs/props only — see note above)
                 torchLight.shadow.radius = 1.5; // Softer local light shadows
                 // Create 3D voxel torch model (view model style)
                 const torchGroup = new THREE.Group();
@@ -31425,16 +31429,14 @@ self.onmessage = async (e) => {
                             // the surface normal toward the light. TIGHTROPE: too small -> acne persists;
                             // too large -> peter-panning (contact gap). Tunable via SETTINGS.blockyShadowOffset
                             // (texels). Worst case is LOW sun. Secondary grazing lever = blockyShadowDepthBias.
-                            shader.vertexShader = shader.vertexShader.replace(
-                                'vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;',
-                                `vWorldPositionCyl = (modelMatrix * vec4(position, 1.0)).xyz;
-                            vWorldNormalCyl = normalize(mat3(modelMatrix) * normal);`
-                            );
-                            shader.vertexShader = shader.vertexShader.replace(
-                                'varying vec3 vWorldPositionCyl;',
-                                `varying vec3 vWorldPositionCyl;
-                            varying vec3 vWorldNormalCyl;`
-                            );
+                            // NOTE: vWorldNormalCyl is no longer a vertex varying. Chunk geometry
+                            // carries NO normal attribute (flatShading optimization), so the old
+                            // vertex-stage `normalize(mat3(modelMatrix) * normal)` read the default
+                            // attribute value (0,0,0) -> normalize(0) = NaN/zero -> the anti-acne
+                            // normal-bias offset collapsed and self-shadow acne appeared as dark
+                            // "stitches" along every block seam. The flat world normal is now derived
+                            // per-fragment from world-position derivatives (see _lfbBlocky below) —
+                            // exact for axis-aligned voxel faces.
                             // Bake the offset (texels -> world units) and the secondary depth bias as GLSL
                             // float literals. toFixed(6) guarantees a decimal point (a bare "0" int literal
                             // would fail to compile); guard against NaN/empty settings.
@@ -31457,7 +31459,6 @@ self.onmessage = async (e) => {
                                 shader.fragmentShader = shader.fragmentShader.replace(
                                     'void main() {',
                                     `#if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
-                                    varying vec3 vWorldNormalCyl;
                                     uniform mat4 directionalShadowMatrix[ NUM_DIR_LIGHT_SHADOWS ];
                                     float blockyGetShadow( sampler2D shadowMap, vec2 shadowMapSize, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
                                         shadowCoord.xyz /= shadowCoord.w;
@@ -31537,6 +31538,13 @@ self.onmessage = async (e) => {
                                         ' directLight.direction = normalize( _tLV ); }\n\t\t' + _torchAnchor;
                                     _lfbBlocky = _lfbBlocky.split(_torchAnchor).join(_torchQuant);
                                 }
+                                // FLAT WORLD NORMAL FROM DERIVATIVES: chunk geometry has no normal
+                                // attribute (flatShading optimization), so derive the face normal
+                                // per-fragment from world-position gradients. Exact for axis-aligned
+                                // voxel faces; FrontSide rendering guarantees the outward sign. The
+                                // local intentionally reuses the old varying's name so _snapCoord's
+                                // token (vWorldNormalCyl) resolves unchanged.
+                                _lfbBlocky = 'vec3 vWorldNormalCyl = normalize( cross( dFdx( vWorldPositionCyl ), dFdy( vWorldPositionCyl ) ) );\n' + _lfbBlocky;
                                 shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_begin>', _lfbBlocky);
                             }
                         }
