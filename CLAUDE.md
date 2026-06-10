@@ -40,7 +40,7 @@ These are the core principles that guide all development decisions:
 
 4. **Flexible Settings and User Preferences**
    - Configurable render distance (4-32 chunks)
-   - Graphics options: AO, shadows, fog, frustum culling, volumetrics, GI, water refraction, stars, clouds
+   - Graphics options: AO, smooth lighting (per-vertex corner light), shadows, fog, frustum culling, volumetrics, GI, water refraction, stars, clouds
    - Water effects: ripples, wading chevrons, splashes, bubbles, swim wake
    - Particle systems: torch flames/smoke, block break, footstep dust
    - Movement options: sprint speed, fly speed, jump force, gravity
@@ -262,6 +262,8 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Watchdog**: Force-clears stuck pending light chunks (300ms grace period)
 - **Semi-Transparent Blocks**: Leaves reduce light by 1 instead of blocking completely
 - **Vertex Colors**: Light levels multiplied by AO, applied as vertex colors during rendering
+- **Smooth Lighting**: `SETTINGS.smoothLighting` — per-corner light sampling (`calculateFaceCornerLight`, same offset table as AO); corner lights are packed into the greedy merge key (layout: `blockId<<20 | 4×3-bit corner light | AO byte`)
+- **Normals**: chunk/water geometries carry NO normal attribute — chunk materials use `flatShading: true` (normals derived in-shader via dFdx/dFdy)
 - **Minimum Light**: Skylight never drops below 1; blocklight has a valid 0-15 range (0 = no torch light present). At mesh time, `extractLightFromChunk()` floors the combined light at **3** (20% base brightness) so deep caves stay faintly visible
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`
 - **Volumetric Sampling**: 7-ray cone for sun/moon visibility, 5-ray cone for point lights (allows partial visibility through foliage)
