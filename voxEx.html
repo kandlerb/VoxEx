@@ -14486,6 +14486,7 @@
                 updateThreshold: 4,     // Minimum movement to trigger update (blocks)
                 _lastUpdate: 0,
                 _updateInterval: 500,   // ms between updates
+                _dirty: false,          // Set on torch place/break for immediate reassignment
 
                 /**
                  * Register a torch position for light consideration.
@@ -14495,6 +14496,34 @@
                  */
                 registerTorch(x, y, z) {
                     this.torchPositions.push({ x, y, z });
+                },
+
+                /**
+                 * Remove a torch position (called when a torch block is broken).
+                 * @param {number} x - World X
+                 * @param {number} y - World Y
+                 * @param {number} z - World Z
+                 * @returns {boolean} True if a matching position was removed.
+                 */
+                unregisterTorch(x, y, z) {
+                    for (let i = 0; i < this.torchPositions.length; i++) {
+                        const p = this.torchPositions[i];
+                        if (Math.abs(p.x - x) < 0.75 && Math.abs(p.y - y) < 0.75 && Math.abs(p.z - z) < 0.75) {
+                            this.torchPositions.splice(i, 1);
+                            return true;
+                        }
+                    }
+                    return false;
+                },
+
+                /**
+                 * Force the next update() to run immediately (bypassing the time and
+                 * movement throttles) without rebuilding from chunkTorches — used when
+                 * a torch is placed/broken so its PointLight appears/disappears the
+                 * same frame instead of after the player walks 4+ blocks.
+                 */
+                markDirty() {
+                    this._dirty = true;
                 },
 
                 /**
@@ -14530,22 +14559,33 @@
                     if (!playerPos || typeof scene === 'undefined') return;
 
                     const now = performance.now();
-                    if (now - this._lastUpdate < this._updateInterval) return;
+                    if (this._dirty) {
+                        // Immediate refresh after a torch place/break. Positions were
+                        // already patched directly (registerTorch/unregisterTorch), so
+                        // skip BOTH throttle gates and the chunkTorches rebuild — the
+                        // edited chunk may not have re-meshed yet, and rebuilding now
+                        // would drop the just-placed torch from the list.
+                        this._dirty = false;
+                        this._lastUpdate = now;
+                        this.lastPlayerPos = { x: playerPos.x, y: playerPos.y, z: playerPos.z };
+                    } else {
+                        if (now - this._lastUpdate < this._updateInterval) return;
 
-                    // Check movement threshold
-                    if (this.lastPlayerPos) {
-                        const dx = playerPos.x - this.lastPlayerPos.x;
-                        const dy = playerPos.y - this.lastPlayerPos.y;
-                        const dz = playerPos.z - this.lastPlayerPos.z;
-                        const distSq = dx*dx + dy*dy + dz*dz;
-                        if (distSq < this.updateThreshold * this.updateThreshold) return;
+                        // Check movement threshold
+                        if (this.lastPlayerPos) {
+                            const dx = playerPos.x - this.lastPlayerPos.x;
+                            const dy = playerPos.y - this.lastPlayerPos.y;
+                            const dz = playerPos.z - this.lastPlayerPos.z;
+                            const distSq = dx*dx + dy*dy + dz*dz;
+                            if (distSq < this.updateThreshold * this.updateThreshold) return;
+                        }
+
+                        this._lastUpdate = now;
+                        this.lastPlayerPos = { x: playerPos.x, y: playerPos.y, z: playerPos.z };
+
+                        // Rebuild positions from chunkTorches (periodic eventual consistency)
+                        this.rebuildTorchPositions();
                     }
-
-                    this._lastUpdate = now;
-                    this.lastPlayerPos = { x: playerPos.x, y: playerPos.y, z: playerPos.z };
-
-                    // Rebuild positions from chunkTorches
-                    this.rebuildTorchPositions();
 
                     if (this.torchPositions.length === 0) {
                         // Hide all lights if no torches
@@ -25766,6 +25806,21 @@
                 // OPTIMIZATION: Mark shadows dirty for update (block changed = shadow geometry changed)
                 markShadowsDirty();
 
+                // Torch PointLight sync: register/unregister immediately so the pooled
+                // light appears the moment a torch is placed and vanishes on break.
+                // (Previously this waited on the pool's 500ms + 4-block movement
+                // throttle, so lights spawned late and lingered after breaking.)
+                // Position matches createWorldTorch(): (x+0.5, y+0.25, z+0.5).
+                if (typeof torchLightPool !== 'undefined') {
+                    if (id === TORCH) {
+                        torchLightPool.registerTorch(x + 0.5, y + 0.25, z + 0.5);
+                        torchLightPool.markDirty();
+                    } else if (oldId === TORCH) {
+                        torchLightPool.unregisterTorch(x + 0.5, y + 0.25, z + 0.5);
+                        torchLightPool.markDirty();
+                    }
+                }
+
                 // Mark chunk system dirty for streaming update
                 markChunkSystemDirty('block modified');
 
@@ -27795,13 +27850,23 @@ self.onmessage = async (e) => {
                 // OPTIMIZATION: Render at 1/2 resolution - blur is barely noticeable through water distortion
                 const REFRACTION_SCALE = 0.5; // 1/2 resolution (use 0.33 for 1/3)
                 const REFRACTION_UPDATE_FRAMES = 2; // Update every N frames (1 = every frame)
-                const REFRACTION_MOVE_THRESHOLD = 0.5; // Force update if camera moves this far
-                const REFRACTION_ROTATE_THRESHOLD = 0.1; // Force update if camera rotates this much (radians)
+                // Tight staleness thresholds: with the old values (0.5u / 0.1rad ≈ 5.7°)
+                // a fast camera pan could leave the capture a full frame behind without
+                // forcing a recapture, smearing misaligned scenery across the water.
+                const REFRACTION_MOVE_THRESHOLD = 0.1; // Force update if camera moves this far
+                const REFRACTION_ROTATE_THRESHOLD = 0.02; // Force update if camera rotates this much (radians, ~1.1°)
+                const _refractW = Math.floor(window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE);
+                const _refractH = Math.floor(window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE);
                 let refractionRenderTarget = new THREE.WebGLRenderTarget(
-                    Math.floor(window.innerWidth * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
-                    Math.floor(window.innerHeight * (window.devicePixelRatio * SETTINGS.pixelRatio) * REFRACTION_SCALE),
+                    _refractW,
+                    _refractH,
                     { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, format: THREE.RGBAFormat }
                 );
+                // Depth attachment: lets the water shader reject distorted refraction
+                // samples that land on geometry IN FRONT of the water surface (this is
+                // what made water "reflect" on-screen foreground blocks).
+                // Three.js auto-resizes the depth texture with renderTarget.setSize().
+                refractionRenderTarget.depthTexture = new THREE.DepthTexture(_refractW, _refractH);
                 window.refractionRenderTarget = refractionRenderTarget; // Expose for resize handling
                 window.REFRACTION_SCALE = REFRACTION_SCALE; // Expose for resize handling
                 // Refraction temporal caching state - exposed via window for renderFrame access
@@ -31144,6 +31209,7 @@ self.onmessage = async (e) => {
                 const waterMaterialRefraction = new THREE.ShaderMaterial({
                     uniforms: {
                         tRefraction: { value: null }, // Set to refractionRenderTarget.texture in render loop
+                        tRefractionDepth: { value: null }, // Depth of the refraction capture (foreground rejection)
                         tWater: { value: tex },
                         time: { value: 0.0 },
                         opacity: { value: SETTINGS.waterOpacity },
@@ -31182,6 +31248,7 @@ self.onmessage = async (e) => {
                     `,
                     fragmentShader: `
                         uniform sampler2D tRefraction;
+                        uniform sampler2D tRefractionDepth;
                         uniform sampler2D tWater;
                         uniform float time;
                         uniform float opacity;
@@ -31237,6 +31304,17 @@ self.onmessage = async (e) => {
                             // Apply distortion to screen UV
                             vec2 distortedUV = screenUV + waveOffset * refractionStrength * waveScale;
                             distortedUV = clamp(distortedUV, 0.001, 0.999); // Prevent edge artifacts
+
+                            // DEPTH MASK: if the distorted sample lands on geometry that is
+                            // closer to the camera than this water fragment (e.g. shoreline
+                            // blocks or anything in front of the water), using it would smear
+                            // on-screen foreground into the water. Fall back to the
+                            // undistorted UV — any visible water pixel is depth-tested, so
+                            // the straight-ahead sample is guaranteed to be behind the water.
+                            float sceneDepth = texture2D(tRefractionDepth, distortedUV).x;
+                            if (sceneDepth < gl_FragCoord.z - 0.0005) {
+                                distortedUV = screenUV;
+                            }
 
                             // Sample refracted scene
                             vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
@@ -42211,6 +42289,7 @@ self.onmessage = async (e) => {
                     // Always update shader uniforms (cheap, keeps things in sync)
                     const mat = window.waterMaterialRefraction;
                     mat.uniforms.tRefraction.value = window.refractionRenderTarget.texture;
+                    mat.uniforms.tRefractionDepth.value = window.refractionRenderTarget.depthTexture;
                     mat.uniforms.time.value = performance.now();
                     mat.uniforms.opacity.value = SETTINGS.waterOpacity;
                     mat.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength;
