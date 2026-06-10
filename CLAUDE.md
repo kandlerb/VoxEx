@@ -262,7 +262,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Watchdog**: Force-clears stuck pending light chunks (300ms grace period)
 - **Semi-Transparent Blocks**: Leaves reduce light by 1 instead of blocking completely
 - **Vertex Colors**: Light levels multiplied by AO, applied as vertex colors during rendering
-- **Minimum Light**: Never drops to 0 — always at least 1 (0 is absence of light, never used)
+- **Minimum Light**: Skylight never drops below 1; blocklight has a valid 0-15 range (0 = no torch light present). At mesh time, `extractLightFromChunk()` floors the combined light at **3** (20% base brightness) so deep caves stay faintly visible
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`
 - **Volumetric Sampling**: 7-ray cone for sun/moon visibility, 5-ray cone for point lights (allows partial visibility through foliage)
 
@@ -495,7 +495,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Memory**: `class MemoryBudgetManager`, `class PerformanceMonitor`, `checkGeometryLeaks`
 - **Pools**: `class ChunkDataPool`, `class GeometryBufferPool`, `class Float32ArrayPool`
 - **World Creation**: `class WorldPreviewRenderer`, `populateBiomeSelector`, `applyTerrainSettings`, `customWorldSettings`
-- **Day/Night**: `updateDayNight`, `setTimeOfDay`
+- **Day/Night**: `updateDayNight`, `dayNightTime`, `btn-time-` (time-of-day buttons), `SETTINGS.dayLength`
 
 ### Light Level Reference
 - **15**: Full sunlight (directly exposed to sky)
@@ -504,7 +504,8 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **8-11**: Medium shade or cave opening
 - **4-7**: Deep shade
 - **2-3**: Deep cave
-- **1**: Minimum light (always faintly visible — 0 never used)
+- **1**: Minimum stored skylight (blocklight may be 0 = no torch light)
+- Note: rendering floors combined light at 3 via `extractLightFromChunk()`, so levels 1-2 appear as level 3 on meshes
 
 ### Performance Tips
 - Prefer typed arrays (Uint8Array, Float32Array) over regular arrays
