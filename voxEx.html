@@ -14127,6 +14127,12 @@
 
                 const clouds = new THREE.Points(geometry, material);
                 clouds.renderOrder = -50;  // Render after stars (-100) but before terrain (0)
+                // CRITICAL: cloud particles are re-centered on the PLAYER inside the
+                // vertex shader (playerPos uniform), but THREE's CPU frustum culling
+                // only sees the static geometry bounds at world origin — so the whole
+                // cloud layer flickered out at view angles that excluded the origin.
+                // Clouds surround the camera at all times; never cull them.
+                clouds.frustumCulled = false;
                 theScene.add(clouds);
 
                 cloudParticles = { mesh: clouds, material, geometry };
@@ -29296,11 +29302,26 @@ self.onmessage = async (e) => {
                                 // Tile based on quad size (for 1×1 quads, fract(x*1) = x unchanged)
                                 float tiledU = fract(localU * vQuadSize.x);
                                 float tiledV = fract(localV * vQuadSize.y);
+                                // ATLAS BLEED FIX (two parts):
+                                // (1) HALF-TEXEL INSET: clamp the tiled UV away from the tile's
+                                //     outermost texel row so filtering/mips can't sample the
+                                //     NEIGHBORING atlas tile (e.g. dirt peeking through the
+                                //     corner of a grass side).
+                                tiledU = clamp(tiledU, 0.0078125, 0.9921875); // 0.5/64 texels
+                                tiledV = clamp(tiledV, 0.0078125, 0.9921875);
                                 // Convert back to atlas UV space
                                 float tileBase = floor(vMapUv.x / tileWidth) * tileWidth;
                                 vec2 tiledUv = vec2(tileBase + tiledU * tileWidth, tiledV);
-                                // Sample texture with tiled UVs
-                                vec4 sampledDiffuseColor = texture2D(map, tiledUv);
+                                // (2) CONTINUOUS-GRADIENT SAMPLING: the fract() wraps above make
+                                //     screen-space UV derivatives spike at every block boundary
+                                //     inside a merged quad, so the GPU dropped to the lowest mip
+                                //     exactly along block seams — sampling heavily averaged texels
+                                //     (visible as bright "light between blocks" lines). Supply
+                                //     gradients from the UNWRAPPED coordinate, which is smooth
+                                //     across the whole quad, so mip selection matches the rest of
+                                //     the surface.
+                                vec2 contUv = vec2(localU * vQuadSize.x * tileWidth, localV * vQuadSize.y);
+                                vec4 sampledDiffuseColor = textureGrad(map, tiledUv, dFdx(contUv), dFdy(contUv));
                                 #ifdef DECODE_VIDEO_TEXTURE
                                     sampledDiffuseColor = vec4(mix(pow(sampledDiffuseColor.rgb * 0.9478672986 + vec3(0.0521327014), vec3(2.4)), sampledDiffuseColor.rgb * 0.0773993808, vec3(lessThanEqual(sampledDiffuseColor.rgb, vec3(0.04045)))), sampledDiffuseColor.w);
                                 #endif
