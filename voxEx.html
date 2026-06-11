@@ -12301,6 +12301,11 @@
             const activeChunks = new Set();
             const globalPendingMods = new Map();
             const chunkBuildQueue = [];
+            // Streaming starvation guards (see updateChunkSystem): count of consecutive
+            // slow frames (>=32ms) that skipped builds, and the last time the build
+            // queue made progress (used for the 10s stall telemetry warning).
+            let slowFrameBuildSkips = 0;
+            let chunkStreamLastProgressMs = 0;
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
             // Track tight bounds effectiveness for frustum culling
@@ -25682,6 +25687,17 @@ self.onmessage = async (e) => {
                 applyShadowRenderDistance();
                 refreshPixelTextureAnisotropy();
                 document.body.appendChild(renderer.domElement);
+                // GPU robustness: surface context loss (GPU process crash / driver reset)
+                // instead of silently rendering nothing while the game appears hung.
+                renderer.domElement.addEventListener('webglcontextlost', (event) => {
+                    event.preventDefault(); // Allow the browser to attempt restoration
+                    console.error('[Renderer] WebGL context lost — GPU process crashed or was reset. Reload to recover if rendering does not resume.');
+                    if (typeof showToast === 'function') showToast('Graphics device was reset — reload the page if the world stays frozen', 'error', 10000);
+                });
+                renderer.domElement.addEventListener('webglcontextrestored', () => {
+                    console.warn('[Renderer] WebGL context restored.');
+                    if (typeof showToast === 'function') showToast('Graphics device recovered', 'success');
+                });
 
                 // Water refraction render target - stores opaque scene for water to sample
                 // OPTIMIZATION: Render at 1/2 resolution - blur is barely noticeable through water distortion
@@ -39072,6 +39088,7 @@ self.onmessage = async (e) => {
                 if (builds > 0) {
                     const timePerChunk = perfMetrics.chunkBuildTime / builds;
                     chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + timePerChunk * 0.1; // Exponential moving average
+                    chunkStreamLastProgressMs = performance.now(); // Feed the stall watchdog in updateChunkSystem
                 }
                 // (build-debt breather removed — see note at the top of this function)
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
@@ -39430,16 +39447,34 @@ self.onmessage = async (e) => {
                 const lightStartMs = performance.now();
                 processLightQueue();
                 perfMetrics.lightingTime = performance.now() - lightStartMs;
-                // Throttle mesh building - prioritize edits even when FPS dips
+                // Throttle mesh building - prioritize edits even when FPS dips.
+                // STARVATION FIX: the old gate skipped builds entirely whenever the frame
+                // delta was >=32ms, which permanently halted streaming on any machine
+                // running below ~31 FPS — the queue sat at a constant count and the
+                // loading spinner never finished. Slow frames now still build on every
+                // 3rd frame; processChunkQueue's internal 5ms budget bounds the cost.
                 const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
-                if (chunkBuildQueue.length > 0 && (time - prevTime < 32 || hasEditWork)) {
-                    const chunkBuildStart = perfMonitor.start("chunkBuild");
-                    // Add error handling to prevent silent failures from async processChunkQueue
-                    processChunkQueue().catch(e => {
-                        logDebug(`[ChunkQueue] Error in processChunkQueue: ${e.message}`);
-                        console.error('[ChunkQueue] processChunkQueue error:', e);
-                    });
-                    perfMonitor.end("chunkBuild", chunkBuildStart);
+                if (chunkBuildQueue.length > 0) {
+                    const fastFrame = time - prevTime < 32;
+                    slowFrameBuildSkips = fastFrame ? 0 : slowFrameBuildSkips + 1;
+                    if (fastFrame || hasEditWork || slowFrameBuildSkips >= 3) {
+                        if (!fastFrame) slowFrameBuildSkips = 0;
+                        const chunkBuildStart = perfMonitor.start("chunkBuild");
+                        // Add error handling to prevent silent failures from async processChunkQueue
+                        processChunkQueue().catch(e => {
+                            logDebug(`[ChunkQueue] Error in processChunkQueue: ${e.message}`);
+                            console.error('[ChunkQueue] processChunkQueue error:', e);
+                        });
+                        perfMonitor.end("chunkBuild", chunkBuildStart);
+                    }
+                    // Stall telemetry: queue has work but nothing has built for 10s —
+                    // emit one throttled state line so stalls are visible in the console.
+                    if (time - chunkStreamLastProgressMs > 10000) {
+                        chunkStreamLastProgressMs = time;
+                        console.warn(`[ChunkQueue] Stalled: ${chunkBuildQueue.length} queued, ${pendingChunkUpdates.size} pending, ${deferredChunkUpdates.size} deferred, ${pendingLightChunks.size} light-pending, frameDelta=${(time - prevTime).toFixed(1)}ms`);
+                    }
+                } else {
+                    chunkStreamLastProgressMs = time;
                 }
                 // Run chunk streaming updates - now internally event-driven
                 // Changed from fixed 200ms interval to smart dirty checking
@@ -40439,7 +40474,13 @@ self.onmessage = async (e) => {
                             }
                         }
                     });
-                    if (meshesWithZeroDrawRange > 0 || meshesWithDrawRange < meshesWithGeometry / 2) {
+                    // Suppress the warning during initial streaming (queue still has work)
+                    // and for the first 30s after boot — few/no chunk meshes is EXPECTED
+                    // then, and warning during it sent debugging down the wrong path.
+                    if (!window._renderDiagBootMs) window._renderDiagBootMs = diagNow;
+                    const streamingActive = chunkBuildQueue.length > 0 || pendingChunkUpdates.size > 0;
+                    const diagWarmedUp = diagNow - window._renderDiagBootMs > 30000;
+                    if (diagWarmedUp && !streamingActive && (meshesWithZeroDrawRange > 0 || meshesWithDrawRange < meshesWithGeometry / 2)) {
                         console.warn(`[RenderDiag] Scene meshes: ${meshesWithGeometry} with geo, ${meshesWithDrawRange} with drawRange>0, ${meshesWithZeroDrawRange} with drawRange=0, total indices: ${totalDrawCount}`);
                     }
                 }
