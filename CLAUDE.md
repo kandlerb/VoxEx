@@ -101,7 +101,7 @@ VoxEx/
 └───────────────┬─────────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ Game Engine (RenderEngine + Three.js)                            │
+│ Game Engine (Three.js render pipeline, module-level functions)   │
 │ ├─ Camera: First-Person + Third-Person (V key, orbit, zoom)     │
 │ ├─ Lighting: Day/Night cycle, Sun/Moon, Torches (max 8 point)   │
 │ ├─ Skybox: Multi-layer stars (3 layers), volumetric clouds      │
@@ -116,10 +116,10 @@ VoxEx/
 └───────────────┬─────────────────────────────────────────────────┘
                 ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ World Management (VoxelWorld + TerrainGenerator)                 │
+│ World Management (VoxelWorld + terrain generation functions)     │
 │ ├─ Chunk Generation (16x16x320, subdivided into 20 sections)    │
 │ ├─ ChunkWorkerPool (Web Workers, auto-sized, zero-copy xfer)    │
-│ ├─ ChunkMesher (face culling, AO, greedy meshing, LOD)          │
+│ ├─ Chunk Meshing (face culling, AO, greedy meshing, LOD)        │
 │ ├─ Biome System (6 biomes + foothill transitions)               │
 │ ├─ Terrain: Continental height, domain-warped biome boundaries   │
 │ ├─ Rivers: Gradient-descent river network (RiverNetworkCache)   │
@@ -141,7 +141,7 @@ VoxEx/
                 ↓
 ┌─────────────────────────────────────────────────────────────────┐
 │ Entity & Player Systems                                          │
-│ ├─ PlayerController (movement, physics, collision, swimming)     │
+│ ├─ Player Movement (physics, collision, swimming functions)      │
 │ ├─ Articulated Characters: Shared buildArticulatedMesh()         │
 │ │   - 3-segment spine (lower/mid/upper) with pivots             │
 │ │   - Arms with shoulder rotation + elbow bend                  │
@@ -149,7 +149,7 @@ VoxEx/
 │ │   - Procedural pixel-art textures (skin, clothing, hair)      │
 │ ├─ Player: Customizable skin/hair/shirt/pants colors            │
 │ ├─ Zombie: Procedural appearance (clothing themes, skin, eyes)  │
-│ ├─ EntityManager (spawning, pooling, max 10 zombies)            │
+│ ├─ Entity Spawning (pooling, max 10 zombies)                    │
 │ ├─ Zombie AI: State machine (wander → chase → attack)           │
 │ ├─ Animation: Spring-damped pose interpolation, 11+ states      │
 │ ├─ Knockdown: 7-keyframe ragdoll animation (3.5s duration)      │
@@ -242,7 +242,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Sections**: Subdivided into 20 vertical sections (SECTION_HEIGHT=16) for LOD and culling
 - **Structure**: `{blocks: Uint8Array, skyLight: Uint8Array, blockLight: Uint8Array}`
 - **Section Analysis**: Per-section `isEmpty`, `isFullySolid`, tight bounding boxes for render skipping
-- **Meshing**: `ChunkMesher` builds indexed geometry; `ChunkWorkerPool` offloads to Web Workers
+- **Meshing**: `renderChunk()` builds indexed geometry; `ChunkWorkerPool` offloads to Web Workers
 - **Worker Pool**: Auto-sized (CPU cores - 1, min 1, max 4), zero-copy Transferable buffers, 500ms mesh timeout
 - **Geometry Tiers**: Small (4K faces, ~0.78MB), Medium (8K, ~1.56MB), Large (16K, ~3.12MB) — auto-upgrades
 - **Pooling**: `ChunkDataPool`, `GeometryBufferPool`, `Float32ArrayPool` reduce allocations
@@ -318,7 +318,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Constraints**: Min/max rotation limits for all limb joints (POSE_CONSTRAINTS)
 
 ### Entity System
-- **EntityManager**: Handles zombie spawning, pooling, and lifecycle
+- **Entity Functions**: `spawnZombieNearPlayer()`/`updateZombies()` handle zombie spawning, pooling, and lifecycle
 - **Zombie AI**: State machine (wander → chase → attack), detection radius, pathfinding with collision probing
 - **Zombie Animation**: Procedural limb swing synced to movement speed and state
 - **Effects**: Red vignette and desaturation when zombies nearby (configurable intensity)
@@ -362,35 +362,27 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 
 | Class | ~Line | Purpose |
 |-------|-------|---------|
-| `SettingsManager` | 6134 | Settings persistence, listeners, profiles |
-| `InputManager` | 6281 | Keyboard/mouse input, pointer lock, bitmask flags |
-| `TerrainGenerator` | 6460 | Terrain/biome generation, noise, height functions |
-| `VoxelWorld` | 7027 | World management, chunk loading/unloading, block access |
-| `ChunkDataPool` | 7584 | Object pooling for chunk data structures |
-| `ChunkMesher` | 8507 | Geometry mesh building with face culling and AO |
-| `RenderEngine` | 8625 | Three.js rendering pipeline, camera, lighting, shadows |
-| `AudioManager` | 8926 | Procedural sound synthesis and playback |
-| `EntityManager` | 9266 | Zombie spawning, lifecycle, pooling |
-| `Mob` | 9454 | Base entity class (position, velocity, physics) |
-| `Zombie` | 9516 | Zombie AI state machine (wander/chase/attack) |
-| `PlayerController` | 9760 | Player movement, physics, collision, swimming |
-| `UIManager` | 10132 | HUD, hotbar, inventory, menus, toast notifications |
-| `VoxExGame` | 10703 | Main game orchestrator, render loop, frame budget |
-| `Uint8ArrayPool` | 11066 | Pool for Uint8Array objects |
-| `Vector3Pool` | 11487 | Pool for Three.js Vector3 objects |
-| `ChunkNeighborCache` | 12336 | Optimized neighbor chunk lookups |
-| `PerformanceMonitor` | 12946 | FPS tracking, frame timing, circular buffer |
-| `ParticleSystem` | 15640 | Particle effects with pooling and custom square shader |
-| `SeededRandom` | 18415 | Deterministic PRNG for world generation (worker copy at 18874; nested `SeededRNG` at 30334) |
-| `Float32ArrayPool` | 18475 | Pool for Float32Array objects |
-| `Uint32ArrayPool` | 18559 | Pool for Uint32Array objects |
-| `ChunkWorkerPool` | 20132 | Web Worker pool for off-thread terrain gen and meshing |
-| `GeometryBufferPool` | 20701 | Tiered GPU buffer pooling (small/medium/large) |
-| `MemoryBudgetManager` | 21069 | Memory monitoring, auto-scaling, emergency unload |
-| `WorldPreviewNoise` | 21763 | Seeded Perlin noise for terrain preview |
-| `WorldPreviewRenderer` | 21859 | Real-time terrain preview during world creation |
-| `SunlightTask` | 25187 | Async sunlight propagation with pressure-based bailout |
-| `ChunkDiskStorage` | 26359 | OPFS disk cache with inline worker backend |
+| `VoxelWorld` | 6186 | World management, chunk loading/unloading, block access |
+| `ChunkDataPool` | 6741 | Object pooling for chunk data structures |
+| `AudioManager` | 7663 | Procedural sound synthesis and playback |
+| `UIManager` | 8020 | HUD, hotbar, inventory, menus, toast notifications |
+| `Uint8ArrayPool` | 8731 | Pool for Uint8Array objects |
+| `Vector3Pool` | 9152 | Pool for Three.js Vector3 objects |
+| `ChunkNeighborCache` | 10001 | Optimized neighbor chunk lookups |
+| `PerformanceMonitor` | 10639 | FPS tracking, frame timing, circular buffer |
+| `ParticleSystem` | 13382 | Particle effects with pooling and custom square shader |
+| `SeededRandom` | 16168 | Deterministic PRNG for world generation (worker copy at 16627; nested `SeededRNG` at 28086) |
+| `Float32ArrayPool` | 16228 | Pool for Float32Array objects |
+| `Uint32ArrayPool` | 16312 | Pool for Uint32Array objects |
+| `ChunkWorkerPool` | 17789 | Web Worker pool for off-thread terrain gen and meshing |
+| `GeometryBufferPool` | 18349 | Tiered GPU buffer pooling (small/medium/large) |
+| `MemoryBudgetManager` | 18714 | Memory monitoring, auto-scaling, emergency unload |
+| `WorldPreviewNoise` | 19408 | Seeded Perlin noise for terrain preview |
+| `WorldPreviewRenderer` | 19504 | Real-time terrain preview during world creation |
+| `SunlightTask` | 22925 | Async sunlight propagation with pressure-based bailout |
+| `ChunkDiskStorage` | 24112 | OPFS disk cache with inline worker backend |
+
+> Note: The old class-based engine (`SettingsManager`, `InputManager`, `TerrainGenerator`, `ChunkMesher`, `RenderEngine`, `EntityManager`, `Mob`, `Zombie`, `PlayerController`, `VoxExGame`) was dead code — never instantiated — and has been removed. The live game uses module-level functions (e.g. `generateChunkData`, `renderChunk`, `buildZombieMesh`/`updateZombies`, the global `animate()` loop) plus the live classes above. Tombstone comments mark the removal sites in `voxEx.html`.
 
 ## Key Constants
 
@@ -489,10 +481,10 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Input**: `onKeyUp`, `onMouseClick`, `onMouseWheel`, `INPUT_FORWARD`, `INPUT_SPRINT`
 - **Compression**: `rleEncode`, `rleDecode`, `compressChunkData`, `decompressChunkData`
 - **Save/Load**: `saveWorld`, `loadWorld`, `saveChunkToCache`, `loadChunkFromCache`, `preGenerateSpawnChunks`
-- **Core Classes**: `class VoxExGame`, `class VoxelWorld`, `class TerrainGenerator`
-- **Rendering**: `class RenderEngine`, `class ChunkMesher`, `class ParticleSystem`
-- **Player/Entity**: `class PlayerController`, `class EntityManager`, `class Mob`, `class Zombie`
-- **UI/Settings**: `class UIManager`, `class SettingsManager`, `class InputManager`
+- **Core Classes**: `class VoxelWorld`
+- **Rendering**: `class ParticleSystem`, `function renderChunk`, `function animate`
+- **Player/Entity**: `buildZombieMesh`, `updateZombies`, `spawnZombieNearPlayer`, `updatePlayer`
+- **UI/Settings**: `class UIManager`, `saveSettings`, `updateUIFromSettings`
 - **Workers**: `class ChunkWorkerPool`, `class ChunkDiskStorage`, `buildChunkWorkerCode`
 - **Memory**: `class MemoryBudgetManager`, `class PerformanceMonitor`, `checkGeometryLeaks`
 - **Pools**: `class ChunkDataPool`, `class GeometryBufferPool`, `class Float32ArrayPool`
