@@ -15924,23 +15924,34 @@
                         // Without this, edge values from neighbors penetrate only one
                         // block — caves crossing the border stay dark
                         propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+
+                        // Defer the (expensive, forced) remesh until light CONVERGES —
+                        // remeshing on every intermediate brightening created a rebuild
+                        // storm during initial streaming that starved fresh chunk loads
+                        chunk._edgeMeshDirty = true;
+
+                        // Ensure we revisit this chunk so the converged pass below can
+                        // fire the single remesh (neighbors may be capped and never
+                        // requeue us)
+                        edgeLightingUpdateQueue.add(key);
                     } else if (!hasValidEdgeLighting || !lightingLooksValid) {
                         // First pass after a recalc: spread own edge light inward once
                         propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                        chunk._edgeMeshDirty = true;
                     }
 
                     // Mark as having edge lighting
                     if (!chunk.renderState) chunk.renderState = 0;
                     chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
 
-                    // Schedule mesh rebuild with force=true AND bypassLighting=true —
-                    // but only when this pass actually changed something (no-change
-                    // passes were previously forcing pointless full remeshes)
+                    // Schedule the mesh rebuild ONCE, on the first no-change pass after
+                    // light stopped arriving (converged) — force=true + bypassLighting
                     // IMPORTANT: Check for BOTH terrain mesh (key) AND water mesh (key + "_WATER")
                     // Water-only chunks have no terrain mesh but still need rebuilding!
                     const hasTerrainMesh = chunkMeshes.has(key);
                     const hasWaterMesh = chunkMeshes.has(key + "_WATER");
-                    if ((edgeChanged > 0 || !hasValidEdgeLighting) && (hasTerrainMesh || hasWaterMesh)) {
+                    if (edgeChanged === 0 && chunk._edgeMeshDirty && (hasTerrainMesh || hasWaterMesh)) {
+                        chunk._edgeMeshDirty = false;
                         scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
                     }
 
@@ -38743,29 +38754,11 @@ self.onmessage = async (e) => {
                 const initialQueueLength = chunkBuildQueue.length;
                 let inspected = 0;
                 heartbeatChunkUpdates();
-                // SPIKE SMOOTHING: a single chunk build is non-preemptible (data load/
-                // gen + sunlight + section analysis + mesh apply can cost 10-20ms) and
-                // the first build each frame intentionally bypasses the time budget.
-                // When the previous frame's builds blew well past the budget, take
-                // breather frame(s) so overruns can't chain into sustained stutter
-                // while streaming across a chunk boundary.
-                if (typeof window.chunkBuildDebtMs !== 'number') window.chunkBuildDebtMs = 0;
-                // Player block edits (dirty chunks) BYPASS the breather — edit latency
-                // is player-visible (a broken block must vanish promptly), and dirty
-                // rebuilds are cheap single-chunk remeshes, not ring floods.
-                if (window.chunkBuildDebtMs > 0 && dirtyChunks.size === 0) {
-                    window.chunkBuildDebtMs -= FRAME_BUDGET_MS * 0.5; // pay down ~8ms per skipped frame
-                    if (chunkBuildQueue.length > 0) perfMetrics.chunksSkipped += chunkBuildQueue.length;
-                    perfMetrics.chunkBuildTime = 0;
-                    // Keep cross-chunk light flowing even on breather frames — edge
-                    // lighting normally runs at the END of this function with leftover
-                    // budget, so skipping builds was also starving it (dark caves
-                    // lingered during/after streaming bursts)
-                    if (edgeLightingUpdateQueue.size > 0 || chunksNeedingLightingUpdate.size > 0) {
-                        processEdgeLightingUpdates(2);
-                    }
-                    return;
-                }
+                // NOTE: an earlier "build-debt breather" here (skip whole frames after
+                // a build overran the budget) was REMOVED — combined with edge-lighting
+                // remesh churn it throttled streaming throughput so hard that chunk
+                // loading never finished. Spike control now relies on the per-frame
+                // build budget below plus the fast-movement throttle.
                 // --- PRIORITY: Sort queue by distance (closest chunks first) ---
                 // Calculate player chunk position for distance sorting
                 if (chunkBuildQueue.length > 1 && controls && controls.getObject) {
@@ -38872,13 +38865,7 @@ self.onmessage = async (e) => {
                     const timePerChunk = perfMetrics.chunkBuildTime / builds;
                     chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + timePerChunk * 0.1; // Exponential moving average
                 }
-                // Large overrun -> record as debt so the next frame(s) skip building
-                // entirely (see SPIKE SMOOTHING above). Threshold 2.5x budget means
-                // normal 5-8ms build frames stream at full rate; only frame-breaking
-                // overruns trigger a breather.
-                if (perfMetrics.chunkBuildTime > CHUNK_BUILD_BUDGET_MS * 2.5) {
-                    window.chunkBuildDebtMs = perfMetrics.chunkBuildTime - CHUNK_BUILD_BUDGET_MS;
-                }
+                // (build-debt breather removed — see note at the top of this function)
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
                 // OPTIMIZATION: Skip neighbor updates if we're over budget
                 const remainingBudget = CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs);
