@@ -15665,10 +15665,6 @@
             // Propagate light from neighboring chunks into this chunk's edge blocks
             // This ensures smooth lighting transitions at chunk boundaries
             function propagateLightFromNeighbors(chunk, cx, cz, chunkSize, chunkHeight) {
-                const skyLight = chunk.skyLight;
-                const blockLight = chunk.blockLight;
-                const blocks = chunk.blocks;
-
                 // Get all 4 cardinal neighbors
                 const neighbors = {
                     west: chunks.get(getChunkKey(cx - 1, cz)),
@@ -15677,25 +15673,31 @@
                     south: chunks.get(getChunkKey(cx, cz + 1))
                 };
 
+                // Total cells brightened across all four edges — convergence signal
+                // for processEdgeLightingUpdates (0 = this chunk learned nothing new)
+                let changed = 0;
+
                 // Process west edge (lx = 0) - receive light from west neighbor's lx = 15
                 if (neighbors.west && neighbors.west.skyLight && neighbors.west.blockLight) {
-                    propagateEdgeLighting(chunk, neighbors.west, 0, 15, 'x', chunkSize, chunkHeight);
+                    changed += propagateEdgeLighting(chunk, neighbors.west, 0, 15, 'x', chunkSize, chunkHeight);
                 }
 
                 // Process east edge (lx = 15) - receive light from east neighbor's lx = 0
                 if (neighbors.east && neighbors.east.skyLight && neighbors.east.blockLight) {
-                    propagateEdgeLighting(chunk, neighbors.east, 15, 0, 'x', chunkSize, chunkHeight);
+                    changed += propagateEdgeLighting(chunk, neighbors.east, 15, 0, 'x', chunkSize, chunkHeight);
                 }
 
                 // Process north edge (lz = 0) - receive light from north neighbor's lz = 15
                 if (neighbors.north && neighbors.north.skyLight && neighbors.north.blockLight) {
-                    propagateEdgeLighting(chunk, neighbors.north, 0, 15, 'z', chunkSize, chunkHeight);
+                    changed += propagateEdgeLighting(chunk, neighbors.north, 0, 15, 'z', chunkSize, chunkHeight);
                 }
 
                 // Process south edge (lz = 15) - receive light from south neighbor's lz = 0
                 if (neighbors.south && neighbors.south.skyLight && neighbors.south.blockLight) {
-                    propagateEdgeLighting(chunk, neighbors.south, 15, 0, 'z', chunkSize, chunkHeight);
+                    changed += propagateEdgeLighting(chunk, neighbors.south, 15, 0, 'z', chunkSize, chunkHeight);
                 }
+
+                return changed;
             }
 
             // Propagate light from one chunk edge to another
@@ -15708,6 +15710,9 @@
                 const targetBlocks = targetChunk.blocks;
                 const sourceSkyLight = sourceChunk.skyLight;
                 const sourceBlockLight = sourceChunk.blockLight;
+                // Track how many cells were brightened — the caller uses this for
+                // convergence detection (changed passes don't count against the cap)
+                let changed = 0;
 
                 // Iterate along the edge
                 for (let i = 0; i < chunkSize; i++) {
@@ -15732,6 +15737,7 @@
                         const propagatedSky = sourceSky > 1 ? sourceSky - 1 : 1;
                         if (propagatedSky > targetSkyLight[targetIdx]) {
                             targetSkyLight[targetIdx] = propagatedSky;
+                            changed++;
                         }
 
                         // Propagate block light
@@ -15744,9 +15750,11 @@
                         const propagatedBlock = sourceBlock > 1 ? sourceBlock - 1 : 0;
                         if (propagatedBlock > targetBlockLight[targetIdx]) {
                             targetBlockLight[targetIdx] = propagatedBlock;
+                            changed++;
                         }
                     }
                 }
+                return changed;
             }
 
             // BFS propagation from chunk edges inward
@@ -15882,10 +15890,17 @@
                     const chunk = chunks.get(key);
                     if (!chunk || !chunk.blocks || !chunk.skyLight) continue;
 
-                    // Track and limit edge lighting passes to prevent infinite reprocessing
+                    // CONVERGENCE-BASED PASS CAP: the cap counts CONSECUTIVE passes in
+                    // which the neighbor-import brightened nothing (i.e., this chunk has
+                    // converged). Previously EVERY visit consumed the cap, so chunks
+                    // burned all passes during initial streaming churn — before their
+                    // neighbors' light had finished converging — and then permanently
+                    // ignored late-arriving light. Symptom: caves crossing a chunk
+                    // border stayed dark until a manual block edit triggered the
+                    // global relight path.
                     const passCount = (edgeLightingPassCount.get(key) || 0) + 1;
                     edgeLightingPassCount.set(key, passCount);
-                    if (passCount > MAX_EDGE_LIGHTING_PASSES) continue; // Skip if already processed enough times
+                    if (passCount > MAX_EDGE_LIGHTING_PASSES) continue; // Converged (N no-change passes) — stop
 
                     const { cx, cz } = parseChunkKeySimple(key);
 
@@ -15898,25 +15913,34 @@
                     }
 
                     // Propagate light from neighbors (sets edge values)
-                    propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                    const edgeChanged = propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
 
-                    // CRITICAL: Spread edge light into chunk interior via BFS
-                    // Without this, edge values from neighbors don't propagate inward
-                    // This fixes dark water chunks that are next to lit land chunks
-                    propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                    if (edgeChanged > 0) {
+                        // New light arrived: this pass carried information, so it does
+                        // NOT count against the convergence cap
+                        edgeLightingPassCount.set(key, 0);
+
+                        // CRITICAL: Spread edge light into chunk interior via BFS
+                        // Without this, edge values from neighbors penetrate only one
+                        // block — caves crossing the border stay dark
+                        propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                    } else if (!hasValidEdgeLighting || !lightingLooksValid) {
+                        // First pass after a recalc: spread own edge light inward once
+                        propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                    }
 
                     // Mark as having edge lighting
                     if (!chunk.renderState) chunk.renderState = 0;
                     chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
 
-                    // Schedule mesh rebuild with force=true AND bypassLighting=true
-                    // This ensures lighting changes are immediately visible even if neighbors
-                    // have pending lighting (which they often will due to re-queuing)
+                    // Schedule mesh rebuild with force=true AND bypassLighting=true —
+                    // but only when this pass actually changed something (no-change
+                    // passes were previously forcing pointless full remeshes)
                     // IMPORTANT: Check for BOTH terrain mesh (key) AND water mesh (key + "_WATER")
                     // Water-only chunks have no terrain mesh but still need rebuilding!
                     const hasTerrainMesh = chunkMeshes.has(key);
                     const hasWaterMesh = chunkMeshes.has(key + "_WATER");
-                    if (hasTerrainMesh || hasWaterMesh) {
+                    if ((edgeChanged > 0 || !hasValidEdgeLighting) && (hasTerrainMesh || hasWaterMesh)) {
                         scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
                     }
 
@@ -15924,7 +15948,9 @@
                     // This chunk now has updated edge values that neighbors can benefit from
                     // Without this, light doesn't propagate properly across multiple chunks
                     // because neighbors were processed before this chunk had correct values
-                    // Only re-queue if this chunk has meaningful light to propagate (value > 2)
+                    // Only re-queue when this chunk's light actually changed this pass
+                    // (no-change passes export nothing new) and it has meaningful light (>2)
+                    if (edgeChanged === 0 && hasValidEdgeLighting && lightingLooksValid) continue;
                     const skyLight = chunk.skyLight;
                     const cs = WORLD_DIMS.chunkSize;
                     const ch = WORLD_DIMS.chunkHeight;
@@ -38731,6 +38757,13 @@ self.onmessage = async (e) => {
                     window.chunkBuildDebtMs -= FRAME_BUDGET_MS * 0.5; // pay down ~8ms per skipped frame
                     if (chunkBuildQueue.length > 0) perfMetrics.chunksSkipped += chunkBuildQueue.length;
                     perfMetrics.chunkBuildTime = 0;
+                    // Keep cross-chunk light flowing even on breather frames — edge
+                    // lighting normally runs at the END of this function with leftover
+                    // budget, so skipping builds was also starving it (dark caves
+                    // lingered during/after streaming bursts)
+                    if (edgeLightingUpdateQueue.size > 0 || chunksNeedingLightingUpdate.size > 0) {
+                        processEdgeLightingUpdates(2);
+                    }
                     return;
                 }
                 // --- PRIORITY: Sort queue by distance (closest chunks first) ---
