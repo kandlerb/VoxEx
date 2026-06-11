@@ -18428,6 +18428,16 @@
                         thickAttr.needsUpdate = true;
                     }
 
+                    // Foam edges: worker mesher doesn't produce this yet (parity project) —
+                    // zero-fill the drawn range so pooled-buffer remnants can't show stale foam.
+                    if (wGeo.attributes.foamEdges) {
+                        const foamAttr = wGeo.attributes.foamEdges;
+                        const foamLen = water.positions.length / 3;
+                        if (water.foam) { for (let i = 0; i < water.foam.length; i++) foamAttr.array[i] = water.foam[i]; }
+                        else { for (let i = 0; i < foamLen; i++) foamAttr.array[i] = 0; }
+                        foamAttr.needsUpdate = true;
+                    }
+
                     wGeo.setDrawRange(0, water.indices.length);
                     wGeo.computeBoundingSphere();
 
@@ -18720,6 +18730,7 @@
                     const colArray = new Float32Array(waterMaxVerts * 3);
                     const shoreArray = new Float32Array(waterMaxVerts);      // shoreDist
                     const thickArray = new Float32Array(waterMaxVerts);      // waterThickness
+                    const foamArray = new Float32Array(waterMaxVerts);       // foamEdges (top-face land-adjacency bitmask)
                     const idxArray = new Uint32Array(waterMaxIdx);
 
                     const posAttr = new THREE.Float32BufferAttribute(posArray, 3);
@@ -18727,6 +18738,7 @@
                     const colAttr = new THREE.Float32BufferAttribute(colArray, 3);
                     const shoreAttr = new THREE.Float32BufferAttribute(shoreArray, 1);
                     const thickAttr = new THREE.Float32BufferAttribute(thickArray, 1);
+                    const foamAttr = new THREE.Float32BufferAttribute(foamArray, 1);
                     const idxAttr = new THREE.Uint32BufferAttribute(idxArray, 1);
 
                     posAttr.setUsage(THREE.DynamicDrawUsage);
@@ -18734,6 +18746,7 @@
                     colAttr.setUsage(THREE.DynamicDrawUsage);
                     shoreAttr.setUsage(THREE.DynamicDrawUsage);
                     thickAttr.setUsage(THREE.DynamicDrawUsage);
+                    foamAttr.setUsage(THREE.DynamicDrawUsage);
                     idxAttr.setUsage(THREE.DynamicDrawUsage);
 
                     geo.setAttribute('position', posAttr);
@@ -18741,6 +18754,7 @@
                     geo.setAttribute('color', colAttr);
                     geo.setAttribute('shoreDist', shoreAttr);
                     geo.setAttribute('waterThickness', thickAttr);
+                    geo.setAttribute('foamEdges', foamAttr);
                     geo.setIndex(idxAttr);
 
                     geo.boundingSphere = new THREE.Sphere();
@@ -29276,17 +29290,20 @@ self.onmessage = async (e) => {
                     vertexShader: `
                         attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
                         attribute float waterThickness; // Water depth in blocks (normalized: 0 = surface, 1 = 8+ blocks)
+                        attribute float foamEdges; // Top-face land-adjacency bitmask (1=+X, 2=-X, 4=+Z, 8=-Z); 0 on side faces
                         varying vec2 vUv;
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
                         varying vec3 vColor;
                         varying float vShoreDist;
                         varying float vWaterThickness;
+                        varying float vFoamEdges;
                         void main() {
                             vUv = uv;
                             vColor = color;
                             vShoreDist = shoreDist;
                             vWaterThickness = waterThickness;
+                            vFoamEdges = foamEdges;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -29317,6 +29334,7 @@ self.onmessage = async (e) => {
                         varying vec3 vColor;
                         varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
                         varying float vWaterThickness; // Actual water depth (0 = surface, 1 = 8+ blocks deep)
+                        varying float vFoamEdges; // Land-adjacency bitmask for top faces (0 = no foam)
 
                         // Simple noise function for wave distortion
                         float hash(vec2 p) {
@@ -29331,6 +29349,17 @@ self.onmessage = async (e) => {
                             float c = hash(i + vec2(0.0, 1.0));
                             float d = hash(i + vec2(1.0, 1.0));
                             return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+                        }
+
+                        // Animated lapping foam band along one block edge.
+                        // d = distance from this fragment to the land edge (0 at the edge),
+                        // along = world coordinate parallel to the edge (varies the wave),
+                        // t2 = time in seconds. The band's width pulses ("crashes") over time
+                        // and is broken up along the edge by noise so it laps unevenly.
+                        float foamEdge(float d, float along, float t2) {
+                            float w = 0.14 + 0.06 * sin(t2 * 2.2 + along * 2.4);
+                            w *= 0.65 + 0.7 * noise(vec2(along * 1.6, t2 * 0.55));
+                            return 1.0 - smoothstep(w * 0.25, w, d);
                         }
 
                         void main() {
@@ -29355,8 +29384,10 @@ self.onmessage = async (e) => {
                             // smearing (vScreenPos.w is view depth).
                             waveOffset /= max(1.0, vScreenPos.w * 0.08);
 
-                            // Apply shore distance scaling: 0.1 at shore, 1.0 far from shore
-                            float waveScale = mix(0.1, 1.0, vShoreDist);
+                            // Shore-distance refraction falloff: quadratic curve — water is nearly
+                            // calm (almost pure see-through) at the shore and ramps up to full
+                            // waviness in open water. Much more visible than the old linear mix.
+                            float waveScale = 0.04 + 0.96 * vShoreDist * vShoreDist;
 
                             // Apply distortion to screen UV
                             vec2 distortedUV = screenUV + waveOffset * refractionStrength * waveScale;
@@ -29401,13 +29432,30 @@ self.onmessage = async (e) => {
 
                             finalColor *= vColor; // Apply vertex colors (depth fog, AO)
 
+                            // SHORE FOAM: animated lapping band on top-face edges adjacent to land.
+                            // vFoamEdges bits: 1 = +X (east), 2 = -X (west), 4 = +Z (south), 8 = -Z (north).
+                            float foam = 0.0;
+                            if (vFoamEdges > 0.5) {
+                                vec2 bp = fract(vWorldPosition.xz); // position within this block, 0-1
+                                float m = floor(vFoamEdges + 0.5);
+                                if (mod(m, 2.0) >= 1.0)             foam = max(foam, foamEdge(1.0 - bp.x, vWorldPosition.z,        t)); // +X edge
+                                if (mod(floor(m / 2.0), 2.0) >= 1.0) foam = max(foam, foamEdge(bp.x,       vWorldPosition.z + 7.3,  t)); // -X edge
+                                if (mod(floor(m / 4.0), 2.0) >= 1.0) foam = max(foam, foamEdge(1.0 - bp.y, vWorldPosition.x + 3.1,  t)); // +Z edge
+                                if (mod(floor(m / 8.0), 2.0) >= 1.0) foam = max(foam, foamEdge(bp.y,       vWorldPosition.x + 11.7, t)); // -Z edge
+                            }
+                            vec3 foamColor = vec3(0.93, 0.97, 1.0);
+                            finalColor = mix(finalColor, foamColor, foam * 0.85);
+
                             // Apply cylindrical fog (horizontal distance only)
                             vec2 fogDiffXZ = vWorldPosition.xz - cameraPosition.xz;
                             float fogDepth = length(fogDiffXZ);
                             float fogFactor = min(smoothstep(fogNear, fogFar, fogDepth) * 1.15, 1.0);
                             finalColor = mix(finalColor, fogColor, fogFactor);
 
-                            gl_FragColor = vec4(finalColor, opacity * waterTex.a);
+                            // Foam is opaque-ish: lift alpha where the band is strong so it reads
+                            // as froth sitting ON the surface, not a tint seen through it.
+                            float outAlpha = max(opacity * waterTex.a, foam * 0.9 * (1.0 - fogFactor));
+                            gl_FragColor = vec4(finalColor, outAlpha);
                         }
                     `,
                     transparent: true,
@@ -37470,7 +37518,7 @@ self.onmessage = async (e) => {
             /**
              * Add a water face using indexed geometry.
              */
-            function addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx) {
+            function addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uv, pos, norm, uvs, col, indices, getter, solidX, solidY, solidZ, blockId, vIdx, uvIdx, cIdx, iIdx, vertexCount, lightGetter, lightX, lightY, lightZ, faceIdx, waterDepth, shoreBuffer, shoreIdx, shoreDist, thicknessBuffer, thicknessIdx, foamBuffer) {
                 const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
                 writeFaceVerticesIndexed(pos, norm, vIdx, verts, wx, wy, wz, nx, ny, nz);
                 const ao = calculateFaceAO(nx, ny, nz, solidX, solidY, solidZ, blockId, getter, faceIdx);
@@ -37489,6 +37537,25 @@ self.onmessage = async (e) => {
                 thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
+                // FOAM EDGES (shore lapping): for TOP faces only, a 4-bit mask of which
+                // horizontal neighbors at water level are LAND (solid, non-water, non-leaf).
+                // The shader draws an animated foam band along each flagged edge.
+                // Bits: 1 = +X (east), 2 = -X (west), 4 = +Z (south), 8 = -Z (north).
+                let foamMask = 0;
+                if (faceIdx === 0) {
+                    let nbr = getter(solidX + 1, solidY, solidZ);
+                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 1;
+                    nbr = getter(solidX - 1, solidY, solidZ);
+                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 2;
+                    nbr = getter(solidX, solidY, solidZ + 1);
+                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 4;
+                    nbr = getter(solidX, solidY, solidZ - 1);
+                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 8;
+                }
+                foamBuffer[shoreIdx] = foamMask;
+                foamBuffer[shoreIdx + 1] = foamMask;
+                foamBuffer[shoreIdx + 2] = foamMask;
+                foamBuffer[shoreIdx + 3] = foamMask;
             }
 
             /**
@@ -38240,6 +38307,7 @@ self.onmessage = async (e) => {
                     const waterIndices = indexPool.acquire(maxFaces * 6);
                     const waterShore = shorePool.acquire(maxFaces * 4); // Shore distance per vertex (1 float × 4 verts per face)
                     const waterThickness = thicknessPool.acquire(maxFaces * 4); // Water thickness per vertex
+                    const waterFoam = shorePool.acquire(maxFaces * 4); // Foam edge mask per vertex (top faces; bits 1/2/4/8 = E/W/S/N land)
                     // Indexed geometry counters: vIdx = position/normal offset, cIdx = color offset, uvIdx = UV offset, iIdx = index offset
                     // tVertCount/wVertCount = vertex count for index base calculations
                     // tQsIdx = quadSize offset for terrain (water doesn't use greedy meshing)
@@ -38445,7 +38513,7 @@ self.onmessage = async (e) => {
                                                     }
                                                 }
                                                 // Indexed water face rendering
-                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, waterNorm, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                                addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, waterNorm, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
                                                 wVIdx += 12; wUvIdx += 8; wCIdx += 12;
                                                 wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
                                             }
@@ -38534,7 +38602,7 @@ self.onmessage = async (e) => {
                                                         }
                                                     }
                                                     // Indexed water face rendering (no quadSize - water doesn't use greedy meshing)
-                                                    addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx);
+                                                    addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
                                                 } else {
                                                     // Indexed terrain face rendering
                                                     addFaceIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, terrainQuadSize, tQsIdx);
@@ -38702,6 +38770,7 @@ self.onmessage = async (e) => {
                         const colAttr = waterGeo.attributes.color;
                         const shoreAttr = waterGeo.attributes.shoreDist;
                         const thickAttr = waterGeo.attributes.waterThickness;
+                        const foamAttr = waterGeo.attributes.foamEdges;
                         const idxAttr = waterGeo.index;
 
                         // Copy from work buffers to geometry buffers
@@ -38710,6 +38779,7 @@ self.onmessage = async (e) => {
                         colAttr.array.set(waterCols.subarray(0, wCIdx));
                         shoreAttr.array.set(waterShore.subarray(0, wSIdx));
                         thickAttr.array.set(waterThickness.subarray(0, wTIdx));
+                        foamAttr.array.set(waterFoam.subarray(0, wSIdx));
                         idxAttr.array.set(waterIndices.subarray(0, wIIdx));
 
                         // Mark attributes as needing GPU upload - only upload the portion we actually filled
@@ -38728,6 +38798,10 @@ self.onmessage = async (e) => {
                         shoreAttr.clearUpdateRanges();
                         shoreAttr.addUpdateRange(0, wSIdx);
                         shoreAttr.needsUpdate = true;
+
+                        foamAttr.clearUpdateRanges();
+                        foamAttr.addUpdateRange(0, wSIdx);
+                        foamAttr.needsUpdate = true;
 
                         thickAttr.clearUpdateRanges();
                         thickAttr.addUpdateRange(0, wTIdx);
@@ -38833,6 +38907,7 @@ self.onmessage = async (e) => {
                     colPool.release(waterCols);
                     indexPool.release(waterIndices);
                     shorePool.release(waterShore);
+                    shorePool.release(waterFoam);
                     thicknessPool.release(waterThickness);
                     // OPTIMIZATION: Clear AO cache after chunk is done
                     clearAOCache();
