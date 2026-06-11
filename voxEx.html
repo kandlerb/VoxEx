@@ -10615,6 +10615,22 @@
                     light.shadow.map = null;
                 }
                 markShadowsDirty();
+                // QW2: the coverage radius just changed, so re-evaluate per-chunk shadow casting.
+                // Rare settings event — a one-time pass over chunkMeshes is fine. Chunks beyond the
+                // shadow radius stop casting; chunks now inside it resume.
+                if (typeof chunkMeshes !== 'undefined' && typeof controls !== 'undefined' && controls) {
+                    const ppos = getPlayerWorldPosition();
+                    const pcx = Math.floor(ppos.x / WORLD_DIMS.chunkSize);
+                    const pcz = Math.floor(ppos.z / WORLD_DIMS.chunkSize);
+                    const shadowChunksR = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
+                    const shadowChunksRSq = shadowChunksR * shadowChunksR;
+                    for (const [mKey, mesh] of chunkMeshes) {
+                        if (mKey.endsWith("_WATER")) continue; // water never casts shadows
+                        const [mcx, mcz] = parseChunkKey(mKey);
+                        const dSq = (mcx - pcx) * (mcx - pcx) + (mcz - pcz) * (mcz - pcz);
+                        mesh.castShadow = SETTINGS.shadows && dSq <= shadowChunksRSq;
+                    }
+                }
                 logDebug(`[Shadows] Render distance ${r} blocks -> frustum ${r * 2}, map ${shadowConfig.mapSize}^2 (texel 1/16 block, maxTex ${maxTex})`);
             }
             let moveForward = false;
@@ -12306,6 +12322,15 @@
             // queue made progress (used for the 10s stall telemetry warning).
             let slowFrameBuildSkips = 0;
             let chunkStreamLastProgressMs = 0;
+            // --- Pipelined worker meshing (Tier 1, Item 1) ---
+            // DISPATCH (cheap, no await, per build-loop iteration) is decoupled from APPLY
+            // (budgeted main-thread drain of completed results, per frame) so the worker pool
+            // runs poolSize jobs concurrently instead of one serial round-trip at a time.
+            const inFlightMeshKeys = new Set();   // chunk keys with a worker mesh job in flight
+            const readyMeshResults = [];          // [{cKey, cx, cz, distSq, meshData}] completed, awaiting apply
+            const syncFallbackQueue = [];         // [{cKey, cx, cz, distSq}] worker unavailable/timeout — main-thread mesh, 1/frame
+            let syncFallbacksThisFrame = 0;       // cap main-thread fallback meshing per frame
+            let streamBurstActive = false;        // set in processChunkQueue, read by the apply drain (Item 2)
             const chunkRenderedFaces = new Map();
             const chunkRenderDiagnostics = new Map();
             // Track tight bounds effectiveness for frustum culling
@@ -15198,6 +15223,8 @@
             const frustumCacheState = { // Cache last frustum computation to avoid re-running the heavy chunk-visibility sweep when stationary
                 chunkX: null,
                 chunkZ: null,
+                enumCenterX: null, // QW3: velocity-biased enumeration center (recompute the sweep when it shifts)
+                enumCenterZ: null,
                 renderRadius: null,
                 normCamX: 0,
                 normCamZ: 0,
@@ -15444,6 +15471,12 @@
             // Track how many edge lighting passes each chunk has had (to prevent infinite reprocessing)
             const edgeLightingPassCount = new Map();
             const MAX_EDGE_LIGHTING_PASSES = 3; // Maximum number of edge lighting passes per chunk
+            // Edge-lighting remesh churn controls (Item 3): a pass that brightened only a trivial
+            // number of cells should count toward convergence instead of resetting the pass cap,
+            // and a chunk should not be remeshed for edge light more than once per debounce window.
+            const EDGE_LIGHT_RESET_MIN_CELLS = 8;   // below this changed-cell count, don't reset the convergence cap
+            const EDGE_REMESH_DEBOUNCE_MS = 150;    // min ms between edge-lighting remeshes of the same chunk
+            const lastEdgeRemeshMs = new Map();     // chunkKey -> last edge-lighting remesh time (ms)
             // Track chunks that have been rendered but need lighting updates
             const chunksNeedingLightingUpdate = new Set();
             // Queue for adjacent chunk updates - chunks that need to be updated after a neighbor is built
@@ -15928,7 +15961,22 @@
                     // global relight path.
                     const passCount = (edgeLightingPassCount.get(key) || 0) + 1;
                     edgeLightingPassCount.set(key, passCount);
-                    if (passCount > MAX_EDGE_LIGHTING_PASSES) continue; // Converged (N no-change passes) — stop
+                    if (passCount > MAX_EDGE_LIGHTING_PASSES) {
+                        // Converged (cap reached). Safety flush (Item 3): if accumulated edge light
+                        // never reached the mesh — e.g. a drip of sub-threshold changes that kept
+                        // incrementing the cap without a clean no-change convergence pass — force the
+                        // single remesh now (debounced) so the border isn't left dark.
+                        if (chunk._edgeMeshDirty && (chunkMeshes.has(key) || chunkMeshes.has(key + "_WATER"))) {
+                            const nowMs = performance.now();
+                            if (nowMs - (lastEdgeRemeshMs.get(key) || 0) >= EDGE_REMESH_DEBOUNCE_MS) {
+                                chunk._edgeMeshDirty = false;
+                                lastEdgeRemeshMs.set(key, nowMs);
+                                const capCC = parseChunkKeySimple(key);
+                                scheduleChunkUpdate(capCC.cx, capCC.cz, true, "edge-lighting-capflush", { bypassLighting: true });
+                            }
+                        }
+                        continue; // Converged (N no-change passes) — stop
+                    }
 
                     const { cx, cz } = parseChunkKeySimple(key);
 
@@ -15944,9 +15992,12 @@
                     const edgeChanged = propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
 
                     if (edgeChanged > 0) {
-                        // New light arrived: this pass carried information, so it does
-                        // NOT count against the convergence cap
-                        edgeLightingPassCount.set(key, 0);
+                        // New light arrived. Only a SUBSTANTIVE brightening resets the convergence
+                        // cap (Item 3) — a trivial few-cell change counts toward convergence so
+                        // streamed chunks settle and remesh once instead of churning 2-3×. The
+                        // cap-drop safety flush above guarantees the accumulated light still reaches
+                        // the mesh even if no clean no-change pass is hit before the cap.
+                        if (edgeChanged > EDGE_LIGHT_RESET_MIN_CELLS) { edgeLightingPassCount.set(key, 0); }
 
                         // CRITICAL: Spread edge light into chunk interior via BFS
                         // Without this, edge values from neighbors penetrate only one
@@ -15979,8 +16030,16 @@
                     const hasTerrainMesh = chunkMeshes.has(key);
                     const hasWaterMesh = chunkMeshes.has(key + "_WATER");
                     if (edgeChanged === 0 && chunk._edgeMeshDirty && (hasTerrainMesh || hasWaterMesh)) {
-                        chunk._edgeMeshDirty = false;
-                        scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
+                        // Debounce (Item 3): don't remesh the same chunk for edge light more than
+                        // once per window. The first convergence of every chunk always passes (no
+                        // prior timestamp); a second convergence within the window is skipped, since
+                        // the recent remesh already captured essentially-final lighting.
+                        const nowMs = performance.now();
+                        if (nowMs - (lastEdgeRemeshMs.get(key) || 0) >= EDGE_REMESH_DEBOUNCE_MS) {
+                            chunk._edgeMeshDirty = false;
+                            lastEdgeRemeshMs.set(key, nowMs);
+                            scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
+                        }
                     }
 
                     // CRITICAL: Re-queue cardinal neighbors for edge lighting
@@ -16236,8 +16295,9 @@
                     dispatchPendingChunkUpdates(source);
                 } else {
                     if (updateTimeout) { clearTimeout(updateTimeout); chunkUpdateDiagnostics.debounceResets++; }
-                    // Debounce: Wait 50ms after the last block change
-                    updateTimeout = setTimeout(() => { dispatchPendingChunkUpdates("debounce"); updateTimeout = null; }, 50);
+                    // Debounce: Wait 20ms after the last block change (QW1, was 50ms). Player edits
+                    // bypass this entirely via immediate:true, so this only affects non-edit schedules.
+                    updateTimeout = setTimeout(() => { dispatchPendingChunkUpdates("debounce"); updateTimeout = null; }, 20);
                 }
             }
             class SeededRandom {
@@ -18235,9 +18295,14 @@
              * @param {number} cx - Chunk X coordinate.
              * @param {number} cz - Chunk Z coordinate.
              * @param {Object} meshData - Mesh data from worker.
+             * @param {number} [distSq=0] - Squared chunk distance from player (for shadow LOD, QW2).
              */
-            function applyWorkerMeshData(cKey, cx, cz, meshData) {
+            function applyWorkerMeshData(cKey, cx, cz, meshData, distSq = 0) {
                 const { terrain, water } = meshData;
+                // QW2: only cast shadows for chunks inside the shadow coverage radius.
+                // shadowConfig.radius is in BLOCKS; distSq is in CHUNKS² — convert to chunks.
+                const shadowChunks = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
+                const meshCastShadow = SETTINGS.shadows && distSq <= shadowChunks * shadowChunks;
 
                 // DEFERRED RELEASE: Store old mesh references instead of releasing immediately
                 // This prevents the "flash" artifact where chunk disappears during mesh swap.
@@ -18286,6 +18351,8 @@
                     const mesh = new THREE.Mesh(geo, voxelMaterial);
                     mesh.position.set(0, 0, 0);
                     mesh.frustumCulled = true;
+                    mesh.castShadow = meshCastShadow;   // QW2: distant chunks don't cast shadows
+                    mesh.receiveShadow = SETTINGS.shadows;
                     scene.add(mesh);
                     chunkMeshes.set(cKey, mesh);
                 }
@@ -18415,7 +18482,7 @@
                     }
 
                     // Apply mesh data to scene
-                    applyWorkerMeshData(cKey, cx, cz, meshData);
+                    applyWorkerMeshData(cKey, cx, cz, meshData, distSq);
                     return true;
 
                 } catch (error) {
@@ -18423,6 +18490,82 @@
                     // Fallback to synchronous rendering
                     renderChunk(cx, cz, distSq);
                     return true;
+                }
+            }
+
+            /**
+             * Pipelined dispatch (Item 1): kick off a worker mesh job WITHOUT awaiting it. The
+             * completed mesh is pushed to readyMeshResults for drainReadyMeshResults() to apply on
+             * a later frame within a time budget — this lets the pool run poolSize jobs at once.
+             * @param {ChunkCoord} cx - Chunk X coordinate.
+             * @param {ChunkCoord} cz - Chunk Z coordinate.
+             * @param {ChunkKey} cKey - Chunk key.
+             * @param {number} distSq - Squared chunk distance from player (LOD + staleness).
+             * @returns {void}
+             */
+            function dispatchMeshJob(cx, cz, cKey, distSq) {
+                const centerData = chunkDataPool.get(cKey);
+                if (!centerData) return;
+                inFlightMeshKeys.add(cKey);
+                chunkDataPool.setMeshState(cKey, MESH_STATE.BUILDING);
+                // Gather neighbor data exactly as renderChunkAsync does.
+                const neighbors = {
+                    n: chunkDataPool.get(`${cx},${cz - 1}`),
+                    s: chunkDataPool.get(`${cx},${cz + 1}`),
+                    e: chunkDataPool.get(`${cx + 1},${cz}`),
+                    w: chunkDataPool.get(`${cx - 1},${cz}`),
+                    nw: chunkDataPool.get(`${cx - 1},${cz - 1}`),
+                    ne: chunkDataPool.get(`${cx + 1},${cz - 1}`),
+                    sw: chunkDataPool.get(`${cx - 1},${cz + 1}`),
+                    se: chunkDataPool.get(`${cx + 1},${cz + 1}`)
+                };
+                generateMeshViaWorker(cx, cz, centerData, neighbors)
+                    .then(meshData => {
+                        inFlightMeshKeys.delete(cKey);
+                        if (meshData) { readyMeshResults.push({ cKey, cx, cz, distSq, meshData }); }
+                        else { syncFallbackQueue.push({ cKey, cx, cz, distSq }); } // null = worker unavailable/timeout
+                    })
+                    .catch(err => {
+                        inFlightMeshKeys.delete(cKey);
+                        logDebug(`[Mesh] Worker dispatch failed for ${cKey}: ${err.message}`);
+                        syncFallbackQueue.push({ cKey, cx, cz, distSq });
+                    });
+            }
+
+            /**
+             * APPLY drain (Item 1): copy completed worker meshes into pooled geometry on the main
+             * thread within a time budget. Staleness guards DROP results that are no longer valid
+             * rather than applying them. At most one sync fallback mesh per frame so slow machines
+             * never serialize a big main-thread mesh during streaming.
+             * @param {number} [budgetMs=4] - Main-thread time budget for this frame's applies.
+             * @returns {void}
+             */
+            function drainReadyMeshResults(budgetMs = 4) {
+                const start = performance.now();
+                syncFallbacksThisFrame = 0;
+                while (readyMeshResults.length > 0 && performance.now() - start < budgetMs) {
+                    const r = readyMeshResults.shift();
+                    // STALENESS GUARDS — drop, never apply:
+                    if (!chunkDataPool.get(r.cKey)) { queuedChunkKeys.delete(r.cKey); continue; }                       // unloaded while meshing
+                    if (r.distSq > currentRenderRadius * currentRenderRadius && !dirtyChunks.has(r.cKey)) { queuedChunkKeys.delete(r.cKey); continue; } // out of range
+                    if (dirtyChunks.has(r.cKey)) { scheduleChunkUpdate(r.cx, r.cz, true, "stale-mesh-redo", { immediate: true }); continue; }            // re-dirtied mid-flight
+                    const applyStart = performance.now();
+                    applyWorkerMeshData(r.cKey, r.cx, r.cz, r.meshData, r.distSq);
+                    chunkDataPool.setMeshState(r.cKey, MESH_STATE.READY);
+                    recordChunkUpdateState(r.cKey, "meshApply", "rendered");
+                    chunkUpdateDiagnostics.pending.delete(r.cKey);
+                    chunkStreamLastProgressMs = performance.now();                                                      // feed stall watchdog
+                    // chunkBuildTimeAvg now tracks APPLY cost (the real main-thread cost; dispatch is ~free).
+                    if (typeof chunkBuildTimeAvg === 'undefined') { window.chunkBuildTimeAvg = 4; }
+                    const perResultMs = performance.now() - applyStart;
+                    chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + perResultMs * 0.1;
+                }
+                // At most ONE sync fallback per frame (slow machines must not serialize big meshes).
+                if (syncFallbackQueue.length > 0 && syncFallbacksThisFrame < 1) {
+                    const f = syncFallbackQueue.shift();
+                    if (chunkDataPool.get(f.cKey)) { renderChunk(f.cx, f.cz, f.distSq); chunkStreamLastProgressMs = performance.now(); }
+                    else { queuedChunkKeys.delete(f.cKey); }
+                    syncFallbacksThisFrame++;
                 }
             }
 
@@ -20864,7 +21007,9 @@
                 if (!spinner) return;
 
                 const queueLength = (typeof chunkBuildQueue !== 'undefined' ? chunkBuildQueue.length : 0) +
-                                   (typeof pendingChunkUpdates !== 'undefined' ? pendingChunkUpdates.size : 0);
+                                   (typeof pendingChunkUpdates !== 'undefined' ? pendingChunkUpdates.size : 0) +
+                                   (typeof inFlightMeshKeys !== 'undefined' ? inFlightMeshKeys.size : 0) +
+                                   (typeof readyMeshResults !== 'undefined' ? readyMeshResults.length : 0);
 
                 if (queueLength > 0) {
                     if (!spinnerVisible) {
@@ -25057,42 +25202,54 @@ self.onmessage = async (e) => {
             // Batch read multiple chunks in a single transaction (~200% faster)
             async function batchLoadChunksFromCache(chunkKeys) {
                 if (!db || !chunkKeys || chunkKeys.length === 0) return new Map();
-                return new Promise((resolve, reject) => {
+                // PHASE 1 (Item 4): gather RAW records in one IndexedDB transaction. Decompression
+                // is NOT done in the request.onsuccess callbacks — running ChunkCompressor.decompress
+                // on every record inline produced a 20-60ms main-thread burst per 20-chunk batch.
+                const rawRecords = await new Promise((resolve) => {
                     const transaction = db.transaction([STORE_NAME], "readonly");
                     const store = transaction.objectStore(STORE_NAME);
-                    const results = new Map();
+                    const collected = [];
                     let pending = chunkKeys.length;
                     let hasError = false;
-                    if (pending === 0) { resolve(results); return; }
+                    if (pending === 0) { resolve(collected); return; }
                     chunkKeys.forEach((key) => {
                         const request = store.get(key);
                         request.onsuccess = () => {
-                            const record = request.result;
-                            if (record && seedsMatch(record.seed, finalSeedDisplay)) {
-                                let decompressed = ChunkCompressor.decompress(record.data);
-                                // Normalize old format (raw Uint8Array) to new format (object),
-                                // matching loadChunkFromCache() behavior
-                                if (decompressed && !decompressed.blocks) {
-                                    decompressed = {
-                                        blocks: decompressed,
-                                        skyLight: new Uint8Array(decompressed.length).fill(15),
-                                        blockLight: new Uint8Array(decompressed.length),
-                                    };
-                                }
-                                results.set(key, decompressed);
-                                // Track cache hit statistics
-                                const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0;
-                                idbCacheStats.recordHit(bytesRead);
-                            } else {
-                                idbCacheStats.recordMiss();
-                            }
+                            collected.push({ key, record: request.result || null });
                             pending--;
-                            if (pending === 0 && !hasError) { resolve(results); }
+                            if (pending === 0 && !hasError) { resolve(collected); }
                         };
-                        request.onerror = () => { idbCacheStats.recordMiss(); hasError = true; pending--; if (pending === 0) { resolve(results); } };
+                        request.onerror = () => { idbCacheStats.recordMiss(); hasError = true; pending--; if (pending === 0) { resolve(collected); } };
                     });
-                    transaction.onerror = () => { if (!hasError) { hasError = true; resolve(results); }};
+                    transaction.onerror = () => { if (!hasError) { hasError = true; resolve(collected); }};
                 });
+                // PHASE 2: decompress off the IDB callback in budgeted slices so a large batch is
+                // spread across frames instead of one main-thread burst. Hit/miss accounting stays
+                // semantically identical (hit = record exists AND seed matches).
+                const results = new Map();
+                let sliceStart = performance.now();
+                for (const { key, record } of rawRecords) {
+                    if (record && seedsMatch(record.seed, finalSeedDisplay)) {
+                        let decompressed = ChunkCompressor.decompress(record.data);
+                        // Normalize old format (raw Uint8Array) to new format (object),
+                        // matching loadChunkFromCache() behavior
+                        if (decompressed && !decompressed.blocks) {
+                            decompressed = {
+                                blocks: decompressed,
+                                skyLight: new Uint8Array(decompressed.length).fill(15),
+                                blockLight: new Uint8Array(decompressed.length),
+                            };
+                        }
+                        results.set(key, decompressed);
+                        // Track cache hit statistics
+                        const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0;
+                        idbCacheStats.recordHit(bytesRead);
+                    } else {
+                        idbCacheStats.recordMiss();
+                    }
+                    if (performance.now() - sliceStart > 4) { await new Promise(r => setTimeout(r, 0)); sliceStart = performance.now(); }
+                }
+                return results;
             }
             // Batch write multiple chunks in a single transaction (~200% faster)
             async function batchSaveChunksToCache(chunkDataMap) {
@@ -38493,7 +38650,10 @@ self.onmessage = async (e) => {
                         terrainMesh.name = "CHUNK_TERRAIN_" + cKey;
                         terrainMesh.geometry = terrainGeo;
                         terrainMesh.frustumCulled = SETTINGS.enableFrustumCulling;
-                        terrainMesh.castShadow = SETTINGS.shadows;
+                        // QW2: only chunks inside the shadow coverage radius cast shadows.
+                        // shadowConfig.radius is in BLOCKS; distSq is in CHUNKS² — convert to chunks.
+                        const shadowChunks = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
+                        terrainMesh.castShadow = SETTINGS.shadows && distSq <= shadowChunks * shadowChunks;
                         terrainMesh.receiveShadow = SETTINGS.shadows;
                         terrainMesh.updateMatrix();
                         scene.add(terrainMesh);
@@ -38727,6 +38887,21 @@ self.onmessage = async (e) => {
                 const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
+                // QW3: prefetch along velocity. Bias the chunk-enumeration CENTER a little toward
+                // where the player is heading so chunks ahead load sooner. Weighted 25% blend,
+                // chunk-quantized — the player stays well inside the loaded set and the center only
+                // shifts ~1 chunk at high fly speeds (the blend rounds to 0 at normal speeds). Used
+                // ONLY for the enumeration loop below; purge/cleanup stay player-relative.
+                let enumCenterX = chunkX;
+                let enumCenterZ = chunkZ;
+                if (typeof velocity !== 'undefined') {
+                    const lookX = pPos.x + velocity.x * 1.5;
+                    const lookZ = pPos.z + velocity.z * 1.5;
+                    const lookChunkX = Math.floor(lookX / WORLD_DIMS.chunkSize);
+                    const lookChunkZ = Math.floor(lookZ / WORLD_DIMS.chunkSize);
+                    enumCenterX = Math.round(chunkX * 0.75 + lookChunkX * 0.25);
+                    enumCenterZ = Math.round(chunkZ * 0.75 + lookChunkZ * 0.25);
+                }
                 // OPTIMIZATION: Purge stale chunks from build queue when player moves to a new chunk
                 const playerChunkChanged = chunkX !== lastChunkX || chunkZ !== lastChunkZ;
                 if (playerChunkChanged && chunkBuildQueue.length > 0) {
@@ -38810,6 +38985,8 @@ self.onmessage = async (e) => {
                     !frustumCacheState.dirty &&
                     frustumCacheState.chunkX === chunkX &&
                     frustumCacheState.chunkZ === chunkZ &&
+                    frustumCacheState.enumCenterX === enumCenterX &&
+                    frustumCacheState.enumCenterZ === enumCenterZ &&
                     frustumCacheState.renderRadius === currentRenderRadius &&
                     frustumCacheState.frustumEnabled === SETTINGS.enableFrustumCulling &&
                     frustumCacheState.cameraFov === camera.fov &&
@@ -38838,8 +39015,8 @@ self.onmessage = async (e) => {
                         for (let dz = -maxR; dz <= maxR; dz++) {
                             const distSq = dx * dx + dz * dz;
                             if (distSq > maxRSq) continue;
-                            const cx = chunkX + dx;
-                            const cz = chunkZ + dz;
+                            const cx = enumCenterX + dx;   // QW3: enumeration centered on the velocity-biased point
+                            const cz = enumCenterZ + dz;
                             const key = getChunkKey(cx, cz);
                             // Add to chunksInRange BEFORE frustum check - all chunks in distance
                             chunksInRange.add(key);
@@ -38853,6 +39030,8 @@ self.onmessage = async (e) => {
                     // Refresh cache snapshot when recomputed
                     frustumCacheState.chunkX = chunkX;
                     frustumCacheState.chunkZ = chunkZ;
+                    frustumCacheState.enumCenterX = enumCenterX;
+                    frustumCacheState.enumCenterZ = enumCenterZ;
                     frustumCacheState.renderRadius = currentRenderRadius;
                     frustumCacheState.normCamX = normCamX;
                     frustumCacheState.normCamZ = normCamZ;
@@ -39029,13 +39208,28 @@ self.onmessage = async (e) => {
                     ? Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z)
                     : 0;
                 const isMovingFast = playerSpeed > 5; // engages at sprint/fly speeds
-                const effectiveBudget = isMovingFast ? CHUNK_BUILD_BUDGET_MS * 0.5 : CHUNK_BUILD_BUDGET_MS;
+                // BURST MODE (Item 2): while a large backlog exists and the player isn't moving
+                // fast, widen the per-frame dispatch budget and cap so initial load and catch-up
+                // streaming clear faster. Steady-state numbers govern when not bursting. The
+                // every-3rd-frame slow-frame starvation guard (updateChunkSystem) still composes —
+                // it decides WHETHER builds run on slow frames; burst raises HOW MUCH runs.
+                const STREAM_BURST_THRESHOLD = 24;   // queue length that triggers burst mode
+                const STREAM_BURST_BUDGET_MS = 10;   // per-frame build/dispatch budget during burst
+                const burstMode = chunkBuildQueue.length > STREAM_BURST_THRESHOLD && !isMovingFast;
+                streamBurstActive = burstMode;       // read by the apply drain in updateChunkSystem
+                const effectiveBudget = burstMode ? STREAM_BURST_BUDGET_MS
+                                      : (isMovingFast ? CHUNK_BUILD_BUDGET_MS * 0.5 : CHUNK_BUILD_BUDGET_MS);
 
-                // Estimate how many chunks we can afford this frame
+                // Estimate how many chunks we can afford this frame. chunkBuildTimeAvg tracks APPLY
+                // cost (fed by the drain), so this also provides back-pressure: don't dispatch
+                // faster than completed meshes can be applied. The cap rises to poolSize so all
+                // workers stay fed (dispatch itself is ~free now that apply is decoupled).
                 const estimatedChunksAllowed = Math.max(1, Math.floor(effectiveBudget / chunkBuildTimeAvg));
-                const maxBuildsThisFrame = isMovingFast
-                    ? Math.min(2, estimatedChunksAllowed, SETTINGS.buildQueueLimit)
-                    : Math.min(estimatedChunksAllowed, SETTINGS.buildQueueLimit);
+                const poolSize = chunkWorkerPool ? chunkWorkerPool.poolSize : 1;
+                const baseCap = Math.max(SETTINGS.buildQueueLimit, poolSize);
+                const maxBuildsThisFrame = burstMode ? baseCap * 2
+                                          : isMovingFast ? Math.min(2, estimatedChunksAllowed, baseCap)
+                                          : Math.min(estimatedChunksAllowed, baseCap);
 
                 while (builds < maxBuildsThisFrame && chunkBuildQueue.length > 0 && inspected < initialQueueLength + chunkBuildQueue.length) {
                     // OPTIMIZATION: Check frame budget - stop if we've exceeded our chunk build time
@@ -39050,6 +39244,15 @@ self.onmessage = async (e) => {
                     if (typeof job.cx !== "number" || typeof job.cz !== "number") { const [jcX, jcZ] = parseChunkKey(job.key); job.cx = jcX; job.cz = jcZ; }
                     const jobCx = job.cx;
                     const jobCz = job.cz;
+                    // PIPELINE INVARIANT: at most one in-flight mesh per chunk. If a worker job for
+                    // this key is already running, drop this queue entry (no re-queue) — the in-flight
+                    // result lands via the apply drain, which re-schedules if the chunk was re-dirtied.
+                    // CRITICAL: release queuedChunkKeys here. This entry was enqueued mid-flight
+                    // (queuedChunkKeys re-added by dispatchPendingChunkUpdates); dropping it without
+                    // the delete orphaned the key, which silently blocked EVERY future
+                    // scheduleChunkUpdate for this chunk — edits made while a mesh was in flight
+                    // never re-meshed (drain's "stale-mesh-redo" reschedule was swallowed too).
+                    if (inFlightMeshKeys.has(job.key)) { queuedChunkKeys.delete(job.key); continue; }
                     const allowLightingBypass = job.allowLightingBypass || forceLightingBypassKeys.has(job.key);
                     if (chunkOrNeighborsPending(jobCx, jobCz) && !allowLightingBypass) { chunkBuildQueue.push(job); if (isDebug && dirtyChunks.has(job.key)) { logDebug(`[ChunkQueue] Deferred dirty chunk ${job.key} while lighting pending.`); } continue; }
                     if (processed.has(job.key)) continue;
@@ -39071,23 +39274,27 @@ self.onmessage = async (e) => {
                     if (isDirty) { dirtyChunks.delete(job.key); }
                     // OPTIMIZATION: Pass distance for LOD calculation
                     const jobDistSq = job.dist || 0;
-                    // Use worker mesh generation if enabled, otherwise fall back to sync
+                    // PIPELINED (Item 1): dispatch the worker mesh job and move on — no await.
+                    // The completed mesh is applied later by drainReadyMeshResults(), so state
+                    // recording is deferred to the apply path (the mesh has not landed yet). The
+                    // sync fallback path renders inline and records state immediately.
                     if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
-                        await renderChunkAsync(jobCx, jobCz, jobDistSq);
+                        dispatchMeshJob(jobCx, jobCz, job.key, jobDistSq);
                     } else {
                         renderChunk(jobCx, jobCz, jobDistSq);
+                        recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
+                        chunkUpdateDiagnostics.pending.delete(job.key);
+                        if (isDirty) { const terrainOK = chunkMeshes.has(job.key); meshLifecycleStats.mark("dirtyRebuild", { key: job.key, terrainAttached: terrainOK, waterAttached: chunkMeshes.has(job.key + "_WATER"), }); }
                     }
-                    recordChunkUpdateState(job.key, "processChunkQueue", "rendered");
-                    chunkUpdateDiagnostics.pending.delete(job.key);
-                    if (isDirty) { const terrainOK = chunkMeshes.has(job.key); meshLifecycleStats.mark("dirtyRebuild", { key: job.key, terrainAttached: terrainOK, waterAttached: chunkMeshes.has(job.key + "_WATER"), }); }
                     builds++;
                     perfMetrics.chunksBuilt++;
                 }
-                // Track chunk build time and update rolling average
+                // Track chunk build time. NOTE: builds now counts cheap DISPATCHES, so this
+                // measures dispatch cost (~free) — chunkBuildTimeAvg is fed from the APPLY drain
+                // (drainReadyMeshResults), the real main-thread cost. Dispatching still counts as
+                // streaming progress for the stall watchdog.
                 perfMetrics.chunkBuildTime = performance.now() - chunkBuildStartMs;
                 if (builds > 0) {
-                    const timePerChunk = perfMetrics.chunkBuildTime / builds;
-                    chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + timePerChunk * 0.1; // Exponential moving average
                     chunkStreamLastProgressMs = performance.now(); // Feed the stall watchdog in updateChunkSystem
                 }
                 // (build-debt breather removed — see note at the top of this function)
@@ -39110,13 +39317,16 @@ self.onmessage = async (e) => {
                         const pcx = Math.floor(playerWorldPos.x / WORLD_DIMS.chunkSize);
                         const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                         const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
-                        // Use worker mesh generation if enabled, otherwise fall back to sync
+                        // PIPELINED (Item 1): dispatch — the apply drain finishes it. Sync path inline.
                         if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
-                            await renderChunkAsync(cx, cz, neighborDistSq);
+                            // If a mesh is already in flight it was built from OLDER neighbor data —
+                            // don't drop this refresh, push it back for a later pass.
+                            if (!inFlightMeshKeys.has(key)) { dispatchMeshJob(cx, cz, key, neighborDistSq); }
+                            else { chunkNeighborUpdateQueue.add(key); }
                         } else {
                             renderChunk(cx, cz, neighborDistSq);
+                            recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                         }
-                        recordChunkUpdateState(key, "neighbor-refresh", "rendered");
                     }
                 }
 
@@ -39475,7 +39685,12 @@ self.onmessage = async (e) => {
                     }
                 } else {
                     chunkStreamLastProgressMs = time;
+                    streamBurstActive = false; // no backlog → no burst
                 }
+                // APPLY drain (Item 1): copy completed worker meshes into geometry within a budget.
+                // Runs every frame — in-flight results from prior frames land here even when the
+                // build queue is now empty. Burst mode (Item 2) widens the budget during a backlog.
+                drainReadyMeshResults(streamBurstActive ? 8 : 4);
                 // Run chunk streaming updates - now internally event-driven
                 // Changed from fixed 200ms interval to smart dirty checking
                 // updateChunks() returns early if nothing changed, so calling every frame is safe
