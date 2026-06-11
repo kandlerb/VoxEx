@@ -31544,7 +31544,16 @@ self.onmessage = async (e) => {
                                 // voxel faces; FrontSide rendering guarantees the outward sign. The
                                 // local intentionally reuses the old varying's name so _snapCoord's
                                 // token (vWorldNormalCyl) resolves unchanged.
-                                _lfbBlocky = 'vec3 vWorldNormalCyl = normalize( cross( dFdx( vWorldPositionCyl ), dFdy( vWorldPositionCyl ) ) );\n' + _lfbBlocky;
+                                // CODEGEN SAFETY: declared at the very TOP of main() (uniform control
+                                // flow), NOT prepended inside the inlined lights chunk — adding new
+                                // statements inside that chunk perturbs fragile D3D/ANGLE codegen
+                                // (same driver-bug class as the documented blockyGetPointShadow
+                                // incident above) and silently broke the held-torch light.
+                                shader.fragmentShader = shader.fragmentShader.replace(
+                                    'void main() {',
+                                    `void main() {
+                                    vec3 vWorldNormalCyl = normalize( cross( dFdx( vWorldPositionCyl ), dFdy( vWorldPositionCyl ) ) );`
+                                );
                                 shader.fragmentShader = shader.fragmentShader.replace('#include <lights_fragment_begin>', _lfbBlocky);
                             }
                         }
@@ -41060,6 +41069,19 @@ self.onmessage = async (e) => {
                 const initialQueueLength = chunkBuildQueue.length;
                 let inspected = 0;
                 heartbeatChunkUpdates();
+                // SPIKE SMOOTHING: a single chunk build is non-preemptible (data load/
+                // gen + sunlight + section analysis + mesh apply can cost 10-20ms) and
+                // the first build each frame intentionally bypasses the time budget.
+                // When the previous frame's builds blew well past the budget, take
+                // breather frame(s) so overruns can't chain into sustained stutter
+                // while streaming across a chunk boundary.
+                if (typeof window.chunkBuildDebtMs !== 'number') window.chunkBuildDebtMs = 0;
+                if (window.chunkBuildDebtMs > 0) {
+                    window.chunkBuildDebtMs -= FRAME_BUDGET_MS * 0.5; // pay down ~8ms per skipped frame
+                    if (chunkBuildQueue.length > 0) perfMetrics.chunksSkipped += chunkBuildQueue.length;
+                    perfMetrics.chunkBuildTime = 0;
+                    return;
+                }
                 // --- PRIORITY: Sort queue by distance (closest chunks first) ---
                 // Calculate player chunk position for distance sorting
                 if (chunkBuildQueue.length > 1 && controls && controls.getObject) {
@@ -41099,10 +41121,13 @@ self.onmessage = async (e) => {
                 }
 
                 // Detect rapid movement and reduce build rate
-                const playerSpeed = typeof playerVelocity !== 'undefined'
-                    ? Math.sqrt(playerVelocity.x * playerVelocity.x + playerVelocity.z * playerVelocity.z)
+                // FIX: this read `playerVelocity`, which never existed (the player's
+                // velocity global is `velocity`) — so the fast-movement throttle was
+                // dead code and never engaged while sprinting/flying across chunks.
+                const playerSpeed = typeof velocity !== 'undefined'
+                    ? Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z)
                     : 0;
-                const isMovingFast = playerSpeed > 5; // ~5 m/s threshold
+                const isMovingFast = playerSpeed > 5; // engages at sprint/fly speeds
                 const effectiveBudget = isMovingFast ? CHUNK_BUILD_BUDGET_MS * 0.5 : CHUNK_BUILD_BUDGET_MS;
 
                 // Estimate how many chunks we can afford this frame
@@ -41162,6 +41187,13 @@ self.onmessage = async (e) => {
                 if (builds > 0) {
                     const timePerChunk = perfMetrics.chunkBuildTime / builds;
                     chunkBuildTimeAvg = chunkBuildTimeAvg * 0.9 + timePerChunk * 0.1; // Exponential moving average
+                }
+                // Large overrun -> record as debt so the next frame(s) skip building
+                // entirely (see SPIKE SMOOTHING above). Threshold 2.5x budget means
+                // normal 5-8ms build frames stream at full rate; only frame-breaking
+                // overruns trigger a breather.
+                if (perfMetrics.chunkBuildTime > CHUNK_BUILD_BUDGET_MS * 2.5) {
+                    window.chunkBuildDebtMs = perfMetrics.chunkBuildTime - CHUNK_BUILD_BUDGET_MS;
                 }
                 // Process 1-2 neighbor updates per frame (low priority, runs after main queue)
                 // OPTIMIZATION: Skip neighbor updates if we're over budget
@@ -41655,7 +41687,20 @@ self.onmessage = async (e) => {
                 } else {
                     controls.getDirection(_physFwd);
                     _physFwd.y = 0;
-                    _physFwd.normalize();
+                    const fwdLenSq = _physFwd.lengthSq();
+                    if (fwdLenSq > 1e-6) {
+                        _physFwd.multiplyScalar(1 / Math.sqrt(fwdLenSq));
+                    } else {
+                        // Looking straight up/down: the horizontal projection of the view
+                        // direction degenerates to float noise, and normalizing it produced
+                        // a random heading (erratic WASD at ±90° pitch). The camera's RIGHT
+                        // vector is pitch-invariant, so derive forward from it instead:
+                        // forward = up × right.
+                        _physRight.setFromMatrixColumn(camera.matrixWorld, 0);
+                        _physRight.y = 0;
+                        _physRight.normalize();
+                        _physFwd.crossVectors(_physUp, _physRight);
+                    }
                     _physRight.crossVectors(_physFwd, _physUp);
                 }
                 // Calculate deltas
