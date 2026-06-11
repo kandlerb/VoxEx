@@ -17488,8 +17488,19 @@
                         // Math.max varargs handles the min-3 floor in one call.
                         return Math.max(3, sky, block);
                     }
-                    // For neighbors, use full light (simplified)
-                    return 15;
+                    // Out-of-chunk samples: clamp to THIS chunk's nearest edge cell.
+                    // The old "return 15 (simplified)" baked bright light-15 lines
+                    // along EVERY chunk border of every worker-built mesh — they were
+                    // masked only by the main thread's full-quality remesh churn, and
+                    // became permanently visible in caves once remeshing was reduced.
+                    // The edge cell preserves light continuity on the surface (it is
+                    // sky-lit anyway) and underground (it is dark) alike.
+                    const ecx = lx < 0 ? 0 : lx > 15 ? 15 : lx;
+                    const ecz = lz < 0 ? 0 : lz > 15 ? 15 : lz;
+                    const eidx = ecx + ecz * 16 + ly * 256;
+                    const esky = centerSkyLight ? centerSkyLight[eidx] : 15;
+                    const eblock = centerBlockLight ? centerBlockLight[eidx] : 0;
+                    return Math.max(3, esky, eblock);
                 };
 
                 // Helper to check if block is a leaf
@@ -25404,7 +25415,16 @@ self.onmessage = async (e) => {
                 scene.add(moon);
                 // Torch Lighting (PointLight with optimized shadow settings)
                 torchLight = new THREE.PointLight(SETTINGS.torchColor, 0, SETTINGS.torchRange, 0.8);
-                torchLight.castShadow = SETTINGS.shadows;
+                // TORCH SHADOWS DISABLED: chunk meshes carry no normal attribute, so
+                // shadow.normalBias is a silent no-op on terrain — the torch's cube
+                // shadow map self-shadows every terrain fragment in range, and the
+                // hard step(0.5,...) cutoff in the blocky shader then multiplies the
+                // torch's ENTIRE terrain contribution to zero. Result: the held torch
+                // stopped lighting the environment at all (deterministic, all GPUs).
+                // Depth-bias compensation proved insufficient. Disabling the shadow
+                // restores the light; torch shadows can return if terrain ever gets
+                // a per-fragment shadow solution (mobs/props are unaffected either way).
+                torchLight.castShadow = false;
                 torchLight.shadow.mapSize.set(torchShadowMapSize, torchShadowMapSize);
                 torchLight.shadow.camera.near = 0.1;
                 torchLight.shadow.camera.far = SETTINGS.torchRange;
@@ -29191,12 +29211,17 @@ self.onmessage = async (e) => {
                                         const _call = _lfbBlocky.slice(_pi, _pe + 1);
                                         // NOTE: an earlier anti-acne attempt substituted the
                                         // vPointShadowCoord ARGUMENT inside this call — it killed the
-                                        // held-torch light on D3D/ANGLE drivers (same silent-misrender
-                                        // class as the documented X4000 incident: ANY mutation of the
-                                        // getPointShadow call beyond this step() wrapper is unsafe).
-                                        // Terrain anti-acne for the torch is handled CPU-side instead,
-                                        // via torchLight.shadow.bias (chunk meshes have no normal
-                                        // attribute, so shadow.normalBias cannot help them).
+                                        // held-torch light DETERMINISTICALLY, on non-NVIDIA hardware
+                                        // too (verified in playtest). So this is NOT a GPU-driver
+                                        // quirk: the failure lives in THREE's own shader-string
+                                        // pipeline (its regex-based #pragma unroll_loop processor runs
+                                        // AFTER onBeforeCompile and re-parses any text injected into
+                                        // these light loops). EMPIRICAL RULE, all vendors: any textual
+                                        // mutation of the getPointShadow call beyond this step()
+                                        // wrapper silently breaks the point light, with no compile
+                                        // error. Terrain anti-acne for the torch is handled CPU-side
+                                        // instead, via torchLight.shadow.bias (chunk meshes have no
+                                        // normal attribute, so shadow.normalBias cannot help them).
                                         _lfbBlocky = _lfbBlocky.slice(0, _pi) + 'step( 0.5, ' + _call + ' )' + _lfbBlocky.slice(_pe + 1);
                                     }
                                 }
@@ -29233,11 +29258,12 @@ self.onmessage = async (e) => {
                                 // voxel faces; FrontSide rendering guarantees the outward sign. The
                                 // local intentionally reuses the old varying's name so _snapCoord's
                                 // token (vWorldNormalCyl) resolves unchanged.
-                                // CODEGEN SAFETY: declared at the very TOP of main() (uniform control
-                                // flow), NOT prepended inside the inlined lights chunk — adding new
-                                // statements inside that chunk perturbs fragile D3D/ANGLE codegen
-                                // (same driver-bug class as the documented blockyGetPointShadow
-                                // incident above) and silently broke the held-torch light.
+                                // PLACEMENT SAFETY: declared at the very TOP of main(), NOT prepended
+                                // inside the inlined lights chunk — inserting statements into that
+                                // chunk broke the held-torch light deterministically on ALL tested
+                                // GPUs (not a driver quirk; THREE's regex-based unroll_loop processor
+                                // re-parses this region after onBeforeCompile, and mutations inside
+                                // it silently mis-render with no compile error).
                                 shader.fragmentShader = shader.fragmentShader.replace(
                                     'void main() {',
                                     `void main() {
@@ -37795,19 +37821,31 @@ self.onmessage = async (e) => {
                     };
                     // OPTIMIZED getLocalLight: Full neighbor support for seamless lighting
                     // Now uses hoisted extractLightFromChunk helper to avoid closure creation
+                    // MISSING-NEIGHBOR DEFAULT: sample THIS chunk's nearest edge cell
+                    // instead of a constant 15. The constant baked bright light-15
+                    // lines along chunk borders whenever a mesh was built before its
+                    // neighbor's data existed — glaring in caves (15 vs the cave floor
+                    // of 3). Clamping to the own edge cell preserves light continuity
+                    // both on the surface (edge cell is sky-lit anyway) and underground
+                    // (edge cell is dark), so missing neighbors can never paint lines.
+                    const ownEdgeLight = (lx, ly, lz) => {
+                        const cx2 = lx < 0 ? 0 : lx > 15 ? 15 : lx;
+                        const cz2 = lz < 0 ? 0 : lz > 15 ? 15 : lz;
+                        return extractLightFromChunk(centerData, cx2 + cz2 * 16 + ly * 256);
+                    };
                     const getLocalLight = (lx, ly, lz) => {     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15;
                         // 1. Center Chunk (most common case - ~85% of lookups)
                         if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) { const idx = lx + lz * 16 + ly * 256; return extractLightFromChunk(centerData, idx); }
-                        // 2. Orthogonal Neighbors - Return 15 (full light) if neighbor missing instead of 0
-                        if (lz < 0 && lx >= 0 && lx < 16) { const idx = lx + 15 * 16 + ly * 256; if (!nN) { missingNeighbor = true; return 15; } return extractLightFromChunk(nN, idx); }
-                        if (lz > 15 && lx >= 0 && lx < 16) { const idx = lx + 0 * 16 + ly * 256; if (!nS) { missingNeighbor = true; return 15; } return extractLightFromChunk(nS, idx); }
-                        if (lx > 15 && lz >= 0 && lz < 16) { const idx = 0 + lz * 16 + ly * 256; if (!nE) { missingNeighbor = true; return 15; } return extractLightFromChunk(nE, idx); }
-                        if (lx < 0 && lz >= 0 && lz < 16) { const idx = 15 + lz * 16 + ly * 256; if (!nW) { missingNeighbor = true; return 15; } return extractLightFromChunk(nW, idx); }
-                        // 3. Diagonal Neighbors - Return 15 (full light) if neighbor missing instead of 0
-                        if (lz < 0 && lx < 0) { const idx = 15 + 15 * 16 + ly * 256; if (!nNW) { missingNeighbor = true; return 15; } return extractLightFromChunk(nNW, idx); }
-                        if (lz < 0 && lx > 15) { const idx = 0 + 15 * 16 + ly * 256; if (!nNE) { missingNeighbor = true; return 15; } return extractLightFromChunk(nNE, idx); }
-                        if (lz > 15 && lx < 0) { const idx = 15 + 0 * 16 + ly * 256; if (!nSW) { missingNeighbor = true; return 15; } return extractLightFromChunk(nSW, idx); }
-                        if (lz > 15 && lx > 15) { const idx = 0 + 0 * 16 + ly * 256; if (!nSE) { missingNeighbor = true; return 15; } return extractLightFromChunk(nSE, idx); }
+                        // 2. Orthogonal Neighbors - clamp to own edge cell if neighbor missing
+                        if (lz < 0 && lx >= 0 && lx < 16) { const idx = lx + 15 * 16 + ly * 256; if (!nN) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nN, idx); }
+                        if (lz > 15 && lx >= 0 && lx < 16) { const idx = lx + 0 * 16 + ly * 256; if (!nS) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nS, idx); }
+                        if (lx > 15 && lz >= 0 && lz < 16) { const idx = 0 + lz * 16 + ly * 256; if (!nE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nE, idx); }
+                        if (lx < 0 && lz >= 0 && lz < 16) { const idx = 15 + lz * 16 + ly * 256; if (!nW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nW, idx); }
+                        // 3. Diagonal Neighbors - clamp to own edge cell if neighbor missing
+                        if (lz < 0 && lx < 0) { const idx = 15 + 15 * 16 + ly * 256; if (!nNW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nNW, idx); }
+                        if (lz < 0 && lx > 15) { const idx = 0 + 15 * 16 + ly * 256; if (!nNE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nNE, idx); }
+                        if (lz > 15 && lx < 0) { const idx = 15 + 0 * 16 + ly * 256; if (!nSW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nSW, idx); }
+                        if (lz > 15 && lx > 15) { const idx = 0 + 0 * 16 + ly * 256; if (!nSE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nSE, idx); }
                         return 15;
                     };
                     // Must match MAX_FACES_PER_CHUNK: renderChunk skips meshes above that
