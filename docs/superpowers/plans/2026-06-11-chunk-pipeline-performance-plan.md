@@ -274,3 +274,16 @@ Record all four in this file under a "Results" section with the date.
 2. **Staleness gap (fixed):** the neighbor-refresh path silently dropped refreshes for in-flight chunks (the in-flight mesh was built from older neighbor data). Fix: re-add the key to `chunkNeighborUpdateQueue` instead of dropping.
 
 Re-run `tools/voxex-tests.html` after these fixes. Everything else verified faithful to spec: state/bookkeeping, staleness guards, burst-mode composition with the slow-frame guard, edge-light cap-flush safety (better than spec), Item 4 phase split, QW1–3 in both mesh paths.
+
+### 2026-06-11 — Playtest crash → MAJOR DISCOVERY: worker meshing never worked
+
+Playtest threw `ReferenceError: voxelMaterial is not defined` from `applyWorkerMeshData` (via the new drain). Investigation conclusion:
+
+- `applyWorkerMeshData` has referenced a **nonexistent material** since it was written. Under the OLD code, the throw was swallowed by `renderChunkAsync`'s try/catch, which then fell back to sync `renderChunk`. **Every "worker-meshed" chunk in the project's history was actually meshed synchronously on the main thread** — after paying a full worker round-trip for a mesh that was discarded. Item 1's drain calls the function outside that try/catch, surfacing the bug.
+- `applyWorkerMeshData` is ALSO missing vs. `renderChunk`'s attach phase: pooled-mesh protocol (`acquireChunkMesh` — it news up meshes, leaking the pool design), `applyTightChunkBounds` (it calls `computeBoundingSphere()` over POOLED buffers — stale vertices beyond drawRange corrupt the bounds), torch model rebuild (`releaseChunkTorches` + torch scan), zero-face `chunkMeshes` map cleanup, `chunkRenderedFaces`/`chunkRenderDiagnostics`, `markShadowsDirty`, neighbor-update queueing.
+- The WORKER mesher itself (inside `CHUNK_WORKER_CODE`) is below parity with the main-thread mesher: no greedy merging (per-face quads), water `shoreDist` hardcoded 1 / `waterThickness` hardcoded 0 (degrades water shading), no corner-light smooth lighting.
+
+**Resolution (applied):** `WORKER_MESH_PIPELINE_ENABLED = false` gate on both dispatch sites — meshing runs sync via `renderChunk`, which is what production always effectively did, now WITHOUT the wasted per-chunk worker round-trip (a net speedup over the status quo). The Item 1 machinery (dispatch/drain/in-flight/fallback) is kept in place behind the gate. Also fixed: the latent `voxelMaterial`→`chunkMaterial` ReferenceError, and a spurious first-frame `[ChunkQueue] Stalled` warn (`chunkStreamLastProgressMs` lazy init).
+
+**Follow-up project (the REAL Item 1, needs its own plan doc): worker mesher parity.**
+Scope: (a) port greedy meshing + corner-light packing + real shore/thickness generation into the worker mesher in `CHUNK_WORKER_CODE`; (b) complete `applyWorkerMeshData` per the missing list above (mirror `renderChunk`'s attach phase, ideally by EXTRACTING that attach phase into a shared function both paths call); (c) verify with a visual A/B (same seed, worker vs sync meshes must be pixel-identical) plus the existing worker round-trip test extended to compare face counts against the main-thread mesher. Only then flip `WORKER_MESH_PIPELINE_ENABLED` to true. Items 2–4 + QW1–3 remain live and unaffected.

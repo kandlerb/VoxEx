@@ -12326,6 +12326,16 @@
             // DISPATCH (cheap, no await, per build-loop iteration) is decoupled from APPLY
             // (budgeted main-thread drain of completed results, per frame) so the worker pool
             // runs poolSize jobs concurrently instead of one serial round-trip at a time.
+            // WORKER MESH PIPELINE GATE — currently OFF. Surfaced 2026-06-11: applyWorkerMeshData
+            // referenced a nonexistent material (voxelMaterial) since it was written, so every
+            // worker mesh result threw, was silently caught, and re-meshed synchronously — worker
+            // meshing never actually shipped a mesh. The worker mesher also lacks parity with
+            // renderChunk (no greedy merging, simplified water shore/thickness, no torch rebuild,
+            // no tight bounds). Until a parity project fixes the worker mesher AND applyWorkerMeshData
+            // (see docs/superpowers/plans/2026-06-11-chunk-pipeline-performance-plan.md), meshing
+            // runs sync via renderChunk — which is what production always effectively did, minus
+            // the wasted worker round-trip per chunk.
+            const WORKER_MESH_PIPELINE_ENABLED = false;
             const inFlightMeshKeys = new Set();   // chunk keys with a worker mesh job in flight
             const readyMeshResults = [];          // [{cKey, cx, cz, distSq, meshData}] completed, awaiting apply
             const syncFallbackQueue = [];         // [{cKey, cx, cz, distSq}] worker unavailable/timeout — main-thread mesh, 1/frame
@@ -18348,7 +18358,15 @@
                     geo.setDrawRange(0, terrain.indices.length);
                     geo.computeBoundingSphere();
 
-                    const mesh = new THREE.Mesh(geo, voxelMaterial);
+                    // FIXED 2026-06-11: was `voxelMaterial`, which never existed — every call threw
+                    // ReferenceError (historically swallowed by renderChunkAsync's catch). The real
+                    // terrain material is chunkMaterial (see acquireChunkMesh).
+                    // WARNING: this path is gated off (WORKER_MESH_PIPELINE_ENABLED=false). Before
+                    // re-enabling, it ALSO needs: pooled-mesh protocol (acquireChunkMesh), tight
+                    // bounds instead of computeBoundingSphere over pooled buffers (stale vertices
+                    // beyond drawRange corrupt the sphere), torch rebuild, zero-face chunkMeshes
+                    // cleanup, chunkRenderedFaces/diagnostics, and markShadowsDirty — see plan doc.
+                    const mesh = new THREE.Mesh(geo, chunkMaterial);
                     mesh.position.set(0, 0, 0);
                     mesh.frustumCulled = true;
                     mesh.castShadow = meshCastShadow;   // QW2: distant chunks don't cast shadows
@@ -39278,7 +39296,8 @@ self.onmessage = async (e) => {
                     // The completed mesh is applied later by drainReadyMeshResults(), so state
                     // recording is deferred to the apply path (the mesh has not landed yet). The
                     // sync fallback path renders inline and records state immediately.
-                    if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                    // NOTE: gated by WORKER_MESH_PIPELINE_ENABLED until worker mesher parity lands.
+                    if (WORKER_MESH_PIPELINE_ENABLED && SETTINGS.useWorkersForMesh && chunkWorkerPool) {
                         dispatchMeshJob(jobCx, jobCz, job.key, jobDistSq);
                     } else {
                         renderChunk(jobCx, jobCz, jobDistSq);
@@ -39318,7 +39337,8 @@ self.onmessage = async (e) => {
                         const pcz = Math.floor(playerWorldPos.z / WORLD_DIMS.chunkSize);
                         const neighborDistSq = (cx - pcx) * (cx - pcx) + (cz - pcz) * (cz - pcz);
                         // PIPELINED (Item 1): dispatch — the apply drain finishes it. Sync path inline.
-                        if (SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                        // NOTE: gated by WORKER_MESH_PIPELINE_ENABLED until worker mesher parity lands.
+                        if (WORKER_MESH_PIPELINE_ENABLED && SETTINGS.useWorkersForMesh && chunkWorkerPool) {
                             // If a mesh is already in flight it was built from OLDER neighbor data —
                             // don't drop this refresh, push it back for a later pass.
                             if (!inFlightMeshKeys.has(key)) { dispatchMeshJob(cx, cz, key, neighborDistSq); }
@@ -39664,6 +39684,10 @@ self.onmessage = async (e) => {
                 // loading spinner never finished. Slow frames now still build on every
                 // 3rd frame; processChunkQueue's internal 5ms budget bounds the cost.
                 const hasEditWork = dirtyChunks.size > 0 || pendingChunkUpdates.size > 0;
+                // Lazy-init the progress timestamp: it starts at 0, so without this the stall
+                // telemetry fired spuriously on the first frame after a long pre-generation
+                // (time - 0 > 10000 with a 46s frameDelta in the log).
+                if (chunkStreamLastProgressMs === 0) chunkStreamLastProgressMs = time;
                 if (chunkBuildQueue.length > 0) {
                     const fastFrame = time - prevTime < 32;
                     slowFrameBuildSkips = fastFrame ? 0 : slowFrameBuildSkips + 1;
