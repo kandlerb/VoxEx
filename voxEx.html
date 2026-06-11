@@ -15233,8 +15233,6 @@
             const frustumCacheState = { // Cache last frustum computation to avoid re-running the heavy chunk-visibility sweep when stationary
                 chunkX: null,
                 chunkZ: null,
-                enumCenterX: null, // QW3: velocity-biased enumeration center (recompute the sweep when it shifts)
-                enumCenterZ: null,
                 renderRadius: null,
                 normCamX: 0,
                 normCamZ: 0,
@@ -38905,21 +38903,13 @@ self.onmessage = async (e) => {
                 const pPos = getPlayerWorldPosition();
                 const chunkX = Math.floor(pPos.x / WORLD_DIMS.chunkSize);
                 const chunkZ = Math.floor(pPos.z / WORLD_DIMS.chunkSize);
-                // QW3: prefetch along velocity. Bias the chunk-enumeration CENTER a little toward
-                // where the player is heading so chunks ahead load sooner. Weighted 25% blend,
-                // chunk-quantized — the player stays well inside the loaded set and the center only
-                // shifts ~1 chunk at high fly speeds (the blend rounds to 0 at normal speeds). Used
-                // ONLY for the enumeration loop below; purge/cleanup stay player-relative.
-                let enumCenterX = chunkX;
-                let enumCenterZ = chunkZ;
-                if (typeof velocity !== 'undefined') {
-                    const lookX = pPos.x + velocity.x * 1.5;
-                    const lookZ = pPos.z + velocity.z * 1.5;
-                    const lookChunkX = Math.floor(lookX / WORLD_DIMS.chunkSize);
-                    const lookChunkZ = Math.floor(lookZ / WORLD_DIMS.chunkSize);
-                    enumCenterX = Math.round(chunkX * 0.75 + lookChunkX * 0.25);
-                    enumCenterZ = Math.round(chunkZ * 0.75 + lookChunkZ * 0.25);
-                }
+                // QW3 REVERTED 2026-06-11: the velocity-biased enumeration center shifted the
+                // chunksInRange disc, and cleanup 6B releases EVERY mesh outside that disc — so
+                // flying destroyed the trailing arc of valid meshes each pass (visible as a large
+                // crescent of missing terrain) and refilled the build queue perpetually. Velocity
+                // jitter also flipped the rounded center, thrashing the frustum cache. If prefetch
+                // is re-attempted, it must ONLY affect queue PRIORITY (e.g. a sort-weight bonus for
+                // chunks ahead of the player), never the enumeration/cleanup disc.
                 // OPTIMIZATION: Purge stale chunks from build queue when player moves to a new chunk
                 const playerChunkChanged = chunkX !== lastChunkX || chunkZ !== lastChunkZ;
                 if (playerChunkChanged && chunkBuildQueue.length > 0) {
@@ -39003,8 +38993,6 @@ self.onmessage = async (e) => {
                     !frustumCacheState.dirty &&
                     frustumCacheState.chunkX === chunkX &&
                     frustumCacheState.chunkZ === chunkZ &&
-                    frustumCacheState.enumCenterX === enumCenterX &&
-                    frustumCacheState.enumCenterZ === enumCenterZ &&
                     frustumCacheState.renderRadius === currentRenderRadius &&
                     frustumCacheState.frustumEnabled === SETTINGS.enableFrustumCulling &&
                     frustumCacheState.cameraFov === camera.fov &&
@@ -39033,8 +39021,8 @@ self.onmessage = async (e) => {
                         for (let dz = -maxR; dz <= maxR; dz++) {
                             const distSq = dx * dx + dz * dz;
                             if (distSq > maxRSq) continue;
-                            const cx = enumCenterX + dx;   // QW3: enumeration centered on the velocity-biased point
-                            const cz = enumCenterZ + dz;
+                            const cx = chunkX + dx;   // player-centered (QW3 bias reverted — see note above)
+                            const cz = chunkZ + dz;
                             const key = getChunkKey(cx, cz);
                             // Add to chunksInRange BEFORE frustum check - all chunks in distance
                             chunksInRange.add(key);
@@ -39048,8 +39036,6 @@ self.onmessage = async (e) => {
                     // Refresh cache snapshot when recomputed
                     frustumCacheState.chunkX = chunkX;
                     frustumCacheState.chunkZ = chunkZ;
-                    frustumCacheState.enumCenterX = enumCenterX;
-                    frustumCacheState.enumCenterZ = enumCenterZ;
                     frustumCacheState.renderRadius = currentRenderRadius;
                     frustumCacheState.normCamX = normCamX;
                     frustumCacheState.normCamZ = normCamZ;
@@ -39688,6 +39674,10 @@ self.onmessage = async (e) => {
                 // telemetry fired spuriously on the first frame after a long pre-generation
                 // (time - 0 > 10000 with a 46s frameDelta in the log).
                 if (chunkStreamLastProgressMs === 0) chunkStreamLastProgressMs = time;
+                // RESUME DETECTION: a huge frame delta means the loop was blocked (pre-generation,
+                // tab hidden, debugger pause) — that gap is not a streaming stall. Reset the
+                // progress clock so the warn only fires after 10s of ACTUAL running frames.
+                if (time - prevTime > 5000) chunkStreamLastProgressMs = time;
                 if (chunkBuildQueue.length > 0) {
                     const fastFrame = time - prevTime < 32;
                     slowFrameBuildSkips = fastFrame ? 0 : slowFrameBuildSkips + 1;

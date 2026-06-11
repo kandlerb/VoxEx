@@ -285,5 +285,11 @@ Playtest threw `ReferenceError: voxelMaterial is not defined` from `applyWorkerM
 
 **Resolution (applied):** `WORKER_MESH_PIPELINE_ENABLED = false` gate on both dispatch sites — meshing runs sync via `renderChunk`, which is what production always effectively did, now WITHOUT the wasted per-chunk worker round-trip (a net speedup over the status quo). The Item 1 machinery (dispatch/drain/in-flight/fallback) is kept in place behind the gate. Also fixed: the latent `voxelMaterial`→`chunkMaterial` ReferenceError, and a spurious first-frame `[ChunkQueue] Stalled` warn (`chunkStreamLastProgressMs` lazy init).
 
+### 2026-06-11 — Playtest round 2: QW3 REVERTED (missing-terrain bug)
+
+Symptom: large regions of terrain not rendering while moving + build queue pinned at ~16. Cause: QW3's velocity-biased enumeration center shifted the `chunksInRange` disc, and cleanup 6B (`updateChunks`) hard-releases every mesh whose key falls outside that disc — so flight destroyed the trailing arc of valid meshes each pass, re-queued them, and destroyed them again (perpetual churn, visible as a crescent-shaped hole). Velocity jitter also flipped the `Math.round`ed center, thrashing the frustum cache. QW3 fully reverted (enumeration is player-centered again; `enumCenter*` removed from `frustumCacheState`). **Lesson recorded:** prefetch must only influence queue PRIORITY (e.g. sort-weight bonus for chunks ahead of the velocity vector) — never the enumeration/cleanup disc.
+
+Also: stall telemetry now has resume detection (frame delta >5s resets the progress clock) — it fired spuriously with `frameDelta=46-58s` on the first frame after pre-generation blocked the loop.
+
 **Follow-up project (the REAL Item 1, needs its own plan doc): worker mesher parity.**
 Scope: (a) port greedy meshing + corner-light packing + real shore/thickness generation into the worker mesher in `CHUNK_WORKER_CODE`; (b) complete `applyWorkerMeshData` per the missing list above (mirror `renderChunk`'s attach phase, ideally by EXTRACTING that attach phase into a shared function both paths call); (c) verify with a visual A/B (same seed, worker vs sync meshes must be pixel-identical) plus the existing worker round-trip test extended to compare face counts against the main-thread mesher. Only then flip `WORKER_MESH_PIPELINE_ENABLED` to true. Items 2–4 + QW1–3 remain live and unaffected.
