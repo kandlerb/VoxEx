@@ -6833,20 +6833,28 @@
                             return null;
                         }
 
-                        // Convert ArrayBuffer to stored format
-                        const storedStr = new TextDecoder().decode(compressedBuffer);
-                        const stored = JSON.parse(storedStr);
-
-                        // Validate seed matches current world (critical for multi-world support)
-                        if (!stored.seed || !seedsMatch(stored.seed, this.currentSeed)) {
-                            this._opfsStats.seedMismatches++;
-                            this.diskCachedKeys.delete(key); // Mark as invalid for this seed
-                            logDebug(`[OPFS] Seed mismatch for ${key}: stored=${stored.seed}, current=${this.currentSeed}`);
-                            return null;
+                        // Fast path: binary format (returns null for legacy JSON files)
+                        let storedSeed = null;
+                        let chunk = null;
+                        const binary = deserializeChunkFromDisk(compressedBuffer);
+                        if (binary) {
+                            storedSeed = binary.seed;
+                            chunk = binary.chunk;
+                        } else {
+                            // Legacy path: JSON envelope from older versions
+                            const storedStr = new TextDecoder().decode(compressedBuffer);
+                            const stored = JSON.parse(storedStr);
+                            storedSeed = stored ? stored.seed : null;
+                            chunk = stored ? ChunkCompressor.decompress(stored.data) : null;
                         }
 
-                        // Decompress chunk data
-                        const chunk = ChunkCompressor.decompress(stored.data);
+                        // Validate seed matches current world (critical for multi-world support)
+                        if (!storedSeed || !chunk || !seedsMatch(storedSeed, this.currentSeed)) {
+                            this._opfsStats.seedMismatches++;
+                            this.diskCachedKeys.delete(key); // Mark as invalid for this seed
+                            logDebug(`[OPFS] Seed mismatch for ${key}: stored=${storedSeed}, current=${this.currentSeed}`);
+                            return null;
+                        }
 
                         this._opfsStats.hits++;
                         this._opfsStats.readBytes += compressedBuffer.byteLength;
@@ -6880,21 +6888,23 @@
                     }
 
                     try {
-                        // Compress chunk data and store with seed for validation
-                        const compressed = ChunkCompressor.compress(chunk);
-                        const stored = {
-                            seed: this.currentSeed,
-                            data: compressed
-                        };
-                        const jsonStr = JSON.stringify(stored);
-                        const buffer = new TextEncoder().encode(jsonStr);
+                        // Fast path: compact binary serialization (RLE + binary header).
+                        // Falls back to the legacy JSON envelope for non-modern chunk shapes.
+                        let buffer = serializeChunkForDisk(this.currentSeed, chunk);
+                        if (!buffer) {
+                            const compressed = ChunkCompressor.compress(chunk);
+                            const stored = { seed: this.currentSeed, data: compressed };
+                            buffer = new TextEncoder().encode(JSON.stringify(stored));
+                        }
 
-                        await this.diskStorage.write(key, buffer);
+                        // write() transfers the buffer (zero-copy) and detaches it,
+                        // so use the byte count returned by the worker for stats.
+                        const bytesWritten = await this.diskStorage.write(key, buffer);
 
                         this.diskCachedKeys.add(key);
                         this.diskDirtyKeys.delete(key);
                         this._opfsStats.writes++;
-                        this._opfsStats.writeBytes += buffer.byteLength;
+                        this._opfsStats.writeBytes += bytesWritten;
                         if (isEviction) this._opfsStats.evictionWrites++;
 
                         return true;
@@ -23729,33 +23739,48 @@
                     bytesDecompressed: 0
                 },
 
+                // Maximum run length per [count, value] pair. Counts are stored in a
+                // Uint16Array, so runs longer than 65535 MUST be split into multiple
+                // pairs or the count silently wraps modulo 65536 and corrupts the data.
+                // This matters for 320-high chunks (81920 cells): an all-zero blockLight
+                // array or the air/skylight span above low terrain easily exceeds 65535.
+                MAX_RUN_LENGTH: 65535,
+
                 // Helper to compress a single Uint8Array
                 _compressArray(uint8Data) {
                     this._callCounts.compressArray++;
                     if (!uint8Data || uint8Data.length === 0) return new Uint16Array(0);
                     this._callCounts.bytesCompressed += uint8Data.length;
-                    // First pass: count runs to allocate exact size
-                    let runCount = 1;
+                    const MAX_RUN = this.MAX_RUN_LENGTH;
+                    // First pass: count entries (runs longer than MAX_RUN need multiple pairs)
+                    let entryCount = 0;
                     let prev = uint8Data[0];
-                    for (let i = 1; i < uint8Data.length; i++) { if (uint8Data[i] !== prev) { runCount++; prev = uint8Data[i]; }}
+                    let runLen = 1;
+                    for (let i = 1; i < uint8Data.length; i++) {
+                        if (uint8Data[i] === prev) { runLen++; }
+                        else { entryCount += Math.ceil(runLen / MAX_RUN); prev = uint8Data[i]; runLen = 1; }
+                    }
+                    entryCount += Math.ceil(runLen / MAX_RUN);
                     // Allocate typed array with exact size needed
-                    const result = new Uint16Array(runCount * 2);
+                    const result = new Uint16Array(entryCount * 2);
                     let writeIdx = 0;
                     prev = uint8Data[0];
-                    let count = 1;
-                    // Second pass: fill the typed array
+                    runLen = 1;
+                    // Second pass: fill the typed array, splitting over-long runs
                     for (let i = 1; i < uint8Data.length; i++) {
                         const current = uint8Data[i];
-                        if (current === prev) { count++;
+                        if (current === prev) { runLen++;
                         } else {
-                            result[writeIdx++] = count;
+                            while (runLen > MAX_RUN) { result[writeIdx++] = MAX_RUN; result[writeIdx++] = prev; runLen -= MAX_RUN; }
+                            result[writeIdx++] = runLen;
                             result[writeIdx++] = prev;
                             prev = current;
-                            count = 1;
+                            runLen = 1;
                         }
                     }
-                    // Write the last run
-                    result[writeIdx++] = count;
+                    // Write the last run (split if over-long)
+                    while (runLen > MAX_RUN) { result[writeIdx++] = MAX_RUN; result[writeIdx++] = prev; runLen -= MAX_RUN; }
+                    result[writeIdx++] = runLen;
                     result[writeIdx] = prev;
                     return result;
                 },
@@ -23789,6 +23814,9 @@
                     if (chunkData.blocks && chunkData.skyLight) { // New format: {blocks, skyLight, blockLight}
                         return {
                             version: 2, // Mark as new format
+                            // Persist the lighting-validity version. Without this, every
+                            // cache load sees version 0 and force-recalculates lighting.
+                            cacheVersion: chunkData._cacheVersion || 0,
                             blocks: Array.from(this._compressArray(chunkData.blocks)),
                             skyLight: Array.from(this._compressArray(chunkData.skyLight)),
                             blockLight: chunkData.blockLight ? Array.from(this._compressArray(chunkData.blockLight)) : null,
@@ -23813,6 +23841,9 @@
                             blockLight,
                             renderState: compressedData.renderState || 0,
                             genState: compressedData.genState || 0,
+                            // Restore persisted cache version (0 for records saved before
+                            // this field existed -> triggers a one-time lighting recalc + re-save)
+                            _cacheVersion: compressedData.cacheVersion || 0,
                         };
                     }
                     return this._decompressArray(new Uint16Array(compressedData)); // Old format: just a Uint16Array
@@ -23844,6 +23875,92 @@
                     }
                 }
             };
+
+            // --- BINARY OPFS CHUNK SERIALIZATION ---
+            // Compact binary envelope for OPFS disk files. Replaces the legacy JSON
+            // envelope (Array.from -> JSON.stringify -> TextEncoder), which was ~4-6x
+            // larger on disk and much slower to parse. Legacy JSON files are still
+            // readable via the fallback in ChunkDataPool.loadFromDisk().
+            // Layout (little-endian):
+            //   u32 magic 'VXC2' | u8 cacheVersion | u8 renderState | u8 genState |
+            //   u8 reserved | u16 seedByteLen | seed UTF-8 bytes |
+            //   3x [u32 pairCount, pairCount*2 u16 RLE values] (blocks, skyLight, blockLight)
+            const CHUNK_DISK_MAGIC = 0x32435856; // 'VXC2' read as little-endian u32
+
+            /**
+             * Serialize a chunk to a compact binary buffer for OPFS storage.
+             * @param {string} seed - Current world seed (stored for load-time validation).
+             * @param {Object} chunk - Modern-format chunk ({blocks, skyLight, blockLight, ...}).
+             * @returns {ArrayBuffer|null} Binary buffer, or null if chunk is not modern format.
+             */
+            function serializeChunkForDisk(seed, chunk) {
+                if (!chunk || !chunk.blocks || !seed) return null;
+                const blocksRle = ChunkCompressor._compressArray(chunk.blocks);
+                const skyRle = chunk.skyLight ? ChunkCompressor._compressArray(chunk.skyLight) : new Uint16Array(0);
+                const lightRle = chunk.blockLight ? ChunkCompressor._compressArray(chunk.blockLight) : new Uint16Array(0);
+                const seedBytes = new TextEncoder().encode(seed.toString());
+                if (seedBytes.length > 65535) return null;
+                const totalSize = 10 + seedBytes.length + 12 + (blocksRle.length + skyRle.length + lightRle.length) * 2;
+                const buffer = new ArrayBuffer(totalSize);
+                const view = new DataView(buffer);
+                let off = 0;
+                view.setUint32(off, CHUNK_DISK_MAGIC, true); off += 4;
+                view.setUint8(off, chunk._cacheVersion || 0); off += 1;
+                view.setUint8(off, chunk.renderState || 0); off += 1;
+                view.setUint8(off, chunk.genState || 0); off += 1;
+                view.setUint8(off, 0); off += 1; // reserved
+                view.setUint16(off, seedBytes.length, true); off += 2;
+                new Uint8Array(buffer, off, seedBytes.length).set(seedBytes); off += seedBytes.length;
+                const rleArrays = [blocksRle, skyRle, lightRle];
+                for (let a = 0; a < 3; a++) {
+                    const rle = rleArrays[a];
+                    view.setUint32(off, rle.length / 2, true); off += 4;
+                    for (let i = 0; i < rle.length; i++) { view.setUint16(off, rle[i], true); off += 2; }
+                }
+                return buffer;
+            }
+
+            /**
+             * Deserialize a binary OPFS chunk buffer created by serializeChunkForDisk().
+             * @param {ArrayBuffer} buffer - Raw file contents.
+             * @returns {{seed: string, chunk: Object}|null} Parsed result, or null if not binary format / malformed.
+             */
+            function deserializeChunkFromDisk(buffer) {
+                if (!buffer || buffer.byteLength < 22) return null;
+                const view = new DataView(buffer);
+                if (view.getUint32(0, true) !== CHUNK_DISK_MAGIC) return null;
+                let off = 4;
+                const cacheVersion = view.getUint8(off); off += 1;
+                const renderState = view.getUint8(off); off += 1;
+                const genState = view.getUint8(off); off += 1;
+                off += 1; // reserved
+                const seedLen = view.getUint16(off, true); off += 2;
+                if (off + seedLen > buffer.byteLength) return null;
+                const seed = new TextDecoder().decode(new Uint8Array(buffer, off, seedLen)); off += seedLen;
+                const arrays = [];
+                for (let a = 0; a < 3; a++) {
+                    if (off + 4 > buffer.byteLength) return null;
+                    const pairCount = view.getUint32(off, true); off += 4;
+                    const len = pairCount * 2;
+                    if (off + len * 2 > buffer.byteLength) return null;
+                    const rle = new Uint16Array(len);
+                    for (let i = 0; i < len; i++) { rle[i] = view.getUint16(off, true); off += 2; }
+                    arrays.push(ChunkCompressor._decompressArray(rle));
+                }
+                const blocks = arrays[0];
+                if (blocks.length === 0) return null;
+                return {
+                    seed,
+                    chunk: {
+                        blocks,
+                        skyLight: arrays[1].length > 0 ? arrays[1] : new Uint8Array(blocks.length).fill(15),
+                        blockLight: arrays[2].length > 0 ? arrays[2] : new Uint8Array(blocks.length),
+                        renderState,
+                        genState,
+                        _cacheVersion: cacheVersion,
+                    }
+                };
+            }
 
             // --- INDEXEDDB CACHE STATISTICS ---
             const idbCacheStats = {
@@ -24947,7 +25064,16 @@ self.onmessage = async (e) => {
                         request.onsuccess = () => {
                             const record = request.result;
                             if (record && seedsMatch(record.seed, finalSeedDisplay)) {
-                                const decompressed = ChunkCompressor.decompress(record.data);
+                                let decompressed = ChunkCompressor.decompress(record.data);
+                                // Normalize old format (raw Uint8Array) to new format (object),
+                                // matching loadChunkFromCache() behavior
+                                if (decompressed && !decompressed.blocks) {
+                                    decompressed = {
+                                        blocks: decompressed,
+                                        skyLight: new Uint8Array(decompressed.length).fill(15),
+                                        blockLight: new Uint8Array(decompressed.length),
+                                    };
+                                }
                                 results.set(key, decompressed);
                                 // Track cache hit statistics
                                 const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0;
@@ -41002,6 +41128,8 @@ self.onmessage = async (e) => {
                     // --- compression ---
                     rleEncode, rleDecode, compressChunkData, decompressChunkData,
                     getCompressionRatio,
+                    // --- persistence codec (IndexedDB / OPFS) ---
+                    ChunkCompressor, serializeChunkForDisk, deserializeChunkFromDisk,
                     // --- noise / rng ---
                     SeededRandom, noise2D, noise3D, fbm2D, fbmWithDomainWarp,
                     // --- terrain / biome ---

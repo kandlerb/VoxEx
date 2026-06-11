@@ -65,7 +65,7 @@ VoxEx/
 │   ├── terrain-visualizer.html   # Shaded relief terrain debugger (cross-section, column inspector)
 │   ├── voxelEditor.html          # Voxel model editor
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
-│   ├── voxex-tests.html          # Test suite — tests the REAL voxEx.html functions/classes via the ?test=1 seam (window.VoxEx); ~193 tests incl. live worker round-trip. Serve over localhost and open it.
+│   ├── voxex-tests.html          # Test suite — tests the REAL voxEx.html functions/classes via the ?test=1 seam (window.VoxEx); ~204 tests incl. live worker round-trip. Serve over localhost and open it.
 │   └── voxex-texture-tests.html  # Visual texture atlas tests (all 17 tiles + automated checks)
 └── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
@@ -344,7 +344,10 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 
 ### Persistence
 - **RLE Compression**: Chunk data (blocks + light) is Run-Length Encoded, v2 format
+- **Run-length limit**: `ChunkCompressor` stores RLE counts as Uint16 — runs longer than 65535 are SPLIT into multiple [count, value] pairs (`MAX_RUN_LENGTH`). Critical for 320-high chunks (81920 cells) where uniform spans (all-zero blockLight, air above low terrain) exceed 65535
+- **Cache versioning**: `_cacheVersion` is persisted inside the compressed record (`cacheVersion` field) and restored on decompress — required so cached lighting isn't needlessly recalculated on every load
 - **Dual Caching**: IndexedDB (fast, persistent) + OPFS disk cache (larger capacity via `ChunkDiskStorage` worker)
+- **OPFS binary format**: `serializeChunkForDisk()`/`deserializeChunkFromDisk()` — compact little-endian envelope (magic `'VXC2'`, cacheVersion/renderState/genState, seed, 3x RLE arrays). Legacy JSON-envelope files remain readable via fallback in `ChunkDataPool.loadFromDisk()`
 - **Batch Operations**: `batchLoadChunksFromCache()`, `batchSaveChunksToCache()` for efficiency
 - **Save Format**: JSON with Seed, Player Pos/Rot, Inventory, RLE-compressed modified chunks, thumbnail
 - **Quick Save/Load**: F5 saves, F9 loads (instant)
@@ -765,12 +768,12 @@ Before committing, verify:
 - [ ] Block lookup tables updated if adding blocks (`initBlockLookupTables()`)
 - [ ] Terrain changes: edit ONLY the main-thread terrain functions (~line 36269–36693); the worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — do not hand-edit a worker copy, and keep the markers intact
 - [ ] Terrain changes: update terrain-visualizer.html to match (biome config, height funcs)
-- [ ] Run `tools/voxex-tests.html` (~193 tests) to verify no regressions (serve over localhost)
+- [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
 
 ## Testing Tools
 
-### `tools/voxex-tests.html` — Automated Test Suite (~193 tests)
-Tests the REAL code inside `voxEx.html` via a `?test=1` seam that exposes `window.VoxEx` (inert without the flag — game boots normally). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB required). Coverage: bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + blendedHeight parity, and IndexedDB persistence round-trip.
+### `tools/voxex-tests.html` — Automated Test Suite (~204 tests)
+Tests the REAL code inside `voxEx.html` via a `?test=1` seam that exposes `window.VoxEx` (inert without the flag — game boots normally). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB required). Coverage: bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + blendedHeight parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS serialize/deserialize round-trip), and IndexedDB persistence round-trip.
 
 ### `tools/terrain-visualizer.html` — Terrain Debugger
 Shaded relief top-down view + cross-section. Click to inspect: height, biome, surface block, slope, noise values, elevation zone. Uses extracted copies of terrain functions — **must be kept in sync with voxEx.html** biome config and height functions.

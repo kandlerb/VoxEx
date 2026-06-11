@@ -253,6 +253,25 @@ async function runAllTests() {
         it("no double-compress", () => { const c = { _compressed: true }; expect(compressChunkData(c)).toBe(c); });
     });
     describe("getCompressionRatio", () => { it("good for uniform", () => { const o = { blocks: new Uint8Array(81920).fill(0) }; expect(getCompressionRatio(o, compressChunkData(o))).toBeLessThan(0.01); }); });
+    // ---- Persistence codec (IndexedDB / OPFS) ----
+    describe("ChunkCompressor (persistence codec)", () => {
+        const CC = VoxEx.ChunkCompressor;
+        it("exposed via seam", () => { expect(CC).toBeDefined(); expect(typeof CC.compress).toBe('function'); });
+        it("splits runs > 65535 (Uint16 overflow regression)", () => { const d = new Uint8Array(CHUNK_DATA_SIZE); const r = CC._decompressArray(CC._compressArray(d)); expect(r).toHaveLength(CHUNK_DATA_SIZE); for (let i = 0; i < CHUNK_DATA_SIZE; i += 4096) expect(r[i]).toBe(0); });
+        it("ocean-like air span round-trips (run 66304)", () => { const d = new Uint8Array(CHUNK_DATA_SIZE); for (let y = 0; y <= 60; y++) d.fill(y < 55 ? STONE : WATER, y * 256, (y + 1) * 256); const r = CC._decompressArray(CC._compressArray(d)); expect(r).toHaveLength(CHUNK_DATA_SIZE); expect(r[60 * 256]).toBe(WATER); expect(r[61 * 256]).toBe(AIR); expect(r[CHUNK_DATA_SIZE - 1]).toBe(AIR); });
+        it("boundary runs 65535/65536/65537", () => { for (const n of [65535, 65536, 65537]) { const d = new Uint8Array(n).fill(15); d[0] = 1; const r = CC._decompressArray(CC._compressArray(d)); expect(r).toHaveLength(n); expect(r[0]).toBe(1); expect(r[1]).toBe(15); expect(r[n - 1]).toBe(15); } });
+        it("persists _cacheVersion through compress/decompress", () => { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE), skyLight: new Uint8Array(CHUNK_DATA_SIZE).fill(15), blockLight: new Uint8Array(CHUNK_DATA_SIZE), renderState: 3, genState: 127, _cacheVersion: 2 }; const d = CC.decompress(JSON.parse(JSON.stringify(CC.compress(ch)))); expect(d._cacheVersion).toBe(2); expect(d.renderState).toBe(3); expect(d.genState).toBe(127); expect(d.blockLight).toHaveLength(CHUNK_DATA_SIZE); });
+        it("old records without cacheVersion decode as 0", () => { const d = CC.decompress({ version: 2, blocks: [1, STONE], skyLight: [1, 15], blockLight: null, renderState: 0, genState: 0 }); expect(d._cacheVersion).toBe(0); expect(d.blockLight).toHaveLength(d.blocks.length); });
+        it("full-chunk blockLight all-zero round-trip (was corrupted pre-fix)", () => { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(STONE), skyLight: new Uint8Array(CHUNK_DATA_SIZE).fill(15), blockLight: new Uint8Array(CHUNK_DATA_SIZE), _cacheVersion: 2 }; const d = CC.decompress(CC.compress(ch)); expect(d.blocks).toHaveLength(CHUNK_DATA_SIZE); expect(d.skyLight).toHaveLength(CHUNK_DATA_SIZE); expect(d.blockLight).toHaveLength(CHUNK_DATA_SIZE); });
+    });
+    describe("binary OPFS serialization", () => {
+        const ser = VoxEx.serializeChunkForDisk, deser = VoxEx.deserializeChunkFromDisk;
+        function mkChunk() { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE), skyLight: new Uint8Array(CHUNK_DATA_SIZE).fill(15), blockLight: new Uint8Array(CHUNK_DATA_SIZE), renderState: 2, genState: 127, _cacheVersion: 2 }; for (let y = 0; y <= 58; y++) ch.blocks.fill(STONE, y * 256, (y + 1) * 256); ch.blockLight[100] = 14; return ch; }
+        it("round-trips chunk + seed + states", () => { const ch = mkChunk(); const out = deser(ser("seed-xyz", ch)); expect(out).toBeDefined(); expect(out.seed).toBe("seed-xyz"); expect(out.chunk.blocks).toHaveLength(CHUNK_DATA_SIZE); expect(out.chunk.blocks[0]).toBe(STONE); expect(out.chunk.blocks[59 * 256]).toBe(AIR); expect(out.chunk.skyLight[0]).toBe(15); expect(out.chunk.blockLight[100]).toBe(14); expect(out.chunk.renderState).toBe(2); expect(out.chunk.genState).toBe(127); expect(out.chunk._cacheVersion).toBe(2); });
+        it("rejects legacy JSON files (fallback path)", () => { const legacy = new TextEncoder().encode(JSON.stringify({ seed: "s", data: {} })); expect(deser(legacy.buffer)).toBe(null); });
+        it("rejects truncated/garbage buffers", () => { const buf = ser("s", mkChunk()); expect(deser(buf.slice(0, 16))).toBe(null); expect(deser(new ArrayBuffer(3))).toBe(null); });
+        it("returns null for non-modern chunks (caller falls back to JSON)", () => { expect(ser("s", new Uint8Array(CHUNK_DATA_SIZE))).toBe(null); });
+    });
 
     // ---- SeededRandom ----
     describe("SeededRandom", () => {
