@@ -45,7 +45,7 @@ These are the core principles that guide all development decisions:
    - Particle systems: torch flames/smoke, block break, footstep dust
    - Movement options: sprint speed, fly speed, jump force, gravity
    - Three settings profiles: Performance, Balanced, Quality
-   - Customizable controls
+   - Key bindings centralized in the `KEY_BINDINGS` table (rebinding UI not yet built; controls menu is a static display)
    - Multiple save slots with unique seeds
    - All settings persist via LocalStorage
 

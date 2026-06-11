@@ -17413,6 +17413,11 @@
             let blockOptimizationInitialized = false;
             let breakProgress = 0;
             let breakingBlock = null;
+            // Current crosshair target (set by updateHighlight, consumed by hold-to-mine)
+            let _highlightHasHit = false;
+            let _highlightHitX = 0;
+            let _highlightHitY = 0;
+            let _highlightHitZ = 0;
             const BREAK_TIME = 0; // seconds
             const chunkNeighborUpdateQueue = new Set();
             const NEIGHBOR_RECONCILE_INTERVAL_MS = 750; // OPTIMIZATION: Increased from 500ms to reduce CPU usage
@@ -30011,6 +30016,9 @@ self.onmessage = async (e) => {
                     if (!isChatOpen && !uiManager.isInventoryOpen() && !poseDebugMode) {
                         setPauseState(true, "pause");
                     }
+                    // Clear held-input state — keyups during the menu would otherwise
+                    // be the only thing stopping movement that began before pausing
+                    resetTransientInput();
                 });
                 // Open Controls Menu
                 if (btnControls) { btnControls.addEventListener("click", () => { mainPauseMenu.style.display = "none"; settingsMenu.style.display = "none"; controlsMenu.style.display = "block"; }); }
@@ -30020,8 +30028,14 @@ self.onmessage = async (e) => {
                 window.addEventListener("keydown", onKeyDown);
                 window.addEventListener("keyup", onKeyUp);
                 window.addEventListener("mousedown", onMouseClick);
+                window.addEventListener("mouseup", onMouseUp);
                 window.addEventListener("wheel", onMouseWheel, { passive: false });
                 window.addEventListener("resize", onWindowResize);
+                // STUCK-INPUT GUARD: keyup/mouseup events are lost when the window
+                // loses focus or the tab is hidden — clear held-input state so the
+                // player doesn't walk/sprint/mine forever after alt-tab.
+                window.addEventListener("blur", resetTransientInput);
+                document.addEventListener("visibilitychange", () => { if (document.hidden) resetTransientInput(); });
                 raycaster = new THREE.Raycaster();
 
                 // 11. Expose game objects to window for settings sync from main menu
@@ -41302,7 +41316,19 @@ self.onmessage = async (e) => {
             function updateHighlight() {
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per physics step
                 const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
-                if (hit) { outlineMesh.visible = true; outlineMesh.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5); } else outlineMesh.visible = false;
+                if (hit) {
+                    outlineMesh.visible = true;
+                    outlineMesh.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
+                    // Track the current target so hold-to-mine can cancel when the
+                    // crosshair leaves the block (reuses this pick — no extra raycast)
+                    _highlightHasHit = true;
+                    _highlightHitX = hit.x;
+                    _highlightHitY = hit.y;
+                    _highlightHitZ = hit.z;
+                } else {
+                    outlineMesh.visible = false;
+                    _highlightHasHit = false;
+                }
             }
             function ensureChunk(x, z) {
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
@@ -42703,17 +42729,25 @@ self.onmessage = async (e) => {
 
                     // Block breaking logic
                     if (breakingBlock && controls.isLocked) {
-                        breakProgress += clampedDt / BREAK_TIME;
-                        if (breakProgress >= 1.0) {
-                            // Spawn block break particles before destroying
-                            const brokenBlockType = getBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z);
-                            if (particleSystem && brokenBlockType !== AIR) {
-                                particleSystem.spawnBlockBreak(breakingBlock.x, breakingBlock.y, breakingBlock.z, brokenBlockType);
-                            }
-                            setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR);
-                            updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z);
+                        // HOLD-TO-MINE: cancel when the crosshair leaves the target block
+                        // (target tracked by updateHighlight — no extra raycast here).
+                        // Releasing the mouse button also cancels (see onMouseUp).
+                        if (!_highlightHasHit || _highlightHitX !== breakingBlock.x || _highlightHitY !== breakingBlock.y || _highlightHitZ !== breakingBlock.z) {
                             breakingBlock = null;
                             breakProgress = 0;
+                        } else {
+                            breakProgress += clampedDt / BREAK_TIME;
+                            if (breakProgress >= 1.0) {
+                                // Spawn block break particles before destroying
+                                const brokenBlockType = getBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z);
+                                if (particleSystem && brokenBlockType !== AIR) {
+                                    particleSystem.spawnBlockBreak(breakingBlock.x, breakingBlock.y, breakingBlock.z, brokenBlockType);
+                                }
+                                setBlock(breakingBlock.x, breakingBlock.y, breakingBlock.z, AIR);
+                                updateLocalArea(breakingBlock.x, breakingBlock.y, breakingBlock.z);
+                                breakingBlock = null;
+                                breakProgress = 0;
+                            }
                         }
                     }
                     frameCount++;
@@ -42801,6 +42835,60 @@ self.onmessage = async (e) => {
                 if (!active) return false;
                 const tag = active.tagName.toLowerCase();
                 return tag === 'input' || tag === 'textarea' || active.isContentEditable;
+            }
+
+            // =====================================================
+            // KEY BINDINGS — single source of truth for in-game keys
+            // =====================================================
+            // Each action lists the KeyboardEvent.code values that trigger it.
+            // onKeyDown/onKeyUp resolve codes through CODE_TO_ACTION, so adding an
+            // alternate key, changing a default, or building a rebinding UI later
+            // means editing THIS table only (no scattered switch cases).
+            // Global/menu keys (Escape, E, F5, F9, O, P, Backquote) are handled
+            // separately in onKeyDown because they work while unlocked.
+            const KEY_BINDINGS = {
+                forward: ["KeyW", "ArrowUp"],
+                backward: ["KeyS", "ArrowDown"],
+                left: ["KeyA", "ArrowLeft"],
+                right: ["KeyD", "ArrowRight"],
+                jump: ["Space"],            // double-tap toggles flight
+                crouch: ["KeyC"],           // toggle on ground, hold = descend while flying
+                sprint: ["ShiftLeft", "ShiftRight"],
+                torch: ["KeyF"],
+                view: ["KeyV"],
+                zoomOut: ["Minus", "NumpadSubtract"],
+                zoomIn: ["Equal", "NumpadAdd"],
+            };
+            /** @type {Object<string, {type: string, index?: number}>} code -> action lookup (built once) */
+            const CODE_TO_ACTION = {};
+            for (const actionType in KEY_BINDINGS) {
+                for (const code of KEY_BINDINGS[actionType]) {
+                    CODE_TO_ACTION[code] = { type: actionType };
+                }
+            }
+            for (let d = 1; d <= 9; d++) {
+                CODE_TO_ACTION["Digit" + d] = { type: "hotbar", index: d };
+            }
+
+            /**
+             * Clear all transient (held-key / held-mouse) input state. Called on
+             * pointer unlock, window blur, and tab-hide — keyup events are lost in
+             * those cases, which previously left movement/sprint/mining stuck on
+             * (walk-forward-forever after alt-tab).
+             * Deliberate toggles (crouch, flight, torch, third-person) are preserved.
+             * @returns {void}
+             */
+            function resetTransientInput() {
+                moveForward = false;
+                moveBackward = false;
+                moveLeft = false;
+                moveRight = false;
+                isSprinting = false;
+                spacePressed = false;
+                flyUp = false;
+                flyDown = false;
+                breakingBlock = null;
+                breakProgress = 0;
             }
 
             const onKeyDown = function (event) {
@@ -42912,46 +43000,43 @@ self.onmessage = async (e) => {
                 // 2. Game-Only Keys (Blocked if in Menu)
                 if (controls.isLocked === false) return;
                 if (event.repeat) return;
-                switch (event.code) {
-                    case "ArrowUp": moveForward = true; break;
-                    case "ArrowLeft": moveLeft = true; break;
-                    case "ArrowDown": moveBackward = true; break;
-                    case "ArrowRight": moveRight = true; break;
-                    case "KeyW": moveForward = true; break;
-                    case "KeyA": moveLeft = true; break;
-                    case "KeyS": moveBackward = true; break;
-                    case "KeyD": moveRight = true; break;
-                    case "Space":
+                const action = CODE_TO_ACTION[event.code];
+                if (!action) return;
+                switch (action.type) {
+                    case "forward": moveForward = true; break;
+                    case "backward": moveBackward = true; break;
+                    case "left": moveLeft = true; break;
+                    case "right": moveRight = true; break;
+                    case "jump": {
                         if (isKnockedDown || playerControlsDisabled) break;  // Block input during knockdown
                         const now = performance.now();
+                        // Double-tap toggles flight
                         if (now - lastSpaceTime < 300) { isFlying = !isFlying; velocity.y = 0; flyUp = false; lastSpaceTime = 0; return; }
                         lastSpaceTime = now;
-                        if (isFlying) { flyUp = true; } else { if (canJump) { velocity.y = SETTINGS.jumpForce; canJump = false; } spacePressed = true; } break;
-                    case "KeyC": if (isFlying) { flyDown = true; } else { isCrouching = !isCrouching; } break;
-                    case "ShiftLeft": isSprinting = true; if (isCrouching) isCrouching = false; break;
-                    case "ShiftRight": isSprinting = true; if (isCrouching) isCrouching = false; break;
-                    case "Digit1": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[0]; currentHotbarSlot = 1; highlightSlot(1); updateHeldBlock(selectedBlockId); break;
-                    case "Digit2": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[1]; currentHotbarSlot = 2; highlightSlot(2); updateHeldBlock(selectedBlockId); break;
-                    case "Digit3": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[2]; currentHotbarSlot = 3; highlightSlot(3); updateHeldBlock(selectedBlockId); break;
-                    case "Digit4": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[3]; currentHotbarSlot = 4; highlightSlot(4); updateHeldBlock(selectedBlockId); break;
-                    case "Digit5": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[4]; currentHotbarSlot = 5; highlightSlot(5); updateHeldBlock(selectedBlockId); break;
-                    case "Digit6": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[5]; currentHotbarSlot = 6; highlightSlot(6); updateHeldBlock(selectedBlockId); break;
-                    case "Digit7": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[6]; currentHotbarSlot = 7; highlightSlot(7); updateHeldBlock(selectedBlockId); break;
-                    case "Digit8": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[7]; currentHotbarSlot = 8; highlightSlot(8); updateHeldBlock(selectedBlockId); break;
-                    case "Digit9": selectedBlockId = HOTBAR_SLOT_TO_BLOCK[8]; currentHotbarSlot = 9; highlightSlot(9); updateHeldBlock(selectedBlockId); break;
-                    case "Minus":
-                    case "NumpadSubtract":
+                        if (isFlying) { flyUp = true; } else { if (canJump) { velocity.y = SETTINGS.jumpForce; canJump = false; } spacePressed = true; }
+                        break;
+                    }
+                    case "crouch": if (isFlying) { flyDown = true; } else { isCrouching = !isCrouching; } break;
+                    case "sprint": isSprinting = true; if (isCrouching) isCrouching = false; break;
+                    case "hotbar": {
+                        const slot = action.index;
+                        selectedBlockId = HOTBAR_SLOT_TO_BLOCK[slot - 1];
+                        currentHotbarSlot = slot;
+                        highlightSlot(slot);
+                        updateHeldBlock(selectedBlockId);
+                        break;
+                    }
+                    case "zoomOut":
                         if (isThirdPerson) {
                             thirdPersonDistance = Math.min(THIRD_PERSON_DISTANCE_MAX, thirdPersonDistance + 0.5);
                         }
                         break;
-                    case "Equal":
-                    case "NumpadAdd":
+                    case "zoomIn":
                         if (isThirdPerson) {
                             thirdPersonDistance = Math.max(THIRD_PERSON_DISTANCE_MIN, thirdPersonDistance - 0.5);
                         }
                         break;
-                    case "KeyF":
+                    case "torch":
                         torchActive = !torchActive;
                         // Viewmodel torch only visible in first-person
                         if (window.torchModel) {
@@ -42965,23 +43050,32 @@ self.onmessage = async (e) => {
                             torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 2 : 0;
                         }
                         break;
-                    case "KeyV": toggleThirdPerson(); break;
+                    case "view": toggleThirdPerson(); break;
                 }
             };
             function onKeyUp(e) {
-                switch (e.code) {
-                    case "ArrowUp":     moveForward = false; break;
-                    case "ArrowLeft":   moveLeft = false; break;
-                    case "ArrowDown":   moveBackward = false; break;
-                    case "ArrowRight":  moveRight = false; break;
-                    case "KeyW":        moveForward = false; break;
-                    case "KeyS":        moveBackward = false; break;
-                    case "KeyA":        moveLeft = false; break;
-                    case "KeyD":        moveRight = false; break;
-                    case "Space":       spacePressed = false; if (isFlying) flyUp = false; break;
-                    case "ShiftLeft":   isSprinting = false; break;
-                    case "ShiftRight":  isSprinting = false; break;
-                    case "KeyC":        if (isFlying) flyDown = false; break;  // Crouch is now toggle, not hold
+                const action = CODE_TO_ACTION[e.code];
+                if (!action) return;
+                switch (action.type) {
+                    case "forward": moveForward = false; break;
+                    case "backward": moveBackward = false; break;
+                    case "left": moveLeft = false; break;
+                    case "right": moveRight = false; break;
+                    case "jump": spacePressed = false; if (isFlying) flyUp = false; break;
+                    case "sprint": isSprinting = false; break;
+                    case "crouch": if (isFlying) flyDown = false; break;  // Crouch is a toggle, not hold
+                }
+            }
+            /**
+             * Mouse release: cancel hold-to-mine. Without this, a single click kept
+             * "mining" the block to completion even after the button was released.
+             * @param {MouseEvent} e - Mouse event
+             * @returns {void}
+             */
+            function onMouseUp(e) {
+                if (e.button === 0 && breakingBlock) {
+                    breakingBlock = null;
+                    breakProgress = 0;
                 }
             }
             function onMouseClick(e) {
