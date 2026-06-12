@@ -8618,6 +8618,12 @@
             let lastSpaceTime = 0;
             let spacePressed = false; // Track if space is physically held
             let isUnderwater = false; // Track if player's eyes are underwater
+            // Shared fog-shape uniform: 0 = cylindrical fog (XZ distance only, the surface
+            // default), 1 = spherical (true 3D distance). Driven toward 1 while underwater so
+            // murk grows in EVERY view direction — cylindrical fog has zero distance looking
+            // straight down/up, which left the sea floor perfectly clear while submerged.
+            // One object shared by all fogged materials, so a single write updates them all.
+            const _fogVerticalBlendUniform = { value: 0 };
             let underwaterDepth = 0; // How deep underwater (for shader effects)
             let isUnderground = false; // Track if player is underground (low sky light)
             let lastStableSkyLight = 15; // Skylight stabilizer to prevent flicker during pending lighting
@@ -25650,6 +25656,8 @@ self.onmessage = async (e) => {
                         bottomColor: { value: new THREE.Color(SETTINGS.daySkyBottom) },
                         offset: { value: -250.0 },  // Raise gradient so bottom color extends higher up sky dome
                         exponent: { value: 0.6 }, // Higher = more gradual, extended gradient transition
+                        underwaterFade: { value: 0.0 },  // 0 on land; ->1 submerged (drives the horizon murk band)
+                        underwaterColor: { value: new THREE.Color(0x123a40) }, // synced to scene.fog.color while underwater
                     },
                     vertexShader: `
 						varying vec3 vWorldPosition;
@@ -25664,12 +25672,23 @@ self.onmessage = async (e) => {
 						uniform vec3 bottomColor;
 						uniform float offset;
 						uniform float exponent;
+						uniform float underwaterFade;
+						uniform vec3 underwaterColor;
 						varying vec3 vWorldPosition;
 						void main() {
 							vec3 pos = vWorldPosition + vec3(0.0, offset, 0.0);
 							float h = normalize(pos).y;
 							float t = max(pow(max(h, 0.0), exponent), 0.0);
-							gl_FragColor = vec4(mix(bottomColor, topColor, t), 1.0);
+							vec3 sky = mix(bottomColor, topColor, t);
+							// Underwater horizon band: while submerged, the sky visible at and
+							// below the horizon (the void past the rendered chunks) fades into
+							// the underwater murk color so the water appears to go on forever.
+							// Uses the TRUE view direction (camera-relative), not the offset
+							// gradient coordinate.
+							float viewY = normalize(vWorldPosition - cameraPosition).y;
+							float band = smoothstep(0.12, -0.04, viewY); // 1 below horizon, 0 above
+							sky = mix(sky, underwaterColor, underwaterFade * band);
+							gl_FragColor = vec4(sky, 1.0);
 						}
 					`,
                     side: THREE.BackSide,
@@ -29281,6 +29300,7 @@ self.onmessage = async (e) => {
                         fogColor: { value: new THREE.Color(0xb3d9ff) },
                         fogNear: { value: 1.0 },
                         fogFar: { value: 400.0 },
+                        fogVerticalBlend: _fogVerticalBlendUniform, // shared: 0=cylindrical, 1=spherical (underwater)
                         // Beer-Lambert absorption for depth fog (matches underwater shader)
                         absorptionR: { value: SETTINGS.waterAbsorptionR },
                         absorptionG: { value: SETTINGS.waterAbsorptionG },
@@ -29323,6 +29343,7 @@ self.onmessage = async (e) => {
                         uniform vec3 fogColor;
                         uniform float fogNear;
                         uniform float fogFar;
+                        uniform float fogVerticalBlend;
                         // Beer-Lambert absorption coefficients
                         uniform float absorptionR;
                         uniform float absorptionG;
@@ -29412,9 +29433,9 @@ self.onmessage = async (e) => {
                             vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
 
                             // Use actual water thickness (from vertex attribute) for absorption
-                            // vWaterThickness is normalized 0-1 where 1 = 8+ blocks deep
+                            // vWaterThickness is normalized 0-1 where 1 = 16+ blocks deep
                             // Convert back to blocks and apply absorption scaling
-                            float thicknessBlocks = vWaterThickness * 8.0;
+                            float thicknessBlocks = vWaterThickness * 16.0;
                             float effectiveDepth = thicknessBlocks * waterDepthScale;
 
                             // Apply Beer-Lambert absorption (same as underwater shader)
@@ -29423,12 +29444,13 @@ self.onmessage = async (e) => {
                             refractedColor *= transmittance;
 
                             // MURK: depth-based scattering. Absorption only darkens — murk HAZES:
-                            // the refracted scene dissolves into a soft water tone as depth grows,
-                            // so shallow water stays readable while deep water hides its bottom.
-                            // ~1 block: ~18% murk; 8+ blocks: ~67% (exp falloff, density 0.28).
-                            float murk = 1.0 - exp(-thicknessBlocks * 0.28);
+                            // the refracted scene dissolves into a soft water tone as depth grows.
+                            // Progressive curve (gentle in shallows, steep at depth): ~22% at 2
+                            // blocks, ~53% at 4, ~87% at 8, ~95% (max) by 12+ — a deep ocean
+                            // floor is effectively invisible instead of "clearly readable".
+                            float murk = 1.0 - exp(-pow(thicknessBlocks * 0.22, 1.6));
                             vec3 murkColor = waterColor * 0.55 + vec3(0.04, 0.09, 0.10);
-                            refractedColor = mix(refractedColor, murkColor, murk * 0.75);
+                            refractedColor = mix(refractedColor, murkColor, murk * 0.95);
 
                             // Sample water texture for surface detail
                             vec4 waterTex = texture2D(tWater, vUv);
@@ -29484,9 +29506,11 @@ self.onmessage = async (e) => {
                             vec3 foamColor = vec3(0.93, 0.97, 1.0);
                             finalColor = mix(finalColor, foamColor, foam * 0.85);
 
-                            // Apply cylindrical fog (horizontal distance only)
+                            // Apply cylindrical fog (horizontal distance only); blends to true
+                            // 3D distance while underwater (fogVerticalBlend -> 1)
                             vec2 fogDiffXZ = vWorldPosition.xz - cameraPosition.xz;
                             float fogDepth = length(fogDiffXZ);
+                            fogDepth = mix(fogDepth, distance(vWorldPosition, cameraPosition), fogVerticalBlend);
                             float fogFactor = min(smoothstep(fogNear, fogFar, fogDepth) * 1.15, 1.0);
                             finalColor = mix(finalColor, fogColor, fogFactor);
 
@@ -29753,6 +29777,8 @@ self.onmessage = async (e) => {
                             #endif`
                         );
 
+                        // Shared fog-shape uniform (0 = cylindrical, 1 = spherical/underwater)
+                        shader.uniforms.fogVerticalBlend = _fogVerticalBlendUniform;
                         // Replace the fog_fragment include with cylindrical fog calculation
                         shader.fragmentShader = shader.fragmentShader.replace(
                             '#include <fog_fragment>',
@@ -29760,6 +29786,9 @@ self.onmessage = async (e) => {
                                 // Cylindrical fog: only use horizontal (XZ) distance
                                 vec2 horizontalDiff = vWorldPositionCyl.xz - cameraPosition.xz;
                                 float fogDepthCyl = length(horizontalDiff);
+                                // Underwater: blend to TRUE 3D distance so murk grows in every
+                                // direction (looking straight down/up included)
+                                fogDepthCyl = mix(fogDepthCyl, distance(vWorldPositionCyl, cameraPosition), fogVerticalBlend);
                                 #ifdef FOG_EXP2
                                     float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
                                 #else
@@ -29769,6 +29798,11 @@ self.onmessage = async (e) => {
                                 #endif
                                 gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor);
                             #endif`
+                        );
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            'void main() {',
+                            `uniform float fogVerticalBlend;
+                            void main() {`
                         );
                     };
                     // Force shader recompilation
@@ -29791,10 +29825,13 @@ self.onmessage = async (e) => {
                             void main() {`
                         );
 
+                        // Shared fog-shape uniform (0 = cylindrical, 1 = spherical/underwater)
+                        shader.uniforms.fogVerticalBlend = _fogVerticalBlendUniform;
                         // Override fog calculation in fragment shader to use cylindrical distance
                         shader.fragmentShader = shader.fragmentShader.replace(
                             'void main() {',
                             `varying vec3 vWorldPositionCyl;
+                            uniform float fogVerticalBlend;
                             void main() {`
                         );
                         // Replace the fog_fragment include with cylindrical fog calculation
@@ -29804,6 +29841,9 @@ self.onmessage = async (e) => {
                                 // Cylindrical fog: only use horizontal (XZ) distance
                                 vec2 horizontalDiff = vWorldPositionCyl.xz - cameraPosition.xz;
                                 float fogDepthCyl = length(horizontalDiff);
+                                // Underwater: blend to TRUE 3D distance so murk grows in every
+                                // direction (looking straight down/up included)
+                                fogDepthCyl = mix(fogDepthCyl, distance(vWorldPositionCyl, cameraPosition), fogVerticalBlend);
                                 #ifdef FOG_EXP2
                                     float fogFactor = 1.0 - exp(-fogDensity * fogDensity * fogDepthCyl * fogDepthCyl);
                                 #else
@@ -37475,7 +37515,9 @@ self.onmessage = async (e) => {
                 shoreBuffer[shoreIdx + 5] = shoreNorm;
                 // Write water thickness (depth in blocks) for Beer-Lambert absorption
                 // Normalize: 0 = surface, 1 = 8+ blocks deep (max absorption)
-                const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+                // Thickness normalized over 16 blocks (was 8) so deep ocean keeps gradating —
+                // at /8 every column deeper than 8 read identical and the bottom stayed visible.
+                const thicknessNorm = Math.min(waterDepth / 16.0, 1.0);
                 thicknessBuffer[thicknessIdx] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
@@ -37570,7 +37612,9 @@ self.onmessage = async (e) => {
                 shoreBuffer[shoreIdx + 1] = shoreNorm;
                 shoreBuffer[shoreIdx + 2] = shoreNorm;
                 shoreBuffer[shoreIdx + 3] = shoreNorm;
-                const thicknessNorm = Math.min(waterDepth / 8.0, 1.0);
+                // Thickness normalized over 16 blocks (was 8) so deep ocean keeps gradating —
+                // at /8 every column deeper than 8 read identical and the bottom stayed visible.
+                const thicknessNorm = Math.min(waterDepth / 16.0, 1.0);
                 thicknessBuffer[thicknessIdx] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
@@ -41012,6 +41056,15 @@ self.onmessage = async (e) => {
                         volumetricLightPass.uniforms.fogDensity.value = SETTINGS.volumetricFogDensity * (1 + 2.5 * rayFade);
                         volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure * (1 + 0.6 * rayFade);
                     }
+                    // Fog becomes spherical underwater (murk in EVERY direction, including
+                    // straight down/up — cylindrical fog has zero distance vertically).
+                    _fogVerticalBlendUniform.value += (1 - _fogVerticalBlendUniform.value) * 0.15;
+                    // Skybox horizon band: the sky below the waterline fades into the murk
+                    // color so the void past the rendered chunks reads as endless water.
+                    if (skyMaterial && skyMaterial.uniforms.underwaterFade) {
+                        skyMaterial.uniforms.underwaterFade.value += (1 - skyMaterial.uniforms.underwaterFade.value) * 0.15;
+                        if (scene && scene.fog) skyMaterial.uniforms.underwaterColor.value.copy(scene.fog.color);
+                    }
                 } else if (wasUnderwater) {
                     // Reset state when exiting water
                     underwaterDepth = 0;
@@ -41038,6 +41091,10 @@ self.onmessage = async (e) => {
                         volumetricLightPass.uniforms.density.value = SETTINGS.volumetricDensity;
                         volumetricLightPass.uniforms.fogDensity.value = SETTINGS.volumetricFogDensity;
                         volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure;
+                    }
+                    _fogVerticalBlendUniform.value = 0; // back to cylindrical surface fog
+                    if (skyMaterial && skyMaterial.uniforms.underwaterFade) {
+                        skyMaterial.uniforms.underwaterFade.value = 0;
                     }
                 }
             }
