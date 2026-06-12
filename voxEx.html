@@ -29354,10 +29354,14 @@ self.onmessage = async (e) => {
                         // Animated lapping foam band along one block edge.
                         // d = distance from this fragment to the land edge (0 at the edge),
                         // along = world coordinate parallel to the edge (varies the wave),
-                        // t2 = time in seconds. The band's width pulses ("crashes") over time
-                        // and is broken up along the edge by noise so it laps unevenly.
+                        // t2 = time in seconds. Three motion layers:
+                        //   drift — slow large-scale swell that pushes the whole band in/out;
+                        //           phase comes from WORLD coords so connected blocks stay lined up
+                        //   pulse — faster lapping ripple along the edge
+                        //   noise — breaks the band up so it laps unevenly
                         float foamEdge(float d, float along, float t2) {
-                            float w = 0.14 + 0.06 * sin(t2 * 2.2 + along * 2.4);
+                            float drift = 0.55 + 0.45 * sin(t2 * 0.6 + along * 0.30);
+                            float w = (0.14 + 0.06 * sin(t2 * 2.2 + along * 2.4)) * drift;
                             w *= 0.65 + 0.7 * noise(vec2(along * 1.6, t2 * 0.55));
                             return 1.0 - smoothstep(w * 0.25, w, d);
                         }
@@ -29418,6 +29422,14 @@ self.onmessage = async (e) => {
                             vec3 transmittance = exp(-absorption * effectiveDepth);
                             refractedColor *= transmittance;
 
+                            // MURK: depth-based scattering. Absorption only darkens — murk HAZES:
+                            // the refracted scene dissolves into a soft water tone as depth grows,
+                            // so shallow water stays readable while deep water hides its bottom.
+                            // ~1 block: ~18% murk; 8+ blocks: ~67% (exp falloff, density 0.28).
+                            float murk = 1.0 - exp(-thicknessBlocks * 0.28);
+                            vec3 murkColor = waterColor * 0.55 + vec3(0.04, 0.09, 0.10);
+                            refractedColor = mix(refractedColor, murkColor, murk * 0.75);
+
                             // Sample water texture for surface detail
                             vec4 waterTex = texture2D(tWater, vUv);
 
@@ -29433,15 +29445,41 @@ self.onmessage = async (e) => {
                             finalColor *= vColor; // Apply vertex colors (depth fog, AO)
 
                             // SHORE FOAM: animated lapping band on top-face edges adjacent to land.
-                            // vFoamEdges bits: 1 = +X (east), 2 = -X (west), 4 = +Z (south), 8 = -Z (north).
+                            // Cardinal bits: 1 = +X, 2 = -X, 4 = +Z, 8 = -Z. Diagonal bits (pure
+                            // corner contact): 16 = +X+Z, 32 = +X-Z, 64 = -X+Z, 128 = -X-Z.
                             float foam = 0.0;
                             if (vFoamEdges > 0.5) {
                                 vec2 bp = fract(vWorldPosition.xz); // position within this block, 0-1
                                 float m = floor(vFoamEdges + 0.5);
-                                if (mod(m, 2.0) >= 1.0)             foam = max(foam, foamEdge(1.0 - bp.x, vWorldPosition.z,        t)); // +X edge
-                                if (mod(floor(m / 2.0), 2.0) >= 1.0) foam = max(foam, foamEdge(bp.x,       vWorldPosition.z + 7.3,  t)); // -X edge
-                                if (mod(floor(m / 4.0), 2.0) >= 1.0) foam = max(foam, foamEdge(1.0 - bp.y, vWorldPosition.x + 3.1,  t)); // +Z edge
-                                if (mod(floor(m / 8.0), 2.0) >= 1.0) foam = max(foam, foamEdge(bp.y,       vWorldPosition.x + 11.7, t)); // -Z edge
+                                float bE = mod(m, 2.0); m = floor(m / 2.0);
+                                float bW = mod(m, 2.0); m = floor(m / 2.0);
+                                float bS = mod(m, 2.0); m = floor(m / 2.0);
+                                float bN = mod(m, 2.0); m = floor(m / 2.0);
+                                float cES = mod(m, 2.0); m = floor(m / 2.0);
+                                float cEN = mod(m, 2.0); m = floor(m / 2.0);
+                                float cWS = mod(m, 2.0); m = floor(m / 2.0);
+                                float cWN = mod(m, 2.0);
+                                // Straight edge bands ('along' is a continuous world coordinate, so
+                                // bands stay aligned across connected blocks on the same shoreline)
+                                if (bE > 0.5) foam = max(foam, foamEdge(1.0 - bp.x, vWorldPosition.z,        t));
+                                if (bW > 0.5) foam = max(foam, foamEdge(bp.x,       vWorldPosition.z + 7.3,  t));
+                                if (bS > 0.5) foam = max(foam, foamEdge(1.0 - bp.y, vWorldPosition.x + 3.1,  t));
+                                if (bN > 0.5) foam = max(foam, foamEdge(bp.y,       vWorldPosition.x + 11.7, t));
+                                // Inner-corner fillets: two adjacent edges both touch land — the
+                                // 0.7 distance scale makes the band reach further diagonally,
+                                // rounding the hard L-junction into a gentle curve.
+                                float dAl = vWorldPosition.x + vWorldPosition.z;
+                                if (bE > 0.5 && bS > 0.5) foam = max(foam, foamEdge(length(vec2(1.0 - bp.x, 1.0 - bp.y)) * 0.7, dAl,        t));
+                                if (bE > 0.5 && bN > 0.5) foam = max(foam, foamEdge(length(vec2(1.0 - bp.x, bp.y))       * 0.7, dAl + 5.1,  t));
+                                if (bW > 0.5 && bS > 0.5) foam = max(foam, foamEdge(length(vec2(bp.x, 1.0 - bp.y))       * 0.7, dAl + 9.7,  t));
+                                if (bW > 0.5 && bN > 0.5) foam = max(foam, foamEdge(length(bp)                           * 0.7, dAl + 13.9, t));
+                                // Outer corners: land touches only diagonally — a small radial arc
+                                // bridges the foam of the two neighboring shoreline blocks so the
+                                // line doesn't break where the coast turns a corner.
+                                if (cES > 0.5) foam = max(foam, 0.85 * foamEdge(length(vec2(1.0 - bp.x, 1.0 - bp.y)), dAl,        t));
+                                if (cEN > 0.5) foam = max(foam, 0.85 * foamEdge(length(vec2(1.0 - bp.x, bp.y)),       dAl + 5.1,  t));
+                                if (cWS > 0.5) foam = max(foam, 0.85 * foamEdge(length(vec2(bp.x, 1.0 - bp.y)),       dAl + 9.7,  t));
+                                if (cWN > 0.5) foam = max(foam, 0.85 * foamEdge(length(bp),                           dAl + 13.9, t));
                             }
                             vec3 foamColor = vec3(0.93, 0.97, 1.0);
                             finalColor = mix(finalColor, foamColor, foam * 0.85);
@@ -37537,25 +37575,42 @@ self.onmessage = async (e) => {
                 thicknessBuffer[thicknessIdx + 1] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 2] = thicknessNorm;
                 thicknessBuffer[thicknessIdx + 3] = thicknessNorm;
-                // FOAM EDGES (shore lapping): for TOP faces only, a 4-bit mask of which
-                // horizontal neighbors at water level are LAND (solid, non-water, non-leaf).
-                // The shader draws an animated foam band along each flagged edge.
-                // Bits: 1 = +X (east), 2 = -X (west), 4 = +Z (south), 8 = -Z (north).
+                // FOAM EDGES (shore lapping): for TOP faces only, an 8-bit mask of which
+                // horizontal neighbors at water level are LAND. The shader draws an animated
+                // foam band along each flagged edge and arcs at flagged corners.
+                // Cardinal bits: 1 = +X, 2 = -X, 4 = +Z, 8 = -Z.
+                // Diagonal bits (set only when BOTH adjacent cardinals are open — pure
+                // corner contact): 16 = +X+Z, 32 = +X-Z, 64 = -X+Z, 128 = -X-Z.
                 let foamMask = 0;
                 if (faceIdx === 0) {
-                    let nbr = getter(solidX + 1, solidY, solidZ);
-                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 1;
-                    nbr = getter(solidX - 1, solidY, solidZ);
-                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 2;
-                    nbr = getter(solidX, solidY, solidZ + 1);
-                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 4;
-                    nbr = getter(solidX, solidY, solidZ - 1);
-                    if (nbr !== WATER && nbr !== AIR && nbr !== TORCH && !isLeafBlock(nbr)) foamMask += 8;
+                    const eL = isFoamLand(getter(solidX + 1, solidY, solidZ));
+                    const wL = isFoamLand(getter(solidX - 1, solidY, solidZ));
+                    const sL = isFoamLand(getter(solidX, solidY, solidZ + 1));
+                    const nL = isFoamLand(getter(solidX, solidY, solidZ - 1));
+                    if (eL) foamMask += 1;
+                    if (wL) foamMask += 2;
+                    if (sL) foamMask += 4;
+                    if (nL) foamMask += 8;
+                    if (!eL && !sL && isFoamLand(getter(solidX + 1, solidY, solidZ + 1))) foamMask += 16;
+                    if (!eL && !nL && isFoamLand(getter(solidX + 1, solidY, solidZ - 1))) foamMask += 32;
+                    if (!wL && !sL && isFoamLand(getter(solidX - 1, solidY, solidZ + 1))) foamMask += 64;
+                    if (!wL && !nL && isFoamLand(getter(solidX - 1, solidY, solidZ - 1))) foamMask += 128;
                 }
                 foamBuffer[shoreIdx] = foamMask;
                 foamBuffer[shoreIdx + 1] = foamMask;
                 foamBuffer[shoreIdx + 2] = foamMask;
                 foamBuffer[shoreIdx + 3] = foamMask;
+            }
+            /**
+             * Foam land test: true if a block id reads as solid LAND for shoreline foam.
+             * Excludes UNLOADED_BLOCK (255) — unloaded neighbor chunks previously read as
+             * land and painted foam lines along chunk borders (fixed 2026-06-11; the
+             * neighbor-update remesh fills in correct foam once the neighbor loads).
+             * @param {BlockId} id - Block id to test.
+             * @returns {boolean} True if foam should lap against this block.
+             */
+            function isFoamLand(id) {
+                return id !== WATER && id !== AIR && id !== TORCH && id !== UNLOADED_BLOCK && !isLeafBlock(id);
             }
 
             /**
