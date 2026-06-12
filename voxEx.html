@@ -15716,23 +15716,25 @@
                                 continue;
                             }
 
-                            // NEIGHBOR TREE VALIDATION
-                            // Verify the trunk was actually placed by checking if source chunk contains trunk blocks
+                            // NEIGHBOR TREE VALIDATION — ROBUST RANGE SCAN (2026-06-11).
+                            // The old single-Y check (log at the ESTIMATED trunk top) failed on
+                            // any difference between the deterministic ground estimate and the
+                            // chunk's actual terrain height, so cross-chunk leaves were silently
+                            // never placed. Scan the trunk column (estimate ± slack) for ANY log.
                             const neighborBlocks = neighborChunk.blocks || neighborChunk;
                             const neighborStartX = ncx * chunkSize;
                             const neighborStartZ = ncz * chunkSize;
 
                             const trunkBaseY = groundY + 1;
                             const trunkTopY = trunkBaseY + trunkHeight;
-
-                            // Check if trunk exists at expected position in neighbor chunk
-                            const trunkLocalX = gx - neighborStartX;
-                            const trunkLocalZ = gz - neighborStartZ;
-                            const checkY = Math.min(trunkTopY, chunkHeight - 1);
-                            const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
-
-                            // Verify trunk block exists - if not, the tree failed validation
-                            if (!isLogBlock(neighborBlocks[trunkIdx])) continue;
+                            const colBase = (gx - neighborStartX) + (gz - neighborStartZ) * chunkSize;
+                            const scanLo = Math.max(0, groundY - 6);
+                            const scanHi = Math.min(chunkHeight - 1, trunkTopY + 6);
+                            let trunkFound = false;
+                            for (let ty = scanLo; ty <= scanHi; ty++) {
+                                if (isLogBlock(neighborBlocks[colBase + ty * chunkSize * chunkSize])) { trunkFound = true; break; }
+                            }
+                            if (!trunkFound) continue; // tree failed validation in its own chunk
 
                             // Place canopy leaves that fall within THIS chunk
                             const minCanopyY = groundY + 2;
@@ -15799,12 +15801,21 @@
                             // Canopy must overlap this chunk
                             if (gx + canopyRadius < startX || gx - canopyRadius >= startX + chunkSize ||
                                 gz + canopyRadius < startZ || gz - canopyRadius >= startZ + chunkSize) continue;
-                            // Validate the trunk in the (now loaded) source chunk — same check
-                            // placeNeighborTreeLeaves uses. Valid tree => keep its leaves.
+                            // Validate the trunk in the (now loaded) source chunk. ROBUST RANGE
+                            // SCAN: trees plant on the chunk's ACTUAL terrain height while
+                            // groundY here is the deterministic ESTIMATE — a single-Y check at
+                            // the estimated trunk top fails on any height delta and would
+                            // misclassify every such tree as phantom. Scan the trunk column
+                            // (estimate ± slack) for ANY log instead.
                             const trunkTopY = groundY + 1 + trunkHeight;
-                            const checkY = Math.min(trunkTopY, chunkHeight - 1);
-                            const trunkIdx = (gx - neighborStartX) + (gz - neighborStartZ) * chunkSize + checkY * chunkSize * chunkSize;
-                            if (isLogBlock(neighborBlocks[trunkIdx])) continue;
+                            const colBase = (gx - neighborStartX) + (gz - neighborStartZ) * chunkSize;
+                            const yLo = Math.max(0, groundY - 6);
+                            const yHi = Math.min(chunkHeight - 1, trunkTopY + 6);
+                            let trunkFound = false;
+                            for (let ty = yLo; ty <= yHi; ty++) {
+                                if (isLogBlock(neighborBlocks[colBase + ty * chunkSize * chunkSize])) { trunkFound = true; break; }
+                            }
+                            if (trunkFound) continue; // valid tree — keep its leaves
                             // PHANTOM: remove this tree's canopy voxels (leaf blocks only)
                             const leafId = tree.profile.blocks.leaves;
                             forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
@@ -17441,14 +17452,19 @@
                 const sourceKey = getChunkKey(tree.sourceCx, tree.sourceCz);
                 const sourceChunk = chunks.get(sourceKey);
                 if (sourceChunk) {
+                    // ROBUST RANGE SCAN (parity with main-thread placeNeighborTreeLeaves):
+                    // single-Y check failed whenever estimated ground != actual ground.
                     const sourceBlocks = sourceChunk.blocks || sourceChunk;
                     const sourceStartX = tree.sourceCx * chunkSize;
                     const sourceStartZ = tree.sourceCz * chunkSize;
-                    const trunkLocalX = gx - sourceStartX;
-                    const trunkLocalZ = gz - sourceStartZ;
-                    const checkY = Math.min(trunkTopY, chunkHeight - 1);
-                    const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
-                    if (!isLogBlock(sourceBlocks[trunkIdx])) continue;
+                    const colBase = (gx - sourceStartX) + (gz - sourceStartZ) * chunkSize;
+                    const scanLo = Math.max(0, groundY - 6);
+                    const scanHi = Math.min(chunkHeight - 1, trunkTopY + 6);
+                    let trunkFound = false;
+                    for (let ty = scanLo; ty <= scanHi; ty++) {
+                        if (isLogBlock(sourceBlocks[colBase + ty * chunkSize * chunkSize])) { trunkFound = true; break; }
+                    }
+                    if (!trunkFound) continue;
                 }
             }
             const actualGroundY = isOwnChunk ? finalGroundY : groundY;
@@ -25421,7 +25437,7 @@ self.onmessage = async (e) => {
                     if (pending === 0) { resolve(); return; }
                     for (const [chunkKey, chunkData] of chunkDataMap) {
                         // Ensure chunk has current cache version for future compatibility checks
-                        chunkData._cacheVersion = 3;  // Current version with valid lighting (v3: water sunlight attenuation)
+                        chunkData._cacheVersion = 4;  // Current version with valid lighting (v4: tree re-reconcile)
                         const record = {
                             key: chunkKey,
                             data: ChunkCompressor.compress(chunkData),
@@ -25520,7 +25536,7 @@ self.onmessage = async (e) => {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
-                const CURRENT_CACHE_VERSION = 3; // v3: water attenuates sunlight (2026-06-11)
+                const CURRENT_CACHE_VERSION = 4; // v4: re-reconcile trees after canopy-prune bug (v3: water sunlight attenuation)
 
                 // === PHASE 1A: Batch load all cached chunks in one IDB transaction ===
                 // This is ~200% faster than individual loadChunkFromCache() calls
@@ -25588,6 +25604,12 @@ self.onmessage = async (e) => {
                         const forceLightingRecalc = cacheVersion < CURRENT_CACHE_VERSION;
                         const lightingValid = !forceLightingRecalc && isLightingDataValid(cachedData, expectedSize);
                         if (!lightingValid) {
+                            // Version bump: also re-run tree/neighbor reconciliation. v4 heals
+                            // chunks whose canopies were wrongly pruned by the v3-era single-Y
+                            // trunk validation (placeNeighborTreeLeaves re-adds valid leaves).
+                            if (forceLightingRecalc && cachedData.genState) {
+                                cachedData.genState &= ~(GEN_PASS.TREE_NEIGHBOR_UPDATE | GEN_PASS.NEIGHBOR_UPDATE);
+                            }
                             calculateChunkSunlight(cachedData, chunkSize, chunkHeight);
                             calculateBlockLight(cachedData, chunkSize, chunkHeight);
                             cachedData._cacheVersion = CURRENT_CACHE_VERSION;
@@ -36818,13 +36840,18 @@ self.onmessage = async (e) => {
 
                         // Cache version check - older caches might have corrupt lighting
                         // Force recalculation for caches without a version marker or with old version
-                        const CURRENT_CACHE_VERSION = 3; // v3: water attenuates sunlight (2026-06-11)  // Increment when cache format changes
+                        const CURRENT_CACHE_VERSION = 4; // v4: re-reconcile trees after canopy-prune bug (v3: water sunlight attenuation)  // Increment when cache format changes
                         const cacheVersion = cachedData._cacheVersion || 0;
                         let forceLightingRecalc = false;
                         if (cacheVersion < CURRENT_CACHE_VERSION) {
                             // Old cache format - force lighting recalculation
                             logDebug(`[Cache] Chunk ${key} has old cache version ${cacheVersion}, recalculating lighting`);
                             forceLightingRecalc = true;
+                            // v4: also re-run tree/neighbor reconciliation (heals canopies wrongly
+                            // pruned by the v3-era single-Y trunk validation)
+                            if (cachedData.genState) {
+                                cachedData.genState &= ~(GEN_PASS.TREE_NEIGHBOR_UPDATE | GEN_PASS.NEIGHBOR_UPDATE);
+                            }
                         }
 
                         // Only recalculate lighting if cached data is missing, invalid, or old version
