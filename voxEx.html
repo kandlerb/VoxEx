@@ -3750,7 +3750,7 @@
                     // transparent: see-through rendering + no AO/light blocking
                     // cutout: tile is allowed alpha < 255 in the atlas validation
                     // collidable: still SOLID for player/entity collision
-                    tags: ["transparent", "cutout", "collidable"],
+                    tags: ["transparent", "cutout", "collidable", "cullAdjacent"],
                     textures: { all: TILE.GLASS },
                     ui: { showInInventory: true, tileIndex: TILE.GLASS, defaultHotbar: true, hotbarOrder: 7 },
                     lighting: { sunlightAttenuation: 0, blocklightAttenuation: 0 }, // light passes fully
@@ -15253,6 +15253,9 @@
             const IS_TRANSPARENT = new Uint8Array(256);
             const SUNLIGHT_ATTENUATION = new Uint8Array(256);
             const BLOCKLIGHT_ATTENUATION = new Uint8Array(256);
+            // Blocks that DON'T render faces against a same-id neighbor (tag "cullAdjacent").
+            // Glass panes merge visually into one volume instead of showing inner borders.
+            const CULLS_SAME_ID = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
@@ -15597,6 +15600,19 @@
             // Process adjacent chunk updates - called from the main game loop
             // This handles cross-chunk features like trees that extend into neighboring chunks
             function processAdjacentChunkUpdates(budget = 2) {
+                // Drain the awaiting set into the work queue. Previously chunksAwaitingNeighborUpdate
+                // was filled on every generation but NEVER consumed — a chunk that generated AFTER
+                // its neighbors (the common case at the streaming frontier, and pregen interiors)
+                // never got its own tree/lighting reconciliation pass. The cardinal-neighbor check
+                // below re-queues entries whose neighbors aren't loaded yet.
+                if (chunksAwaitingNeighborUpdate.size > 0) {
+                    for (const key of chunksAwaitingNeighborUpdate) {
+                        const c = chunks.get(key);
+                        if (!c) { chunksAwaitingNeighborUpdate.delete(key); continue; }
+                        if (!(c.genState & GEN_PASS.TREE_NEIGHBOR_UPDATE)) adjacentChunkUpdateQueue.add(key);
+                        chunksAwaitingNeighborUpdate.delete(key);
+                    }
+                }
                 if (adjacentChunkUpdateQueue.size === 0) return 0;
 
                 let processed = 0;
@@ -15744,14 +15760,77 @@
                 }
             }
 
+            /**
+             * Removes PHANTOM canopy leaves: leaves placed for a neighbor-chunk tree that the
+             * neighbor ultimately REJECTED (bad ground / no trunk space). Worker-generated
+             * chunks place neighbor canopies optimistically — the worker has no neighbor data
+             * to validate against ("trust the deterministic generator") — and the main thread
+             * does the same when a neighbor isn't loaded yet. Nothing ever removed those
+             * leaves, so failed trees left floating leaf blobs at chunk borders (the "trees
+             * aren't working with worker" symptom). Run BEFORE placeNeighborTreeLeaves, which
+             * re-adds any leaves belonging to VALID trees (so overlap removal self-heals).
+             * NOTE: a phantom canopy overlapping an own-chunk tree's canopy can prune shared
+             * voxels — rare, cosmetic, and corrected on any later remesh-triggering edit.
+             * @param {Object} chunk - Chunk data ({blocks, ...}).
+             * @param {ChunkCoord} cx - Chunk X.
+             * @param {ChunkCoord} cz - Chunk Z.
+             * @returns {number} Number of leaf voxels removed.
+             */
+            function prunePhantomNeighborLeaves(chunk, cx, cz) {
+                const chunkSize = WORLD_DIMS.chunkSize;
+                const chunkHeight = WORLD_DIMS.chunkHeight;
+                const startX = cx * chunkSize;
+                const startZ = cz * chunkSize;
+                const blocks = chunk.blocks;
+                const seed = WORLD_CONFIG.seed;
+                let removed = 0;
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dz = -1; dz <= 1; dz++) {
+                        if (dx === 0 && dz === 0) continue;
+                        const ncx = cx + dx, ncz = cz + dz;
+                        const neighborChunk = chunks.get(getChunkKey(ncx, ncz));
+                        if (!neighborChunk) continue; // can't validate yet — leave optimistic leaves
+                        const neighborBlocks = neighborChunk.blocks || neighborChunk;
+                        const neighborStartX = ncx * chunkSize;
+                        const neighborStartZ = ncz * chunkSize;
+                        const neighborTrees = getChunkTreePositions(ncx, ncz, seed, chunkSize);
+                        for (const tree of neighborTrees) {
+                            const { gx, gz, groundY, trunkHeight, trunkW, trunkD, profile, canopyRadius } = tree;
+                            // Canopy must overlap this chunk
+                            if (gx + canopyRadius < startX || gx - canopyRadius >= startX + chunkSize ||
+                                gz + canopyRadius < startZ || gz - canopyRadius >= startZ + chunkSize) continue;
+                            // Validate the trunk in the (now loaded) source chunk — same check
+                            // placeNeighborTreeLeaves uses. Valid tree => keep its leaves.
+                            const trunkTopY = groundY + 1 + trunkHeight;
+                            const checkY = Math.min(trunkTopY, chunkHeight - 1);
+                            const trunkIdx = (gx - neighborStartX) + (gz - neighborStartZ) * chunkSize + checkY * chunkSize * chunkSize;
+                            if (isLogBlock(neighborBlocks[trunkIdx])) continue;
+                            // PHANTOM: remove this tree's canopy voxels (leaf blocks only)
+                            const leafId = tree.profile.blocks.leaves;
+                            forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
+                                const lx = gx + cdx - startX, lz = gz + cdz - startZ;
+                                if (lx < 0 || lx >= chunkSize || lz < 0 || lz >= chunkSize || y < 0 || y >= chunkHeight) return;
+                                const idx = lx + lz * chunkSize + y * chunkSize * chunkSize;
+                                if (blocks[idx] === leafId) { blocks[idx] = AIR; removed++; }
+                            });
+                        }
+                    }
+                }
+                if (removed > 0) logDebug(`[Trees] Pruned ${removed} phantom canopy leaves in ${cx},${cz}`);
+                return removed;
+            }
+
             // Run neighbor update pass on a chunk
             // Handles cross-chunk tree leaves and edge lighting propagation
             function runNeighborUpdatePass(chunk, cx, cz) {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
 
-                // First, place leaves from neighbor chunk trees that overlap into this chunk
-                // This must happen BEFORE lighting recalculation
+                // First, remove canopy leaves of neighbor trees that FAILED validation in
+                // their own chunk (optimistically placed by worker / pre-neighbor generation),
+                // then (re-)place leaves from VALID neighbor trees. Order matters: the prune
+                // may remove overlapping voxels that the placement pass restores.
+                prunePhantomNeighborLeaves(chunk, cx, cz);
                 placeNeighborTreeLeaves(chunk, cx, cz);
 
                 // Recalculate edge lighting to account for neighboring chunks
@@ -28211,6 +28290,8 @@ self.onmessage = async (e) => {
                         SUNLIGHT_ATTENUATION[id] = 0;   // Default: transparent blocks don't block sunlight
                         transparentIds.push(id);
                     }
+                    // Same-id face culling (glass-to-glass: no inner pane borders)
+                    CULLS_SAME_ID[id] = block.tags.includes("cullAdjacent") ? 1 : 0;
                     // Apply custom lighting overrides from config
                     if (block.lighting) {
                         if (block.lighting.sunlightAttenuation !== undefined) {
@@ -38003,6 +38084,8 @@ self.onmessage = async (e) => {
                             // Check visibility - neighbor must be transparent
                             const neighborId = getLocal(x + dx, y + dy, z + dz);
                             if (!IS_TRANSPARENT[neighborId]) continue;
+                            // Same-id culling: glass panes don't render inner faces against glass
+                            if (neighborId === blockId && CULLS_SAME_ID[blockId]) continue;
 
                             // Calculate AO
                             const ao = calculateFaceAO(nx, ny, nz, x, y, z, blockId, getLocal, faceIdx);
@@ -38018,8 +38101,11 @@ self.onmessage = async (e) => {
                             // Top faces only (ny === 1); ring 2 probes only run when ring 1 is dry.
                             if (ny === 1) {
                                 let dampFactor = 0;
-                                if (getLocal(x + 1, y, z) === WATER || getLocal(x - 1, y, z) === WATER || getLocal(x, y, z + 1) === WATER || getLocal(x, y, z - 1) === WATER) {
-                                    dampFactor = 0.78; // ring 1: directly beside water
+                                // Ring 1: water touching ANY of the 6 faces (sides, above, below)
+                                // darkens to the dampest level.
+                                if (getLocal(x + 1, y, z) === WATER || getLocal(x - 1, y, z) === WATER || getLocal(x, y, z + 1) === WATER || getLocal(x, y, z - 1) === WATER ||
+                                    getLocal(x, y + 1, z) === WATER || getLocal(x, y - 1, z) === WATER) {
+                                    dampFactor = 0.78; // ring 1: directly touching water
                                 } else if (
                                     getLocal(x + 1, y, z + 1) === WATER || getLocal(x + 1, y, z - 1) === WATER ||
                                     getLocal(x - 1, y, z + 1) === WATER || getLocal(x - 1, y, z - 1) === WATER ||
@@ -38837,8 +38923,9 @@ self.onmessage = async (e) => {
                                             // OPTIMIZATION: Use pre-computed UV values instead of array lookup
                                             const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
                                             const nid = getLocal(lx, ly, lz);
-                                            // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces
-                                            const draw = isWater ? nid === AIR || isLeafBlock(nid) : IS_TRANSPARENT[nid];
+                                            // Water only draws faces at boundaries (against air or leaves), not internal water-to-water faces.
+                                            // Same-id culling: glass doesn't render inner faces against glass.
+                                            const draw = isWater ? nid === AIR || isLeafBlock(nid) : (IS_TRANSPARENT[nid] && !(nid === id && CULLS_SAME_ID[id]));
 
                                             if (draw) {
                                                 // Sample light from the neighboring air block (lx,ly,lz), not from inside the solid block
@@ -39711,8 +39798,10 @@ self.onmessage = async (e) => {
 
                 // Process adjacent chunk generation updates (cross-chunk terrain features)
                 // This runs after neighbors are processed to handle tree overhang, lighting, etc.
+                // Also gated on chunksAwaitingNeighborUpdate: processAdjacentChunkUpdates drains
+                // that set into its queue (it was previously never consumed at all).
                 const adjacentBudget = Math.max(0, CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs));
-                if (adjacentChunkUpdateQueue.size > 0 && adjacentBudget > 1) {
+                if ((adjacentChunkUpdateQueue.size > 0 || chunksAwaitingNeighborUpdate.size > 0) && adjacentBudget > 1) {
                     processAdjacentChunkUpdates(2);
                 }
 
