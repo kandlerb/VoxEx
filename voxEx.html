@@ -3728,8 +3728,10 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.6";
+            const VOXEX_BUILD = "2026-06-12.8";
             const VOXEX_RECENT_CHANGES = [
+                "Water surface pass: gentle vertex bobbing (swell field, calm at shores), top-down caustic web in shallow water, view-graded sky reflection (horizon vs zenith), 3rd swell component + bright breaking crest cores tied to the bobbing geometry",
+                "FIX: wave crests no longer a uniform dot grid — swell field reweighted (primary swell + noise breaks fronts into uneven segments) with low-freq patch gating for calm vs. active stretches",
                 "Trees: deterministic site validation — no trees on slopes/cliffs, longwood trunks never hang over air, per-column ground+cave checks (chunk cache v5)",
                 "FIX: floating phantom canopies — slope-rejected trees are now rejected deterministically in getChunkTreePositions, so neighbor chunks never optimistically place their leaves",
                 "Leaves: ambient occlusion now applies within/around leaf canopies (AO_OCCLUDES table; leaves occlude, glass/water never do)",
@@ -30328,7 +30330,8 @@ self.onmessage = async (e) => {
                         fogVerticalBlend: _fogVerticalBlendUniform, // shared: 0=cylindrical, 1=spherical (underwater)
                         sunDir: { value: new THREE.Vector3(0, 1, 0) },        // toward the sun (synced per frame)
                         sunGlintColor: { value: new THREE.Color(0xfff3c0) },  // sun color × intensity (synced per frame)
-                        skyReflColor: { value: new THREE.Color(0x87ceeb) },   // sky color for Fresnel reflection (synced per frame)
+                        skyReflHorizon: { value: new THREE.Color(0xbfdcf0) }, // sky color at the horizon, for grazing-angle Fresnel (synced per frame)
+                        skyReflZenith: { value: new THREE.Color(0x4a8ed0) },  // sky color overhead, reflected when looking down (synced per frame)
                         // Beer-Lambert absorption for depth fog (matches underwater shader)
                         absorptionR: { value: SETTINGS.waterAbsorptionR },
                         absorptionG: { value: SETTINGS.waterAbsorptionG },
@@ -30336,6 +30339,7 @@ self.onmessage = async (e) => {
                         waterDepthScale: { value: 0.15 } // How quickly water gets murky with view depth
                     },
                     vertexShader: `
+                        uniform float time;
                         attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
                         attribute float waterThickness; // Water depth in blocks (normalized: 0 = surface, 1 = 8+ blocks)
                         attribute float foamEdges; // Top-face land-adjacency bitmask (1=+X, 2=-X, 4=+Z, 8=-Z); 0 on side faces
@@ -30353,8 +30357,23 @@ self.onmessage = async (e) => {
                             vWaterThickness = waterThickness;
                             vFoamEdges = foamEdges;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                            // GENTLE SWELL BOBBING: displace the surface with the SAME
+                            // three-sine swell field the fragment shader uses for crest
+                            // highlights (swellGeo — keep weights/frequencies IN SYNC), so
+                            // bright crests ride physically raised water. Scaled by shoreDist:
+                            // shoreline faces (shoreDist 0) don't move at all — no gaps open
+                            // against land, and water side faces (always at shoreDist 0)
+                            // keep their seabed edges pinned. Adjacent faces can differ by
+                            // one shoreDist step (0.25), so amplitude stays small enough
+                            // that the seam offset (<0.02 blocks) is invisible.
+                            float tv = time * 0.001;
+                            vec2 wpv = worldPos.xz;
+                            float bob = sin(dot(wpv, vec2(0.45, 0.25)) + tv * 1.1) * 0.55
+                                      + sin(dot(wpv, vec2(-0.22, 0.38)) + tv * 0.8) * 0.30
+                                      + sin(dot(wpv, vec2(0.13, -0.41)) + tv * 0.95) * 0.25;
+                            worldPos.y += bob * 0.06 * shoreDist;
                             vWorldPosition = worldPos.xyz;
-                            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                            vec4 mvPosition = viewMatrix * worldPos;
                             gl_Position = projectionMatrix * mvPosition;
                             // Screen space position for sampling refraction texture
                             vScreenPos = gl_Position;
@@ -30374,7 +30393,8 @@ self.onmessage = async (e) => {
                         uniform float fogVerticalBlend;
                         uniform vec3 sunDir;
                         uniform vec3 sunGlintColor;
-                        uniform vec3 skyReflColor;
+                        uniform vec3 skyReflHorizon; // sky color at the horizon (synced per frame)
+                        uniform vec3 skyReflZenith;  // sky color overhead (synced per frame)
                         // Beer-Lambert absorption coefficients
                         uniform float absorptionR;
                         uniform float absorptionG;
@@ -30438,8 +30458,12 @@ self.onmessage = async (e) => {
                             vec2 wp = vWorldPosition.xz;
                             float w1 = sin(dot(wp, vec2(0.45, 0.25)) + t * 1.1);
                             float w2 = sin(dot(wp, vec2(-0.22, 0.38)) + t * 0.8);
+                            // Third swell at an incommensurate frequency/direction — breaks the
+                            // two-wave repeat so open water never settles into a visible cycle.
+                            // Same three sines (same weights) drive the vertex bobbing.
+                            float w3 = sin(dot(wp, vec2(0.13, -0.41)) + t * 0.95);
                             float n  = noise(wp * 0.9 + vec2(t * 0.35, -t * 0.27)) * 2.0 - 1.0;
-                            vec2 waveOffset = vec2(w1 + 0.6 * n, w2 - 0.6 * n) * 0.5;
+                            vec2 waveOffset = vec2(w1 + 0.6 * n + 0.35 * w3, w2 - 0.6 * n - 0.30 * w3) * 0.5;
                             // Perspective attenuation: a constant screen-UV offset spans far more
                             // WORLD at distance — fade it so far water shimmers subtly instead of
                             // smearing (vScreenPos.w is view depth).
@@ -30473,6 +30497,24 @@ self.onmessage = async (e) => {
                             // Convert back to blocks and apply absorption scaling
                             float thicknessBlocks = vWaterThickness * 16.0;
                             float effectiveDepth = thicknessBlocks * waterDepthScale;
+
+                            // TOP-DOWN CAUSTICS: animated light web playing across the bottom of
+                            // shallow water (the underwater caustic post pass only runs when the
+                            // CAMERA is submerged — from above the bottom was static). Two
+                            // drifting noise fields produce bright filaments where they cross
+                            // (|a-b| small) — the classic caustic web. Swayed by the surface
+                            // wave field, faded out by depth (gone past ~7 blocks), sun height
+                            // (off at night), and while underwater (post pass takes over).
+                            float sunUp = clamp(sunDir.y * 3.0, 0.0, 1.0);
+                            float shallowAmt = 1.0 - smoothstep(1.0, 7.0, thicknessBlocks);
+                            float cauAmt = shallowAmt * sunUp * (1.0 - fogVerticalBlend);
+                            if (cauAmt > 0.01) {
+                                vec2 cwp = wp + waveOffset * 1.5;
+                                float ca = noise(cwp * 1.6 + vec2(t * 0.9, t * 0.55));
+                                float cb = noise(cwp * 1.8 - vec2(t * 0.7, t * 1.05));
+                                float web = 1.0 - smoothstep(0.0, 0.22, abs(ca - cb));
+                                refractedColor *= 1.0 + web * web * 0.5 * cauAmt;
+                            }
 
                             // Apply Beer-Lambert absorption (same as underwater shader)
                             vec3 absorption = vec3(absorptionR, absorptionG, absorptionB);
@@ -30523,7 +30565,13 @@ self.onmessage = async (e) => {
                                 // Schlick Fresnel (F0 = 0.04): grazing views mirror the sky
                                 float fresnel = 0.04 + 0.96 * pow(1.0 - max(dot(viewDir, wn), 0.0), 5.0);
                                 reflAmtOut = clamp(fresnel * (0.55 + 0.45 * vShoreDist), 0.0, 0.75) * surfGate;
-                                finalColor = mix(finalColor, skyReflColor, reflAmtOut);
+                                // VIEW-GRADED SKY REFLECTION: grazing views mirror the bright
+                                // horizon band, looking straight down reflects the deeper zenith
+                                // blue — matches what a real sky dome would reflect. Using the
+                                // wave-perturbed normal makes the grade shimmer with the waves.
+                                float grazing = pow(1.0 - clamp(dot(viewDir, wn), 0.0, 1.0), 2.0);
+                                vec3 skyRefl = mix(skyReflZenith, skyReflHorizon, grazing);
+                                finalColor = mix(finalColor, skyRefl, reflAmtOut);
                                 // Tight Blinn-Phong streak that dances on the waves; fades out as
                                 // the sun drops to the horizon and is off at night
                                 if (sunDir.y > 0.0) {
@@ -30533,15 +30581,31 @@ self.onmessage = async (e) => {
                                 }
                             }
 
-                            // WAVE CRESTS & TROUGHS: the swell field (w1+w2) marks where waves
-                            // peak — lighten crests into soft highlight lines (fakes light
-                            // catching the wave tops) and slightly darken troughs. Scaled by
-                            // waveScale so calm shore water stays clean and open water reads
-                            // as rolling texture.
-                            float swell = (w1 + w2) * 0.5;
-                            float crest = smoothstep(0.55, 0.95, swell) * waveScale;
-                            float troughDark = smoothstep(0.55, 0.95, -swell) * waveScale;
-                            finalColor = mix(finalColor, vec3(0.85, 0.93, 0.98), crest * 0.4);
+                            // WAVE CRESTS & TROUGHS: highlight where the swell field peaks.
+                            // FIXED 2026-06-12: the old equal-weight (w1+w2)*0.5 is a two-plane-
+                            // wave interference pattern — its peaks form a PERFECTLY REGULAR
+                            // lattice of identical dots drifting at the phase velocity (looked
+                            // like uniform white circles unrelated to the water). Now the field
+                            // is dominated by the primary swell (crest LINES along wave fronts),
+                            // the secondary swell + animated noise n break each line into uneven
+                            // segments of varying size, and a low-frequency patch mask gates
+                            // whole areas so some stretches of water are calm while others show
+                            // breaking crests. All terms are the SAME world-anchored fields that
+                            // drive the refraction offset, so highlights ride the visible waves.
+                            // swellGeo is the EXACT field that bobs the vertices (see vertex
+                            // shader — keep weights in sync), so highlights sit on water that is
+                            // physically raised; n breaks fronts into uneven segments on top.
+                            float swellGeo = w1 * 0.55 + w2 * 0.30 + w3 * 0.25;
+                            float swell = swellGeo + n * 0.45;
+                            float patch = noise(wp * 0.12 + vec2(t * 0.10, -t * 0.08)); // ~8-block calm/active patches
+                            float crestGate = waveScale * (0.25 + 0.95 * patch);
+                            float crest = smoothstep(0.60, 1.10, swell) * crestGate;
+                            // Bright core where the swell truly peaks — a small, rarer "breaking
+                            // tip" inside the broad highlight, for crests with structure.
+                            float crestCore = smoothstep(1.00, 1.40, swell) * crestGate;
+                            float troughDark = smoothstep(0.60, 1.10, -swell) * waveScale;
+                            finalColor = mix(finalColor, vec3(0.85, 0.93, 0.98), min(crest, 1.0) * 0.4);
+                            finalColor = mix(finalColor, vec3(0.96, 0.99, 1.0), min(crestCore, 1.0) * 0.45);
                             finalColor *= 1.0 - troughDark * 0.12;
 
                             // SHORE FOAM: animated lapping band on top-face edges adjacent to land.
@@ -42015,7 +42079,11 @@ self.onmessage = async (e) => {
                         mat.uniforms.sunGlintColor.value.copy(sun.color).multiplyScalar(Math.min(1, sun.intensity));
                     }
                     if (typeof skyMaterial !== 'undefined' && skyMaterial) {
-                        mat.uniforms.skyReflColor.value.lerpColors(skyMaterial.uniforms.bottomColor.value, skyMaterial.uniforms.topColor.value, 0.35);
+                        // View-graded reflection: horizon = sky bottom color; zenith biased
+                        // toward the sky top color (0.75 keeps a touch of horizon warmth so
+                        // looking straight down isn't a flat dark blue)
+                        mat.uniforms.skyReflHorizon.value.copy(skyMaterial.uniforms.bottomColor.value);
+                        mat.uniforms.skyReflZenith.value.lerpColors(skyMaterial.uniforms.bottomColor.value, skyMaterial.uniforms.topColor.value, 0.75);
                     }
                 }
 
