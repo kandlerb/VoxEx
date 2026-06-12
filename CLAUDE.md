@@ -771,6 +771,8 @@ Before committing, verify:
 - [ ] Terrain changes: edit ONLY the main-thread terrain functions (~line 36269–36693); the worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — do not hand-edit a worker copy, and keep the markers intact
 - [ ] Terrain changes: update terrain-visualizer.html to match (biome config, height funcs)
 - [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
+- [ ] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES` (top of voxEx.html, console boot banner)
+- [ ] Worker parity: the worker template's `WORLD_DIMS` (incl. `yOffset`!), `BIOME_CONFIG`, and tree code are HAND-MAINTAINED copies — verify they match main thread (a `yOffset` drift of 64 silently broke ALL worker tree generation; found 2026-06-12)
 
 ## Testing Tools
 
