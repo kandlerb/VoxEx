@@ -1,3 +1,7 @@
+# Completed
+### Mobile / Touch Controls — ✅ Done (build 2026-06-12.3)
+Full touch parity: floating analog joystick (+sprint), drag-to-look, tap-place / hold-mine gesture grammar, on-screen action buttons (jump/crouch/torch/camera/inventory/pause), responsive HUD/menus with safe-area insets, fullscreen + landscape hint, and a **Touch Controls** settings category (auto/on/off, look sensitivity, joystick size, button scale, left-handed). Implemented via Pointer Events behind an `isGameplayActive()` abstraction; desktop unchanged. See `mobileControlsPlan.md`.
+
 # Biomes
 ### Longwoods
 #### Concept: A biome with massive trees (2x2 - 3x3 trunks) that tower over the player, creating a sense of scale.

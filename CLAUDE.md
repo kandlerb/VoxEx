@@ -358,7 +358,8 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 
 ### Settings System
 - **Profiles**: Performance, Balanced, Quality — plus custom profile save
-- **Categories**: Performance, Graphics (Basic, Lighting, Sky, Water, Water Effects, Volumetric, GI, Diffuse/Specular, Stars, Clouds, Torch Particles, Block Break, Footstep), Gameplay (Movement, Physics, Camera, Interaction), Zombie Effects, Color Grading, Biome Fog
+- **Categories**: Performance, Graphics (Basic, Lighting, Sky, Water, Water Effects, Volumetric, GI, Diffuse/Specular, Stars, Clouds, Torch Particles, Block Break, Footstep), Gameplay (Movement, Physics, Camera, Interaction), Touch Controls, Zombie Effects, Color Grading, Biome Fog
+- **Touch settings**: `touchControls` (auto/on/off), `touchLookSensitivity`, `touchJoystickSize`, `touchButtonScale`, `touchLeftHanded` — these are user preferences, deliberately EXCLUDED from `SETTINGS_PROFILES` (profiles only set keys they list, so touch prefs survive profile switches)
 - **Search**: Settings search bar for quick lookup
 - **Persistence**: All settings saved to LocalStorage, synced to DOM on load via `updateUIFromSettings()`
 - **Live Updates**: Setting changes immediately apply via side-effect callbacks (material updates, shader uniform sync, chunk rebuilds)
@@ -450,6 +451,25 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 | ~ (Tilde) | Toggle Debug Overlay |
 | ESC | Pause / Navigate Menus |
 
+### Touch Controls (Mobile)
+
+Activated by `touchControls` setting (`auto`/`on`/`off`); `auto` detects coarse-pointer/touch devices and excludes `(pointer: fine)` laptops. When active, `body.touch-mode` is set, an `#touch-controls` DOM overlay is shown, and all gameplay input flows through the same globals as keyboard/mouse.
+
+| Desktop input | Touch equivalent |
+|---|---|
+| WASD | Left virtual joystick (analog; floating origin, left 40% / bottom 60% zone) |
+| Mouse look | Drag on the look region (right/remainder of screen) |
+| SHIFT sprint | Push joystick past the outer ring (forward-dominant, hysteresis) |
+| SPACE jump / dbl-tap fly | Jump button (double-tap toggles flight) |
+| C crouch / fly down | Crouch button |
+| Left-hold mine | Touch-and-hold on look region (≥200 ms) |
+| Right-click place | Short tap on look region (<200 ms, <8 px) |
+| 1-9 / scroll hotbar | Tap hotbar slot; horizontal swipe cycles |
+| E / F / V | Inventory / Torch / Camera buttons |
+| ESC pause | Pause button (top); F5/F9/O/~ are pause-menu buttons in touch mode |
+
+Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay gates (pointer-lock on desktop OR `virtualGameplayFocus` on touch); `enterGameplay()`/`exitGameplay()` are the single enter/leave transitions (desktop locks/unlocks, touch sets virtual focus + runs the shared `onGameplayFocusGained()`/`onGameplayFocusLost()` routines). Pointer events (`pointerdown/move/up/cancel`) with `setPointerCapture` and per-`pointerId` ownership drive all touch input. **Every touch listener body starts with `if (!touchModeActive) return;`** and the three window-level mouse handlers (`onMouseClick`/`onMouseUp`/`onMouseWheel`) early-return in touch mode to suppress synthesized mouse events.
+
 ## Development Guidelines
 
 ### When Modifying `voxEx.html`:
@@ -484,6 +504,8 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Animation**: `animatePlayerLimbs`, `animateZombieLimbs`, `updateKnockdown`, `KNOCKDOWN_KEYFRAMES`, `POSE_PRESETS`, `springDamper`
 - **Camera**: `toggleThirdPerson`, `getThirdPersonCameraDistance`, `updatePoseDebugCamera`
 - **Input**: `onKeyUp`, `onMouseClick`, `onMouseWheel`, `INPUT_FORWARD`, `INPUT_SPRINT`
+- **Touch/Mobile**: `touchModeActive`, `isGameplayActive`, `enterGameplay`, `exitGameplay`, `recomputeTouchMode`, `initTouchControls`, `computeJoystickVector`, `touchMoveX`/`touchMoveZ`, `resetTouchInput`, `#touch-controls`, `#touch-look-region`, `#touch-joystick`, `applyTouchControlSettings`, `SETTINGS.touchControls`
+- **Shared actions** (keyboard+touch single-source): `handleJumpPressed`/`handleJumpReleased`, `handleCrouchPressed`/`handleCrouchReleased`, `toggleTorch`, `selectHotbarSlot`, `cycleHotbar`, `stopMining`, `togglePerfOverlay`, `toggleDebugOverlay`
 - **Compression**: `rleEncode`, `rleDecode`, `compressChunkData`, `decompressChunkData`
 - **Save/Load**: `saveWorld`, `loadWorld`, `saveChunkToCache`, `loadChunkFromCache`, `preGenerateSpawnChunks`
 - **Core Classes**: `class VoxelWorld`
@@ -764,6 +786,7 @@ Before committing, verify:
 - [ ] New DOM IDs exist in HTML and match JS references
 - [ ] Logs use `logDebug()` with `[Tag]` prefix, not `console.log()`
 - [ ] No work added to the per-frame render loop without batching
+- [ ] Touch handlers start with `if (!touchModeActive) return;`; no allocations/closures/logging in `pointermove` paths; gameplay gates use `isGameplayActive()` not raw `controls.isLocked`
 - [ ] Chunk size is 16x16x320 (not 128)
 - [ ] Atlas has 18 tiles (update `NUM_TILES` if adding blocks)
 - [ ] Worker parity: terrain changes reflected in `buildChunkWorkerCode()`

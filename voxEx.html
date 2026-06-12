@@ -2,9 +2,26 @@
 <html lang="en">
     <head>
         <meta charset="UTF-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
         <title>VoxEx </title>
         <style>
+            /* ===== Mobile/touch page behavior (Phase 0) ===== */
+            html, body { overscroll-behavior: none; }
+            /* The WebGL canvas and the touch overlay must swallow all native
+               touch gestures (scroll/zoom/select/callout) so they don't hijack
+               joystick/look input. Menus opt back into taps via touch-action. */
+            canvas, #touch-controls {
+                touch-action: none;
+                -webkit-user-select: none;
+                user-select: none;
+                -webkit-tap-highlight-color: transparent;
+                -webkit-touch-callout: none;
+            }
+            /* Menus/inventory need taps but not double-tap zoom. */
+            #blocker, #inventory-overlay, #main-pause-menu, #settings-menu,
+            #controls-menu, #create-world-panel, #seed-menu, #toast-container {
+                touch-action: manipulation;
+            }
             body {
                 margin: 0;
                 overflow: hidden;
@@ -12,6 +29,174 @@
                 user-select: none;
                 background: #1a1a1a;
             }
+            /* ===== Touch controls overlay (mobile) =====
+               Tunable via CSS custom properties set by applyTouchControlSettings()
+               (Phase 7). Defaults keep the overlay sized for a typical phone. */
+            :root {
+                --touch-joy-size: 1.0;
+                --touch-btn-scale: 1.0;
+            }
+            #touch-controls {
+                position: fixed;
+                inset: 0;
+                z-index: 50;            /* above HUD, below #blocker (999) */
+                pointer-events: none;   /* children opt back in individually */
+                display: none;          /* shown only when touchModeActive && gameplay active */
+            }
+            #touch-look-region {
+                position: absolute;
+                inset: 0;
+                pointer-events: auto;   /* owns any pointer not claimed by a control */
+            }
+            #touch-joystick {
+                position: absolute;
+                left: 0; top: 0;
+                width: calc(128px * var(--touch-joy-size));
+                height: calc(128px * var(--touch-joy-size));
+                margin-left: calc(-64px * var(--touch-joy-size));
+                margin-top: calc(-64px * var(--touch-joy-size));
+                border-radius: 25%;     /* rounded square — HUD-consistent voxel feel */
+                background: rgba(255, 255, 255, 0.08);
+                border: 2px solid rgba(255, 255, 255, 0.35);
+                box-sizing: border-box;
+                pointer-events: none;   /* the look region captures the pointer */
+                opacity: 0;
+                transition: opacity 0.12s ease;
+                will-change: transform, opacity;
+            }
+            #touch-joystick.visible { opacity: 1; }
+            #touch-joystick.sprinting {
+                border-color: rgba(255, 196, 0, 0.9);
+                background: rgba(255, 196, 0, 0.12);
+            }
+            #touch-joystick-knob {
+                position: absolute;
+                left: 50%; top: 50%;
+                width: 45%;
+                height: 45%;
+                margin-left: -22.5%;
+                margin-top: -22.5%;
+                border-radius: 25%;
+                background: rgba(255, 255, 255, 0.5);
+                border: 2px solid rgba(255, 255, 255, 0.7);
+                box-sizing: border-box;
+                will-change: transform;
+            }
+            #touch-buttons {
+                position: absolute;
+                right: calc(16px + env(safe-area-inset-right));
+                bottom: calc(16px + env(safe-area-inset-bottom));
+                display: flex;
+                flex-wrap: wrap-reverse;
+                flex-direction: row;
+                align-items: flex-end;
+                justify-content: flex-end;
+                gap: 12px;
+                width: calc(180px * var(--touch-btn-scale));
+                pointer-events: none;
+            }
+            #touch-top-bar {
+                position: absolute;
+                top: calc(8px + env(safe-area-inset-top));
+                right: calc(8px + env(safe-area-inset-right));
+                display: flex;
+                gap: 12px;
+                pointer-events: none;
+            }
+            .touch-btn {
+                pointer-events: auto;
+                box-sizing: border-box;
+                width: calc(64px * var(--touch-btn-scale));
+                height: calc(64px * var(--touch-btn-scale));
+                border-radius: 14%;
+                background: rgba(20, 20, 20, 0.55);
+                border: 2px solid rgba(255, 255, 255, 0.4);
+                color: rgba(255, 255, 255, 0.92);
+                font-size: calc(24px * var(--touch-btn-scale));
+                font-family: "Segoe UI", sans-serif;
+                line-height: 1;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 0;
+                touch-action: none;
+                -webkit-tap-highlight-color: transparent;
+                user-select: none;
+            }
+            .touch-btn.touch-btn-large {
+                width: calc(80px * var(--touch-btn-scale));
+                height: calc(80px * var(--touch-btn-scale));
+                font-size: calc(30px * var(--touch-btn-scale));
+            }
+            .touch-btn.touch-btn-small {
+                width: calc(48px * var(--touch-btn-scale));
+                height: calc(48px * var(--touch-btn-scale));
+                font-size: calc(20px * var(--touch-btn-scale));
+            }
+            .touch-btn.active {
+                background: rgba(76, 175, 80, 0.5);
+                border-color: rgba(120, 220, 120, 0.95);
+            }
+            .touch-btn:active {
+                background: rgba(80, 80, 80, 0.7);
+            }
+            /* Left-handed mirroring: joystick zone is computed in JS; here we just
+               flip the button clusters to the left edge. */
+            body.touch-left-handed #touch-buttons {
+                right: auto;
+                left: calc(16px + env(safe-area-inset-left));
+                justify-content: flex-start;
+            }
+            body.touch-left-handed #touch-top-bar {
+                right: auto;
+                left: calc(8px + env(safe-area-inset-left));
+            }
+            /* ===== Responsive HUD/menus in touch mode (Phase 6) ===== */
+            /* Lift the hotbar above the full-screen look region (z-index 50) so slot
+               taps/swipes land on it instead of being captured for camera look. */
+            body.touch-mode #hotbar {
+                bottom: calc(8px + env(safe-area-inset-bottom));
+                z-index: 60;
+                pointer-events: auto;
+            }
+            /* Display-only HUD must not create look-region dead zones. */
+            body.touch-mode #block-name-display,
+            body.touch-mode #movement-indicators,
+            body.touch-mode #flight-indicator {
+                pointer-events: none;
+            }
+            body.touch-mode #block-name-display {
+                bottom: calc(72px + env(safe-area-inset-bottom));
+            }
+            /* Move the sprint/crouch indicators clear of the right-side button cluster. */
+            body.touch-mode #movement-indicators {
+                bottom: auto;
+                top: calc(64px + env(safe-area-inset-top));
+                right: auto;
+                left: calc(8px + env(safe-area-inset-left));
+            }
+            body.touch-mode.touch-left-handed #movement-indicators {
+                left: auto;
+                right: calc(8px + env(safe-area-inset-right));
+            }
+            /* Scrollable, touch-friendly menus. */
+            body.touch-mode #blocker { backdrop-filter: blur(2px); }
+            body.touch-mode .settings-panel,
+            body.touch-mode #main-pause-menu,
+            body.touch-mode #settings-menu,
+            body.touch-mode #controls-menu,
+            body.touch-mode #create-world-panel,
+            body.touch-mode #seed-menu {
+                max-height: 100dvh;
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
+                touch-action: pan-y;
+            }
+            body.touch-mode .menu-btn,
+            body.touch-mode .category-btn {
+                min-height: 44px;
+            }
+            body.touch-mode #instructions { padding: 24px; }
             #blocker {
                 position: absolute;
                 top: 0;
@@ -1175,7 +1360,25 @@
                 border-radius: 12px;
                 border: 2px solid #444;
                 box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+                position: relative;
             }
+            /* Touch-only inventory close button (phones have no E/ESC key). */
+            #inventory-close-btn {
+                position: absolute;
+                top: 8px;
+                right: 8px;
+                width: 40px;
+                height: 40px;
+                border-radius: 8px;
+                background: rgba(40, 40, 40, 0.9);
+                border: 1px solid #555;
+                color: #fff;
+                font-size: 20px;
+                line-height: 1;
+                cursor: pointer;
+                display: none;
+            }
+            body.touch-mode #inventory-close-btn { display: block; }
             #inventory-title {
                 color: #4caf50;
                 font-size: 24px;
@@ -1253,6 +1456,12 @@
                 background: rgba(76, 175, 80, 0.3);
                 transform: scale(1.1);
                 box-shadow: 0 0 12px rgba(76, 175, 80, 0.5), inset 0 0 0 2px rgba(0, 0, 0, 0.4);
+            }
+            /* Touch tap-to-assign: highlight the picked inventory item (Phase 5). */
+            .inventory-slot.tap-selected {
+                outline: 3px solid #4caf50;
+                outline-offset: -3px;
+                box-shadow: 0 0 12px rgba(76, 175, 80, 0.6);
             }
             .inventory-hotbar-slot .slot-number {
                 position: absolute;
@@ -1832,6 +2041,26 @@
         </div>
         <div id="crosshair" style="display: none"></div>
         <div id="torch-overlay"></div>
+        <!-- ===== Touch controls overlay (mobile). Inert unless touch mode is
+             active; children wired up in initTouchControls(). z-index sits above
+             the HUD but below #blocker/menus/#toast-container so pausing visually
+             disables gameplay controls. ===== -->
+        <div id="touch-controls" aria-hidden="true">
+            <div id="touch-look-region"></div>
+            <div id="touch-joystick">
+                <div id="touch-joystick-knob"></div>
+            </div>
+            <div id="touch-top-bar">
+                <button id="touch-btn-pause" class="touch-btn touch-btn-small" type="button" aria-label="Pause">II</button>
+                <button id="touch-btn-inventory" class="touch-btn touch-btn-small" type="button" aria-label="Inventory">▥</button>
+            </div>
+            <div id="touch-buttons">
+                <button id="touch-btn-camera" class="touch-btn touch-btn-small" type="button" aria-label="Camera">◉</button>
+                <button id="touch-btn-torch" class="touch-btn touch-btn-small" type="button" aria-label="Torch">★</button>
+                <button id="touch-btn-crouch" class="touch-btn" type="button" aria-label="Crouch">▼</button>
+                <button id="touch-btn-jump" class="touch-btn touch-btn-large" type="button" aria-label="Jump">▲</button>
+            </div>
+        </div>
         <div id="debug-overlay">Debug Mode Active</div>
         <div id="perf-overlay"><div class="perf-graph-container"><canvas id="fps-graph" width="200" height="40"></canvas></div><div id="perf-text">Performance Monitor</div></div>
         <div id="pose-debug-panel">
@@ -2073,6 +2302,13 @@
                     </div>
                     <button class="menu-btn" id="btn-controls">Controls</button>
                     <button class="menu-btn" id="btn-settings">Settings</button>
+                    <!-- Touch-only quick actions (no F5/F9/O/~ keys on phones). Hidden on desktop. -->
+                    <div id="touch-pause-actions" style="display: none; gap: 5px; margin-bottom: 10px; flex-wrap: wrap; justify-content: center">
+                        <button class="menu-btn" id="btn-touch-quicksave" style="width: 45%; margin: 0; padding: 8px; font-size: 14px">Quick Save</button>
+                        <button class="menu-btn" id="btn-touch-quickload" style="width: 45%; margin: 0; padding: 8px; font-size: 14px">Quick Load</button>
+                        <button class="menu-btn" id="btn-touch-perf" style="width: 45%; margin: 0; padding: 8px; font-size: 14px">Perf Overlay</button>
+                        <button class="menu-btn" id="btn-touch-debug" style="width: 45%; margin: 0; padding: 8px; font-size: 14px">Debug Overlay</button>
+                    </div>
                     <button class="menu-btn" id="btn-quit">Quit / New Seed</button>
                 </div>
                 <div id="controls-menu" style="display: none; text-align: left">
@@ -2116,6 +2352,7 @@
                     <button class="menu-btn category-btn" id="btn-settings-graphics">Graphics</button>
                     <button class="menu-btn category-btn" id="btn-settings-gameplay">Gameplay</button>
                     <button class="menu-btn category-btn" id="btn-settings-world">World</button>
+                    <button class="menu-btn category-btn" id="btn-settings-touch">Touch Controls</button>
                     <button class="menu-btn" id="btn-save-custom-profile" style="margin-top: 15px; background: #aa8800; border-color: #ccaa00">Save as Custom Profile</button>
                     <button class="menu-btn reset-btn" id="btn-reset-all">Reset All to Default</button>
                     <button class="menu-btn" id="btn-back-from-settings">Back</button>
@@ -3125,6 +3362,36 @@
                     <button class="menu-btn reset-btn" id="btn-reset-gameplay-interaction">Reset to Default</button>
                     <button class="menu-btn" id="btn-back-from-gameplay-interaction">Back</button>
                 </div>
+                <!-- Touch Controls Settings -->
+                <div id="settings-touch" class="settings-panel" style="display: none">
+                    <h1>Touch Controls</h1>
+                    <div class="setting-item">
+                        <label for="touch-controls-select">On-screen controls</label>
+                        <select id="touch-controls-select" style="padding: 4px 8px; border: 1px solid #555; border-radius: 4px; background: #333; color: #fff;">
+                            <option value="auto">Auto (touch devices)</option>
+                            <option value="on">Always on</option>
+                            <option value="off">Always off</option>
+                        </select>
+                    </div>
+                    <div class="setting-item">
+                        <label for="touch-look-sens-slider">Look Sensitivity: <span id="touch-look-sens-val">1.0</span></label>
+                        <input type="range" id="touch-look-sens-slider" min="0.2" max="3.0" step="0.1" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="touch-joystick-size-slider">Joystick Size: <span id="touch-joystick-size-val">1.0</span></label>
+                        <input type="range" id="touch-joystick-size-slider" min="0.7" max="1.5" step="0.05" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="touch-button-scale-slider">Button Scale: <span id="touch-button-scale-val">1.0</span></label>
+                        <input type="range" id="touch-button-scale-slider" min="0.8" max="1.6" step="0.05" />
+                    </div>
+                    <div class="setting-item">
+                        <label for="touch-left-handed-toggle">Left-handed layout</label>
+                        <input type="checkbox" id="touch-left-handed-toggle" />
+                    </div>
+                    <button class="menu-btn reset-btn" id="btn-reset-touch">Reset to Default</button>
+                    <button class="menu-btn" id="btn-back-from-touch">Back</button>
+                </div>
                 <!-- World Settings -->
                 <div id="settings-world" class="settings-panel" style="display: none">
                     <h1>World</h1>
@@ -3207,6 +3474,7 @@
         <!-- Inventory UI -->
         <div id="inventory-overlay">
             <div id="inventory-container">
+                <button id="inventory-close-btn" type="button" aria-label="Close inventory">✕</button>
                 <div id="inventory-title">Inventory</div>
                 <div id="inventory-grid"></div>
                 <div id="inventory-hotbar-label">Hotbar (drag blocks here)</div>
@@ -3324,6 +3592,8 @@
                     ['btn-settings-graphics', 'settings-graphics'],
                     ['btn-settings-gameplay', 'settings-gameplay'],
                     ['btn-settings-world', 'settings-world'],
+                    ['btn-settings-touch', 'settings-touch'],
+                    ['btn-back-from-touch', 'settings-menu'],
                     // Performance branches
                     ['btn-performance-rendering', 'settings-performance-rendering'],
                     ['btn-performance-streaming', 'settings-performance-streaming'],
@@ -3385,8 +3655,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.2";
+            const VOXEX_BUILD = "2026-06-12.3";
             const VOXEX_RECENT_CHANGES = [
+                "Mobile: full touch controls — virtual joystick, drag-look, tap-place/hold-mine, action buttons, responsive HUD/menus, Touch Controls settings. Desktop unchanged.",
                 "Mining: BREAK_TIME 0 → 0.3s — blocks no longer break instantly; hold to mine, per-block control",
                 "FIX: worker terrain yOffset drift (64 vs 0) — trees never generated in worker chunks; old worlds will show cliffs at new chunks, create a fresh world",
                 "Damp rework: dark damp = direct water contact (any face); light damp = touching a dark-damp block only (no chaining)",
@@ -5341,6 +5612,12 @@
                 footstepEnabled: savedSettings.footstepEnabled ?? true,
                 footstepSize: savedSettings.footstepSize ?? 0.1,
                 footstepDecay: savedSettings.footstepDecay ?? 0.5,
+                // Touch / mobile controls (Phase 7)
+                touchControls: savedSettings.touchControls ?? "auto",        // auto | on | off
+                touchLookSensitivity: savedSettings.touchLookSensitivity ?? 1.0,
+                touchJoystickSize: savedSettings.touchJoystickSize ?? 1.0,
+                touchButtonScale: savedSettings.touchButtonScale ?? 1.0,
+                touchLeftHanded: savedSettings.touchLeftHanded ?? false,
             };
             const DEFAULTS = {
                 // Performance
@@ -5557,6 +5834,12 @@
                 footstepEnabled: true,
                 footstepSize: 0.1,
                 footstepDecay: 0.5,
+                // Touch / mobile controls (Phase 7)
+                touchControls: "auto",
+                touchLookSensitivity: 1.0,
+                touchJoystickSize: 1.0,
+                touchButtonScale: 1.0,
+                touchLeftHanded: false,
             };
             // Settings Profiles - predefined configurations
             const SETTINGS_PROFILES = {
@@ -8567,6 +8850,28 @@
                             }
                         }
                     });
+
+                    // ===== Touch tap-to-assign (Phase 5) — HTML5 drag-drop above doesn't
+                    //       fire on touch. Desktop drag-drop path is left untouched. =====
+                    grid.addEventListener('click', (e) => {
+                        if (!touchModeActive) return;
+                        const slot = e.target.closest('.inventory-slot');
+                        if (!slot) return;
+                        this.pendingAssignBlock = parseInt(slot.dataset.blockId);
+                        grid.querySelectorAll('.inventory-slot.tap-selected').forEach((s) => s.classList.remove('tap-selected'));
+                        slot.classList.add('tap-selected');
+                    });
+                    hotbar.addEventListener('click', (e) => {
+                        if (!touchModeActive) return;
+                        const slot = e.target.closest('.inventory-hotbar-slot');
+                        if (!slot || this.pendingAssignBlock == null) return;
+                        const slotIndex = parseInt(slot.dataset.slotIndex);
+                        this.hotbarSlots[slotIndex] = this.pendingAssignBlock;
+                        this.updateInventoryHotbarSlot(slot, this.pendingAssignBlock);
+                        if (this.onHotbarChange) {
+                            this.onHotbarChange(slotIndex, this.pendingAssignBlock);
+                        }
+                    });
                 }
 
                 toggleInventory(controls) {
@@ -8586,10 +8891,8 @@
                     }
                     // Refresh hotbar display
                     this.populateInventoryHotbar();
-                    // Unlock controls to show cursor
-                    if (controls && controls.isLocked) {
-                        controls.unlock();
-                    }
+                    // Drop gameplay focus to show cursor (desktop: pointer unlock; touch: hide overlay)
+                    exitGameplay("inventory");
                 }
 
                 closeInventory(controls) {
@@ -8597,10 +8900,8 @@
                     if (this.elements.inventoryOverlay) {
                         this.elements.inventoryOverlay.style.display = 'none';
                     }
-                    // Re-lock controls
-                    if (controls && !controls.isLocked) {
-                        setTimeout(() => controls.lock(), 50);
-                    }
+                    // Re-enter gameplay (desktop: pointer lock; touch: virtual focus)
+                    setTimeout(() => enterGameplay(), 50);
                 }
 
                 isInventoryOpen() {
@@ -19580,9 +19881,12 @@
             // Centralized pause/resume controller - delegates to UIManager
             function setPauseState(isPaused, reason = "pause") {
                 uiManager.setPauseState(isPaused, reason, controls);
-                // Handle controls lock/unlock (not in UIManager since controls is external)
-                if (!isPaused && controls && !controls.isLocked) {
-                    controls.lock();
+                // Handle controls lock/unlock (not in UIManager since controls is external).
+                // enterGameplay() is re-entrancy safe: it early-returns once gameplay is
+                // active, so the lock→"lock" event→onGameplayFocusGained→setPauseState(false)
+                // path does not recurse. On touch it sets virtual focus instead of locking.
+                if (!isPaused && controls && !isGameplayActive()) {
+                    enterGameplay();
                 }
             }
 
@@ -21384,6 +21688,13 @@
             function syncSettingsToUI() {
                 const hexToColor = (hex) => "#" + hex.toString(16).padStart(6, "0");
 
+                // Touch Controls (Phase 7)
+                { const el = document.getElementById("touch-controls-select"); if (el) el.value = SETTINGS.touchControls; }
+                { const s = document.getElementById("touch-look-sens-slider"); const v = document.getElementById("touch-look-sens-val"); if (s) s.value = SETTINGS.touchLookSensitivity; if (v) v.innerText = Number(SETTINGS.touchLookSensitivity).toFixed(1); }
+                { const s = document.getElementById("touch-joystick-size-slider"); const v = document.getElementById("touch-joystick-size-val"); if (s) s.value = SETTINGS.touchJoystickSize; if (v) v.innerText = Number(SETTINGS.touchJoystickSize).toFixed(2); }
+                { const s = document.getElementById("touch-button-scale-slider"); const v = document.getElementById("touch-button-scale-val"); if (s) s.value = SETTINGS.touchButtonScale; if (v) v.innerText = Number(SETTINGS.touchButtonScale).toFixed(2); }
+                { const el = document.getElementById("touch-left-handed-toggle"); if (el) el.checked = !!SETTINGS.touchLeftHanded; }
+
                 // Performance - Rendering
                 const frustumToggle = document.getElementById("frustum-culling-toggle");
                 const renderDistSlider = document.getElementById("render-dist-slider");
@@ -23149,8 +23460,9 @@
                     if (mainPauseMenu) mainPauseMenu.style.display = "block";
                     // Hide blocker (HUD will be shown by "lock" event handler)
                     blocker.style.display = "none";
-                    // Lock controls - the "lock" event handler will call setHUDVisible(true)
-                    controls.lock();
+                    // Enter gameplay - the "lock"/focus handler will call setHUDVisible(true).
+                    // On touch this sets virtual focus (pointer lock is unavailable).
+                    enterGameplay();
                     // Clean up listeners
                     instructions.removeEventListener("click", startGame);
                     blocker.removeEventListener("click", startGame);
@@ -26632,7 +26944,7 @@ self.onmessage = async (e) => {
                         saveWorld();
                         // Don't call setHUDVisible(true) here - let the "lock" event handler do it
                         // Add delay to avoid pointer lock security error
-                        setTimeout(() => controls.lock(), 100);
+                        setTimeout(() => enterGameplay(), 100);
                     });
                 }
                 // Load Button (Pause Menu)
@@ -26659,7 +26971,7 @@ self.onmessage = async (e) => {
                                 }
                                 // Don't call setHUDVisible(true) here - let the "lock" event handler do it
                                 // Add delay to avoid pointer lock security error
-                                setTimeout(() => controls.lock(), 100);
+                                setTimeout(() => enterGameplay(), 100);
                             }
                         }
                     });
@@ -26724,7 +27036,7 @@ self.onmessage = async (e) => {
                         if (!isChatOpen) {
                             // Don't call setHUDVisible(true) here - let the "lock" event handler do it
                             // Add delay to avoid pointer lock security error
-                            setTimeout(() => controls.lock(), 100);
+                            setTimeout(() => enterGameplay(), 100);
                         }
                     });
                 }
@@ -27730,6 +28042,12 @@ self.onmessage = async (e) => {
                 });
                 // RESET FUNCTIONALITY
                 function updateUIFromSettings() {
+                    // Touch Controls (Phase 7)
+                    { const el = document.getElementById("touch-controls-select"); if (el) el.value = SETTINGS.touchControls; }
+                    { const s = document.getElementById("touch-look-sens-slider"); const v = document.getElementById("touch-look-sens-val"); if (s) s.value = SETTINGS.touchLookSensitivity; if (v) v.innerText = Number(SETTINGS.touchLookSensitivity).toFixed(1); }
+                    { const s = document.getElementById("touch-joystick-size-slider"); const v = document.getElementById("touch-joystick-size-val"); if (s) s.value = SETTINGS.touchJoystickSize; if (v) v.innerText = Number(SETTINGS.touchJoystickSize).toFixed(2); }
+                    { const s = document.getElementById("touch-button-scale-slider"); const v = document.getElementById("touch-button-scale-val"); if (s) s.value = SETTINGS.touchButtonScale; if (v) v.innerText = Number(SETTINGS.touchButtonScale).toFixed(2); }
+                    { const el = document.getElementById("touch-left-handed-toggle"); if (el) el.checked = !!SETTINGS.touchLeftHanded; }
                     // Performance
                     if (frustumToggle) frustumToggle.checked = SETTINGS.enableFrustumCulling;
                     if (lowerFpsSlider && lowerFpsVal) { lowerFpsSlider.value = SETTINGS.lowerBoundFPS; lowerFpsVal.textContent = SETTINGS.lowerBoundFPS; }
@@ -28221,6 +28539,56 @@ self.onmessage = async (e) => {
                     localStorage.setItem("voxex_settings", JSON.stringify(SETTINGS));
                     updateUIFromSettings();
                 });
+                // ===== Touch Controls settings (Phase 7) =====
+                {
+                    const tcSelect = document.getElementById("touch-controls-select");
+                    if (tcSelect) tcSelect.addEventListener("change", () => {
+                        SETTINGS.touchControls = tcSelect.value;
+                        saveSettings();
+                        recomputeTouchMode();
+                    });
+                    const tlSlider = document.getElementById("touch-look-sens-slider");
+                    const tlVal = document.getElementById("touch-look-sens-val");
+                    if (tlSlider) tlSlider.addEventListener("input", () => {
+                        SETTINGS.touchLookSensitivity = parseFloat(tlSlider.value);
+                        if (tlVal) tlVal.innerText = SETTINGS.touchLookSensitivity.toFixed(1);
+                        saveSettings();
+                    });
+                    const jsSlider = document.getElementById("touch-joystick-size-slider");
+                    const jsVal = document.getElementById("touch-joystick-size-val");
+                    if (jsSlider) jsSlider.addEventListener("input", () => {
+                        SETTINGS.touchJoystickSize = parseFloat(jsSlider.value);
+                        if (jsVal) jsVal.innerText = SETTINGS.touchJoystickSize.toFixed(2);
+                        saveSettings();
+                        applyTouchControlSettings();
+                    });
+                    const bsSlider = document.getElementById("touch-button-scale-slider");
+                    const bsVal = document.getElementById("touch-button-scale-val");
+                    if (bsSlider) bsSlider.addEventListener("input", () => {
+                        SETTINGS.touchButtonScale = parseFloat(bsSlider.value);
+                        if (bsVal) bsVal.innerText = SETTINGS.touchButtonScale.toFixed(2);
+                        saveSettings();
+                        applyTouchControlSettings();
+                    });
+                    const lhToggle = document.getElementById("touch-left-handed-toggle");
+                    if (lhToggle) lhToggle.addEventListener("change", () => {
+                        SETTINGS.touchLeftHanded = lhToggle.checked;
+                        saveSettings();
+                        applyTouchControlSettings();
+                    });
+                }
+                // Reset Touch Controls
+                document.getElementById("btn-reset-touch")?.addEventListener("click", () => {
+                    SETTINGS.touchControls = DEFAULTS.touchControls;
+                    SETTINGS.touchLookSensitivity = DEFAULTS.touchLookSensitivity;
+                    SETTINGS.touchJoystickSize = DEFAULTS.touchJoystickSize;
+                    SETTINGS.touchButtonScale = DEFAULTS.touchButtonScale;
+                    SETTINGS.touchLeftHanded = DEFAULTS.touchLeftHanded;
+                    saveSettings();
+                    updateUIFromSettings();
+                    recomputeTouchMode();
+                    applyTouchControlSettings();
+                });
                 // Reset World Time
                 document.getElementById("btn-reset-world-time")?.addEventListener("click", () => {
                     SETTINGS.dayLength = DEFAULTS.dayLength;
@@ -28238,21 +28606,15 @@ self.onmessage = async (e) => {
                 });
                 // Controls Lock/Unlock
                 controls.addEventListener("lock", () => {
-                    isChatOpen = false;
-                    // Clear menu navigation stack when resuming gameplay
-                    clearMenuNavigationStack();
-                    // Resuming gameplay: hide overlays and ensure pointer lock stays consistent
-                    setPauseState(false, "gameplay");
+                    // Shared resume routine (desktop pointer lock + touch enterGameplay).
+                    onGameplayFocusGained();
                 });
                 controls.addEventListener("unlock", () => {
-                    // Pausing from pointer unlock (Escape): show blocker and pause menu stack
-                    // Skip if inventory is open, pose debug mode, or chat is open
-                    if (!isChatOpen && !uiManager.isInventoryOpen() && !poseDebugMode) {
-                        setPauseState(true, "pause");
-                    }
-                    // Clear held-input state — keyups during the menu would otherwise
-                    // be the only thing stopping movement that began before pausing
-                    resetTransientInput();
+                    // Guard: a spurious pointer-lock unlock must not fire the pause
+                    // routine while a touch gameplay session owns focus.
+                    if (virtualGameplayFocus) return;
+                    // Shared pause routine (desktop pointer unlock + touch exitGameplay).
+                    onGameplayFocusLost();
                 });
                 // Open Controls Menu
                 if (btnControls) { btnControls.addEventListener("click", () => { mainPauseMenu.style.display = "none"; settingsMenu.style.display = "none"; controlsMenu.style.display = "block"; }); }
@@ -34159,10 +34521,8 @@ self.onmessage = async (e) => {
                     document.addEventListener('mouseup', onPoseDebugMouseUp);
                     document.addEventListener('wheel', onPoseDebugWheel, { passive: false });
 
-                    // Unlock pointer AFTER setting poseDebugMode (so unlock handler skips pause)
-                    if (controls && controls.isLocked) {
-                        controls.unlock();
-                    }
+                    // Drop gameplay focus AFTER setting poseDebugMode (so the pause routine skips)
+                    exitGameplay("poseDebug");
                     panel.classList.add('active');
 
                     // Initialize sliders from current pose
@@ -40295,10 +40655,24 @@ self.onmessage = async (e) => {
                     // Update direction from input
                     direction.z = Number(moveForward) - Number(moveBackward);
                     direction.x = Number(moveLeft) - Number(moveRight);
-                    direction.normalize();
+                    // Analog joystick (touch) overrides the boolean-derived direction.
+                    // Signs match the keyboard convention: push up = forward (direction.z>0),
+                    // push right = strafe right (direction.x<0, like pressing D).
+                    let usingJoystick = false;
+                    if (touchModeActive && joyPointerId !== -1) {
+                        direction.x = -touchMoveX;
+                        direction.z = -touchMoveZ;
+                        usingJoystick = true;
+                    }
+                    // Normalize ONLY when over-unit length, so analog joystick magnitude
+                    // survives. Keyboard cardinal (len 1) and diagonal (len √2 → 1) are
+                    // unchanged: cardinal skips normalize but is already length 1.
+                    if (direction.lengthSq() > 1) direction.normalize();
                     // Apply input to velocity
-                    if (moveForward || moveBackward) velocity.z -= direction.z * inputSpeed * dt;
-                    if (moveLeft || moveRight) velocity.x -= direction.x * inputSpeed * dt;
+                    const moveZActive = moveForward || moveBackward || (usingJoystick && direction.z !== 0);
+                    const moveXActive = moveLeft || moveRight || (usingJoystick && direction.x !== 0);
+                    if (moveZActive) velocity.z -= direction.z * inputSpeed * dt;
+                    if (moveXActive) velocity.x -= direction.x * inputSpeed * dt;
                 }
                 // Apply damping
                 const dampingFactor = Math.pow(0.00001, dt);
@@ -40531,7 +40905,7 @@ self.onmessage = async (e) => {
              */
             function updateVisualEffects(time, dt) {
                 // FOV changes for sprint
-                const targetFOV = isSprinting && !isFlying && controls.isLocked ?
+                const targetFOV = isSprinting && !isFlying && isGameplayActive() ?
                     SETTINGS.sprintFOV : SETTINGS.normalFOV;
                 camera.fov += (targetFOV - camera.fov) * 0.1;
                 camera.updateProjectionMatrix();
@@ -41504,7 +41878,7 @@ self.onmessage = async (e) => {
                     perfMonitor.updateBuildQueueDepth(chunkBuildQueue.length);
 
                     // Block breaking logic
-                    if (breakingBlock && controls.isLocked) {
+                    if (breakingBlock && isGameplayActive()) {
                         // HOLD-TO-MINE: cancel when the crosshair leaves the target block
                         // (target tracked by updateHighlight — no extra raycast here).
                         // If the button is still held, the auto-start block below
@@ -41531,7 +41905,7 @@ self.onmessage = async (e) => {
                     // HOLD-TO-MINE: while the button is held and nothing is being
                     // mined (fresh hold past a mob, previous target broke, or the
                     // crosshair moved to a new block), start on the current target.
-                    if (!breakingBlock && leftMouseHeld && controls.isLocked && _highlightHasHit) {
+                    if (!breakingBlock && leftMouseHeld && isGameplayActive() && _highlightHasHit) {
                         if (getBlock(_highlightHitX, _highlightHitY, _highlightHitZ) !== BEDROCK) {
                             breakingBlock = { x: _highlightHitX, y: _highlightHitY, z: _highlightHitZ };
                             breakProgress = 0;
@@ -41539,7 +41913,7 @@ self.onmessage = async (e) => {
                     }
                     // HOLD-TO-PLACE: repeat placement at a fixed cadence while the
                     // right button is held, building against the current crosshair face
-                    if (rightMouseHeld && controls.isLocked) {
+                    if (rightMouseHeld && isGameplayActive()) {
                         placeRepeatTimer -= clampedDt;
                         if (placeRepeatTimer <= 0) {
                             if (_highlightHasHit && _highlightHasFace) {
@@ -41551,7 +41925,7 @@ self.onmessage = async (e) => {
                     frameCount++;
 
                     // Game active updates
-                    if (controls.isLocked) {
+                    if (isGameplayActive()) {
                         updateDayNight(clampedDt);
                         // INSTRUMENTATION: Track underwater update time
                         const underwaterStartMs = performance.now();
@@ -41576,7 +41950,7 @@ self.onmessage = async (e) => {
                     // Periodic geometry leak detection (every 5 seconds)
                     checkGeometryLeaks(time);
                     // Update torch light pool (throttled internally)
-                    if (typeof torchLightPool !== 'undefined' && controls.isLocked) {
+                    if (typeof torchLightPool !== 'undefined' && isGameplayActive()) {
                         torchLightPool.update(getPlayerWorldPosition());
                     }
                     // Auto-save modified chunks to IndexedDB (throttled internally)
@@ -41689,16 +42063,14 @@ self.onmessage = async (e) => {
                 rightMouseHeld = false;
                 breakingBlock = null;
                 breakProgress = 0;
+                // Touch state shares the same reset path (blur/visibilitychange cover both).
+                if (typeof resetTouchInput === 'function') resetTouchInput();
             }
 
             const onKeyDown = function (event) {
                 // 1. Global Keys (Works in Menu & Game)
                 if (event.code === "Backquote") {
-                    isDebug = !isDebug;
-                    const overlay = document.getElementById("debug-overlay");
-                    const perfOverlay = document.getElementById("perf-overlay");
-                    if (overlay) { overlay.style.display = isDebug ? "block" : "none"; if (isDebug && typeof updateDebugInfo === "function") { updateDebugInfo(fpsInstant, fpsAvg); }}
-                    if (perfOverlay) { perfOverlay.style.display = isDebug ? "block" : "none"; }
+                    toggleDebugOverlay();
                     return;
                 }
                 // Pose Debug Mode (P key) - skip if typing
@@ -41722,17 +42094,7 @@ self.onmessage = async (e) => {
                 // O key - Toggle Performance Overlay (alternative to ~ which shows both)
                 if (event.code === "KeyO" && !event.repeat) {
                     if (isTypingInInput()) return;
-                    const perfOverlay = document.getElementById("perf-overlay");
-                    if (perfOverlay) {
-                        const isVisible = perfOverlay.style.display !== "none";
-                        perfOverlay.style.display = isVisible ? "none" : "block";
-                        // Enable debug mode if showing perf overlay (for proper updates)
-                        if (!isVisible && !isDebug) {
-                            isDebug = true;
-                            const debugOverlay = document.getElementById("debug-overlay");
-                            if (debugOverlay) debugOverlay.style.display = "none"; // Keep debug hidden, just perf
-                        }
-                    }
+                    togglePerfOverlay();
                     return;
                 }
                 if (event.code === "Escape") {
@@ -41742,7 +42104,7 @@ self.onmessage = async (e) => {
                         event.preventDefault();
                         return;
                     }
-                    if (controls.isLocked === false) {
+                    if (!isGameplayActive()) {
                         const seedMenu = document.getElementById("seed-menu");
                         const settingsMenu = document.getElementById("settings-menu");
                         const mainPauseMenu = document.getElementById("main-pause-menu");
@@ -41780,7 +42142,7 @@ self.onmessage = async (e) => {
                             // At pause menu root - resume gameplay
                             // Don't call setHUDVisible(true) here - let the "lock" event handler do it
                             // Add small delay to avoid "user exited lock" security error
-                            setTimeout(() => controls.lock(), 100);
+                            setTimeout(() => enterGameplay(), 100);
                         }
                         event.preventDefault();
                         return;
@@ -41791,14 +42153,14 @@ self.onmessage = async (e) => {
                     if (isTypingInInput()) return;
                     if (uiManager.isInventoryOpen()) {
                         uiManager.closeInventory(controls);
-                    } else if (controls.isLocked) {
+                    } else if (isGameplayActive()) {
                         uiManager.openInventory(controls);
                     }
                     event.preventDefault();
                     return;
                 }
                 // 2. Game-Only Keys (Blocked if in Menu)
-                if (controls.isLocked === false) return;
+                if (!isGameplayActive()) return;
                 if (event.repeat) return;
                 const action = CODE_TO_ACTION[event.code];
                 if (!action) return;
@@ -41807,25 +42169,10 @@ self.onmessage = async (e) => {
                     case "backward": moveBackward = true; break;
                     case "left": moveLeft = true; break;
                     case "right": moveRight = true; break;
-                    case "jump": {
-                        if (isKnockedDown || playerControlsDisabled) break;  // Block input during knockdown
-                        const now = performance.now();
-                        // Double-tap toggles flight
-                        if (now - lastSpaceTime < 300) { isFlying = !isFlying; velocity.y = 0; flyUp = false; lastSpaceTime = 0; return; }
-                        lastSpaceTime = now;
-                        if (isFlying) { flyUp = true; } else { if (canJump) { velocity.y = SETTINGS.jumpForce; canJump = false; } spacePressed = true; }
-                        break;
-                    }
-                    case "crouch": if (isFlying) { flyDown = true; } else { isCrouching = !isCrouching; } break;
+                    case "jump": handleJumpPressed(); break;
+                    case "crouch": handleCrouchPressed(); break;
                     case "sprint": isSprinting = true; if (isCrouching) isCrouching = false; break;
-                    case "hotbar": {
-                        const slot = action.index;
-                        selectedBlockId = HOTBAR_SLOT_TO_BLOCK[slot - 1];
-                        currentHotbarSlot = slot;
-                        highlightSlot(slot);
-                        updateHeldBlock(selectedBlockId);
-                        break;
-                    }
+                    case "hotbar": selectHotbarSlot(action.index); break;
                     case "zoomOut":
                         if (isThirdPerson) {
                             thirdPersonDistance = Math.min(THIRD_PERSON_DISTANCE_MAX, thirdPersonDistance + 0.5);
@@ -41836,20 +42183,7 @@ self.onmessage = async (e) => {
                             thirdPersonDistance = Math.max(THIRD_PERSON_DISTANCE_MIN, thirdPersonDistance - 0.5);
                         }
                         break;
-                    case "torch":
-                        torchActive = !torchActive;
-                        // Viewmodel torch only visible in first-person
-                        if (window.torchModel) {
-                            window.torchModel.visible = torchActive && !isThirdPerson;
-                        }
-                        // Third-person torch visible only in third-person
-                        if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
-                            playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
-                        }
-                        if (torchLight) {
-                            torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 3 : 0; // HELD_TORCH_MULT (see applyTorchSettingsToLights)
-                        }
-                        break;
+                    case "torch": toggleTorch(); break;
                     case "view": toggleThirdPerson(); break;
                 }
             };
@@ -41861,9 +42195,9 @@ self.onmessage = async (e) => {
                     case "backward": moveBackward = false; break;
                     case "left": moveLeft = false; break;
                     case "right": moveRight = false; break;
-                    case "jump": spacePressed = false; if (isFlying) flyUp = false; break;
+                    case "jump": handleJumpReleased(); break;
                     case "sprint": isSprinting = false; break;
-                    case "crouch": if (isFlying) flyDown = false; break;  // Crouch is a toggle, not hold
+                    case "crouch": handleCrouchReleased(); break;  // Crouch is a toggle, not hold
                 }
             }
             /**
@@ -41873,12 +42207,11 @@ self.onmessage = async (e) => {
              * @returns {void}
              */
             function onMouseUp(e) {
+                // Touch mode owns mine/place via pointer events; ignore synthesized
+                // mouse events that follow taps (would double-fire actions).
+                if (touchModeActive) return;
                 if (e.button === 0) {
-                    leftMouseHeld = false;
-                    if (breakingBlock) {
-                        breakingBlock = null;
-                        breakProgress = 0;
-                    }
+                    stopMining();
                 } else if (e.button === 2) {
                     rightMouseHeld = false;
                 }
@@ -41916,7 +42249,8 @@ self.onmessage = async (e) => {
                 return true;
             }
             function onMouseClick(e) {
-                if (!controls.isLocked) return;
+                if (touchModeActive) return; // taps drive mine/place via pointer events
+                if (!isGameplayActive()) return;
                 // OPTIMIZATION: Reuse _pickDirTmp instead of allocating new Vector3 per click
                 const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
                 // Left click: melee takes priority over mining when a mob is closer
@@ -41966,19 +42300,17 @@ self.onmessage = async (e) => {
             function updateMovementIndicators() {
                 uiManager.updateMovementIndicators({
                     isFlying: isFlying,
-                    isSprinting: isSprinting && controls.isLocked,
-                    isCrouching: isCrouching && controls.isLocked
+                    isSprinting: isSprinting && isGameplayActive(),
+                    isCrouching: isCrouching && isGameplayActive()
                 });
             }
             const onMouseWheel = function (event) {
+                if (touchModeActive) return; // touch uses hotbar taps/swipe instead of wheel
                 event.preventDefault();
 
                 // Scroll always changes hotbar slot (zoom is now on - and = keys)
-                if (event.deltaY > 0) { currentHotbarSlot++; if (currentHotbarSlot > 9) currentHotbarSlot = 1;
-                } else if (event.deltaY < 0) { currentHotbarSlot--; if (currentHotbarSlot < 1) currentHotbarSlot = 9; }
-                selectedBlockId = HOTBAR_SLOT_TO_BLOCK[currentHotbarSlot - 1];
-                highlightSlot(currentHotbarSlot);
-                updateHeldBlock(selectedBlockId);
+                if (event.deltaY > 0) cycleHotbar(1);
+                else if (event.deltaY < 0) cycleHotbar(-1);
             };
             function onWindowResize() {
                 camera.aspect = window.innerWidth / window.innerHeight;
@@ -42021,6 +42353,678 @@ self.onmessage = async (e) => {
                     }
                 }
             }
+
+            // ============================================================
+            // MOBILE / TOUCH CONTROLS  (mobileControlsPlan.md, Phases 0–7)
+            // All touch listener bodies start with `if (!touchModeActive) return;`.
+            // Desktop (fine pointer, no touch) sees zero behavioral change.
+            // Module-scope by necessity: these are referenced by onKeyDown/onKeyUp,
+            // animate(), applyPlayerVelocity(), UIManager and the lock/unlock
+            // handlers — so they cannot live inside init().
+            // ============================================================
+
+            // ----- Detection (§3.6) -----
+            /** @type {boolean} True if the device reports any touch capability. */
+            const IS_TOUCH_CAPABLE = ((navigator.maxTouchPoints ?? 0) > 0) ||
+                (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches);
+            /** @type {boolean} True when the touch overlay/input layer is live. */
+            let touchModeActive = false;
+
+            // ----- Gameplay-focus abstraction (§3.3, Phase 1) -----
+            /** @type {boolean} True when touch controls own the screen instead of pointer lock. */
+            let virtualGameplayFocus = false;
+            /** @type {boolean} Re-entrancy guard for enter/exitGameplay transitions. */
+            let _gameplayFocusTransition = false;
+
+            /**
+             * Whether gameplay input should be processed (pointer-locked on desktop,
+             * or a touch session is active on mobile).
+             * @returns {boolean}
+             */
+            function isGameplayActive() {
+                return computeGameplayActive((typeof controls !== 'undefined' && controls && controls.isLocked), virtualGameplayFocus);
+            }
+
+            /**
+             * Body of the PointerLockControls "lock" event — shared by desktop pointer
+             * lock and the touch enterGameplay() path so there is one resume routine.
+             * @returns {void}
+             */
+            function onGameplayFocusGained() {
+                isChatOpen = false;
+                clearMenuNavigationStack();
+                setPauseState(false, "gameplay");
+                updateTouchOverlayVisibility();
+            }
+
+            /**
+             * Body of the PointerLockControls "unlock" event — shared by desktop pointer
+             * unlock and the touch exitGameplay() path.
+             * @returns {void}
+             */
+            function onGameplayFocusLost() {
+                if (!isChatOpen && !uiManager.isInventoryOpen() && !poseDebugMode) {
+                    setPauseState(true, "pause");
+                }
+                resetTransientInput();
+                updateTouchOverlayVisibility();
+            }
+
+            /**
+             * Enter active gameplay. On desktop engages pointer lock (the "lock" event
+             * then runs onGameplayFocusGained); on touch sets virtual focus and runs it
+             * directly. Re-entrancy safe (setPauseState calls this when unpausing).
+             * @returns {void}
+             */
+            function enterGameplay() {
+                if (isGameplayActive()) return;       // already playing — avoids lock↔setPauseState recursion
+                if (_gameplayFocusTransition) return;
+                if (touchModeActive) {
+                    _gameplayFocusTransition = true;
+                    virtualGameplayFocus = true;
+                    try { onGameplayFocusGained(); } finally { _gameplayFocusTransition = false; }
+                    maybeRequestFullscreen();
+                } else if (typeof controls !== 'undefined' && controls) {
+                    controls.lock();                  // "lock" event fires onGameplayFocusGained
+                }
+            }
+
+            /**
+             * Leave active gameplay (pause, open inventory, pose-debug, etc.).
+             * @param {string} [reason="pause"] - Why focus was dropped (for parity with desktop).
+             * @returns {void}
+             */
+            function exitGameplay(reason = "pause") {
+                if (touchModeActive || virtualGameplayFocus) {
+                    if (_gameplayFocusTransition) return;
+                    _gameplayFocusTransition = true;
+                    virtualGameplayFocus = false;
+                    try { onGameplayFocusLost(); } finally { _gameplayFocusTransition = false; }
+                } else if (typeof controls !== 'undefined' && controls && controls.isLocked) {
+                    controls.unlock();                // "unlock" event fires onGameplayFocusLost
+                }
+            }
+
+            /**
+             * Recompute whether touch mode is active from the touchControls setting and
+             * device capabilities (§3.6). Toggles body.touch-mode and overlay visibility.
+             * @returns {void}
+             */
+            function recomputeTouchMode() {
+                const setting = (typeof SETTINGS !== 'undefined' && SETTINGS && SETTINGS.touchControls) || 'auto';
+                const hasFine = typeof matchMedia === 'function' && matchMedia('(pointer: fine)').matches;
+                if (setting === 'on') touchModeActive = true;
+                else if (setting === 'off') touchModeActive = false;
+                else touchModeActive = IS_TOUCH_CAPABLE && !hasFine; // 'auto'
+                if (document.body) document.body.classList.toggle('touch-mode', touchModeActive);
+                // Touch-only pause-menu quick actions (inline display:none overrides a class rule).
+                const pa = document.getElementById('touch-pause-actions');
+                if (pa) pa.style.display = touchModeActive ? 'flex' : 'none';
+                updateTouchOverlayVisibility();
+            }
+
+            /**
+             * Show the touch overlay only while touch mode is active AND gameplay is live
+             * (so menus/inventory/pause hide the on-screen controls).
+             * @returns {void}
+             */
+            function updateTouchOverlayVisibility() {
+                const root = document.getElementById('touch-controls');
+                if (!root) return;
+                const show = touchModeActive && isGameplayActive();
+                root.style.display = show ? 'block' : 'none';
+                root.setAttribute('aria-hidden', show ? 'false' : 'true');
+                if (!show) resetTouchInput();
+            }
+
+            // ----- Shared action functions (§8.1) — extracted from onKeyDown/onKeyUp so
+            //       keyboard and touch buttons drive identical logic. -----
+            /**
+             * Jump button / Space pressed. Double-tap within 300 ms toggles flight;
+             * otherwise a ground jump or fly-up. Single source of the fly-toggle timing.
+             * @returns {void}
+             */
+            function handleJumpPressed() {
+                if (isKnockedDown || playerControlsDisabled) return; // Block input during knockdown
+                const now = performance.now();
+                if (now - lastSpaceTime < 300) { isFlying = !isFlying; velocity.y = 0; flyUp = false; lastSpaceTime = 0; return; }
+                lastSpaceTime = now;
+                if (isFlying) { flyUp = true; } else { if (canJump) { velocity.y = SETTINGS.jumpForce; canJump = false; } spacePressed = true; }
+            }
+            /** Jump button / Space released. @returns {void} */
+            function handleJumpReleased() {
+                spacePressed = false;
+                if (isFlying) flyUp = false;
+            }
+            /** Crouch button / C pressed: descend while flying, else toggle crouch. @returns {void} */
+            function handleCrouchPressed() {
+                if (isFlying) { flyDown = true; } else { isCrouching = !isCrouching; }
+            }
+            /** Crouch button / C released: stop descending (crouch is a toggle). @returns {void} */
+            function handleCrouchReleased() {
+                if (isFlying) flyDown = false;
+            }
+            /** Toggle the held torch and sync viewmodel/body/light visibility. @returns {void} */
+            function toggleTorch() {
+                torchActive = !torchActive;
+                if (window.torchModel) {
+                    window.torchModel.visible = torchActive && !isThirdPerson;
+                }
+                if (playerBodyMesh && playerBodyMesh.userData.thirdPersonTorch) {
+                    playerBodyMesh.userData.thirdPersonTorch.visible = torchActive && isThirdPerson;
+                }
+                if (torchLight) {
+                    torchLight.intensity = torchActive ? SETTINGS.torchIntensity * 3 : 0; // HELD_TORCH_MULT
+                }
+                updateTouchButtonStates();
+            }
+            /**
+             * Select hotbar slot n (1-9): set held block, highlight, update viewmodel.
+             * @param {number} n - 1-based slot number.
+             * @returns {void}
+             */
+            function selectHotbarSlot(n) {
+                if (n < 1 || n > 9) return;
+                selectedBlockId = HOTBAR_SLOT_TO_BLOCK[n - 1];
+                currentHotbarSlot = n;
+                highlightSlot(n);
+                updateHeldBlock(selectedBlockId);
+            }
+            /**
+             * Cycle the hotbar one step with wraparound (shared by scroll wheel + swipe).
+             * @param {number} dir - >0 next slot, <0 previous slot.
+             * @returns {void}
+             */
+            function cycleHotbar(dir) {
+                currentHotbarSlot = nextHotbarSlot(currentHotbarSlot, dir);
+                selectedBlockId = HOTBAR_SLOT_TO_BLOCK[currentHotbarSlot - 1];
+                highlightSlot(currentHotbarSlot);
+                updateHeldBlock(selectedBlockId);
+            }
+            /** Stop hold-to-mine (shared by onMouseUp left-button and touch gesture release). @returns {void} */
+            function stopMining() {
+                leftMouseHeld = false;
+                if (breakingBlock) { breakingBlock = null; breakProgress = 0; }
+            }
+            /** Toggle perf overlay (shared by KeyO and pause-menu button). @returns {void} */
+            function togglePerfOverlay() {
+                const perfOverlay = document.getElementById("perf-overlay");
+                if (!perfOverlay) return;
+                const isVisible = perfOverlay.style.display !== "none";
+                perfOverlay.style.display = isVisible ? "none" : "block";
+                if (!isVisible && !isDebug) {
+                    isDebug = true;
+                    const debugOverlay = document.getElementById("debug-overlay");
+                    if (debugOverlay) debugOverlay.style.display = "none";
+                }
+            }
+            /** Toggle debug overlay (shared by Backquote and pause-menu button). @returns {void} */
+            function toggleDebugOverlay() {
+                isDebug = !isDebug;
+                const overlay = document.getElementById("debug-overlay");
+                const perfOverlay = document.getElementById("perf-overlay");
+                if (overlay) { overlay.style.display = isDebug ? "block" : "none"; if (isDebug && typeof updateDebugInfo === "function") { updateDebugInfo(fpsInstant, fpsAvg); } }
+                if (perfOverlay) { perfOverlay.style.display = isDebug ? "block" : "none"; }
+            }
+
+            // ----- Touch input state (module scope, no per-event allocation) -----
+            // Look region / gesture (§6, §8.2)
+            let lookPointerId = -1;
+            let lookLastX = 0, lookLastY = 0;
+            let lookStartX = 0, lookStartY = 0, lookStartTime = 0;
+            let lookIsDrag = false;
+            let lookHoldTimer = -1;
+            let lookMining = false;
+            const TAP_MAX_MS = 200, TAP_SLOP_PX = 8;
+            // Joystick (§7)
+            let joyPointerId = -1, joyOriginX = 0, joyOriginY = 0, joyRadius = 64;
+            let touchMoveX = 0, touchMoveZ = 0; // -1..1, consumed by applyPlayerVelocity
+            let joySprintLatched = false;
+            const _joyOut = { x: 0, z: 0, len: 0, clampedX: 0, clampedY: 0 }; // scratch, reused
+            // Button hold tracking
+            let touchBtnJumpHeld = false, touchBtnCrouchHeld = false;
+            // Audio unlock (Web Audio needs a user gesture)
+            let _touchAudioUnlocked = false;
+            // Cached DOM refs (filled by initTouchControls)
+            let _touchRoot = null, _touchJoystick = null, _touchJoystickKnob = null;
+
+            /**
+             * Pure joystick math: maps a finger offset to an analog -1..1 vector with a
+             * rescaled dead zone, plus clamped knob coords and raw length. Writes into
+             * `out` (no allocation) and returns it. Exposed for the test seam.
+             * @param {number} dx - Finger X minus origin X (px).
+             * @param {number} dy - Finger Y minus origin Y (px).
+             * @param {number} radius - Joystick base radius (px).
+             * @param {number} deadZone - Fractional dead zone (0..1).
+             * @param {{x:number,z:number,len:number,clampedX:number,clampedY:number}} out - Scratch result.
+             * @returns {{x:number,z:number,len:number,clampedX:number,clampedY:number}} out.
+             */
+            function computeJoystickVector(dx, dy, radius, deadZone, out) {
+                const len = Math.hypot(dx, dy);
+                const cl = Math.min(len, radius);
+                const ux = len > 0 ? dx / len : 0;
+                const uy = len > 0 ? dy / len : 0;
+                let mag = cl / radius;
+                if (mag < deadZone) mag = 0;
+                else mag = (mag - deadZone) / (1 - deadZone);
+                out.x = ux * mag;
+                out.z = uy * mag;
+                out.len = len;
+                out.clampedX = ux * cl;
+                out.clampedY = uy * cl;
+                return out;
+            }
+
+            // ----- Pure logic helpers (single-source; exposed on the ?test=1 seam) -----
+            /**
+             * Next hotbar slot with 1-9 wraparound. @param {number} current @param {number} dir
+             * @returns {number} Wrapped slot 1-9.
+             */
+            function nextHotbarSlot(current, dir) {
+                let n = current + (dir > 0 ? 1 : -1);
+                if (n > 9) n = 1;
+                if (n < 1) n = 9;
+                return n;
+            }
+            /** True once a gesture's displacement exceeds the tap slop (becomes a drag). @returns {boolean} */
+            function exceedsTapSlop(dx, dy) {
+                return (dx * dx + dy * dy) > (TAP_SLOP_PX * TAP_SLOP_PX);
+            }
+            /**
+             * Classify a finished look-region gesture (§8.2).
+             * @param {boolean} mining - Mining already started (hold fired).
+             * @param {boolean} cancelled - Pointer was cancelled.
+             * @param {boolean} isDrag - Became a drag (look).
+             * @param {number} elapsedMs - Press duration.
+             * @returns {'mine'|'place'|'none'}
+             */
+            function classifyLookGesture(mining, cancelled, isDrag, elapsedMs) {
+                if (mining) return 'mine';
+                if (!cancelled && !isDrag && elapsedMs < TAP_MAX_MS) return 'place';
+                return 'none';
+            }
+            /**
+             * Next sprint-latch state with hysteresis (latch at full forward deflection,
+             * release below 0.8R or when no longer forward-dominant).
+             * @returns {boolean}
+             */
+            function sprintLatchNext(latched, len, radius, forwardDominant) {
+                if (!latched) return (len > radius && forwardDominant);
+                return !(len < radius * 0.8 || !forwardDominant);
+            }
+            /** Pure gameplay-active truth table. @returns {boolean} */
+            function computeGameplayActive(isLocked, virtualFocus) {
+                return !!(isLocked || virtualFocus);
+            }
+
+            /**
+             * Clear ALL transient touch input state. Called from resetTransientInput()
+             * (so blur/visibilitychange cover touch too) and on pointercancel.
+             * Deliberate toggles (flight/crouch/torch) are preserved, matching keyboard.
+             * @returns {void}
+             */
+            function resetTouchInput() {
+                // Joystick
+                if (joyPointerId !== -1 && joySprintLatched) isSprinting = false;
+                joyPointerId = -1;
+                joySprintLatched = false;
+                touchMoveX = 0; touchMoveZ = 0;
+                if (_touchJoystick) { _touchJoystick.classList.remove('visible', 'sprinting'); }
+                // Look / gesture
+                if (lookHoldTimer !== -1) { clearTimeout(lookHoldTimer); lookHoldTimer = -1; }
+                if (lookMining) stopMining();
+                lookMining = false;
+                lookPointerId = -1;
+                lookIsDrag = false;
+                // Buttons
+                if (touchBtnJumpHeld) { handleJumpReleased(); touchBtnJumpHeld = false; }
+                if (touchBtnCrouchHeld) { handleCrouchReleased(); touchBtnCrouchHeld = false; }
+                rightMouseHeld = false;
+            }
+
+            /**
+             * Reflect flying/crouch/torch toggle states on the touch buttons. Only mutates
+             * classList when the state actually changed (no per-frame DOM thrash).
+             * @returns {void}
+             */
+            function updateTouchButtonStates() {
+                if (!touchModeActive) return;
+                const setActive = (id, on) => {
+                    const el = document.getElementById(id);
+                    if (!el) return;
+                    const has = el.classList.contains('active');
+                    if (on && !has) el.classList.add('active');
+                    else if (!on && has) el.classList.remove('active');
+                };
+                setActive('touch-btn-jump', isFlying);
+                setActive('touch-btn-crouch', isCrouching || (isFlying && flyDown));
+                setActive('touch-btn-torch', torchActive);
+                setActive('touch-btn-camera', isThirdPerson);
+            }
+
+            /** Resume the (lazily-created) Web Audio context on the first touch gesture. @returns {void} */
+            function ensureTouchAudio() {
+                if (_touchAudioUnlocked) return;
+                _touchAudioUnlocked = true;
+                try { audioManager.initContext(); audioManager.resumeContext(); } catch (e) { /* no-op */ }
+            }
+
+            // ----- Look region pointer handlers (§6 look + §8.2 gesture classifier) -----
+            /**
+             * Apply touch look rotation for first or third person. Hot path: no allocation.
+             * @param {number} dx - Pointer delta X (px).
+             * @param {number} dy - Pointer delta Y (px).
+             * @returns {void}
+             */
+            function applyTouchLook(dx, dy) {
+                const sens = (SETTINGS.touchLookSensitivity ?? 1.0) * 0.0025;
+                if (isThirdPerson) {
+                    thirdPersonOrbitYaw -= dx * sens;
+                    thirdPersonOrbitPitch += dy * sens;
+                    thirdPersonOrbitPitch = Math.max(ORBIT_PITCH_MIN, Math.min(ORBIT_PITCH_MAX, thirdPersonOrbitPitch));
+                    applyThirdPersonCameraRotation();
+                } else {
+                    camera.rotation.y -= dx * sens;
+                    camera.rotation.x -= dy * sens;
+                    camera.rotation.x = Math.max(-Math.PI / 2, Math.min(Math.PI / 2, camera.rotation.x));
+                }
+            }
+
+            /** Hold timer fired: begin mining at the crosshair (existing per-frame logic does the work). */
+            function onLookHoldFired() {
+                lookHoldTimer = -1;
+                if (lookPointerId === -1) return;
+                lookMining = true;
+                leftMouseHeld = true;
+            }
+
+            /** Tap on the look region = place a block at the crosshair (mirrors right-click body). @returns {void} */
+            function touchPlaceBlock() {
+                const hit = pickVoxel(getPlayerWorldPosition(), controls.getDirection(_pickDirTmp), SETTINGS.blockReach);
+                if (hit && hit.face) {
+                    tryPlaceBlock(hit.x, hit.y, hit.z, hit.face[0], hit.face[1], hit.face[2]);
+                }
+            }
+
+            function onTouchLookDown(e, x, y) {
+                lookPointerId = e.pointerId;
+                lookLastX = x; lookLastY = y;
+                lookStartX = x; lookStartY = y;
+                lookStartTime = performance.now();
+                lookIsDrag = false;
+                lookMining = false;
+                // Gesture grammar is fixed: tap = place, hold = mine. The §8.2 swap
+                // setting was dropped — it doesn't map onto hold-to-mine mechanics.
+                lookHoldTimer = setTimeout(onLookHoldFired, TAP_MAX_MS);
+            }
+
+            function onTouchLookMove(x, y) {
+                const dx = x - lookLastX;
+                const dy = y - lookLastY;
+                lookLastX = x; lookLastY = y;
+                if (!lookIsDrag) {
+                    if (exceedsTapSlop(x - lookStartX, y - lookStartY)) lookIsDrag = true;
+                }
+                if (dx !== 0 || dy !== 0) applyTouchLook(dx, dy);
+            }
+
+            function onTouchLookUp(cancelled) {
+                if (lookHoldTimer !== -1) { clearTimeout(lookHoldTimer); lookHoldTimer = -1; }
+                const elapsed = performance.now() - lookStartTime;
+                const gesture = classifyLookGesture(lookMining, cancelled, lookIsDrag, elapsed);
+                if (gesture === 'mine') {
+                    stopMining();
+                } else if (gesture === 'place') {
+                    touchPlaceBlock();
+                }
+                lookMining = false;
+                lookPointerId = -1;
+                lookIsDrag = false;
+            }
+
+            // ----- Joystick pointer handlers (§7) -----
+            /**
+             * True if a pointerdown at (x,y) should start the movement joystick rather than
+             * the look region. Movement zone = left 40% / bottom 60% (mirrored if left-handed).
+             * @param {number} x - Client X. @param {number} y - Client Y.
+             * @returns {boolean}
+             */
+            function inJoystickZone(x, y) {
+                const w = window.innerWidth, h = window.innerHeight;
+                const leftHanded = !!(SETTINGS && SETTINGS.touchLeftHanded);
+                const inX = leftHanded ? (x > w * 0.6) : (x < w * 0.4);
+                const inY = y > h * 0.4; // bottom 60%
+                return inX && inY;
+            }
+
+            function onJoystickDown(e, x, y) {
+                joyPointerId = e.pointerId;
+                joyRadius = 64 * (SETTINGS.touchJoystickSize ?? 1.0);
+                // Center the base on the touch point, clamped fully on-screen.
+                joyOriginX = Math.max(joyRadius, Math.min(window.innerWidth - joyRadius, x));
+                joyOriginY = Math.max(joyRadius, Math.min(window.innerHeight - joyRadius, y));
+                touchMoveX = 0; touchMoveZ = 0;
+                if (_touchJoystick) {
+                    _touchJoystick.style.transform = `translate(${joyOriginX}px, ${joyOriginY}px)`;
+                    _touchJoystick.classList.add('visible');
+                }
+                if (_touchJoystickKnob) _touchJoystickKnob.style.transform = 'translate(0px, 0px)';
+            }
+
+            function onJoystickMove(x, y) {
+                const dx = x - joyOriginX, dy = y - joyOriginY;
+                computeJoystickVector(dx, dy, joyRadius, 0.15, _joyOut);
+                touchMoveX = _joyOut.x;
+                touchMoveZ = _joyOut.z;
+                if (_touchJoystickKnob) {
+                    _touchJoystickKnob.style.transform = `translate(${_joyOut.clampedX}px, ${_joyOut.clampedY}px)`;
+                }
+                // Sprint: full forward-dominant deflection latches; hysteresis on release.
+                const forwardDominant = (-dy) > Math.abs(dx);
+                const wasLatched = joySprintLatched;
+                joySprintLatched = sprintLatchNext(joySprintLatched, _joyOut.len, joyRadius, forwardDominant);
+                if (joySprintLatched !== wasLatched) {
+                    isSprinting = joySprintLatched;
+                    if (joySprintLatched && isCrouching) isCrouching = false;
+                    if (_touchJoystick) _touchJoystick.classList.toggle('sprinting', joySprintLatched);
+                }
+            }
+
+            function onJoystickUp() {
+                if (joySprintLatched) { isSprinting = false; joySprintLatched = false; }
+                joyPointerId = -1;
+                touchMoveX = 0; touchMoveZ = 0;
+                if (_touchJoystick) _touchJoystick.classList.remove('visible', 'sprinting');
+            }
+
+            // ----- Combined look-region pointer dispatch (multiplexes joystick vs look) -----
+            function onTouchRegionPointerDown(e) {
+                if (!touchModeActive || !isGameplayActive()) return;
+                if (e.pointerType === 'mouse' && !touchModeActive) return;
+                ensureTouchAudio();
+                const x = e.clientX, y = e.clientY;
+                if (joyPointerId === -1 && inJoystickZone(x, y)) {
+                    onJoystickDown(e, x, y);
+                } else if (lookPointerId === -1) {
+                    onTouchLookDown(e, x, y);
+                } else {
+                    return; // already tracking both; ignore extra pointers on the look region
+                }
+                try { e.target.setPointerCapture(e.pointerId); } catch (err) { /* no-op */ }
+            }
+            function onTouchRegionPointerMove(e) {
+                if (e.pointerId === joyPointerId) onJoystickMove(e.clientX, e.clientY);
+                else if (e.pointerId === lookPointerId) onTouchLookMove(e.clientX, e.clientY);
+            }
+            function onTouchRegionPointerUp(e) {
+                if (e.pointerId === joyPointerId) onJoystickUp();
+                else if (e.pointerId === lookPointerId) onTouchLookUp(e.type === 'pointercancel');
+            }
+
+            // ----- Action button wiring (§8.3) -----
+            /**
+             * Wire a press/release button (jump, crouch) using pointer capture so sliding
+             * off still delivers pointerup.
+             * @param {string} id - Element id.
+             * @param {Function} onDown @param {Function} onUp
+             * @returns {void}
+             */
+            function wireHoldButton(id, onDown, onUp) {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('pointerdown', (e) => {
+                    if (!touchModeActive || !isGameplayActive()) return;
+                    e.preventDefault();
+                    ensureTouchAudio();
+                    try { el.setPointerCapture(e.pointerId); } catch (err) { /* no-op */ }
+                    onDown();
+                    updateTouchButtonStates();
+                });
+                const up = (e) => { if (!touchModeActive) return; e.preventDefault(); onUp(); updateTouchButtonStates(); };
+                el.addEventListener('pointerup', up);
+                el.addEventListener('pointercancel', up);
+            }
+            /**
+             * Wire a one-shot tap button (torch, camera, inventory, pause).
+             * @param {string} id - Element id. @param {Function} action @param {boolean} [needGameplay=true]
+             * @returns {void}
+             */
+            function wireTapButton(id, action, needGameplay = true) {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.addEventListener('pointerdown', (e) => {
+                    if (!touchModeActive) return;
+                    if (needGameplay && !isGameplayActive()) return;
+                    e.preventDefault();
+                    ensureTouchAudio();
+                    action();
+                    updateTouchButtonStates();
+                });
+            }
+
+            /**
+             * One-time setup of the touch overlay: cache DOM refs and attach pointer
+             * listeners. Safe to call once at module init (the overlay HTML is static).
+             * @returns {void}
+             */
+            function initTouchControls() {
+                _touchRoot = document.getElementById('touch-controls');
+                _touchJoystick = document.getElementById('touch-joystick');
+                _touchJoystickKnob = document.getElementById('touch-joystick-knob');
+                const region = document.getElementById('touch-look-region');
+                if (region) {
+                    region.addEventListener('pointerdown', onTouchRegionPointerDown);
+                    region.addEventListener('pointermove', onTouchRegionPointerMove);
+                    region.addEventListener('pointerup', onTouchRegionPointerUp);
+                    region.addEventListener('pointercancel', onTouchRegionPointerUp);
+                }
+                // Hold buttons
+                wireHoldButton('touch-btn-jump', handleJumpPressed, handleJumpReleased);
+                wireHoldButton('touch-btn-crouch', handleCrouchPressed, handleCrouchReleased);
+                // Track held flags so resetTouchInput can release them
+                const jb = document.getElementById('touch-btn-jump');
+                if (jb) { jb.addEventListener('pointerdown', () => { if (touchModeActive) touchBtnJumpHeld = true; }); jb.addEventListener('pointerup', () => { touchBtnJumpHeld = false; }); jb.addEventListener('pointercancel', () => { touchBtnJumpHeld = false; }); }
+                const cb = document.getElementById('touch-btn-crouch');
+                if (cb) { cb.addEventListener('pointerdown', () => { if (touchModeActive) touchBtnCrouchHeld = true; }); cb.addEventListener('pointerup', () => { touchBtnCrouchHeld = false; }); cb.addEventListener('pointercancel', () => { touchBtnCrouchHeld = false; }); }
+                // Tap buttons
+                wireTapButton('touch-btn-torch', toggleTorch);
+                wireTapButton('touch-btn-camera', toggleThirdPerson);
+                wireTapButton('touch-btn-inventory', () => { if (uiManager.isInventoryOpen()) uiManager.closeInventory(controls); else uiManager.openInventory(controls); });
+                wireTapButton('touch-btn-pause', () => exitGameplay('pause'));
+                // Pause-menu quick actions (plain clicks — fire while paused, no gameplay gate).
+                document.getElementById('btn-touch-quicksave')?.addEventListener('click', () => { if (typeof quickSave === 'function') quickSave(); });
+                document.getElementById('btn-touch-quickload')?.addEventListener('click', () => { if (typeof quickLoad === 'function') quickLoad(); });
+                document.getElementById('btn-touch-perf')?.addEventListener('click', togglePerfOverlay);
+                document.getElementById('btn-touch-debug')?.addEventListener('click', toggleDebugOverlay);
+                // Suppress the long-press context menu on the overlay + canvas.
+                const ctxBlock = (e) => { if (touchModeActive) e.preventDefault(); };
+                if (_touchRoot) _touchRoot.addEventListener('contextmenu', ctxBlock);
+                if (renderer && renderer.domElement) renderer.domElement.addEventListener('contextmenu', ctxBlock);
+                else document.addEventListener('contextmenu', ctxBlock);
+                // Inventory close affordances for touch (no E/ESC key on phones):
+                // a visible ✕ button plus tap-the-backdrop-to-close.
+                document.getElementById('inventory-close-btn')?.addEventListener('click', () => {
+                    if (uiManager.isInventoryOpen()) uiManager.closeInventory(controls);
+                });
+                const invOverlay = document.getElementById('inventory-overlay');
+                if (invOverlay) invOverlay.addEventListener('click', (e) => {
+                    if (!touchModeActive) return;
+                    if (e.target === invOverlay && uiManager.isInventoryOpen()) uiManager.closeInventory(controls);
+                });
+                // Hotbar taps + swipe (§9 Phase 5)
+                initTouchHotbar();
+                applyTouchControlSettings();
+                recomputeTouchMode();
+                logDebug("[Touch] capable=" + IS_TOUCH_CAPABLE + " active=" + touchModeActive);
+            }
+
+            // ----- Hotbar touch (Phase 5) -----
+            let _hbSwipeStartX = 0, _hbSwiped = false, _hbActive = false;
+            const HB_SWIPE_STEP = 32;
+            function initTouchHotbar() {
+                const hotbar = document.getElementById('hotbar');
+                if (!hotbar) return;
+                hotbar.addEventListener('pointerdown', (e) => {
+                    if (!touchModeActive || !isGameplayActive()) return;
+                    _hbActive = true; _hbSwiped = false; _hbSwipeStartX = e.clientX;
+                });
+                hotbar.addEventListener('pointermove', (e) => {
+                    if (!_hbActive) return;
+                    const d = e.clientX - _hbSwipeStartX;
+                    if (Math.abs(d) >= HB_SWIPE_STEP) {
+                        cycleHotbar(d > 0 ? 1 : -1);
+                        _hbSwiped = true;
+                        _hbSwipeStartX = e.clientX;
+                    }
+                });
+                const end = (e) => {
+                    if (!_hbActive) return;
+                    _hbActive = false;
+                    if (_hbSwiped) return; // it was a swipe, not a tap
+                    const slot = e.target && e.target.closest ? e.target.closest('.slot') : null;
+                    if (slot && slot.id) {
+                        const n = parseInt(slot.id.replace('slot-', ''), 10);
+                        if (n >= 1 && n <= 9) selectHotbarSlot(n);
+                    }
+                };
+                hotbar.addEventListener('pointerup', end);
+                hotbar.addEventListener('pointercancel', () => { _hbActive = false; });
+            }
+
+            // ----- Live-applied touch settings (Phase 7) -----
+            /**
+             * Apply touch control settings to CSS custom properties + body classes.
+             * Avoids touching individual element styles.
+             * @returns {void}
+             */
+            function applyTouchControlSettings() {
+                const root = document.documentElement;
+                root.style.setProperty('--touch-joy-size', String(SETTINGS.touchJoystickSize ?? 1.0));
+                root.style.setProperty('--touch-btn-scale', String(SETTINGS.touchButtonScale ?? 1.0));
+                if (document.body) document.body.classList.toggle('touch-left-handed', !!(SETTINGS && SETTINGS.touchLeftHanded));
+            }
+
+            // ----- Fullscreen / orientation (Phase 6) -----
+            let _fullscreenTried = false;
+            /** Attempt fullscreen + landscape lock on touch (silently degrades). @returns {void} */
+            function maybeRequestFullscreen() {
+                if (!touchModeActive || _fullscreenTried) return;
+                _fullscreenTried = true;
+                try {
+                    const el = document.documentElement;
+                    if (el.requestFullscreen) {
+                        el.requestFullscreen({ navigationUI: "hide" }).then(() => {
+                            try { if (screen.orientation && screen.orientation.lock) screen.orientation.lock("landscape").catch(() => {}); } catch (e) {}
+                        }).catch(() => {});
+                    }
+                } catch (e) { /* unsupported (e.g. iPhone Safari) — ignore */ }
+                if (typeof matchMedia === 'function' && matchMedia('(orientation: portrait)').matches && typeof showToast === 'function') {
+                    showToast('Rotate to landscape for the best experience', 'info', 4000);
+                }
+            }
+
+            // Boot: wire up the overlay now (module script is deferred → DOM is ready).
+            initTouchControls();
 
             // SEAM-RECONCILE: initNoise, workerNumericSeed, CHUNK_SIZE, CHUNK_HEIGHT are
             //   worker-template-only (declared inside CHUNK_WORKER_CODE; no module-scope binding).
@@ -42075,6 +43079,10 @@ self.onmessage = async (e) => {
                     buildChunkWorkerCode,
                     // --- shadows (single source of truth: frustum=2r, map=32r => texel locked to 1/16 block) ---
                     SHADOW_RENDER_DISTANCES, deriveShadowConfig,
+                    // --- touch controls pure logic (mobileControlsPlan.md Phase 9) ---
+                    computeJoystickVector, nextHotbarSlot, exceedsTapSlop,
+                    classifyLookGesture, sprintLatchNext, computeGameplayActive,
+                    TAP_MAX_MS, TAP_SLOP_PX,
                     // --- seeding + mutable module state ---
                     seedNoise: function(seedStr) { return seedMainThreadNoise(new SeededRandom(seedStr)); },
                     get worldSeed() { return worldConfig.seed; },

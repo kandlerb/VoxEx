@@ -106,6 +106,10 @@ Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water,
 | ~ (Tilde) | Debug Overlay |
 | ESC | Pause |
 
+### Mobile / Touch
+
+VoxEx is fully touch-playable on phones and tablets. Touch controls auto-activate on touch devices (configurable in **Settings → Touch Controls**: auto / on / off, plus look sensitivity, joystick size, button scale, and a left-handed layout). A floating left-thumb joystick handles analog movement (push to the edge to sprint), dragging the rest of the screen looks around, a short tap places a block and touch-and-hold mines, and on-screen buttons cover jump (double-tap to fly), crouch, torch, camera, inventory, and pause. Quick save/load and the perf/debug overlays appear as buttons in the pause menu. Desktop mouse/keyboard play is unchanged.
+
 ## Tech Stack
 
 | Technology | Version | Purpose |
