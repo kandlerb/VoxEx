@@ -3728,8 +3728,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.9";
+            const VOXEX_BUILD = "2026-06-12.10";
             const VOXEX_RECENT_CHANGES = [
+                "Water: bobbing dies down at shorelines (quadratic shoreDist falloff); wave noise is now 3 domain-warped octaves drifting in different directions (pattern deforms, doesn't slide); slow per-swell amplitude cycles create natural wave sets",
                 "Water surface pass: gentle vertex bobbing (swell field, calm at shores), top-down caustic web in shallow water, view-graded sky reflection (horizon vs zenith), 3rd swell component + bright breaking crest cores tied to the bobbing geometry",
                 "FIX: wave crests no longer a uniform dot grid — swell field reweighted (primary swell + noise breaks fronts into uneven segments) with low-freq patch gating for calm vs. active stretches",
                 "Trees: deterministic site validation — no trees on slopes/cliffs, longwood trunks never hang over air, per-column ground+cave checks (chunk cache v5)",
@@ -30368,10 +30369,18 @@ self.onmessage = async (e) => {
                             // that the seam offset (<0.02 blocks) is invisible.
                             float tv = time * 0.001;
                             vec2 wpv = worldPos.xz;
-                            float bob = sin(dot(wpv, vec2(0.45, 0.25)) + tv * 1.1) * 0.55
-                                      + sin(dot(wpv, vec2(-0.22, 0.38)) + tv * 0.8) * 0.30
-                                      + sin(dot(wpv, vec2(0.13, -0.41)) + tv * 0.95) * 0.25;
-                            worldPos.y += bob * 0.06 * shoreDist;
+                            // Slow per-swell amplitude cycles (wave "sets" grow and fade over
+                            // ~40-75s). MUST match the fragment shader's a1/a2/a3 exactly.
+                            float a1 = 0.55 + 0.12 * sin(tv * 0.151);
+                            float a2 = 0.30 + 0.10 * sin(tv * 0.117 + 2.1);
+                            float a3 = 0.25 + 0.08 * sin(tv * 0.083 + 4.2);
+                            float bob = sin(dot(wpv, vec2(0.45, 0.25)) + tv * 1.1) * a1
+                                      + sin(dot(wpv, vec2(-0.22, 0.38)) + tv * 0.8) * a2
+                                      + sin(dot(wpv, vec2(0.13, -0.41)) + tv * 0.95) * a3;
+                            // QUADRATIC shore falloff: shoreDist saturates only 4 blocks from
+                            // land, so a linear scale still bobbed visibly against the
+                            // shoreline. Squared: 1 block out ~6%, 2 ~25%, 3 ~56%, 4+ full.
+                            worldPos.y += bob * 0.06 * shoreDist * shoreDist;
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = viewMatrix * worldPos;
                             gl_Position = projectionMatrix * mvPosition;
@@ -30462,7 +30471,21 @@ self.onmessage = async (e) => {
                             // two-wave repeat so open water never settles into a visible cycle.
                             // Same three sines (same weights) drive the vertex bobbing.
                             float w3 = sin(dot(wp, vec2(0.13, -0.41)) + t * 0.95);
-                            float n  = noise(wp * 0.9 + vec2(t * 0.35, -t * 0.27)) * 2.0 - 1.0;
+                            // Slow per-swell amplitude cycles — wave sets that grow and fade.
+                            // MUST match the vertex shader's a1/a2/a3 (drives the bobbing).
+                            float a1 = 0.55 + 0.12 * sin(t * 0.151);
+                            float a2 = 0.30 + 0.10 * sin(t * 0.117 + 2.1);
+                            float a3 = 0.25 + 0.08 * sin(t * 0.083 + 4.2);
+                            // DOMAIN-WARPED MULTI-OCTAVE NOISE: a single octave rigidly
+                            // translating reads as a fixed picture sliding by once crests
+                            // highlight it. Three octaves drift in DIFFERENT directions, and
+                            // the swells warp the sample coordinates so the features
+                            // continuously DEFORM instead of just translating.
+                            vec2 warp = vec2(w1, w2) * 0.35;
+                            float n1 = noise(wp * 0.9 + warp + vec2(t * 0.35, -t * 0.27));
+                            float n2 = noise(wp * 1.9 - warp.yx + vec2(-t * 0.21, t * 0.43));
+                            float n3 = noise(wp * 0.45 + vec2(t * 0.12, t * 0.09));
+                            float n = (n1 * 0.55 + n2 * 0.30 + n3 * 0.15) * 2.0 - 1.0;
                             vec2 waveOffset = vec2(w1 + 0.6 * n + 0.35 * w3, w2 - 0.6 * n - 0.30 * w3) * 0.5;
                             // Perspective attenuation: a constant screen-UV offset spans far more
                             // WORLD at distance — fade it so far water shimmers subtly instead of
@@ -30595,9 +30618,9 @@ self.onmessage = async (e) => {
                             // swellGeo is the EXACT field that bobs the vertices (see vertex
                             // shader — keep weights in sync), so highlights sit on water that is
                             // physically raised; n breaks fronts into uneven segments on top.
-                            float swellGeo = w1 * 0.55 + w2 * 0.30 + w3 * 0.25;
+                            float swellGeo = w1 * a1 + w2 * a2 + w3 * a3;
                             float swell = swellGeo + n * 0.45;
-                            float crestPatch = noise(wp * 0.12 + vec2(t * 0.10, -t * 0.08)); // ~8-block calm/active patches ('patch' is a GLSL reserved word)
+                            float crestPatch = noise(wp * 0.12 + warp * 0.2 + vec2(t * 0.10, -t * 0.08)); // ~8-block calm/active patches ('patch' is a GLSL reserved word)
                             float crestGate = waveScale * (0.25 + 0.95 * crestPatch);
                             float crest = smoothstep(0.60, 1.10, swell) * crestGate;
                             // Bright core where the swell truly peaks — a small, rarer "breaking
