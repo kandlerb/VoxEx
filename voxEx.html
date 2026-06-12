@@ -3728,8 +3728,15 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.4";
+            const VOXEX_BUILD = "2026-06-12.5";
             const VOXEX_RECENT_CHANGES = [
+                "Trees: deterministic site validation — no trees on slopes/cliffs, longwood trunks never hang over air, per-column ground+cave checks (chunk cache v5)",
+                "FIX: floating phantom canopies — slope-rejected trees are now rejected deterministically in getChunkTreePositions, so neighbor chunks never optimistically place their leaves",
+                "Leaves: ambient occlusion now applies within/around leaf canopies (AO_OCCLUDES table; leaves occlude, glass/water never do)",
+                "FIX: placed-torch PointLights dim by voxel line-of-sight to the player (5-ray cone) — no more light pooling through solid blocks",
+                "Shadows: cutout-accurate shadows for glass/leaves via alpha-tested custom depth material (glass panes cast their frame pattern, not a solid quad)",
+                "FIX: distant leaf darkening — atlas dilation floods opaque RGB under transparent texels so mipmaps stop averaging in the black prefill",
+                "Worker parity: GLASS added to worker transparency + same-id culling tables (faces behind glass no longer culled in worker meshes)",
                 "FIX: touch look up/down no longer rolls the camera (yaw/pitch edited in YXZ euler space, parity with PointerLockControls)",
                 "Camera: intentional turn-lean — subtle banked roll while turning that recenters (Gameplay > Camera toggle, default on)",
                 "FIX: touch inventory button opens on a plain tap (backdrop close handler ignored the opening tap's synthesized click)",
@@ -4867,9 +4874,58 @@
                 return true;
             }
 
+            // Maximum height delta (blocks) allowed in the 1-block ring around a tree's
+            // trunk footprint. Rejects cliff edges and steep slopes deterministically.
+            const TREE_MAX_RING_SLOPE = 2;
+
+            /**
+             * Deterministic per-site terrain validation shared by ALL tree paths (own-chunk
+             * placement, optimistic neighbor canopies, prune/place passes, worker copy).
+             * Rejects sites on slopes/cliffs, and multi-trunk (longwood) sites whose
+             * footprint columns don't share one ground height — no logs hanging over air.
+             * Uses only blendedHeight() so every chunk reaches the SAME verdict without
+             * needing neighbor chunk data (prevents floating phantom canopies).
+             * @param {GlobalCoord} gx - Trunk center global X.
+             * @param {GlobalCoord} gz - Trunk center global Z.
+             * @param {number} groundY - Deterministic ground height at center.
+             * @param {number} minTx - Trunk footprint min X offset.
+             * @param {number} maxTx - Trunk footprint max X offset.
+             * @param {number} minTz - Trunk footprint min Z offset.
+             * @param {number} maxTz - Trunk footprint max Z offset.
+             * @param {number} worldSeed - World seed.
+             * @returns {boolean} True if the site is viable for a tree.
+             */
+            function isTreeSiteViable(gx, gz, groundY, minTx, maxTx, minTz, maxTz, worldSeed) {
+                for (let tx = minTx - 1; tx <= maxTx + 1; tx++) {
+                    for (let tz = minTz - 1; tz <= maxTz + 1; tz++) {
+                        if (tx === 0 && tz === 0) continue; // center already = groundY
+                        const h = Math.floor(blendedHeight(gx + tx, gz + tz, worldSeed));
+                        const inFootprint = tx >= minTx && tx <= maxTx && tz >= minTz && tz <= maxTz;
+                        if (inFootprint) {
+                            // Every trunk column must sit ON the ground — not over air,
+                            // not buried in a rise (multi-trunk longwood overhang fix)
+                            if (h !== groundY) return false;
+                        } else if (Math.abs(h - groundY) > TREE_MAX_RING_SLOPE) {
+                            // Ring around the trunk too steep — sloped terrain / cliff edge
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            // Per-chunk tree position memo — getChunkTreePositions is called for the
+            // 3x3 neighborhood of EVERY generating chunk plus the prune/place passes,
+            // so each chunk's list is recomputed many times. Keyed by seed so stale
+            // entries from a previous world are never reused.
+            const treePositionsCache = new Map();
+
             // Calculate tree positions for a chunk deterministically (without needing chunk data)
             // Returns array of tree objects with position and profile info
             function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
+                const treeCacheKey = worldSeed + ':' + cx + ',' + cz;
+                const cachedTrees = treePositionsCache.get(treeCacheKey);
+                if (cachedTrees) return cachedTrees;
                 const startX = cx * chunkSize;
                 const startZ = cz * chunkSize;
                 const trees = [];
@@ -4946,6 +5002,13 @@
                         const heightRange = trunk.maxHeight - trunk.minHeight;
                         const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
 
+                        // DETERMINISTIC SITE VALIDATION — must reject here (not at
+                        // placement time) so neighbor chunks never optimistically place
+                        // a canopy for a tree that its own chunk then refuses (floating
+                        // leaves). Checks slope, footprint overhang, and world-top room.
+                        if (groundY + 1 + trunkHeight + canopy.topExtension >= WORLD_DIMS.chunkHeight) continue;
+                        if (!isTreeSiteViable(gx, gz, groundY, minTx, maxTx, minTz, maxTz, worldSeed)) continue;
+
                         trees.push({
                             gx, gz, lx, lz,
                             groundY,  // Include computed ground height
@@ -4964,6 +5027,8 @@
                     }
                 }
 
+                if (treePositionsCache.size >= 512) treePositionsCache.clear();
+                treePositionsCache.set(treeCacheKey, trees);
                 return trees;
             }
 
@@ -5020,29 +5085,43 @@
                     const localX = gx - startX;
                     const localZ = gz - startZ;
 
-                    // Use the pre-computed groundY from getChunkTreePositions
-                    // For own chunk trees, prefer the cached height which matches actual terrain
-                    let finalGroundY = groundY;
-                    if (isOwnChunk) {
-                        // Use cached height for trees in this chunk (more accurate)
-                        finalGroundY = heightCache[lx + lz * chunkSize];
-                    }
+                    // Use the deterministic groundY from getChunkTreePositions for BOTH
+                    // own-chunk and neighbor trees. Trunk and canopy must derive from the
+                    // SAME height or cross-chunk canopies float above/below their trunk.
+                    // (heightCache holds the identical blendedHeight value for own-chunk
+                    // columns, so nothing is lost by using the deterministic value.)
+                    const finalGroundY = groundY;
 
                     const trunkBaseY = finalGroundY + 1;
                     const trunkTopY = trunkBaseY + trunkHeight;
 
                     // Validate and place trunk only for trees in THIS chunk
-                    // Note: River check and spacing check are now done in getChunkTreePositions
+                    // Note: River/spacing/slope/overhang checks are done deterministically
+                    // in getChunkTreePositions; the checks below need actual chunk data.
                     if (isOwnChunk) {
-                        // Ground block check - only this requires actual chunk data
-                        const groundId = get(lx, finalGroundY, lz);
-                        if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
+                        // Ground + support check for EVERY trunk footprint column —
+                        // multi-trunk longwoods must not stand on invalid ground, and a
+                        // cave/tunnel directly under the surface disqualifies the site.
+                        let groundOk = true;
+                        for (let tx = minTx; tx <= maxTx && groundOk; tx++) {
+                            for (let tz = minTz; tz <= maxTz && groundOk; tz++) {
+                                const groundId = get(lx + tx, finalGroundY, lz + tz);
+                                if (!isValidTreeGround(groundId, allowedGroundBlocks)) groundOk = false;
+                                const belowId = get(lx + tx, finalGroundY - 1, lz + tz);
+                                if (belowId === AIR || belowId === WATER) groundOk = false; // cave roof / overhang
+                            }
+                        }
+                        if (!groundOk) continue;
 
-                        // Check space for trunk
+                        // Check space for the FULL trunk footprint
                         let hasSpace = true;
                         for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
-                            const block = get(lx, y, lz);
-                            if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                            for (let tx = minTx; tx <= maxTx && hasSpace; tx++) {
+                                for (let tz = minTz; tz <= maxTz && hasSpace; tz++) {
+                                    const block = get(lx + tx, y, lz + tz);
+                                    if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                                }
+                            }
                         }
                         if (!hasSpace) continue;
 
@@ -5070,29 +5149,31 @@
                         const sourceChunk = chunks.get(sourceKey);
 
                         if (sourceChunk) {
-                            // Source chunk exists - verify trunk block is present
-                            // (Tree may have failed ground/space checks due to caves)
+                            // ROBUST RANGE SCAN (parity with worker copy and
+                            // placeNeighborTreeLeaves): a single-Y check fails on any
+                            // estimate/actual height delta. Scan the trunk column
+                            // (estimate ± slack) for ANY log.
                             const sourceBlocks = sourceChunk.blocks || sourceChunk;
                             const sourceStartX = tree.sourceCx * chunkSize;
                             const sourceStartZ = tree.sourceCz * chunkSize;
-
-                            const trunkLocalX = gx - sourceStartX;
-                            const trunkLocalZ = gz - sourceStartZ;
-                            const checkY = Math.min(trunkTopY, chunkHeight - 1);
-                            const trunkIdx = trunkLocalX + trunkLocalZ * chunkSize + checkY * chunkSize * chunkSize;
-
+                            const colBase = (gx - sourceStartX) + (gz - sourceStartZ) * chunkSize;
+                            const scanLo = Math.max(0, groundY - 6);
+                            const scanHi = Math.min(chunkHeight - 1, trunkTopY + 6);
+                            let trunkFound = false;
+                            for (let ty = scanLo; ty <= scanHi; ty++) {
+                                if (isLogBlock(sourceBlocks[colBase + ty * chunkSize * chunkSize])) { trunkFound = true; break; }
+                            }
                             // If chunk exists but trunk doesn't, tree failed validation - skip leaves
-                            if (!isLogBlock(sourceBlocks[trunkIdx])) continue;
+                            if (!trunkFound) continue;
                         }
                         // If sourceChunk is undefined, trust the deterministic generator
                         // and place leaves now. The trunk will be placed when that chunk generates.
                     }
 
                     // Place canopy leaves that fall within THIS chunk
-                    // This runs for ALL trees (own and neighbor) whose canopy overlaps
-                    // Use finalGroundY for own chunk trees, groundY (from tree object) for neighbor trees
-                    const actualGroundY = isOwnChunk ? finalGroundY : groundY;
-                    const minCanopyY = actualGroundY + 2;
+                    // This runs for ALL trees (own and neighbor) whose canopy overlaps.
+                    // finalGroundY === groundY for both cases (single deterministic height).
+                    const minCanopyY = finalGroundY + 2;
                     forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
                         if (y < minCanopyY) return; // Skip leaves that would be too low
 
@@ -12740,6 +12821,12 @@
                     if (!playerPos || typeof scene === 'undefined') return;
 
                     const now = performance.now();
+
+                    // OCCLUSION DIMMING: runs on its own (shorter) throttle, BEFORE the
+                    // position/interval gates below, so a torch that gets walled off dims
+                    // even when the player hasn't moved 4+ blocks. See updateOcclusion().
+                    this.updateOcclusion(now);
+
                     if (this._dirty) {
                         // Immediate refresh after a torch place/break. Positions were
                         // already patched directly (registerTorch/unregisterTorch), so
@@ -12802,11 +12889,50 @@
                     for (let i = 0; i < this.lights.length; i++) {
                         if (i < closest.length) {
                             const pos = closest[i].pos;
-                            this.lights[i].position.set(pos.x, pos.y + 0.33, pos.z);
-                            this.lights[i].visible = true;
+                            const light = this.lights[i];
+                            if (!light.visible || light.position.x !== pos.x ||
+                                light.position.y !== pos.y + 0.33 || light.position.z !== pos.z) {
+                                // Reassigned to a different torch — reset occlusion smoothing
+                                // so the new torch doesn't inherit the old one's dim factor.
+                                light.userData.visFactor = undefined;
+                            }
+                            light.position.set(pos.x, pos.y + 0.33, pos.z);
+                            light.visible = true;
                         } else {
                             this.lights[i].visible = false;
                         }
+                    }
+                    // Apply occlusion immediately to freshly (re)assigned lights
+                    this._lastVisUpdate = 0;
+                    this.updateOcclusion(performance.now());
+                },
+
+                _lastVisUpdate: 0,
+
+                /**
+                 * Dim each pooled torch PointLight by its voxel line-of-sight to the
+                 * player (5-ray cone, same sampling the volumetric pass uses). The
+                 * dynamic PointLight is only the "gloss" on top of baked voxel block
+                 * light, so an obscured torch must not splash dynamic light onto
+                 * surfaces in front of its occluder (torch-behind-a-log ground flare).
+                 * Baked block light still illuminates the torch's own area correctly.
+                 * Smoothed toward the target factor to avoid popping. Throttled to
+                 * every 150ms; ~5 rays x <=8 lights of cheap voxel lookups.
+                 * @param {number} now - performance.now() timestamp.
+                 * @returns {void}
+                 */
+                updateOcclusion(now) {
+                    if (now - this._lastVisUpdate < 150) return;
+                    this._lastVisUpdate = now;
+                    if (typeof getPointLightVisibility !== 'function') return;
+                    const baseIntensity = (typeof SETTINGS !== 'undefined' ? SETTINGS.torchIntensity : 2.0) * 1; // PLACED_TORCH_MULT (see applyTorchSettingsToLights)
+                    for (const light of this.lights) {
+                        if (!light.visible) continue;
+                        const target = getPointLightVisibility(light.position);
+                        const cur = light.userData.visFactor ?? target; // first sample: jump straight there
+                        const next = cur + (target - cur) * 0.35; // ~0.5s settle at 150ms cadence
+                        light.userData.visFactor = next;
+                        light.intensity = baseIntensity * next;
                     }
                 },
 
@@ -12892,6 +13018,7 @@
             let torchLight = null; // Torch point light
             let outlineMesh;
             let chunkMaterial;
+            let chunkDepthMaterial; // Alpha-tested shadow depth material (cutout shadows for glass/leaves)
             let waterMaterial;
             const mobs = [];
             const mobPool = [];
@@ -15747,6 +15874,12 @@
             // Blocks that DON'T render faces against a same-id neighbor (tag "cullAdjacent").
             // Glass panes merge visually into one volume instead of showing inner borders.
             const CULLS_SAME_ID = new Uint8Array(256);
+            // Blocks that occlude for ambient-occlusion purposes. Opaque blocks plus
+            // LEAVES — leaves are render-transparent, but a leaf canopy needs self-AO
+            // or large leaf masses read as a flat depthless blob. Glass/water/torch do
+            // NOT occlude (real see-through), and UNLOADED_BLOCK never occludes
+            // (prevents dark seams at chunk boundaries). Built in initBlockOptimization().
+            const AO_OCCLUDES = new Uint8Array(256);
             let finalSeedDisplay = "";
             const faceVertexCache = new Map();
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
@@ -17162,6 +17295,7 @@
     const GRAVEL = 12;
     const LONGWOOD_LOG = 13;
     const LONGWOOD_LEAVES = 14;
+    const GLASS = 15;
 
     // Block type sets for tree generation
     const LOG_BLOCK_IDS = new Set([LOG, LONGWOOD_LOG]);
@@ -17306,8 +17440,22 @@
     IS_TRANSPARENT_WORKER[LEAVES] = 1;
     IS_TRANSPARENT_WORKER[LONGWOOD_LEAVES] = 1;
     IS_TRANSPARENT_WORKER[TORCH] = 1;
+    IS_TRANSPARENT_WORKER[GLASS] = 1; // parity with main IS_TRANSPARENT (tag "transparent")
     // CRITICAL: Mark UNLOADED_BLOCK as transparent to prevent chunk boundary shadows
     IS_TRANSPARENT_WORKER[UNLOADED_BLOCK] = 1;
+
+    // Same-id face culling (parity with main CULLS_SAME_ID, tag "cullAdjacent"):
+    // glass-to-glass inner faces are not rendered so panes merge into one volume.
+    const CULLS_SAME_ID_WORKER = new Uint8Array(256);
+    CULLS_SAME_ID_WORKER[GLASS] = 1;
+
+    // AO occluder table (parity with main AO_OCCLUDES): opaque blocks plus
+    // LEAVES occlude — leaf canopies need self-AO for depth. Glass/water/torch
+    // and UNLOADED_BLOCK never occlude.
+    const AO_OCCLUDES_WORKER = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) AO_OCCLUDES_WORKER[i] = IS_TRANSPARENT_WORKER[i] ? 0 : 1;
+    AO_OCCLUDES_WORKER[LEAVES] = 1;
+    AO_OCCLUDES_WORKER[LONGWOOD_LEAVES] = 1;
 
     // AO lookup table
     const AO_LOOKUP = [1.0, 0.85, 0.7, 0.5];
@@ -17717,7 +17865,33 @@
         return true;
     }
 
+    // Parity with main-thread isTreeSiteViable (see voxEx main tree generation):
+    // deterministic slope / footprint-overhang validation so worker chunks reach
+    // the SAME placement verdict as the main thread without neighbor data.
+    const TREE_MAX_RING_SLOPE = 2;
+    function isTreeSiteViable(gx, gz, groundY, minTx, maxTx, minTz, maxTz, worldSeed) {
+        for (let tx = minTx - 1; tx <= maxTx + 1; tx++) {
+            for (let tz = minTz - 1; tz <= maxTz + 1; tz++) {
+                if (tx === 0 && tz === 0) continue;
+                const h = Math.floor(blendedHeight(gx + tx, gz + tz, worldSeed));
+                const inFootprint = tx >= minTx && tx <= maxTx && tz >= minTz && tz <= maxTz;
+                if (inFootprint) {
+                    if (h !== groundY) return false;
+                } else if (Math.abs(h - groundY) > TREE_MAX_RING_SLOPE) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // Per-chunk tree position memo (parity with main thread; keyed by seed)
+    const treePositionsCache = new Map();
+
     function getChunkTreePositions(cx, cz, worldSeed, chunkSize) {
+        const treeCacheKey = worldSeed + ':' + cx + ',' + cz;
+        const cachedTrees = treePositionsCache.get(treeCacheKey);
+        if (cachedTrees) return cachedTrees;
         const startX = cx * chunkSize, startZ = cz * chunkSize;
         const trees = [];
         for (let lx = 0; lx < chunkSize; lx++) {
@@ -17758,6 +17932,11 @@
                 const val01 = (n + 1) * 0.5;
                 const heightRange = trunk.maxHeight - trunk.minHeight;
                 const trunkHeight = trunk.minHeight + Math.floor(val01 * heightRange);
+                // DETERMINISTIC SITE VALIDATION (parity with main thread): slope,
+                // footprint overhang, world-top room — rejected HERE so neighbor
+                // chunks never place a canopy this chunk will refuse (floating leaves)
+                if (groundY + 1 + trunkHeight + canopy.topExtension >= WORLD_DIMS.chunkHeight) continue;
+                if (!isTreeSiteViable(gx, gz, groundY, minTx, maxTx, minTz, maxTz, worldSeed)) continue;
                 trees.push({
                     gx, gz, lx, lz, groundY, trunkHeight, trunkW, trunkD,
                     halfW, halfD, minTx, maxTx, minTz, maxTz,
@@ -17766,6 +17945,8 @@
                 });
             }
         }
+        if (treePositionsCache.size >= 512) treePositionsCache.clear();
+        treePositionsCache.set(treeCacheKey, trees);
         return trees;
     }
 
@@ -17922,17 +18103,33 @@
                     halfW, halfD, minTx, maxTx, minTz, maxTz, groundY } = tree;
             const { canopy, blocks, allowedGroundBlocks } = profile;
             const localX = gx - startX, localZ = gz - startZ;
-            let finalGroundY = groundY;
-            if (isOwnChunk) finalGroundY = heightCache[lx + lz * chunkSize];
+            // Deterministic groundY for BOTH own and neighbor trees (parity with main
+            // thread): trunk and canopy must derive from the SAME height value.
+            const finalGroundY = groundY;
             const trunkBaseY = finalGroundY + 1;
             const trunkTopY = trunkBaseY + trunkHeight;
             if (isOwnChunk) {
-                const groundId = get(lx, finalGroundY, lz);
-                if (!isValidTreeGround(groundId, allowedGroundBlocks)) continue;
+                // Ground + support check for EVERY trunk footprint column (longwood
+                // multi-trunk: no invalid ground, no cave/tunnel directly below)
+                let groundOk = true;
+                for (let tx = minTx; tx <= maxTx && groundOk; tx++) {
+                    for (let tz = minTz; tz <= maxTz && groundOk; tz++) {
+                        const groundId = get(lx + tx, finalGroundY, lz + tz);
+                        if (!isValidTreeGround(groundId, allowedGroundBlocks)) groundOk = false;
+                        const belowId = get(lx + tx, finalGroundY - 1, lz + tz);
+                        if (belowId === AIR || belowId === WATER) groundOk = false;
+                    }
+                }
+                if (!groundOk) continue;
+                // Space check across the FULL trunk footprint
                 let hasSpace = true;
                 for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
-                    const block = get(lx, y, lz);
-                    if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                    for (let tx = minTx; tx <= maxTx && hasSpace; tx++) {
+                        for (let tz = minTz; tz <= maxTz && hasSpace; tz++) {
+                            const block = get(lx + tx, y, lz + tz);
+                            if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
+                        }
+                    }
                 }
                 if (!hasSpace) continue;
                 if (trunkTopY + canopy.topExtension >= chunkHeight) continue;
@@ -17966,8 +18163,8 @@
                     if (!trunkFound) continue;
                 }
             }
-            const actualGroundY = isOwnChunk ? finalGroundY : groundY;
-            const minCanopyY = actualGroundY + 2;
+            // finalGroundY === groundY for both cases (single deterministic height)
+            const minCanopyY = finalGroundY + 2;
             forEachCanopyVoxel(profile, seed, gx, gz, trunkTopY, trunkW, trunkD, (cdx, cdz, y) => {
                 if (y < minCanopyY) return;
                 const globalX = gx + cdx, globalZ = gz + cdz;
@@ -18251,9 +18448,11 @@
                 };
 
                 const calculateVertexAO = (lx, ly, lz, offsets) => {
-                    const s1 = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[0], ly + offsets[1], lz + offsets[2])] ? 0 : 1;
-                    const s2 = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[3], ly + offsets[4], lz + offsets[5])] ? 0 : 1;
-                    const c = IS_TRANSPARENT_WORKER[getLocal(lx + offsets[6], ly + offsets[7], lz + offsets[8])] ? 0 : 1;
+                    // AO_OCCLUDES_WORKER (not IS_TRANSPARENT_WORKER): leaves count as
+                    // occluders so canopies have internal depth (parity with main thread).
+                    const s1 = AO_OCCLUDES_WORKER[getLocal(lx + offsets[0], ly + offsets[1], lz + offsets[2])];
+                    const s2 = AO_OCCLUDES_WORKER[getLocal(lx + offsets[3], ly + offsets[4], lz + offsets[5])];
+                    const c = AO_OCCLUDES_WORKER[getLocal(lx + offsets[6], ly + offsets[7], lz + offsets[8])];
                     return AO_LOOKUP[s1 + s2 + c];
                 };
 
@@ -18312,7 +18511,7 @@
 
                                 const draw = isWater
                                     ? (nid === AIR || isLeafBlockWorker(nid))
-                                    : IS_TRANSPARENT_WORKER[nid];
+                                    : (IS_TRANSPARENT_WORKER[nid] && !(nid === id && CULLS_SAME_ID_WORKER[id]));
 
                                 if (draw) {
                                     const pos = isWater ? waterPos : terrainPos;
@@ -26047,7 +26246,7 @@ self.onmessage = async (e) => {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
-                const CURRENT_CACHE_VERSION = 4; // v4: re-reconcile trees after canopy-prune bug (v3: water sunlight attenuation)
+                const CURRENT_CACHE_VERSION = 5; // v5: re-reconcile trees after deterministic site validation (slope/overhang) (v4: canopy-prune fix, v3: water sunlight attenuation)
 
                 // === PHASE 1A: Batch load all cached chunks in one IDB transaction ===
                 // This is ~200% faster than individual loadChunkFromCache() calls
@@ -28890,6 +29089,12 @@ self.onmessage = async (e) => {
                     }
                 }
 
+                // 2b. AO occluder table: opaque blocks occlude; leaves additionally
+                // occlude so canopies get internal depth (see AO_OCCLUDES declaration).
+                for (let i = 0; i < 256; i++) AO_OCCLUDES[i] = IS_TRANSPARENT[i] ? 0 : 1;
+                for (const id of LEAF_BLOCK_IDS) AO_OCCLUDES[id] = 1;
+                AO_OCCLUDES[UNLOADED_BLOCK] = 0; // never AO-darken against unloaded chunks
+
                 // 3. Build UV map from BLOCK_CONFIG textures
                 const uvStep = 1 / NUM_TILES;
                 if (!uvMap[GRASS]) {
@@ -29953,6 +30158,62 @@ self.onmessage = async (e) => {
                     console.log(`[Textures] Transparency validation passed: all non-leaf tiles are fully opaque`);
                 }
 
+                // =====================================================
+                // MIPMAP COLOR DILATION (cutout tiles)
+                // =====================================================
+                // The atlas is pre-filled opaque BLACK, and cutout tiles (leaves, glass)
+                // punch holes with clearRect — leaving RGB(0,0,0) under every transparent
+                // texel. GPU mipmap generation box-filters straight (non-premultiplied)
+                // RGBA, so at distance the black under the holes bleeds into the leaf
+                // color and canopies turn dark/muddy. Fix: BFS-flood the nearest opaque
+                // texel's RGB into all fully-transparent texels (alpha stays 0, so the
+                // cutout holes are untouched — only the HIDDEN color changes).
+                /**
+                 * Dilate opaque RGB into transparent texels of one atlas tile (in place).
+                 * @param {number} tileStartX - Tile's left edge in atlas pixels.
+                 * @returns {void}
+                 */
+                function dilateTileHiddenColor(tileStartX) {
+                    const atlasW = cvs.width;
+                    const size = TILE_SIZE;
+                    const filled = new Uint8Array(size * size); // 1 = texel has a real color
+                    const queue = new Int32Array(size * size * 2);
+                    let tail = 0;
+                    for (let py = 0; py < size; py++) {
+                        for (let px = 0; px < size; px++) {
+                            if (atlasData[((py * atlasW) + tileStartX + px) * 4 + 3] > 0) {
+                                filled[py * size + px] = 1;
+                                queue[tail++] = px; queue[tail++] = py;
+                            }
+                        }
+                    }
+                    if (tail === 0 || tail === size * size * 2) return; // fully transparent or fully opaque
+                    let head = 0;
+                    while (head < tail) {
+                        const px = queue[head++], py = queue[head++];
+                        const src = ((py * atlasW) + tileStartX + px) * 4;
+                        for (let k = 0; k < 4; k++) {
+                            const nx = px + (k === 0 ? 1 : k === 1 ? -1 : 0);
+                            const ny = py + (k === 2 ? 1 : k === 3 ? -1 : 0);
+                            if (nx < 0 || nx >= size || ny < 0 || ny >= size) continue;
+                            const fi = ny * size + nx;
+                            if (filled[fi]) continue;
+                            filled[fi] = 1;
+                            const dst = ((ny * atlasW) + tileStartX + nx) * 4;
+                            atlasData[dst] = atlasData[src];
+                            atlasData[dst + 1] = atlasData[src + 1];
+                            atlasData[dst + 2] = atlasData[src + 2];
+                            // alpha intentionally left at 0 — hole preserved
+                            queue[tail++] = nx; queue[tail++] = ny;
+                        }
+                    }
+                }
+                for (const cutoutTileIdx of ALLOW_TRANSPARENCY) {
+                    dilateTileHiddenColor(cutoutTileIdx * TILE_SIZE);
+                }
+                ctx.putImageData(atlasImageData, 0, 0);
+                logDebug(`[Textures] Dilated hidden RGB under transparent texels for ${ALLOW_TRANSPARENCY.size} cutout tiles (mipmap darkening fix)`);
+
                 const tex = new THREE.CanvasTexture(cvs);
                 registerPixelTexture(tex);
 
@@ -30011,6 +30272,16 @@ self.onmessage = async (e) => {
                     // faces, and lets the mesher skip the normal attribute entirely
                     // (~48 bytes/face saved across every chunk geometry)
                     flatShading: true,
+                });
+                // CUTOUT SHADOWS: the default shadow-depth pass ignores texture alpha,
+                // so greedy-merged glass (and leaf canopies) cast one SOLID quad shadow.
+                // A custom depth material with the atlas map + alphaTest discards
+                // transparent texels during the shadow render, so shadows match the
+                // visible cutout texture (glass panes keep their frame/X pattern).
+                chunkDepthMaterial = new THREE.MeshDepthMaterial({
+                    depthPacking: THREE.RGBADepthPacking,
+                    map: tex,
+                    alphaTest: 0.5,
                 });
                 // Create two water materials - Standard (quality) and Lambert (fast)
                 const waterMaterialStandard = new THREE.MeshStandardMaterial({
@@ -37417,7 +37688,7 @@ self.onmessage = async (e) => {
 
                         // Cache version check - older caches might have corrupt lighting
                         // Force recalculation for caches without a version marker or with old version
-                        const CURRENT_CACHE_VERSION = 4; // v4: re-reconcile trees after canopy-prune bug (v3: water sunlight attenuation)  // Increment when cache format changes
+                        const CURRENT_CACHE_VERSION = 5; // v5: re-reconcile trees after deterministic site validation (slope/overhang) (v4: canopy-prune fix, v3: water sunlight attenuation)  // Increment when cache format changes
                         const cacheVersion = cachedData._cacheVersion || 0;
                         let forceLightingRecalc = false;
                         if (cacheVersion < CURRENT_CACHE_VERSION) {
@@ -37737,9 +38008,11 @@ self.onmessage = async (e) => {
              * @returns {AOValue} AO value (0.25-1.0)
              */
             function calculateVertexAO(lx, ly, lz, offsets, getter) {
-                const s1 = IS_TRANSPARENT[getter(lx + offsets[0], ly + offsets[1], lz + offsets[2])] ? 0 : 1;
-                const s2 = IS_TRANSPARENT[getter(lx + offsets[3], ly + offsets[4], lz + offsets[5])] ? 0 : 1;
-                const c = IS_TRANSPARENT[getter(lx + offsets[6], ly + offsets[7], lz + offsets[8])] ? 0 : 1;
+                // AO_OCCLUDES (not IS_TRANSPARENT): leaves count as occluders so
+                // canopies have internal depth; glass/water/torch never occlude.
+                const s1 = AO_OCCLUDES[getter(lx + offsets[0], ly + offsets[1], lz + offsets[2])];
+                const s2 = AO_OCCLUDES[getter(lx + offsets[3], ly + offsets[4], lz + offsets[5])];
+                const c = AO_OCCLUDES[getter(lx + offsets[6], ly + offsets[7], lz + offsets[8])];
                 // Use lookup table for occlusion count
                 const occlusionCount = s1 + s2 + c;
                 return AO_LOOKUP[occlusionCount];
@@ -38985,6 +39258,9 @@ self.onmessage = async (e) => {
                 mesh.geometry = null;
                 mesh.matrixAutoUpdate = false;
                 mesh.material = type === "water" ? waterMaterial : chunkMaterial;
+                // Alpha-tested depth material so cutout blocks (glass/leaves) cast
+                // texture-accurate shadows instead of solid merged quads
+                mesh.customDepthMaterial = type === "water" ? undefined : chunkDepthMaterial;
                 mesh.frustumCulled = type === "water" ? false : SETTINGS.enableFrustumCulling;
                 mesh.castShadow = type === "water" ? false : SETTINGS.shadows;
                 mesh.receiveShadow = type === "water" ? false : SETTINGS.shadows;
