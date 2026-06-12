@@ -10621,23 +10621,38 @@
                     light.shadow.map = null;
                 }
                 markShadowsDirty();
-                // QW2: the coverage radius just changed, so re-evaluate per-chunk shadow casting.
-                // Rare settings event — a one-time pass over chunkMeshes is fine. Chunks beyond the
-                // shadow radius stop casting; chunks now inside it resume.
-                if (typeof chunkMeshes !== 'undefined' && typeof controls !== 'undefined' && controls) {
+                // QW2: the coverage radius just changed — re-evaluate per-chunk shadow casting.
+                if (typeof controls !== 'undefined' && controls) {
                     const ppos = getPlayerWorldPosition();
-                    const pcx = Math.floor(ppos.x / WORLD_DIMS.chunkSize);
-                    const pcz = Math.floor(ppos.z / WORLD_DIMS.chunkSize);
-                    const shadowChunksR = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
-                    const shadowChunksRSq = shadowChunksR * shadowChunksR;
-                    for (const [mKey, mesh] of chunkMeshes) {
-                        if (mKey.endsWith("_WATER")) continue; // water never casts shadows
-                        const [mcx, mcz] = parseChunkKey(mKey);
-                        const dSq = (mcx - pcx) * (mcx - pcx) + (mcz - pcz) * (mcz - pcz);
-                        mesh.castShadow = SETTINGS.shadows && dSq <= shadowChunksRSq;
-                    }
+                    refreshChunkShadowCasters(Math.floor(ppos.x / WORLD_DIMS.chunkSize), Math.floor(ppos.z / WORLD_DIMS.chunkSize));
                 }
                 logDebug(`[Shadows] Render distance ${r} blocks -> frustum ${r * 2}, map ${shadowConfig.mapSize}^2 (texel 1/16 block, maxTex ${maxTex})`);
+            }
+            /**
+             * Re-evaluates which chunk meshes cast sun/moon shadows from the CURRENT player
+             * position (QW2 gates casting to the shadow coverage radius). Called when the
+             * player crosses a chunk boundary and when the radius setting changes. The flag
+             * was previously set only at MESH time, so terrain that streamed in far away
+             * never started casting as the player approached — a whole mountain threw no
+             * shadow until a block edit forced one chunk to remesh.
+             * @param {ChunkCoord} pcx - Player chunk X.
+             * @param {ChunkCoord} pcz - Player chunk Z.
+             * @returns {void}
+             */
+            function refreshChunkShadowCasters(pcx, pcz) {
+                if (typeof chunkMeshes === 'undefined' || !SETTINGS.shadows) return;
+                const shadowChunksR = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
+                const rSq = shadowChunksR * shadowChunksR;
+                let changed = 0;
+                for (const [mKey, mesh] of chunkMeshes) {
+                    if (mKey.endsWith("_WATER")) continue; // water never casts shadows
+                    const [mcx, mcz] = parseChunkKey(mKey);
+                    const dSq = (mcx - pcx) * (mcx - pcx) + (mcz - pcz) * (mcz - pcz);
+                    const should = dSq <= rSq;
+                    if (mesh.castShadow !== should) { mesh.castShadow = should; changed++; }
+                }
+                // New casters entered (or left) the radius — the shadow map must re-render
+                if (changed > 0) markShadowsDirty();
             }
             let moveForward = false;
             let moveBackward = false;
@@ -29825,6 +29840,25 @@ self.onmessage = async (e) => {
 
                         // Shared fog-shape uniform (0 = cylindrical, 1 = spherical/underwater)
                         shader.uniforms.fogVerticalBlend = _fogVerticalBlendUniform;
+                        // VOXEL-LIGHT OCCLUSION GATE for dynamic lights: the torch point light
+                        // casts no shadows (texture limits) and sun/moon shadows only cover the
+                        // coverage radius, so their direct diffuse/specular leaked through solid
+                        // blocks — you could tell a light was behind a wall from its sheen. The
+                        // baked voxel light in the vertex colors KNOWS occlusion (BFS-propagated),
+                        // so scale the dynamic direct contribution by it. Camera-proximity
+                        // exemption (~9 blocks): the HELD torch writes no voxel light, so nearby
+                        // surfaces must keep dynamic light — and near sun/moon leaks are already
+                        // prevented there by the real shadow map.
+                        shader.fragmentShader = shader.fragmentShader.replace(
+                            '#include <lights_fragment_end>',
+                            `#include <lights_fragment_end>
+                            #ifdef USE_COLOR
+                                float camProxGate = clamp(1.0 - length(vWorldPositionCyl - cameraPosition) / 9.0, 0.0, 1.0);
+                                float bakedLightGate = max(smoothstep(0.10, 0.55, dot(vColor, vec3(0.3333))), camProxGate);
+                                reflectedLight.directDiffuse *= bakedLightGate;
+                                reflectedLight.directSpecular *= bakedLightGate;
+                            #endif`
+                        );
                         // Replace the fog_fragment include with cylindrical fog calculation
                         shader.fragmentShader = shader.fragmentShader.replace(
                             '#include <fog_fragment>',
@@ -39179,6 +39213,10 @@ self.onmessage = async (e) => {
                 // chunks ahead of the player), never the enumeration/cleanup disc.
                 // OPTIMIZATION: Purge stale chunks from build queue when player moves to a new chunk
                 const playerChunkChanged = chunkX !== lastChunkX || chunkZ !== lastChunkZ;
+                // QW2 follow-up: shadow casting is distance-gated, so crossing a chunk
+                // boundary must re-evaluate which meshes cast (terrain that streamed in
+                // beyond the radius starts casting as the player approaches it).
+                if (playerChunkChanged) refreshChunkShadowCasters(chunkX, chunkZ);
                 if (playerChunkChanged && chunkBuildQueue.length > 0) {
                     const purgeMaxDistSq = currentRenderRadius * currentRenderRadius;
                     for (let i = chunkBuildQueue.length - 1; i >= 0; i--) {
