@@ -66,7 +66,7 @@ VoxEx/
 │   ├── voxelEditor.html          # Voxel model editor
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
 │   ├── voxex-tests.html          # Test suite — tests the REAL voxEx.html functions/classes via the ?test=1 seam (window.VoxEx); ~204 tests incl. live worker round-trip. Serve over localhost and open it.
-│   └── voxex-texture-tests.html  # Visual texture atlas tests (all 17 tiles + automated checks)
+│   └── voxex-texture-tests.html  # Visual texture atlas tests (all 18 tiles + automated checks)
 └── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
 
@@ -181,7 +181,7 @@ VoxEx/
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Block Types (Current: 15 blocks)
+## Block Types (Current: 16 blocks)
 
 | ID | Constant | Description |
 |----|----------|-------------|
@@ -200,9 +200,11 @@ VoxEx/
 | 12 | `GRAVEL` | Gravel block |
 | 13 | `LONGWOOD_LOG` | Longwood biome log (2x2/3x3 trunks) |
 | 14 | `LONGWOOD_LEAVES` | Longwood biome leaves |
+| 15 | `GLASS` | Transparent + collidable (tags: transparent/cutout/collidable), zero light attenuation |
 | 255 | `UNLOADED_BLOCK` | Placeholder for unloaded chunks |
 
-**Texture Atlas**: `NUM_TILES = 17` tiles in a horizontal strip.
+**Texture Atlas**: `NUM_TILES = 18` tiles in a horizontal strip.
+**Water light**: water attenuates sunlight 1/block and blocklight 2/block (chunk cache v3 — bump `CURRENT_CACHE_VERSION` + `_cacheVersion` writes when changing attenuation).
 **Lookup Tables**: `BLOCK_IS_SOLID[256]`, `BLOCK_IS_OPAQUE[256]`, `IS_TRANSPARENT[256]`, `SUNLIGHT_ATTENUATION[256]`, `BLOCKLIGHT_ATTENUATION[256]` — Uint8Array fast lookups.
 
 ## Biome System (6 Biomes + Foothills)
@@ -269,7 +271,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 - **Volumetric Sampling**: 7-ray cone for sun/moon visibility, 5-ray cone for point lights (allows partial visibility through foliage)
 
 ### Rendering System
-- **Textures**: Procedurally generated 16x16 pixel art on a canvas (Atlas: 17 tiles)
+- **Textures**: Procedurally generated 16x16 pixel art on a canvas (Atlas: 18 tiles)
 - **Terrain Material**: MeshStandardMaterial with vertex colors, roughness, alpha test 0.1
 - **Water Materials**: Three modes — Standard (PBR), Fast (Lambert), Refraction (custom GLSL with Beer-Lambert absorption)
 - **Fog**: Custom cylindrical fog shader (XZ-only distance, not vertical) — injected via `onBeforeCompile`
@@ -452,7 +454,7 @@ Biomes are configured in `BIOME_CONFIG` (~line 3987). Tags enable biome-specific
 
 ### When Modifying `voxEx.html`:
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, and JavaScript
-2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 3552) and add texture generation in `initTextures`. Current count: **17**
+2. **Texture Atlas**: If adding blocks, update `NUM_TILES` (~line 3552) and add texture generation in `initTextures`. Current count: **18**
 3. **Block Config**: Add new blocks to `BLOCK_CONFIG` array (~line 3580). The system auto-derives inventory, textures, and transparency. Also update `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`, `IS_TRANSPARENT`, and attenuation lookup tables via `initBlockLookupTables()` (~line 11831)
 4. **Biome Config**: Add new biomes to `BIOME_CONFIG` (~line 3987). Missing fields inherit from `BIOME_DEFAULTS`. Add a height function to `HEIGHT_FUNCS` lookup table
 5. **Settings**: Add default in `DEFAULTS` (~line 5284), wire into `SETTINGS` (~line 5067), add DOM binding in settings UI section (event-listener wiring ~line 28800+), call `saveSettings()`
@@ -763,7 +765,7 @@ Before committing, verify:
 - [ ] Logs use `logDebug()` with `[Tag]` prefix, not `console.log()`
 - [ ] No work added to the per-frame render loop without batching
 - [ ] Chunk size is 16x16x320 (not 128)
-- [ ] Atlas has 17 tiles (update `NUM_TILES` if adding blocks)
+- [ ] Atlas has 18 tiles (update `NUM_TILES` if adding blocks)
 - [ ] Worker parity: terrain changes reflected in `buildChunkWorkerCode()`
 - [ ] Block lookup tables updated if adding blocks (`initBlockLookupTables()`)
 - [ ] Terrain changes: edit ONLY the main-thread terrain functions (~line 36269–36693); the worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — do not hand-edit a worker copy, and keep the markers intact
@@ -779,4 +781,4 @@ Tests the REAL code inside `voxEx.html` via a `?test=1` seam that exposes `windo
 Shaded relief top-down view + cross-section. Click to inspect: height, biome, surface block, slope, noise values, elevation zone. Uses extracted copies of terrain functions — **must be kept in sync with voxEx.html** biome config and height functions.
 
 ### `tools/voxex-texture-tests.html` — Visual Texture Tests
-Renders all 17 atlas tiles at configurable resolution/zoom. Automated checks: opacity (non-leaf tiles fully opaque), transparency (leaf tiles have holes), color sanity (grass=green, water=blue, snow=bright, etc.), atlas dimensions.
+Renders all 18 atlas tiles at configurable resolution/zoom. Automated checks: opacity (non-leaf tiles fully opaque), transparency (leaf/cutout tiles have holes), color sanity (grass=green, water=blue, snow=bright, etc.), atlas dimensions.

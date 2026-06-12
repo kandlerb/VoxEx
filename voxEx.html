@@ -3396,6 +3396,7 @@
                 GRAVEL = 12,
                 LONGWOOD_LOG = 13,
                 LONGWOOD_LEAVES = 14,
+                GLASS = 15,
                 UNLOADED_BLOCK = 255;
 
             // =====================================================
@@ -3567,8 +3568,9 @@
                 LONGWOOD_LOG_SIDE: 14,
                 LONGWOOD_LOG_TOP: 15,
                 LONGWOOD_LEAF: 16,
+                GLASS: 17,
             };
-            const NUM_TILES = 17;
+            const NUM_TILES = 18;
 
             // =====================================================
             // WORLD GENERATION SETTINGS - Global config for terrain
@@ -3688,7 +3690,11 @@
                     textures: { all: TILE.WATER },
                     // Fluid: available from the inventory but not in the default hotbar
                     ui: { showInInventory: true, tileIndex: TILE.WATER, defaultHotbar: false },
-                    lighting: { blocklightAttenuation: 2 },
+                    // Sunlight loses 1 level per block of water (was 0: oceans passed FULL
+                    // sunlight, so underwater caves were lit as if open to the sky). 15 at
+                    // the surface fades out by ~14 blocks down — matches the visual murk.
+                    // Bump CURRENT_CACHE_VERSION when changing these (cached light is stale).
+                    lighting: { sunlightAttenuation: 1, blocklightAttenuation: 2 },
                 },
                 // TORCH
                 {
@@ -3735,6 +3741,19 @@
                     textures: { all: TILE.LONGWOOD_LEAF },
                     ui: { showInInventory: true, tileIndex: TILE.LONGWOOD_LEAF },
                     lighting: { sunlightAttenuation: 1, blocklightAttenuation: 1 },
+                },
+                // GLASS
+                {
+                    id: GLASS,
+                    key: "glass",
+                    name: "Glass",
+                    // transparent: see-through rendering + no AO/light blocking
+                    // cutout: tile is allowed alpha < 255 in the atlas validation
+                    // collidable: still SOLID for player/entity collision
+                    tags: ["transparent", "cutout", "collidable"],
+                    textures: { all: TILE.GLASS },
+                    ui: { showInInventory: true, tileIndex: TILE.GLASS, defaultHotbar: true, hotbarOrder: 7 },
+                    lighting: { sunlightAttenuation: 0, blocklightAttenuation: 0 }, // light passes fully
                 },
                 // UNLOADED_BLOCK - internal sentinel
                 {
@@ -9522,6 +9541,11 @@
                     // Fluids are not solid but may be opaque (water is transparent)
                     if (block.tags.includes("fluid")) {
                         BLOCK_IS_SOLID[block.id] = 0;
+                    }
+                    // Collidable overrides transparent: see-through blocks that still block
+                    // movement (glass). Must come AFTER the transparent handling above.
+                    if (block.tags.includes("collidable")) {
+                        BLOCK_IS_SOLID[block.id] = 1;
                     }
                 }
             }
@@ -16674,7 +16698,7 @@
     // ============================================================
     const UNLOADED_BLOCK = 255;
     const TORCH = 10;
-    const NUM_TILES = 17;
+    const NUM_TILES = 18;
 
     // Face directions: [dx, dy, dz, nx, ny, nz]
     const FACE_DIRECTIONS = [
@@ -25318,7 +25342,7 @@ self.onmessage = async (e) => {
                     if (pending === 0) { resolve(); return; }
                     for (const [chunkKey, chunkData] of chunkDataMap) {
                         // Ensure chunk has current cache version for future compatibility checks
-                        chunkData._cacheVersion = 2;  // Current version with valid lighting
+                        chunkData._cacheVersion = 3;  // Current version with valid lighting (v3: water sunlight attenuation)
                         const record = {
                             key: chunkKey,
                             data: ChunkCompressor.compress(chunkData),
@@ -25417,7 +25441,7 @@ self.onmessage = async (e) => {
                 const chunkSize = WORLD_DIMS.chunkSize;
                 const chunkHeight = WORLD_DIMS.chunkHeight;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
-                const CURRENT_CACHE_VERSION = 2;
+                const CURRENT_CACHE_VERSION = 3; // v3: water attenuates sunlight (2026-06-11)
 
                 // === PHASE 1A: Batch load all cached chunks in one IDB transaction ===
                 // This is ~200% faster than individual loadChunkFromCache() calls
@@ -29194,6 +29218,34 @@ self.onmessage = async (e) => {
                     }
                 }
 
+                // --- Glass: Tile 17 ---
+                // Classic glass: pale border frame, a few interior glint specks and a short
+                // diagonal streak (old-Minecraft style); everything else fully transparent.
+                logicalFillsize += TILE_SIZE;
+                {
+                    const glassRng = new SeededRNG(12345 + TILE.GLASS);
+                    const frame = "#cfe8ef";     // pale blue-white frame
+                    const frameDark = "#9fc4cf"; // beveled corners
+                    const speck = "#e8f7fb";     // glints
+                    for (let y = 0; y < PIXELS_PER_TILE; y++) {
+                        for (let x = 0; x < PIXELS_PER_TILE; x++) {
+                            const onBorder = x === 0 || y === 0 || x === PIXELS_PER_TILE - 1 || y === PIXELS_PER_TILE - 1;
+                            if (onBorder) {
+                                const corner = (x === 0 || x === PIXELS_PER_TILE - 1) && (y === 0 || y === PIXELS_PER_TILE - 1);
+                                fillLogicalPixel(logicalFillsize, x, y, corner ? frameDark : frame);
+                            } else if (glassRng.next() < 0.05) {
+                                fillLogicalPixel(logicalFillsize, x, y, speck); // sparse interior specks
+                            }
+                            // remaining interior pixels stay fully transparent
+                        }
+                    }
+                    // Short diagonal highlight streak in the upper-right quadrant
+                    fillLogicalPixel(logicalFillsize, 12, 2, speck);
+                    fillLogicalPixel(logicalFillsize, 11, 3, speck);
+                    fillLogicalPixel(logicalFillsize, 10, 4, speck);
+                    fillLogicalPixel(logicalFillsize, 9, 5, speck);
+                }
+
                 // =====================================================
                 // TRANSPARENCY VALIDATION PASS
                 // =====================================================
@@ -29478,7 +29530,11 @@ self.onmessage = async (e) => {
                             // blocks, ~53% at 4, ~87% at 8, ~95% (max) by 12+ — a deep ocean
                             // floor is effectively invisible instead of "clearly readable".
                             float murk = 1.0 - exp(-pow(thicknessBlocks * 0.22, 1.6));
-                            vec3 murkColor = waterColor * 0.55 + vec3(0.04, 0.09, 0.10);
+                            // Beer-Lambert the murk itself: in-scattered light is absorbed too,
+                            // so the haze color shifts blue-green with depth. A FLAT murk color
+                            // here was crushing the per-channel color filtering — deep water
+                            // looked uniformly gray-teal instead of filtering red first.
+                            vec3 murkColor = (waterColor * 0.55 + vec3(0.04, 0.09, 0.10)) * exp(-absorption * effectiveDepth * 0.6);
                             refractedColor = mix(refractedColor, murkColor, murk * 0.95);
 
                             // Sample water texture for surface detail
@@ -36669,7 +36725,7 @@ self.onmessage = async (e) => {
 
                         // Cache version check - older caches might have corrupt lighting
                         // Force recalculation for caches without a version marker or with old version
-                        const CURRENT_CACHE_VERSION = 2;  // Increment when cache format changes
+                        const CURRENT_CACHE_VERSION = 3; // v3: water attenuates sunlight (2026-06-11)  // Increment when cache format changes
                         const cacheVersion = cachedData._cacheVersion || 0;
                         let forceLightingRecalc = false;
                         if (cacheVersion < CURRENT_CACHE_VERSION) {
@@ -41792,7 +41848,7 @@ self.onmessage = async (e) => {
                 window.VoxEx = {
                     // --- constants ---
                     AIR, GRASS, DIRT, STONE, WOOD, LOG, LEAVES, BEDROCK, SAND, WATER,
-                    TORCH, SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, UNLOADED_BLOCK,
+                    TORCH, SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, GLASS, UNLOADED_BLOCK,
                     SECTION_HEIGHT, SECTIONS_PER_CHUNK,
                     BIOME_CELL_SIZE, LEAF_BLOCK_IDS, WORLD_DIMS, NEIGHBOR_OFFSETS,
                     BIOME_CONFIG, HEIGHT_FUNCS,
