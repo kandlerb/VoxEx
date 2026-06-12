@@ -40908,6 +40908,8 @@ self.onmessage = async (e) => {
                 perfMonitor.end("rendering", renderStart);
             }
             // Update underwater state and shader uniforms
+            // Scratch color for the underwater fog target (no per-frame allocations)
+            const _underwaterFogColor = new THREE.Color();
             function updateUnderwaterState() {
                 if (!controls) return;
 
@@ -40985,6 +40987,31 @@ self.onmessage = async (e) => {
                         underwaterPass.uniforms.absorptionG.value = SETTINGS.waterAbsorptionG;
                         underwaterPass.uniforms.absorptionB.value = SETTINGS.waterAbsorptionB;
                     }
+
+                    // --- UNDERWATER ATMOSPHERE: depth-scaled fog + god-ray haze ---
+                    // The normal fog-distance updates and biome fog tint both skip frames
+                    // where isUnderwater is true, so this block owns scene.fog while submerged.
+                    const submersion = Math.min(underwaterDepth / 24, 1); // 0 at surface → 1 by 24 blocks down
+                    if (scene && scene.fog) {
+                        // View distance collapses with depth: ~45 blocks just under the
+                        // surface down to ~14 in deep water. Lerped to avoid pops when the
+                        // depth value steps (it only recomputes on >0.25 block Y change).
+                        const targetFar = 45 - 31 * submersion;
+                        scene.fog.near += (2 - scene.fog.near) * 0.12;
+                        scene.fog.far += (targetFar - scene.fog.far) * 0.12;
+                        // Murky blue-green from the water tint setting, darkening with depth
+                        _underwaterFogColor.set(SETTINGS.waterColor).multiplyScalar(0.55 * (1 - submersion * 0.6));
+                        scene.fog.color.lerp(_underwaterFogColor, 0.12);
+                    }
+                    if (volumetricLightPass && SETTINGS.volumetricLightingEnabled) {
+                        // God-ray haze: strongest just below the surface, fading out by ~20
+                        // blocks down where sunlight no longer penetrates. Always derived
+                        // from SETTINGS so the user's tuned values are never overwritten.
+                        const rayFade = Math.max(0, 1 - underwaterDepth / 20);
+                        volumetricLightPass.uniforms.density.value = SETTINGS.volumetricDensity * (1 + 1.5 * rayFade);
+                        volumetricLightPass.uniforms.fogDensity.value = SETTINGS.volumetricFogDensity * (1 + 2.5 * rayFade);
+                        volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure * (1 + 0.6 * rayFade);
+                    }
                 } else if (wasUnderwater) {
                     // Reset state when exiting water
                     underwaterDepth = 0;
@@ -41001,6 +41028,16 @@ self.onmessage = async (e) => {
                     // Reset underwater shader uniforms
                     if (underwaterPass) {
                         underwaterPass.uniforms.isUnderwater.value = false;
+                    }
+
+                    // Restore surface atmosphere: invalidate lastFogFar so the normal fog
+                    // update recomputes distances on the next updateChunks pass; the biome
+                    // fog tint (skipped while underwater) re-lerps the color back smoothly.
+                    lastFogFar = -1;
+                    if (volumetricLightPass && SETTINGS.volumetricLightingEnabled) {
+                        volumetricLightPass.uniforms.density.value = SETTINGS.volumetricDensity;
+                        volumetricLightPass.uniforms.fogDensity.value = SETTINGS.volumetricFogDensity;
+                        volumetricLightPass.uniforms.exposure.value = SETTINGS.volumetricExposure;
                     }
                 }
             }
