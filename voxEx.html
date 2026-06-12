@@ -3728,9 +3728,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.10";
+            const VOXEX_BUILD = "2026-06-12.11";
             const VOXEX_RECENT_CHANGES = [
-                "Water: bobbing dies down at shorelines (quadratic shoreDist falloff); wave noise is now 3 domain-warped octaves drifting in different directions (pattern deforms, doesn't slide); slow per-swell amplitude cycles create natural wave sets",
+                "Water: swell/crest driver rebuilt — sum-of-sines (a readable interference lattice) replaced by WATER_SWELL_GLSL: 3 value-noise layers advected in different directions with cross-warping, shared verbatim by vertex bob + fragment crests; quadratic shoreline falloff on bobbing",
                 "Water surface pass: gentle vertex bobbing (swell field, calm at shores), top-down caustic web in shallow water, view-graded sky reflection (horizon vs zenith), 3rd swell component + bright breaking crest cores tied to the bobbing geometry",
                 "FIX: wave crests no longer a uniform dot grid — swell field reweighted (primary swell + noise breaks fronts into uneven segments) with low-freq patch gating for calm vs. active stretches",
                 "Trees: deterministic site validation — no trees on slopes/cliffs, longwood trunks never hang over air, per-column ground+cave checks (chunk cache v5)",
@@ -30315,6 +30315,34 @@ self.onmessage = async (e) => {
                     depthTest: true,
                     flatShading: true, // Normals derived in-shader (normal attribute removed)
                 });
+                // Shared GLSL for the water swell field — injected into BOTH the vertex
+                // shader (surface bobbing) and fragment shader (crest highlights) of the
+                // refraction material so the two can NEVER drift out of sync.
+                // Sum-of-sines was abandoned for the swell driver: any sum of fixed-
+                // wavevector sinusoids is a quasi-periodic interference lattice, and the
+                // crest highlights made that lattice readable. This is THREE value-noise
+                // layers advected along genuinely different directions, with the third
+                // layer's sample position warped by the first two — the field churns and
+                // deforms; there is no underlying picture that translates. Slow amplitude
+                // cycles fade layers in and out (wave sets). Output ~±1.2, typically ±0.5.
+                const WATER_SWELL_GLSL = `
+                    float wHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+                    float wNoise(vec2 p) {
+                        vec2 i = floor(p); vec2 f = fract(p);
+                        f = f * f * (3.0 - 2.0 * f);
+                        return mix(mix(wHash(i), wHash(i + vec2(1.0, 0.0)), f.x),
+                                   mix(wHash(i + vec2(0.0, 1.0)), wHash(i + vec2(1.0, 1.0)), f.x), f.y);
+                    }
+                    float swellField(vec2 p, float t2) {
+                        float aA = 0.45 + 0.12 * sin(t2 * 0.151);
+                        float aB = 0.30 + 0.10 * sin(t2 * 0.117 + 2.1);
+                        float aC = 0.45 + 0.12 * sin(t2 * 0.083 + 4.2);
+                        float nA = wNoise(p * 0.085 + vec2(t2 * 0.09,  t2 * 0.03)) * 2.0 - 1.0;
+                        float nB = wNoise(p * 0.060 + vec2(-t2 * 0.05, t2 * 0.075) + vec2(7.7, 3.1)) * 2.0 - 1.0;
+                        float nC = wNoise(p * 0.110 + vec2(nA, nB) * 1.8 + vec2(t2 * 0.02, -t2 * 0.085)) * 2.0 - 1.0;
+                        return nA * aA + nB * aB + nC * aC;
+                    }
+                `;
                 // Refraction water material - ShaderMaterial that samples opaque scene with UV distortion
                 const waterMaterialRefraction = new THREE.ShaderMaterial({
                     uniforms: {
@@ -30341,6 +30369,7 @@ self.onmessage = async (e) => {
                     },
                     vertexShader: `
                         uniform float time;
+                        ${WATER_SWELL_GLSL}
                         attribute float shoreDist; // Shore distance: 0 = at shore, 1 = far from shore
                         attribute float waterThickness; // Water depth in blocks (normalized: 0 = surface, 1 = 8+ blocks)
                         attribute float foamEdges; // Top-face land-adjacency bitmask (1=+X, 2=-X, 4=+Z, 8=-Z); 0 on side faces
@@ -30359,28 +30388,21 @@ self.onmessage = async (e) => {
                             vFoamEdges = foamEdges;
                             vec4 worldPos = modelMatrix * vec4(position, 1.0);
                             // GENTLE SWELL BOBBING: displace the surface with the SAME
-                            // three-sine swell field the fragment shader uses for crest
-                            // highlights (swellGeo — keep weights/frequencies IN SYNC), so
+                            // swellField the fragment shader uses for crest highlights
+                            // (shared via WATER_SWELL_GLSL — sync is structural), so
                             // bright crests ride physically raised water. Scaled by shoreDist:
                             // shoreline faces (shoreDist 0) don't move at all — no gaps open
                             // against land, and water side faces (always at shoreDist 0)
                             // keep their seabed edges pinned. Adjacent faces can differ by
                             // one shoreDist step (0.25), so amplitude stays small enough
                             // that the seam offset (<0.02 blocks) is invisible.
-                            float tv = time * 0.001;
-                            vec2 wpv = worldPos.xz;
-                            // Slow per-swell amplitude cycles (wave "sets" grow and fade over
-                            // ~40-75s). MUST match the fragment shader's a1/a2/a3 exactly.
-                            float a1 = 0.55 + 0.12 * sin(tv * 0.151);
-                            float a2 = 0.30 + 0.10 * sin(tv * 0.117 + 2.1);
-                            float a3 = 0.25 + 0.08 * sin(tv * 0.083 + 4.2);
-                            float bob = sin(dot(wpv, vec2(0.45, 0.25)) + tv * 1.1) * a1
-                                      + sin(dot(wpv, vec2(-0.22, 0.38)) + tv * 0.8) * a2
-                                      + sin(dot(wpv, vec2(0.13, -0.41)) + tv * 0.95) * a3;
+                            // Bobbing driven by the shared swellField (same call as the
+                            // fragment shader's crest highlights — see WATER_SWELL_GLSL).
+                            float bob = swellField(worldPos.xz, time * 0.001);
                             // QUADRATIC shore falloff: shoreDist saturates only 4 blocks from
                             // land, so a linear scale still bobbed visibly against the
                             // shoreline. Squared: 1 block out ~6%, 2 ~25%, 3 ~56%, 4+ full.
-                            worldPos.y += bob * 0.06 * shoreDist * shoreDist;
+                            worldPos.y += bob * 0.07 * shoreDist * shoreDist;
                             vWorldPosition = worldPos.xyz;
                             vec4 mvPosition = viewMatrix * worldPos;
                             gl_Position = projectionMatrix * mvPosition;
@@ -30416,6 +30438,7 @@ self.onmessage = async (e) => {
                         varying float vShoreDist; // 0 = at shore (calm), 1 = far from shore (wavy)
                         varying float vWaterThickness; // Actual water depth (0 = surface, 1 = 8+ blocks deep)
                         varying float vFoamEdges; // Land-adjacency bitmask for top faces (0 = no foam)
+                        ${WATER_SWELL_GLSL}
 
                         // Simple noise function for wave distortion
                         float hash(vec2 p) {
@@ -30471,11 +30494,6 @@ self.onmessage = async (e) => {
                             // two-wave repeat so open water never settles into a visible cycle.
                             // Same three sines (same weights) drive the vertex bobbing.
                             float w3 = sin(dot(wp, vec2(0.13, -0.41)) + t * 0.95);
-                            // Slow per-swell amplitude cycles — wave sets that grow and fade.
-                            // MUST match the vertex shader's a1/a2/a3 (drives the bobbing).
-                            float a1 = 0.55 + 0.12 * sin(t * 0.151);
-                            float a2 = 0.30 + 0.10 * sin(t * 0.117 + 2.1);
-                            float a3 = 0.25 + 0.08 * sin(t * 0.083 + 4.2);
                             // DOMAIN-WARPED MULTI-OCTAVE NOISE: a single octave rigidly
                             // translating reads as a fixed picture sliding by once crests
                             // highlight it. Three octaves drift in DIFFERENT directions, and
@@ -30615,18 +30633,18 @@ self.onmessage = async (e) => {
                             // whole areas so some stretches of water are calm while others show
                             // breaking crests. All terms are the SAME world-anchored fields that
                             // drive the refraction offset, so highlights ride the visible waves.
-                            // swellGeo is the EXACT field that bobs the vertices (see vertex
-                            // shader — keep weights in sync), so highlights sit on water that is
-                            // physically raised; n breaks fronts into uneven segments on top.
-                            float swellGeo = w1 * a1 + w2 * a2 + w3 * a3;
-                            float swell = swellGeo + n * 0.45;
+                            // swellGeo is the EXACT field that bobs the vertices (shared
+                            // swellField from WATER_SWELL_GLSL), so highlights sit on water
+                            // that is physically raised; n adds fine breakup on top.
+                            float swellGeo = swellField(wp, t);
+                            float swell = swellGeo + n * 0.35;
                             float crestPatch = noise(wp * 0.12 + warp * 0.2 + vec2(t * 0.10, -t * 0.08)); // ~8-block calm/active patches ('patch' is a GLSL reserved word)
                             float crestGate = waveScale * (0.25 + 0.95 * crestPatch);
-                            float crest = smoothstep(0.60, 1.10, swell) * crestGate;
+                            float crest = smoothstep(0.50, 0.95, swell) * crestGate;
                             // Bright core where the swell truly peaks — a small, rarer "breaking
                             // tip" inside the broad highlight, for crests with structure.
-                            float crestCore = smoothstep(1.00, 1.40, swell) * crestGate;
-                            float troughDark = smoothstep(0.60, 1.10, -swell) * waveScale;
+                            float crestCore = smoothstep(0.80, 1.15, swell) * crestGate;
+                            float troughDark = smoothstep(0.50, 0.95, -swell) * waveScale;
                             finalColor = mix(finalColor, vec3(0.85, 0.93, 0.98), min(crest, 1.0) * 0.4);
                             finalColor = mix(finalColor, vec3(0.96, 0.99, 1.0), min(crestCore, 1.0) * 0.45);
                             finalColor *= 1.0 - troughDark * 0.12;
