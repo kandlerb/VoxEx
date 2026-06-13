@@ -3724,8 +3724,14 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-12.13";
+            const VOXEX_BUILD = "2026-06-13.1";
             const VOXEX_RECENT_CHANGES = [
+                "Zombie AI: bounded BFS grid pathfinding (jump-aware, throttled + per-frame budget) routes mobs around walls and pits when line-of-sight is lost or greedy steering stalls",
+                "Zombie AI: line-of-sight gating — mobs no longer detect or attack through walls; on losing sight they pursue the last-seen position, then wander",
+                "FIX: zombies couldn't climb a step right in front of them (probe scored any block as a wall, gating out the jump) — 1-block steps are now climbable; jumpForce 4.25→6.5 so they actually clear a block at the mob's half-gravity",
+                "FIX: knockback no longer spins zombies to face away — a hitstun window keeps them facing the player while sliding back; the death topple now falls away from the player using the hit direction",
+                "FIX: on-hit hop reduced (2.5→1.2) and only fires when grounded — no more leaping away on every hit",
+                "Zombie AI: idle wander now avoids walls and ledges (wires the previously-dead cliffCheckDistance); obstacle-memory fade is now frame-rate independent",
                 "Camera turn-lean REMOVED (was briefly added, then flipped) — banked roll while turning caused motion sickness and didn't match the game's feel",
                 "Water: swell/crest driver rebuilt — sum-of-sines (a readable interference lattice) replaced by WATER_SWELL_GLSL: 3 value-noise layers advected in different directions with cross-warping, shared verbatim by vertex bob + fragment crests; quadratic shoreline falloff on bobbing",
                 "Water surface pass: gentle vertex bobbing (swell field, calm at shores), top-down caustic web in shallow water, view-graded sky reflection (horizon vs zenith), 3rd swell component + bright breaking crest cores tied to the bobbing geometry",
@@ -13033,7 +13039,7 @@
                 spawnCooldown: 3.5,
                 attackCooldown: 1.2,
                 attackDamage: 2,
-                jumpForce: 4.25,
+                jumpForce: 6.5,             // tuned so a mob clears a full 1-block step at half-gravity (~1.4-block peak); still can't reach 2
                 cliffCheckDistance: 2.5,
                 memoryDuration: 6,
                 targetLostWanderDelay: 1.25,
@@ -13043,6 +13049,17 @@
                 detourProbeDepth: 2,
                 detourSideBias: 0.65,
                 sidestepSpeed: 3.2,
+                // --- Hit reaction (consumed by damageMob / faceAndAnimate) ---
+                hitStunDuration: 0.35,      // Sec the mob keeps facing the player after a hit (no velocity-facing spin)
+                hopOnHit: 1.2,              // Small vertical stagger when hit while grounded (was a fixed 2.5 leap)
+                // --- Perception & navigation (consumed by MOB_RULES + pathfinder) ---
+                losCheckInterval: 0.25,     // Sec between line-of-sight samples (staggered per mob)
+                pathRecomputeInterval: 0.7, // Sec between grid-path searches while pursuing
+                pathMaxNodes: 256,          // BFS node-expansion budget per search
+                pathMaxRadius: 24,          // Max search radius in blocks (Chebyshev)
+                pathMaxDrop: 3,             // Max blocks a mob will path/step down
+                pathWaypointReach: 1.1,     // Distance at which a path waypoint counts as reached
+                maxPathsPerFrame: 2,        // Cap path searches across all mobs per frame (perf guard)
                 // --- Health / combat / sunburn (consumed by MOB_RULES) ---
                 maxHealth: 20,
                 sunburnDPS: 5,              // HP/s while burning in daylight
@@ -32676,6 +32693,16 @@ self.onmessage = async (e) => {
                 // Stagger exposure checks so all mobs don't sample skylight the same frame
                 group.userData.sunCheckTimer = Math.random() * ZOMBIE_CONFIG.sunburnCheckInterval;
                 group.userData.rules = MOB_RULE_SETS.zombie;
+                // --- Hit reaction / perception / pathfinding state ---
+                group.userData.hitStunTimer = 0;
+                group.userData.grounded = false;
+                group.userData.losTimer = Math.random() * ZOMBIE_CONFIG.losCheckInterval;
+                group.userData.hasLOS = false;
+                group.userData.path = null;
+                group.userData.pathIndex = 0;
+                // Stagger path searches so pooled/spawned mobs don't all search the same frame
+                group.userData.pathTimer = Math.random() * ZOMBIE_CONFIG.pathRecomputeInterval;
+                group.userData.deathDir = group.userData.deathDir || new THREE.Vector3();
                 // Reset any death-pose leftovers from a pooled corpse
                 group.rotation.x = 0;
                 group.rotation.order = "XYZ";
@@ -32941,6 +32968,7 @@ self.onmessage = async (e) => {
                 dragFactor: 1, gravityDelta: 0,
                 detectionRadiusSq: 0, attackRangeSq: 0, despawnDistSq: 0,
                 index: 0, distanceSq: 0, stateHandled: false, removed: false,
+                canSeePlayer: false, pathsThisFrame: 0,
             };
 
             /**
@@ -32957,8 +32985,17 @@ self.onmessage = async (e) => {
                     const dist = ZOMBIE_CONFIG.detourProbeStep * step;
                     const gx = Math.floor(pos.x + dir.x * dist);
                     const gz = Math.floor(pos.z + dir.z * dist);
-                    if (isSolidBlock(gx, footY, gz) || isSolidBlock(gx, footY + 1, gz)) {
-                        return Infinity; // immediate wall in the way
+                    const footSolid = isSolidBlock(gx, footY, gz);
+                    const headSolid = isSolidBlock(gx, footY + 1, gz);
+                    if (footSolid && headSolid) {
+                        return Infinity; // 2+ block wall — impassable
+                    }
+                    if (footSolid) {
+                        // A single-block step: climbable only if there's headroom to stand
+                        // on top. Caller's jump logic does the actual hop.
+                        if (isSolidBlock(gx, footY + 2, gz)) return Infinity;
+                        score += 0.5;
+                        continue;
                     }
                     // Prefer tiles that have ground beneath to avoid stepping into holes
                     if (!isSolidBlock(gx, footY - 1, gz)) score += 0.35;
@@ -32994,6 +33031,168 @@ self.onmessage = async (e) => {
                 return mobTmpD;
             }
 
+            /** Reusable steering result for path following (avoids per-call allocation). */
+            const _pathSteer = { x: 0, z: 0 };
+            /** 4-neighbour offsets for the grid pathfinder. */
+            const _pathDirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            /**
+             * Solidity test for AI queries that must NOT trigger synchronous chunk
+             * generation. Unloaded cells (getBlock === undefined) are treated as solid so
+             * pathfinding/LOS stay inside already-loaded terrain near the player.
+             * @param {GlobalCoord} x - Global block X.
+             * @param {GlobalCoord} y - Global block Y.
+             * @param {GlobalCoord} z - Global block Z.
+             * @returns {boolean} True if the cell blocks movement/sight.
+             */
+            function pathCellSolid(x, y, z) {
+                const b = getBlock(x, y, z);
+                if (b === undefined) return true;
+                return b !== AIR && b !== WATER && b !== TORCH;
+            }
+            /**
+             * Voxel line-of-sight from a mob's eye to a target point. Sampled (not full
+             * DDA) — fine for the short detection ranges involved.
+             * @param {THREE.Group} mob - The mob.
+             * @param {Position3D} targetPos - Target (player eye) position.
+             * @returns {boolean} True if no solid block interrupts the ray.
+             */
+            function hasLineOfSight(mob, targetPos) {
+                const ox = mob.position.x, oy = mob.position.y + ZOMBIE_EYE_HEIGHT, oz = mob.position.z;
+                let dx = targetPos.x - ox, dy = targetPos.y - oy, dz = targetPos.z - oz;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < 0.0001) return true;
+                const inv = 1 / dist;
+                dx *= inv; dy *= inv; dz *= inv;
+                const stepLen = 0.45;
+                const steps = Math.floor(dist / stepLen);
+                for (let i = 1; i <= steps; i++) {
+                    const d = i * stepLen;
+                    if (pathCellSolid(Math.floor(ox + dx * d), Math.floor(oy + dy * d), Math.floor(oz + dz * d))) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            /**
+             * Find the foot (standing) Y for a mob in column (x,z) at/below a reference
+             * height: the highest solid block at/below refY that has 3 air cells above it
+             * (clearance for the ~2-block-tall mob). Used by the grid pathfinder.
+             * @param {GlobalCoord} x - Column X.
+             * @param {GlobalCoord} z - Column Z.
+             * @param {number} refY - Reference foot Y to search down from (allows step up 1).
+             * @returns {number|null} Foot Y (air cell above ground), or null if none found.
+             */
+            function findWalkableGround(x, z, refY) {
+                const top = Math.min(WORLD_DIMS.chunkHeight - 4, refY);
+                const bottom = Math.max(1, refY - ZOMBIE_CONFIG.pathMaxDrop - 1);
+                for (let y = top; y >= bottom; y--) {
+                    if (pathCellSolid(x, y, z) &&
+                        !pathCellSolid(x, y + 1, z) &&
+                        !pathCellSolid(x, y + 2, z) &&
+                        !pathCellSolid(x, y + 3, z)) {
+                        return y + 1;
+                    }
+                }
+                return null;
+            }
+            /**
+             * Bounded BFS over walkable columns toward a goal. Jump-aware (step up 1, drop
+             * up to pathMaxDrop). Returns world-center waypoints from the first step to the
+             * goal, or null if the goal isn't reachable within the node/radius budget.
+             * @param {number} startX @param {number} startZ - Mob position (world).
+             * @param {number} startFootY - Mob foot Y.
+             * @param {number} goalX @param {number} goalZ - Target position (world).
+             * @returns {Array<{x:number,z:number}>|null} Waypoints, or null.
+             */
+            function findMobPath(startX, startZ, startFootY, goalX, goalZ) {
+                const sX = Math.floor(startX), sZ = Math.floor(startZ);
+                const gX = Math.floor(goalX), gZ = Math.floor(goalZ);
+                if (sX === gX && sZ === gZ) return null;
+                const maxR = ZOMBIE_CONFIG.pathMaxRadius;
+                const visited = new Map();
+                const start = { x: sX, z: sZ, footY: Math.floor(startFootY), parent: null };
+                visited.set(sX + "," + sZ, start);
+                const queue = [start];
+                let head = 0, expanded = 0, goalNode = null;
+                while (head < queue.length && expanded < ZOMBIE_CONFIG.pathMaxNodes) {
+                    const cur = queue[head++];
+                    expanded++;
+                    if (cur.x === gX && cur.z === gZ) { goalNode = cur; break; }
+                    for (let d = 0; d < 4; d++) {
+                        const nx = cur.x + _pathDirs[d][0];
+                        const nz = cur.z + _pathDirs[d][1];
+                        if (Math.abs(nx - sX) > maxR || Math.abs(nz - sZ) > maxR) continue;
+                        const nkey = nx + "," + nz;
+                        if (visited.has(nkey)) continue;
+                        const nFootY = findWalkableGround(nx, nz, cur.footY);
+                        if (nFootY === null) continue;
+                        const dyUp = nFootY - cur.footY;
+                        if (dyUp > 1 || dyUp < -ZOMBIE_CONFIG.pathMaxDrop) continue;
+                        const node = { x: nx, z: nz, footY: nFootY, parent: cur };
+                        visited.set(nkey, node);
+                        queue.push(node);
+                    }
+                }
+                if (!goalNode) return null;
+                const wp = [];
+                for (let n = goalNode; n && n.parent; n = n.parent) {
+                    wp.push({ x: n.x + 0.5, z: n.z + 0.5 });
+                }
+                wp.reverse();
+                return wp.length ? wp : null;
+            }
+            /**
+             * Normalized steering direction toward the mob's cached path, lazily
+             * (re)computing it on an interval and within the per-frame search budget.
+             * @param {THREE.Group} mob - The mob.
+             * @param {Object} ctx - Shared mob context (_mobCtx).
+             * @param {Position3D} targetPos - Pursuit target (player or last-seen pos).
+             * @returns {{x:number,z:number}|null} Steering dir, or null to fall back to greedy.
+             */
+            function getMobPathDirection(mob, ctx, targetPos) {
+                const ud = mob.userData;
+                const pos = mob.position;
+                if ((ud.pathTimer <= 0 || !ud.path) && ctx.pathsThisFrame < ZOMBIE_CONFIG.maxPathsPerFrame) {
+                    ud.pathTimer = ZOMBIE_CONFIG.pathRecomputeInterval;
+                    ctx.pathsThisFrame++;
+                    ud.path = findMobPath(pos.x, pos.z, Math.floor(pos.y + 0.2), targetPos.x, targetPos.z);
+                    ud.pathIndex = 0;
+                }
+                const path = ud.path;
+                if (!path || ud.pathIndex >= path.length) return null;
+                const reachSq = ZOMBIE_CONFIG.pathWaypointReach * ZOMBIE_CONFIG.pathWaypointReach;
+                let wp = path[ud.pathIndex];
+                let ddx = wp.x - pos.x, ddz = wp.z - pos.z;
+                while (ddx * ddx + ddz * ddz < reachSq) {
+                    ud.pathIndex++;
+                    if (ud.pathIndex >= path.length) { ud.path = null; return null; }
+                    wp = path[ud.pathIndex];
+                    ddx = wp.x - pos.x; ddz = wp.z - pos.z;
+                }
+                const len = Math.sqrt(ddx * ddx + ddz * ddz);
+                if (len < 1e-4) return null;
+                _pathSteer.x = ddx / len;
+                _pathSteer.z = ddz / len;
+                return _pathSteer;
+            }
+            /**
+             * True if a wander direction is neither a wall nor a ledge — used so idle mobs
+             * stop walking into walls and off cliffs.
+             * @param {Position3D} pos - Mob position.
+             * @param {THREE.Vector3} dir - Candidate (normalized) wander direction.
+             * @returns {boolean} True if the direction is safe to walk.
+             */
+            function isWanderDirSafe(pos, dir) {
+                if (probeDirectionForZombie(pos, dir) === Infinity) return false;
+                const footY = Math.floor(pos.y + 0.2);
+                const ax = Math.floor(pos.x + dir.x * ZOMBIE_CONFIG.cliffCheckDistance);
+                const az = Math.floor(pos.z + dir.z * ZOMBIE_CONFIG.cliffCheckDistance);
+                for (let dy = 0; dy <= ZOMBIE_CONFIG.pathMaxDrop; dy++) {
+                    if (pathCellSolid(ax, footY - dy, az)) return true; // ground within a survivable drop
+                }
+                return false;
+            }
+
             const MOB_RULES = {
                 /** Despawn when beyond despawnDistance from the player. */
                 despawnWhenFar(mob, ctx) {
@@ -33002,10 +33201,14 @@ self.onmessage = async (e) => {
                         ctx.removed = true;
                     }
                 },
-                /** Tick shared timers: attack cooldown and obstacle-memory fade. */
+                /** Tick shared timers: attack cooldown, hit-stun, path timer, obstacle fade. */
                 tickTimers(mob, ctx) {
-                    if (mob.userData.attackCooldown > 0) mob.userData.attackCooldown -= ctx.dt;
-                    mob.userData.lastObstacleNormal.multiplyScalar(0.9);
+                    const ud = mob.userData;
+                    if (ud.attackCooldown > 0) ud.attackCooldown -= ctx.dt;
+                    if (ud.hitStunTimer > 0) ud.hitStunTimer -= ctx.dt;
+                    if (ud.pathTimer > 0) ud.pathTimer -= ctx.dt;
+                    // Frame-rate-independent obstacle-memory fade (was a per-frame *0.9).
+                    ud.lastObstacleNormal.multiplyScalar(Math.pow(0.9, ctx.dt * 60));
                 },
                 /**
                  * Daylight burn: mobs exposed to open sky during the day ignite and
@@ -33038,10 +33241,27 @@ self.onmessage = async (e) => {
                     }
                     if (ud.health <= 0) startMobDeath(mob);
                 },
-                /** Attack when the player is within attackRange (also faces the player). */
+                /**
+                 * Update line-of-sight to the player (throttled, staggered per mob) and
+                 * publish ctx.canSeePlayer for the attack/chase rules. Detection now
+                 * requires both range AND an unobstructed view — no more aggro through
+                 * walls. The lastSeenPos memory (set in chaseInRange) keeps pursuit alive
+                 * after the player breaks contact.
+                 */
+                senseTarget(mob, ctx) {
+                    const ud = mob.userData;
+                    const within = ctx.distanceSq < ctx.detectionRadiusSq;
+                    ud.losTimer -= ctx.dt;
+                    if (ud.losTimer <= 0) {
+                        ud.losTimer = ZOMBIE_CONFIG.losCheckInterval;
+                        ud.hasLOS = within ? hasLineOfSight(mob, ctx.playerPos) : false;
+                    }
+                    ctx.canSeePlayer = within && ud.hasLOS;
+                },
+                /** Attack when the player is within reach AND visible (also faces them). */
                 attackInReach(mob, ctx) {
                     if (ctx.stateHandled) return;
-                    if (!(ctx.distanceSq < ctx.attackRangeSq && ctx.distanceSq < ctx.detectionRadiusSq)) return;
+                    if (!(ctx.distanceSq < ctx.attackRangeSq && ctx.canSeePlayer)) return;
                     const vel = mob.userData.velocity;
                     mob.userData.state = "attack";
                     vel.x *= 0.5;
@@ -33053,6 +33273,9 @@ self.onmessage = async (e) => {
                     mob.rotation.y = Math.atan2(mobTmpA.x, mobTmpA.z);
                     if (mob.userData.attackCooldown <= 0) {
                         mob.userData.attackCooldown = ZOMBIE_CONFIG.attackCooldown;
+                        // NOTE: zombies deal no player damage by design (no player-health
+                        // system yet). The swing is cosmetic; ZOMBIE_CONFIG.attackDamage is
+                        // reserved for when combat is wired up.
                     }
                     ctx.stateHandled = true;
                 },
@@ -33064,7 +33287,7 @@ self.onmessage = async (e) => {
                 chaseInRange(mob, ctx) {
                     const ud = mob.userData;
                     // Memory updates even while the attack rule owns movement
-                    const canDetect = ctx.distanceSq < ctx.detectionRadiusSq;
+                    const canDetect = ctx.canSeePlayer;
                     if (canDetect) {
                         ud.lastSeenPos.copy(ctx.playerPos);
                         ud.lastSeenAge = 0;
@@ -33080,48 +33303,92 @@ self.onmessage = async (e) => {
                     mobTmpA.subVectors(targetPos, pos);
                     mobTmpA.y = 0;
                     const targetDistSq = mobTmpA.lengthSq();
-                    if (targetDistSq > 0.04) {
-                        mobTmpA.multiplyScalar(1 / Math.sqrt(targetDistSq));
-                        const sideDir = mobTmpB.set(-mobTmpA.z, 0, mobTmpA.x);
-                        const moveDir = pickZombieMoveDirection(pos, mobTmpA, sideDir);
-                        if (moveDir.score !== Infinity) {
-                            const chaseSpeed = canDetect ? ZOMBIE_CONFIG.chaseSpeed : ZOMBIE_CONFIG.walkSpeed * 0.9;
-                            vel.x += moveDir.x * chaseSpeed * ctx.dt;
-                            vel.z += moveDir.z * chaseSpeed * ctx.dt;
-                            // Lightly sidestep when recently stuck or facing a wall
-                            if (ud.stuckTimer > ZOMBIE_CONFIG.stuckTimeout * 0.5 || moveDir.score > 0.6) {
-                                mobTmpC.copy(sideDir);
-                                if (ud.lastObstacleNormal.lengthSq() > 0.0001) {
-                                    mobTmpC.set(-ud.lastObstacleNormal.z, 0, ud.lastObstacleNormal.x);
-                                }
-                                mobTmpC.normalize();
-                                vel.x += mobTmpC.x * ZOMBIE_CONFIG.sidestepSpeed * ctx.dt;
-                                vel.z += mobTmpC.z * ZOMBIE_CONFIG.sidestepSpeed * ctx.dt;
-                            }
-                            // Check for obstacle and jump if needed
-                            const obstacleX = Math.floor(pos.x + moveDir.x * 0.7);
-                            const obstacleZ = Math.floor(pos.z + moveDir.z * 0.7);
-                            const obstacleY = Math.floor(pos.y + 0.5);
-                            if (Math.abs(vel.y) < 0.1 && isSolidBlock(obstacleX, obstacleY, obstacleZ) && !isSolidBlock(obstacleX, obstacleY + 1, obstacleZ)) {
-                                vel.y = ZOMBIE_CONFIG.jumpForce;
-                                ud.lastObstacleNormal.set(-moveDir.x, 0, -moveDir.z);
-                            }
-                            mob.userData.state = canDetect ? "chase" : "wander";
-                            ctx.stateHandled = true;
+                    if (targetDistSq <= 0.04) {
+                        // Arrived (at player column or at last-seen spot). Drop any path and,
+                        // if we were chasing a stale memory, let it lapse toward wandering.
+                        ud.path = null;
+                        if (!canDetect && ud.lastSeenAge > ZOMBIE_CONFIG.targetLostWanderDelay) {
+                            ud.lastSeenAge = ZOMBIE_CONFIG.memoryDuration + 1;
                         }
+                        return;
                     }
-                    if (!ctx.stateHandled && ud.lastSeenAge > ZOMBIE_CONFIG.targetLostWanderDelay) {
-                        ud.lastSeenAge = ZOMBIE_CONFIG.memoryDuration + 1; // Force wander fallback
+                    mobTmpA.multiplyScalar(1 / Math.sqrt(targetDistSq));
+                    const sideDir = mobTmpB.set(-mobTmpA.z, 0, mobTmpA.x);
+                    const moveDir = pickZombieMoveDirection(pos, mobTmpA, sideDir);
+                    const blocked = moveDir.score === Infinity;
+                    const stuck = ud.stuckTimer > ZOMBIE_CONFIG.stuckTimeout * 0.5;
+                    // Greedy steering handles open chases; fall back to grid pathfinding when
+                    // the straight line is blocked, the mob is stuck, or it's pursuing a
+                    // remembered position it can no longer see.
+                    let dirX, dirZ;
+                    let usingPath = false;
+                    if (blocked || stuck || !canDetect) {
+                        const pathDir = getMobPathDirection(mob, ctx, targetPos);
+                        if (pathDir) {
+                            dirX = pathDir.x;
+                            dirZ = pathDir.z;
+                            usingPath = true;
+                        } else if (!blocked) {
+                            dirX = moveDir.x;
+                            dirZ = moveDir.z;
+                        } else {
+                            // Walled in with no path — let stuck-recovery / wander act.
+                            if (!canDetect && ud.lastSeenAge > ZOMBIE_CONFIG.targetLostWanderDelay) {
+                                ud.lastSeenAge = ZOMBIE_CONFIG.memoryDuration + 1;
+                            }
+                            return;
+                        }
+                    } else {
+                        ud.path = null; // steering cleanly toward a visible target
+                        dirX = moveDir.x;
+                        dirZ = moveDir.z;
                     }
+                    const chaseSpeed = canDetect ? ZOMBIE_CONFIG.chaseSpeed : ZOMBIE_CONFIG.walkSpeed * 0.9;
+                    vel.x += dirX * chaseSpeed * ctx.dt;
+                    vel.z += dirZ * chaseSpeed * ctx.dt;
+                    // Lightly sidestep when grinding along a wall under greedy steering — but
+                    // never while following a path (the path already routes around obstacles).
+                    if (!usingPath && (stuck || moveDir.score > 0.6)) {
+                        mobTmpC.copy(sideDir);
+                        if (ud.lastObstacleNormal.lengthSq() > 0.0001) {
+                            mobTmpC.set(-ud.lastObstacleNormal.z, 0, ud.lastObstacleNormal.x);
+                        }
+                        mobTmpC.normalize();
+                        vel.x += mobTmpC.x * ZOMBIE_CONFIG.sidestepSpeed * ctx.dt;
+                        vel.z += mobTmpC.z * ZOMBIE_CONFIG.sidestepSpeed * ctx.dt;
+                    }
+                    // Jump 1-block steps / obstacles in the chosen direction (uses grounded
+                    // flag so it can't double-jump at the apex of a hop).
+                    const obstacleX = Math.floor(pos.x + dirX * 0.7);
+                    const obstacleZ = Math.floor(pos.z + dirZ * 0.7);
+                    const obstacleY = Math.floor(pos.y + 0.2);
+                    if (ud.grounded && isSolidBlock(obstacleX, obstacleY, obstacleZ) && !isSolidBlock(obstacleX, obstacleY + 1, obstacleZ)) {
+                        vel.y = ZOMBIE_CONFIG.jumpForce;
+                        ud.lastObstacleNormal.set(-dirX, 0, -dirZ);
+                    }
+                    mob.userData.state = canDetect ? "chase" : "wander";
+                    ctx.stateHandled = true;
                 },
-                /** Wander aimlessly when no other rule claimed movement this frame. */
+                /** Wander when no other rule claimed movement — avoiding walls and ledges. */
                 wanderWhenIdle(mob, ctx) {
                     if (ctx.stateHandled) return;
                     const ud = mob.userData;
                     const vel = ud.velocity;
-                    if (!ud.wanderDir || ud.wanderTimer <= 0) {
+                    // (Re)pick a direction that is neither a wall nor a cliff edge.
+                    if (!ud.wanderDir || ud.wanderTimer <= 0 || !isWanderDirSafe(mob.position, ud.wanderDir)) {
                         ud.wanderDir = ud.wanderDir || new THREE.Vector3();
-                        ud.wanderDir.set(Math.random() - 0.5, 0, Math.random() - 0.5).normalize();
+                        let chosen = false;
+                        for (let tries = 0; tries < 4; tries++) {
+                            mobTmpC.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+                            if (mobTmpC.lengthSq() < 1e-4) continue;
+                            mobTmpC.normalize();
+                            if (isWanderDirSafe(mob.position, mobTmpC)) {
+                                ud.wanderDir.copy(mobTmpC);
+                                chosen = true;
+                                break;
+                            }
+                        }
+                        if (!chosen) ud.wanderDir.set(0, 0, 0); // nowhere safe — hold position
                         ud.wanderTimer = 2 + Math.random() * 3;
                     }
                     ud.wanderTimer -= ctx.dt;
@@ -33139,6 +33406,7 @@ self.onmessage = async (e) => {
                     vel.x *= ctx.dragFactor;
                     vel.z *= ctx.dragFactor;
                     vel.y -= ctx.gravityDelta;
+                    ud.grounded = false; // set true below if a downward collision lands us
                     // Move with collision handling (blocks + other zombies)
                     const step = Math.max(Math.abs(vel.x), Math.abs(vel.z), Math.abs(vel.y)) * dt;
                     const steps = Math.max(1, Math.ceil(step / 0.25));
@@ -33159,6 +33427,7 @@ self.onmessage = async (e) => {
                         pos.y += vel.y * stepDt;
                         if (zombieCollides(pos)) {
                             pos.y -= vel.y * stepDt;
+                            if (vel.y < 0) ud.grounded = true; // landed on ground/block
                             ud.lastObstacleNormal.set(0, Math.sign(-vel.y) || 0, 0);
                             vel.y = 0;
                         }
@@ -33182,10 +33451,18 @@ self.onmessage = async (e) => {
                         ud.stuckTimer = 0.4; // Small cooldown before checking again
                     }
                 },
-                /** Face the movement direction (unless attacking) and drive limb animation. */
+                /** Face the player while hit-stunned, else the movement direction; animate. */
                 faceAndAnimate(mob, ctx) {
-                    const vel = mob.userData.velocity;
-                    if (mob.userData.state !== "attack") {
+                    const ud = mob.userData;
+                    const vel = ud.velocity;
+                    if (ud.hitStunTimer > 0) {
+                        // Knocked back: keep facing the player while sliding, instead of
+                        // spinning to face the (away-pointing) knockback velocity.
+                        mobTmpA.subVectors(ctx.playerPos, mob.position);
+                        if (mobTmpA.x * mobTmpA.x + mobTmpA.z * mobTmpA.z > 1e-8) {
+                            mob.rotation.y = Math.atan2(mobTmpA.x, mobTmpA.z);
+                        }
+                    } else if (ud.state !== "attack") {
                         const velXSq = vel.x * vel.x;
                         const velZSq = vel.z * vel.z;
                         if (velXSq + velZSq > 0.00000001) {
@@ -33195,18 +33472,19 @@ self.onmessage = async (e) => {
                     // Animate based on state - use lengthSq to avoid sqrt
                     const horizontalSpeedSq = vel.x * vel.x + vel.z * vel.z;
                     const horizontalSpeed = Math.sqrt(horizontalSpeedSq);
-                    if (mob.userData.state === "attack") {
+                    if (ud.state === "attack") {
                         animateZombieLimbs(mob, ctx.dt, "attack", horizontalSpeed);
                     } else if (horizontalSpeedSq > 0.0025) {
                         // 0.05^2 = 0.0025
-                        animateZombieLimbs(mob, ctx.dt, mob.userData.state, horizontalSpeed);
+                        animateZombieLimbs(mob, ctx.dt, ud.state, horizontalSpeed);
                     } else {
                         animateZombieLimbs(mob, ctx.dt, "idle", 0);
                     }
                 },
                 /**
-                 * Death sequence: brief forward collapse (smoothstepped topple around
-                 * the facing-relative X axis), then a voxel particle burst + despawn.
+                 * Death sequence: smoothstepped topple around the facing-relative X axis
+                 * (negative rotation.x tips the mob onto its back — startMobDeath faces it
+                 * at the player so it falls AWAY), then a voxel particle burst + despawn.
                  * Installed exclusively via MOB_RULE_SETS.dying by startMobDeath().
                  */
                 collapseAndExpire(mob, ctx) {
@@ -33235,7 +33513,7 @@ self.onmessage = async (e) => {
                 zombie: {
                     maxHealth: ZOMBIE_CONFIG.maxHealth,
                     rules: [
-                        "despawnWhenFar", "tickTimers", "burnInSunlight",
+                        "despawnWhenFar", "tickTimers", "burnInSunlight", "senseTarget",
                         "attackInReach", "chaseInRange", "wanderWhenIdle",
                         "moveWithPhysics", "faceAndAnimate",
                     ],
@@ -33266,7 +33544,21 @@ self.onmessage = async (e) => {
                 const vel = ud.velocity;
                 vel.x += kbX;
                 vel.z += kbZ;
-                if (Math.abs(vel.y) < 0.1) vel.y = 2.5; // small hop on hit
+                // Record the horizontal hit direction (knockback, or player→mob fallback)
+                // so hitstun facing and the death topple stay oriented to the player.
+                if (kbX !== 0 || kbZ !== 0) {
+                    ud.deathDir.set(kbX, 0, kbZ);
+                } else {
+                    ud.deathDir.subVectors(mob.position, getPlayerWorldPosition());
+                    ud.deathDir.y = 0;
+                }
+                if (ud.deathDir.lengthSq() > 1e-6) ud.deathDir.normalize();
+                ud.hitStunTimer = ZOMBIE_CONFIG.hitStunDuration;
+                // Small grounded stagger instead of a fixed leap on every hit.
+                if (ud.grounded && Math.abs(vel.y) < 0.1) {
+                    vel.y = ZOMBIE_CONFIG.hopOnHit;
+                    ud.grounded = false;
+                }
                 logDebug(`[Mobs] Zombie hit for ${amount} (${Math.max(0, ud.health).toFixed(1)} HP left)`);
                 if (ud.health <= 0) startMobDeath(mob);
             }
@@ -33281,8 +33573,15 @@ self.onmessage = async (e) => {
                 ud.state = "dying";
                 ud.deathTimer = 0;
                 ud.velocity.set(0, 0, 0);
+                ud.path = null;
                 ud.rules = MOB_RULE_SETS.dying;
                 mob.rotation.order = "YXZ"; // topple around facing-relative X
+                // Face the player so the backward topple (collapseAndExpire sets
+                // rotation.x < 0) falls AWAY from them. deathDir points away from the
+                // player (set in damageMob); left untouched for pure-sunburn deaths.
+                if (ud.deathDir && ud.deathDir.lengthSq() > 1e-6) {
+                    mob.rotation.y = Math.atan2(-ud.deathDir.x, -ud.deathDir.z);
+                }
                 logDebug(`[Mobs] Zombie dying${ud.burning ? " (sunburn)" : ""}`);
             }
             /**
@@ -33368,6 +33667,7 @@ self.onmessage = async (e) => {
                 _mobCtx.detectionRadiusSq = ZOMBIE_CONFIG.detectionRadius * ZOMBIE_CONFIG.detectionRadius;
                 _mobCtx.attackRangeSq = ZOMBIE_CONFIG.attackRange * ZOMBIE_CONFIG.attackRange;
                 _mobCtx.despawnDistSq = ZOMBIE_CONFIG.despawnDistance * ZOMBIE_CONFIG.despawnDistance;
+                _mobCtx.pathsThisFrame = 0; // perf guard: bounds path searches per frame
                 // Run each mob's rule list (shared arrays from MOB_RULE_SETS)
                 for (let i = mobs.length - 1; i >= 0; i--) {
                     const mob = mobs[i];
