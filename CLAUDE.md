@@ -795,7 +795,8 @@ Before committing, verify:
 - [ ] Terrain changes: update terrain-visualizer.html to match (biome config, height funcs)
 - [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
 - [ ] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES` (top of voxEx.html, console boot banner)
-- [ ] Worker parity: the worker template's `WORLD_DIMS` (incl. `yOffset`!), `BIOME_CONFIG`, and tree code are HAND-MAINTAINED copies — verify they match main thread (a `yOffset` drift of 64 silently broke ALL worker tree generation; found 2026-06-12)
+- [ ] Worker parity: the worker template's `WORLD_DIMS` (incl. `yOffset`!) and `BIOME_CONFIG` are HAND-MAINTAINED copies — verify they match main thread (a `yOffset` drift of 64 silently broke ALL worker tree generation; found 2026-06-12)
+- [ ] Tree code is now SINGLE-SOURCE (2026-06-13): the tree mask/placement/canopy functions (`treePlacementValue`, `getTreeDensityForBiome`, `generateTreeMaskForChunk`, `getTreeMaskForChunk`, `getTreeMaskValueGlobal`, `resolveTreeProfile`, `pickTrunkSize`, `wouldHaveValidTree`, `isTreeSiteViable`, `getChunkTreePositions`, `getCanopyLayerRadius`, `forEachCanopyVoxel`, `generateTreesForChunk`) are injected into the worker by `buildChunkWorkerCode()` via `Function.toString()` between the `/* __TREE_FUNCS_START__ */ … __END__ */` markers. Edit ONLY the main-thread sources; do NOT hand-edit a worker copy. The worker still hand-maintains leaf helpers (`seededRandom`, `isLeafBlock`/`isLogBlock`/`isValidTreeGround`, `getTreeMaskKey`, `noise2D`), caches (`treeMaskCache`, `treePositionsCache`), `chunks`/`getChunkKey`, and `TREE_MAX_RING_SLOPE`; injected tree functions also depend on the terrain-injected `getBiomeParams`/`blendedHeight`/`getRiverFactor`/`biomeByName`. Keep the markers intact.
 
 ## Testing Tools
 
