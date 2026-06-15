@@ -2632,6 +2632,10 @@
                         <input type="number" id="blocky-shadow-slope-input" min="0" max="1" step="0.1" value="0" />
                     </div>
                     <div class="setting-item">
+                        <label for="blocky-shadow-step-input">Blocky Shadow Ratchet (blocks/step; 0 = off. Steps the sun forward to stop edge wobble; higher = chunkier)</label>
+                        <input type="number" id="blocky-shadow-step-input" min="0" max="4" step="0.25" value="1" />
+                    </div>
+                    <div class="setting-item">
                         <label for="blocky-torch-levels-input">Blocky Torch Light Levels (1 = smooth/off; lower = chunkier cells, higher = smoother)</label>
                         <input type="number" id="blocky-torch-levels-input" min="1" max="24" step="1" value="8" />
                     </div>
@@ -3785,8 +3789,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-14.6";
+            const VOXEX_BUILD = "2026-06-15.1";
             const VOXEX_RECENT_CHANGES = [
+                "Blocky shadows: adaptive sun-angle RATCHET (SETTINGS.blockyShadowStep, Graphics>Lighting; 0=off, default 1 block/step) — the light-space depth map only re-renders when a monotonic committed sun angle advances, so it's frozen between commits and the hard pixel edge steps forward instead of wobbling back-and-forth. Angular step ∝ sin²(elevation) => coarse at noon, fine near the horizon (≈constant world step). Main-thread only (updateDayNight); soft mode + step=0 are byte-identical to before; visible sun sprite/god rays untouched (they track smoothH)",
                 "Mobile: blocking 'rotate to landscape' overlay (#orientation-overlay) replaces the one-time toast — driven by updateOrientationOverlay() off a cached (orientation: portrait) matchMedia + orientationchange listener; shows only when touchModeActive && portrait, hides the instant the device is rotated to landscape",
                 "FIX: knockdown ground-pose elbows were the only keyframe authored with opposite-sign elbows, so they inverted after the negation fix — flipped to match (+0.5)",
                 "FIX: walking right-arm Z-splay was reversed vs the left (swung out when forward); now both arms tuck in when forward, out when back",
@@ -5722,6 +5727,7 @@
                 blockyShadowOffset: savedSettings.blockyShadowOffset !== undefined ? savedSettings.blockyShadowOffset : 0.5,
                 blockyShadowDepthBias: savedSettings.blockyShadowDepthBias !== undefined ? savedSettings.blockyShadowDepthBias : 0.0,
                 blockyShadowSlopeScale: savedSettings.blockyShadowSlopeScale !== undefined ? savedSettings.blockyShadowSlopeScale : 0.0,
+                blockyShadowStep: savedSettings.blockyShadowStep !== undefined ? savedSettings.blockyShadowStep : 1.0,
                 blockyTorchLevels: savedSettings.blockyTorchLevels !== undefined ? savedSettings.blockyTorchLevels : 8,
                 antialiasing: savedSettings.antialiasing !== undefined ? savedSettings.antialiasing : true,
                 pixelRatio: savedSettings.pixelRatio !== undefined ? savedSettings.pixelRatio : 0.5,  // Keep in sync with DEFAULTS.pixelRatio
@@ -5947,6 +5953,7 @@
                 blockyShadowOffset: 0.5, // Blocky normal-bias offset in 1/16-block texels (anti-acne at boundary angles; too high -> peter-pan). Live-tunable.
                 blockyShadowDepthBias: 0.0, // Blocky secondary depth bias (normalized depth; negative = anti-acne at grazing sun). Advanced, no UI.
                 blockyShadowSlopeScale: 0.0, // Grazing slope scale [0..1]: restores the normal-offset depth-push at low sun to kill leading-edge stripe acne. 0=off (no change). ~0.7 = strong; raises peter-pan at extreme grazing.
+                blockyShadowStep: 1.0,   // Shadow "ratchet": target blocks of shadow travel per discrete sun-angle commit. 0 = off (smooth/continuous). Freezes the depth map between commits so blocky edges step forward monotonically instead of wobbling back-and-forth. Adaptive: angular step ∝ sin²(elevation), so coarse at noon, fine near the horizon (constant world-step). blockyShadows-gated. Live-tunable.
                 blockyTorchLevels: 8,    // Held-torch blocky light: # of discrete attenuation steps, evaluated per 1/16-block world cell. 1 = off (smooth). Lower = chunkier; higher = smoother. blockyShadows-gated, held-torch only.
                 antialiasing: true,
                 pixelRatio: 0.5,
@@ -6220,6 +6227,7 @@
                 const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
                 const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const blockyTorchLevelsInput = document.getElementById("blocky-torch-levels-input");
+                const blockyShadowStepInput = document.getElementById("blocky-shadow-step-input");
                 const shadowQualitySelect = document.getElementById("shadow-quality-select");
                 if (aoToggle) aoToggle.checked = SETTINGS.AO;
                 { const _slt = document.getElementById("smooth-lighting-toggle"); if (_slt) _slt.checked = SETTINGS.smoothLighting; }
@@ -6228,6 +6236,7 @@
                 if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
                 if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
                 if (blockyTorchLevelsInput) blockyTorchLevelsInput.value = SETTINGS.blockyTorchLevels;
+                if (blockyShadowStepInput) blockyShadowStepInput.value = SETTINGS.blockyShadowStep;
                 if (shadowQualitySelect) shadowQualitySelect.value = SETTINGS.shadowRenderDistance;
                 // Graphics - Water
                 const waterFastToggle = document.getElementById("water-fast-toggle");
@@ -6684,7 +6693,8 @@
                 targetX: -1,
                 targetY: -1,
                 targetZ: -1,
-                sunAngle: -1,
+                sunAngle: -1,          // effective (committed) sun angle last RENDERED into the depth map
+                committedAngle: -1,    // ratchet latch: monotonic sun angle currently driving the shadow (advances in discrete steps; -1 = uninitialized)
                 lastSunShadowMs: -1, // performance.now() of last sun-driven shadow refresh (decoupled from movement)
             };
             import * as THREE from "three";
@@ -11217,6 +11227,20 @@
             // shadows sweep over time while standing still (not only when the player moves).
             const SUN_SHADOW_REFRESH_MS = 140; // ~7 Hz cap: smooth at all day lengths, never per-frame, stays under the rate already paid while walking
             const SUN_SHADOW_MIN_ANGLE = 1e-5; // Skip the refresh when the day/night cycle hasn't actually advanced (e.g. paused)
+            // --- BLOCKY SHADOW RATCHET (SETTINGS.blockyShadowStep) ---
+            // The blocky per-fragment world snap samples a LIGHT-space depth map that rotates with the
+            // sun; under a continuous sun angle the depth map is re-rasterized every refresh and texel
+            // aliasing flips edge cells non-monotonically -> the hard edge wobbles forward-and-back.
+            // The ratchet quantizes the sun angle into discrete, monotonic commits: between commits the
+            // depth map is frozen (zero wobble); at a commit the edge advances by a step large enough to
+            // dominate the ~1-texel aliasing, so it only ever moves forward. The step is ADAPTIVE:
+            // shadow-tip speed dL/dθ ≈ H/sin²(elev), so to keep a constant WORLD step the angular step
+            // scales with sin²(elev) — coarse near noon, fine near the horizon (more steps where shadows
+            // sweep fastest). sin(elev) == |sin(sunAngle)| (sun-dir y, normalized, z=0).
+            const RATCHET_REF_HEIGHT = 12;      // reference caster height (blocks) calibrating blocks-per-step -> angle
+            const RATCHET_MIN_SIN2 = 0.02;      // floor on sin²(elev) to bound the step near the horizon (sun is fading there anyway)
+            const RATCHET_MAX_STEP_RAD = 0.035; // ~2° cap: high-sun commits stay small so the light DIRECTION never jumps hard (shading/edge)
+            const RATCHET_MIN_STEP_RAD = 3e-4;  // tiny floor; the SUN_SHADOW_REFRESH_MS cadence is the real low-sun throttle
             /**
              * Marks the shadow map as needing an update on the next frame.
              * Call this when chunks change, blocks are modified, or sun angle changes significantly.
@@ -21862,6 +21886,7 @@
                 const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
                 const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const blockyTorchLevelsInput = document.getElementById("blocky-torch-levels-input");
+                const blockyShadowStepInput = document.getElementById("blocky-shadow-step-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 if (aoToggle) aoToggle.checked = SETTINGS.AO;
@@ -21871,6 +21896,7 @@
                 if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
                 if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
                 if (blockyTorchLevelsInput) blockyTorchLevelsInput.value = SETTINGS.blockyTorchLevels;
+                if (blockyShadowStepInput) blockyShadowStepInput.value = SETTINGS.blockyShadowStep;
                 if (textureResSelect) textureResSelect.value = SETTINGS.textureResolution;
                 if (antialiasingToggle) antialiasingToggle.checked = SETTINGS.antialiasing;
 
@@ -22361,6 +22387,7 @@
                 const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
                 const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const blockyTorchLevelsInput = document.getElementById("blocky-torch-levels-input");
+                const blockyShadowStepInput = document.getElementById("blocky-shadow-step-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const antialiasingToggle = document.getElementById("antialiasing-toggle");
                 const reloadNotice = document.getElementById("reload-notice");
@@ -22423,6 +22450,18 @@
                         // Re-bake the held-torch discrete-level count into the chunk shader (recompile on change).
                         // val <= 1 makes onBeforeCompile skip the torch-quant injection entirely (smooth torch).
                         if (chunkMaterial) chunkMaterial.needsUpdate = true;
+                    }
+                });
+
+                blockyShadowStepInput?.addEventListener("change", () => {
+                    const val = parseFloat(blockyShadowStepInput.value);
+                    if (!isNaN(val) && val >= 0) {
+                        SETTINGS.blockyShadowStep = val;
+                        saveSettings();
+                        // JS-side ratchet only (no shader recompile): reset the latch so it re-inits cleanly
+                        // at the current sun angle, then force one refresh so the change is visible immediately.
+                        lastShadowState.committedAngle = -1;
+                        markShadowsDirty();
                     }
                 });
 
@@ -27091,6 +27130,7 @@ self.onmessage = async (e) => {
                 const blockyShadowOffsetInput = document.getElementById("blocky-shadow-offset-input");
                 const blockyShadowSlopeInput = document.getElementById("blocky-shadow-slope-input");
                 const blockyTorchLevelsInput = document.getElementById("blocky-torch-levels-input");
+                const blockyShadowStepInput = document.getElementById("blocky-shadow-step-input");
                 const textureResSelect = document.getElementById("texture-res-select");
                 const reloadNotice = document.getElementById("reload-notice");
                 // Init UI state
@@ -27101,6 +27141,7 @@ self.onmessage = async (e) => {
                 if (blockyShadowOffsetInput) blockyShadowOffsetInput.value = SETTINGS.blockyShadowOffset;
                 if (blockyShadowSlopeInput) blockyShadowSlopeInput.value = SETTINGS.blockyShadowSlopeScale;
                 if (blockyTorchLevelsInput) blockyTorchLevelsInput.value = SETTINGS.blockyTorchLevels;
+                if (blockyShadowStepInput) blockyShadowStepInput.value = SETTINGS.blockyShadowStep;
                 if (textureResSelect) textureResSelect.value = SETTINGS.textureResolution;
                 const dynamicDistToggle = document.getElementById("dynamic-dist-toggle");
                 const renderDistSlider = document.getElementById("render-dist-slider");
@@ -41094,13 +41135,37 @@ self.onmessage = async (e) => {
                     // posChanged. Now: a fixed time cadence (perf-bounded, never per-frame —
                     // renderer.shadowMap.autoUpdate stays false), gated on the cycle having
                     // actually advanced so a paused cycle costs nothing.
+                    // --- RATCHET: derive the EFFECTIVE (committed) sun angle the shadow renders with ---
+                    // Off (blockyShadowStep<=0) or soft mode -> effective == continuous sunAngle (byte-identical
+                    // to the old behavior). On -> committedAngle latches forward in adaptive steps and the depth
+                    // map only re-renders once the COMMITTED angle (not the continuous one) has advanced, so the
+                    // frozen-between-commits depth map can't wobble the hard edge backward.
+                    let effectiveSunAngle = sunAngle;
+                    if (SETTINGS.blockyShadows && SETTINGS.blockyShadowStep > 0) {
+                        if (lastShadowState.committedAngle < 0) lastShadowState.committedAngle = sunAngle;
+                        let _ratchetDelta = sunAngle - lastShadowState.committedAngle;
+                        // Day-cycle wrap (sunAngle resets 2π->0 at dawn): resync forward, never ratchet backward.
+                        if (_ratchetDelta < -0.5) { lastShadowState.committedAngle = sunAngle; _ratchetDelta = 0; }
+                        // Adaptive angular step ∝ sin²(elev): constant WORLD step (~blockyShadowStep blocks),
+                        // coarse near noon, fine near the horizon. sin(elev) == |sin(sunAngle)| (dir.y, normalized).
+                        const _sinElev = Math.abs(Math.sin(sunAngle));
+                        const _sin2 = Math.max(RATCHET_MIN_SIN2, _sinElev * _sinElev);
+                        let _ratchetStepRad = (SETTINGS.blockyShadowStep / RATCHET_REF_HEIGHT) * _sin2;
+                        if (_ratchetStepRad > RATCHET_MAX_STEP_RAD) _ratchetStepRad = RATCHET_MAX_STEP_RAD;
+                        else if (_ratchetStepRad < RATCHET_MIN_STEP_RAD) _ratchetStepRad = RATCHET_MIN_STEP_RAD;
+                        if (_ratchetDelta >= _ratchetStepRad) lastShadowState.committedAngle = sunAngle; // commit one forward step
+                        effectiveSunAngle = lastShadowState.committedAngle;
+                    } else {
+                        // Keep the latch in sync while off so re-enabling never ratchets across a stale gap.
+                        lastShadowState.committedAngle = sunAngle;
+                    }
                     const angleChanged =
                         (shadowStartMs - lastShadowState.lastSunShadowMs) >= SUN_SHADOW_REFRESH_MS &&
-                        Math.abs(sunAngle - lastShadowState.sunAngle) > SUN_SHADOW_MIN_ANGLE;
+                        Math.abs(effectiveSunAngle - lastShadowState.sunAngle) > SUN_SHADOW_MIN_ANGLE;
                     if (posChanged || angleChanged) {
-                        // 3. Sun direction from angle
-                        const diskH = Math.sin(sunAngle);
-                        const diskX = Math.cos(sunAngle);
+                        // 3. Sun direction from the EFFECTIVE (ratcheted) angle
+                        const diskH = Math.sin(effectiveSunAngle);
+                        const diskX = Math.cos(effectiveSunAngle);
                         const sunOffset = 100;
                         shadowLightDir.set(diskX, diskH, 0).normalize();
                         // PIXEL-PERFECT SHADOWS — light-space camera texel-snap, SOFT MODE ONLY.
@@ -41145,7 +41210,7 @@ self.onmessage = async (e) => {
                         lastShadowState.targetX = snapTargetX;
                         lastShadowState.targetY = snapTargetY;
                         lastShadowState.targetZ = snapTargetZ;
-                        lastShadowState.sunAngle = sunAngle;
+                        lastShadowState.sunAngle = effectiveSunAngle;
                         lastShadowState.lastSunShadowMs = shadowStartMs;
                         // Mark shadows dirty for next render frame
                         markShadowsDirty();
