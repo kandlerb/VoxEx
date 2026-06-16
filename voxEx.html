@@ -3789,8 +3789,10 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-15.3";
+            const VOXEX_BUILD = "2026-06-16.2";
             const VOXEX_RECENT_CHANGES = [
+                "PERF (fire) Fix 3 + light: fire models are now managed INCREMENTALLY (addFireModel/removeFireModel/refreshFireModel) instead of being torn down and rebuilt on every chunk re-mesh. chunkFires is now Map<chunkKey, Map<cellKey, Group>>. setBlock now also skips the chunk re-mesh ENTIRELY for mesh-neutral AIR<->FIRE edits, so fire spread/extinguish touch neither the terrain mesh nor lighting nor shadows — only a single Group add/remove. Char (grass->dirt etc.) still re-meshes (texture changed). renderChunk's fire loop is now an idempotent, non-destructive sync (instantiates models for saved/streamed-in fire, prunes stale) — no more model GC churn, no burn-timer resets. The fire glow PointLight now sits at the flame's GROUND CONTACT (y+0.1) so the floor pool reads as cast by the fire, not floating mid-cell.",
+                "PERF (fire): eliminated the two per-edit cost multipliers that made burning fires tank FPS. (1) Shadow gate — setBlock now only markShadowsDirty() when BLOCK_CASTS_SHADOW status actually changes, so fire spread/extinguish (air<->fire) and same-footprint char (grass->dirt, log->burnt) no longer force a full sun shadow-map re-render every frame (torch place/break still flags it explicitly since the stick model casts). (2) Light gate — FIRE now bakes 0 block-light (glows via the dynamic PointLight pool instead), and setBlock skips the lighting BFS entirely for light-neutral edits (same emission+attenuation+opacity), killing the ~14-radius flood + multi-chunk immediate re-mesh that fired on every spread/char/extinguish. leaves->air still relights (atten changes). Net: fire edits now cost ~one batched chunk re-mesh instead of shadow re-render + light flood + multi-chunk immediate re-mesh.",
                 "Fire tuning: per-block burnTime + spreadChance (grass/leaves fast & eager, planks/logs slow) via BURN_TIME/BURN_SPREAD lookup tables; global caps SETTINGS.fireSpreadBudget (4 flames per 2 Hz tick) / fireSpreadChance / fireMaxAge",
                 "FIRE SYSTEM: new FIRE block (16) + BURNT_LOG (17) + BURNT_PLANKS (18); 'burnable' tag on grass/planks/all logs/all leaves with burnsTo mapping (grass→dirt, logs→burnt log, planks→burnt planks, leaves→air). Fire is a transparent, walk-through, emissive separate-render block (like TORCH) that lives in AIR and CLINGS to adjacent block faces (flames render against floor/walls/ceiling it touches), 4-frame looping animation via shared cloned-atlas offset.x, distance LOD (far fires freeze on frame 0). Simulation (CLING-AND-SPREAD, 2 Hz): a flame crawls into adjacent AIR cells that touch a burnable block — all directions, weighted UP (heat rises) so it climbs the outside of logs/walls without replacing them; after ~2-4 s it chars the burnable block(s) it touches IN PLACE (to their burnt result) and then goes out; needs something to cling to or it dies; water douses; mob fire damage via burnInFire rule; pauses with the game. Atlas: NUM_TILES 18→33 (12 fire frames + 3 burnt). Settings under SETTINGS.fire*. Hand/left-click + water extinguish (cell empties).",
                 "Blocky shadows: adaptive sun-angle RATCHET (SETTINGS.blockyShadowStep, Graphics>Lighting; 0=off, default 1 block/step) — the light-space depth map only re-renders when a monotonic committed sun angle advances, so it's frozen between commits and the hard pixel edge steps forward instead of wobbling back-and-forth. Angular step ∝ sin²(elevation) => coarse at noon, fine near the horizon (≈constant world step). Main-thread only (updateDayNight); soft mode + step=0 are byte-identical to before; visible sun sprite/god rays untouched (they track smoothH)",
@@ -4247,14 +4249,20 @@
                     name: "Fire",
                     // transparent: no AO/light blocking, walk-through (not solid, not collidable)
                     // cutout: atlas tiles may have alpha (flame over transparency)
-                    // emissive: marks it a light source; fire-specific behaviour via "fire" tag
+                    // emissive: descriptive only (glow comes from the dynamic PointLight pool,
+                    // NOT baked block-light — see lightEmission below); fire behaviour via "fire" tag
                     tags: ["transparent", "cutout", "emissive", "fire"],
                     // FIRE is drawn by createWorldFire() (animated), NOT via the chunk mesher.
                     // textures/tileIndex point at frame-0 tiles only — used for the static inventory icon.
                     textures: { top: TILE.FIRE_FREE_0, side: TILE.FIRE_SIDE_0, bottom: TILE.FIRE_BOTTOM_0 },
                     ui: { showInInventory: true, tileIndex: TILE.FIRE_FREE_0, defaultHotbar: false },
                     lighting: { sunlightAttenuation: 0, blocklightAttenuation: 0 }, // light passes through
-                    lightEmission: 14, // default block-light level -> BLOCK_LIGHT_EMISSION[FIRE]; fireLightLevel overrides
+                    // PERF: fire does NOT bake block-light (emission 0). Baking would force a
+                    // ~14-radius light-flood BFS + multi-chunk immediate re-mesh on EVERY
+                    // spread/char/extinguish (fire edits constantly), and the baked light is
+                    // daylight-masked anyway. The glow comes from the dynamic PointLight pool
+                    // (torchLightPool), which follows the fire for free. See setBlock light-neutral skip.
+                    lightEmission: 0,
                 },
                 // BURNT_LOG - solid cube, burn result of every log type (Oak + Longwood)
                 {
@@ -6028,7 +6036,7 @@
                 fireDPS: 3,                  // damage/second to mobs in fire
                 fireMaxActive: 48,           // global active-fire cap (<= per-chunk model cap 64, so all render)
                 fireMaxEditsPerTick: 32,     // per-tick edit budget (anti-thrash)
-                fireLightLevel: 14,          // block-light emission (-> BLOCK_LIGHT_EMISSION[FIRE])
+                fireLightLevel: 14,          // DEPRECATED/unused: fire no longer bakes block-light (glows via PointLight pool)
                 fireParticles: true,         // flame/smoke particle toggle
                 fireParticleRadius: 20,      // only fires within this radius emit particles
                 fireMaxEmittersPerFrame: 24, // hard cap on fires emitting per frame-window
@@ -10296,6 +10304,9 @@
             // Fast lookup for block properties using typed arrays
             const BLOCK_IS_SOLID = new Uint8Array(256);
             const BLOCK_IS_OPAQUE = new Uint8Array(256);
+            // 1 if a block contributes occluder geometry to the castShadow terrain mesh
+            // (solid blocks incl. glass, and cutout leaves). Drives the setBlock shadow gate.
+            const BLOCK_CASTS_SHADOW = new Uint8Array(256);
 
             function initBlockLookupTables() {
                 // Data-driven from BLOCK_CONFIG tags
@@ -10315,6 +10326,19 @@
                     // movement (glass). Must come AFTER the transparent handling above.
                     if (block.tags.includes("collidable")) {
                         BLOCK_IS_SOLID[block.id] = 1;
+                    }
+                }
+                // Shadow-caster table: a block casts a sun/moon shadow only if it
+                // contributes occluder geometry to the castShadow terrain mesh — i.e.
+                // solid blocks (incl. glass) and cutout leaves. Blocks rendered as
+                // separate models (torch) or excluded from the mesh (fire), plus the
+                // non-casting water mesh, do NOT cast. setBlock uses this to skip
+                // shadow-map re-renders for edits that can't change the silhouette
+                // (fire spread/extinguish, same-footprint char like grass->dirt).
+                BLOCK_CASTS_SHADOW.fill(0);
+                for (const block of BLOCK_CONFIG) {
+                    if (BLOCK_IS_SOLID[block.id] === 1 || block.tags.includes("leaves")) {
+                        BLOCK_CASTS_SHADOW[block.id] = 1;
                     }
                 }
             }
@@ -12928,7 +12952,12 @@
             let terrainMeshCount = 0;
             let waterMeshCount = 0;
             const chunkTorches = new Map(); // Store torch 3D models per chunk
-            const chunkFires = new Map(); // Store fire 3D models per chunk (parity with chunkTorches)
+            // chunkFires: chunkKey -> Map(cellKey -> THREE.Group). Per-cell so fire models can be
+            // added/removed/refreshed INCREMENTALLY by the fire system (addFireModel/removeFireModel/
+            // refreshFireModel) without a chunk re-mesh. The outer key groups by chunk for O(1)
+            // disposal on unload (releaseChunkFires). Models carry userData.fireAttMask for cheap
+            // attachment-change detection.
+            const chunkFires = new Map();
 
             // =====================================================
             // TORCH LIGHT POOL SYSTEM
@@ -13031,11 +13060,14 @@
                     // Fires emit a dynamic glow too — feed their cell centres into the same pool so
                     // nearby fire casts real light (the baked block-light alone is masked in daylight).
                     if (typeof chunkFires !== 'undefined') {
-                        for (const fireArray of chunkFires.values()) {
-                            for (const fire of fireArray) {
+                        for (const fireMap of chunkFires.values()) {
+                            for (const fire of fireMap.values()) {
                                 this.torchPositions.push({
                                     x: fire.position.x + 0.5,
-                                    y: fire.position.y + 0.5,
+                                    // Sit the glow at the flame's GROUND CONTACT (fire.position.y is the
+                                    // top of the support block) so the floor pool reads as cast by the
+                                    // fire itself, not floating mid-cell. Tiny +0.1 keeps it off the seam.
+                                    y: fire.position.y + 0.1,
                                     z: fire.position.z + 0.5
                                 });
                             }
@@ -23807,7 +23839,9 @@
             }
             /**
              * Block-light emission for any source block. TORCH is dynamic (settings-driven);
-             * everything else reads the static BLOCK_LIGHT_EMISSION table (FIRE = 14 by default).
+             * everything else reads the static BLOCK_LIGHT_EMISSION table. NOTE: FIRE bakes 0
+             * (it glows via the dynamic PointLight pool, not baked light) to avoid per-edit
+             * light floods — see the FIRE BLOCK_CONFIG entry and setBlock's light-neutral skip.
              * @param {BlockId} id @returns {LightLevel}
              */
             function getBlockEmission(id) {
@@ -24467,8 +24501,16 @@
                 const changed = voxelWorld.setBlock(x, y, z, id);
                 if (!changed) return;
 
-                // OPTIMIZATION: Mark shadows dirty for update (block changed = shadow geometry changed)
-                markShadowsDirty();
+                // OPTIMIZATION: Only re-render the sun/moon shadow map when the edit
+                // actually changes shadow-casting geometry. Same-footprint swaps
+                // (grass->dirt, log->burnt) and fire spread/extinguish (air<->fire)
+                // leave the shadow silhouette identical, so dirtying here would force
+                // a full shadow re-render every frame while fire burns. The torch's
+                // stick model casts a shadow but the torch block isn't in the terrain
+                // mesh, so that case is flagged explicitly in the TORCH branch below.
+                if (BLOCK_CASTS_SHADOW[oldId] !== BLOCK_CASTS_SHADOW[id]) {
+                    markShadowsDirty();
+                }
 
                 // Torch PointLight sync: register/unregister immediately so the pooled
                 // light appears the moment a torch is placed and vanishes on break.
@@ -24479,9 +24521,11 @@
                     if (id === TORCH) {
                         torchLightPool.registerTorch(x + 0.5, y + 0.25, z + 0.5);
                         torchLightPool.markDirty();
+                        markShadowsDirty(); // torch stick model casts a shadow (not in terrain mesh)
                     } else if (oldId === TORCH) {
                         torchLightPool.unregisterTorch(x + 0.5, y + 0.25, z + 0.5);
                         torchLightPool.markDirty();
+                        markShadowsDirty(); // removing the torch stick changes the shadow
                     }
                 }
 
@@ -24505,6 +24549,36 @@
                 invalidateFaceCache(key);
                 // Invalidate section analysis (Y bounds, visibility bitmap may have changed)
                 chunkDataPool.invalidateSectionAnalysis(key);
+
+                // OPTIMIZATION: Skip the lighting BFS entirely when the edit cannot change
+                // any light value — identical emission AND identical light transmission
+                // (attenuation + opacity/transparency). Fire spread/extinguish (air<->fire;
+                // fire is non-emissive) and same-footprint char (grass->dirt, log->burnt)
+                // are light-neutral, so the BFS would be a no-op and the multi-chunk
+                // immediate re-mesh it schedules (createLightTaskTracker.finalize) is pure
+                // waste — the single biggest per-edit cost while fire burns. leaves->air is
+                // NOT neutral (atten 1 -> 0) so canopy burn still relights correctly.
+                // We still rebuild THIS chunk's mesh (texture/geometry may have changed),
+                // but with bypassLighting since existing light values remain valid.
+                const lightNeutral =
+                    getBlockEmission(oldId) === getBlockEmission(id) &&
+                    SUNLIGHT_ATTENUATION[oldId] === SUNLIGHT_ATTENUATION[id] &&
+                    BLOCKLIGHT_ATTENUATION[oldId] === BLOCKLIGHT_ATTENUATION[id] &&
+                    IS_TRANSPARENT[oldId] === IS_TRANSPARENT[id] &&
+                    BLOCK_IS_OPAQUE[oldId] === BLOCK_IS_OPAQUE[id];
+                if (lightNeutral) {
+                    // Mesh-neutral too? AIR<->FIRE changes neither the terrain nor water mesh (fire is
+                    // a separate model managed incrementally by the fire system), so skip the re-mesh
+                    // ENTIRELY — this is what makes fire spread/extinguish nearly free. Other light-
+                    // neutral edits (char grass->dirt, log->burnt) DO change the terrain texture, so
+                    // they still rebuild the mesh (bypassLighting; existing light values stay valid).
+                    const meshNeutral = (oldId === AIR || oldId === FIRE) && (id === AIR || id === FIRE);
+                    if (!meshNeutral) {
+                        scheduleChunkUpdate(cx, cz, false, "block-edit-lightneutral", { bypassLighting: true });
+                    }
+                    return;
+                }
+
                 const jobKey = `${x},${y},${z}`;
                 if (!queuedLightUpdates.has(jobKey)) {
                     queuedLightUpdates.add(jobKey);
@@ -39774,15 +39848,76 @@ self.onmessage = async (e) => {
             function releaseChunkFires(baseKey) {
                 const fires = chunkFires.get(baseKey);
                 if (!fires) return;
-                for (const fire of fires) {
+                for (const fire of fires.values()) {
                     if (fire.parent) fire.parent.remove(fire);
                     else if (typeof scene !== "undefined") scene.remove(fire);
-                    // MODELS ONLY — do NOT unregister sim cells here. This runs on EVERY re-mesh, and
-                    // unregistering (then re-registering in the spawn loop) would reset each flame's age
-                    // to 0 so the burn timer never elapses. Orphaned cells (chunk unloaded) self-clean
-                    // in the tick: getBlock() != FIRE -> the cell is deleted. Shared geo/material reused.
+                    // MODELS ONLY — do NOT unregister sim cells here. Runs on chunk unload; orphaned
+                    // sim cells self-clean in the tick (getBlock() != FIRE -> deleted). Shared geo/material reused.
                 }
                 chunkFires.delete(baseKey);
+            }
+            /** @returns {ChunkKey} chunk key for a world XZ (matches getChunkKey/renderChunk cKey). */
+            function _fireChunkKeyFor(x, z) { return getChunkKey(x >> 4, z >> 4); }
+            /** Pack a fire attachment descriptor into a 6-bit mask for cheap change detection. */
+            function _attMask(att) {
+                return (att.floor ? 1 : 0) | (att.ceiling ? 2 : 0) | (att.sideNX ? 4 : 0)
+                     | (att.sidePX ? 8 : 0) | (att.sideNZ ? 16 : 0) | (att.sidePZ ? 32 : 0);
+            }
+            /**
+             * Create the fire model for one cell if it doesn't already have one. Idempotent.
+             * @returns {boolean} True if a new model was created.
+             */
+            function addFireModel(x, y, z) {
+                if (typeof scene === "undefined") return false;
+                const ck = _fireChunkKeyFor(x, z);
+                let m = chunkFires.get(ck);
+                if (m && m.size >= 64) return false; // per-chunk model cap (parity with old spawn loop)
+                const cellKey = x + "," + y + "," + z;
+                if (m && m.has(cellKey)) return false; // already modelled
+                const att = computeFireAttachment(x, y, z);
+                if (!att.any) return false; // nothing to cling to; tick will clear the cell
+                const model = createWorldFire(x, y, z, att, _fireNearPlayer(x, y, z));
+                model.userData.fireAttMask = _attMask(att);
+                scene.add(model);
+                if (!m) { m = new Map(); chunkFires.set(ck, m); }
+                m.set(cellKey, model);
+                return true;
+            }
+            /** Dispose the fire model for one cell, if present. */
+            function removeFireModel(x, y, z) {
+                const ck = _fireChunkKeyFor(x, z);
+                const m = chunkFires.get(ck);
+                if (!m) return;
+                const cellKey = x + "," + y + "," + z;
+                const model = m.get(cellKey);
+                if (!model) return;
+                if (model.parent) model.parent.remove(model);
+                else if (typeof scene !== "undefined") scene.remove(model);
+                m.delete(cellKey);
+                if (m.size === 0) chunkFires.delete(ck);
+            }
+            /**
+             * Rebuild a fire model only if which faces it clings to changed (e.g. a clung block charred
+             * to air or was mined). Cheap no-op when the attachment mask is unchanged. Purely visual —
+             * a fire that lost ALL support is left for the tick to remove (getBlock/!scan.any).
+             */
+            function refreshFireModel(x, y, z) {
+                const ck = _fireChunkKeyFor(x, z);
+                const m = chunkFires.get(ck);
+                if (!m) return;
+                const cellKey = x + "," + y + "," + z;
+                const old = m.get(cellKey);
+                if (!old) return;
+                const att = computeFireAttachment(x, y, z);
+                if (!att.any) return; // leave for the tick to remove
+                const mask = _attMask(att);
+                if (mask === old.userData.fireAttMask) return;
+                if (old.parent) old.parent.remove(old);
+                else if (typeof scene !== "undefined") scene.remove(old);
+                const model = createWorldFire(x, y, z, att, _fireNearPlayer(x, y, z));
+                model.userData.fireAttMask = mask;
+                scene.add(model);
+                m.set(cellKey, model);
             }
             /** @returns {boolean} True if the fire cell is within the animation radius of the player. */
             function _fireNearPlayer(x, y, z) {
@@ -39812,8 +39947,8 @@ self.onmessage = async (e) => {
                 if (_fireLodAccum < 0.25) return; // ~4 Hz
                 _fireLodAccum = 0;
                 const r = _sharedFireResources;
-                for (const arr of chunkFires.values()) {
-                    for (const g of arr) {
+                for (const fireMap of chunkFires.values()) {
+                    for (const g of fireMap.values()) {
                         const near = _fireNearPlayer(g.position.x, g.position.y, g.position.z);
                         if (near === g.userData.fireAnimated) continue;
                         g.userData.fireAnimated = near;
@@ -39939,24 +40074,28 @@ self.onmessage = async (e) => {
                         f.age += tickDt;
                         const scan = scanFireNeighbors(x, y, z, _fireScan);
                         if (scan.unloaded) continue; // defer at chunk boundaries (incomplete neighbour data)
-                        if (SETTINGS.fireWaterExtinguish && scan.water) { removeFire(f, dirty); continue; }
+                        if (SETTINGS.fireWaterExtinguish && scan.water) { removeFire(f); continue; }
                         // Nothing solid/burnable left to cling to (e.g. the leaf it clung to burned away) -> out.
-                        if (!scan.any) { removeFire(f, dirty); continue; }
+                        if (!scan.any) { removeFire(f); continue; }
                         // CHARRING (always — never starved, never reset): each adjacent burnable chars on
                         // its OWN clock (BURN_TIME[type] x this flame's scale). Returns how many burnable
-                        // neighbours remain un-charred.
+                        // neighbours remain un-charred. (dirty drives terrain re-mesh for the charred blocks.)
                         const remaining = charReadyBurnables(f, dirty);
                         // The flame goes out once its fuel is spent (nothing left to char) — or hits the
                         // safety cap. A fuel-less flame (placed on stone) shows for FIRE_MIN_LIFETIME.
                         if ((remaining === 0 && f.age >= FIRE_MIN_LIFETIME) || f.age >= SETTINGS.fireMaxAge) {
-                            removeFire(f, dirty); continue;
+                            removeFire(f); continue;
                         }
+                        // Update the flame model if the faces it clings to changed (e.g. a clung block
+                        // just charred to air, or a neighbour was mined). Cheap no-op when unchanged —
+                        // replaces the old "rebuild every model on chunk re-mesh" behaviour.
+                        refreshFireModel(x, y, z);
                         // SPREAD: rate-limited by the global per-tick budget; per-flame eagerness is the
                         // fastest adjacent fuel's spreadChance (grass/leaves high, logs/planks low),
                         // scaled by the global fireSpreadChance multiplier.
                         if (spreadBudget > 0 && SETTINGS.fireSpread && this.cells.size < SETTINGS.fireMaxActive
                             && Math.random() < scan.spreadChance * SETTINGS.fireSpreadChance) {
-                            if (spreadFire(f, dirty)) spreadBudget--;
+                            if (spreadFire(f)) spreadBudget--;
                         }
                     }
                     for (const ck of dirty) scheduleChunkUpdate(ck.cx, ck.cz, false, "fire-tick");
@@ -39986,15 +40125,18 @@ self.onmessage = async (e) => {
             ];
             const _FIRE_HORIZ = [[-1, 0], [1, 0], [0, -1], [0, 1]]; // [dx,dz] for step-down-over-an-edge spread
             // Remove a fire — its air cell simply empties (fire never leaves a block behind).
-            function removeFire(f, dirty) {
+            // FIRE->AIR is mesh-neutral (setBlock skips the re-mesh), so the model is removed
+            // incrementally here; no chunk re-mesh is scheduled.
+            function removeFire(f) {
                 setBlock(f.x, f.y, f.z, AIR);
                 fireSystem.cells.delete(f.key);
-                dirty.add(f.x >> 4, f.z >> 4);
+                removeFireModel(f.x, f.y, f.z);
             }
             // Hand/water extinguish at a position (the air cell empties).
             function extinguishAt(x, y, z) {
                 setBlock(x, y, z, AIR);
                 fireSystem.cells.delete(x + "," + y + "," + z);
+                removeFireModel(x, y, z);
             }
             // Char each burnable block this flame clings to once the flame has clung long enough for
             // THAT block type (BURN_TIME[type] x the flame's scale). Fast fuels (grass/leaves ~1-2s)
@@ -40028,7 +40170,7 @@ self.onmessage = async (e) => {
                 _spreadTotalW += w;
                 if (Math.random() < w / _spreadTotalW) { _spreadX = tx; _spreadY = ty; _spreadZ = tz; _spreadFound = true; }
             }
-            function spreadFire(f, dirty) {
+            function spreadFire(f) {
                 _spreadTotalW = 0; _spreadFound = false;
                 // 1) Crawl into adjacent AIR cells that cling to a burnable (weighted UP — heat rises).
                 for (let i = 0; i < _FIRE_SPREAD.length; i++) {
@@ -40050,9 +40192,9 @@ self.onmessage = async (e) => {
                     _considerSpread(f.x + d[0], f.y - 1, f.z + d[1], 1);          // down + over, low weight
                 }
                 if (!_spreadFound) return false;
-                setBlock(_spreadX, _spreadY, _spreadZ, FIRE);
+                setBlock(_spreadX, _spreadY, _spreadZ, FIRE);   // AIR->FIRE is mesh-neutral: no chunk re-mesh
                 fireSystem.register(_spreadX, _spreadY, _spreadZ);
-                dirty.add(_spreadX >> 4, _spreadZ >> 4);
+                addFireModel(_spreadX, _spreadY, _spreadZ);      // incremental model add (no rebuild)
                 return true;
             }
 
@@ -40999,32 +41141,45 @@ self.onmessage = async (e) => {
                     if (torchArray.length > 0) {
                         chunkTorches.set(cKey, torchArray);
                     }
-                    // --- CREATE FIRE MODELS (composite, animated; parity with torches) ---
-                    releaseChunkFires(cKey);
-                    const MAX_FIRES_PER_CHUNK = 64;
-                    const fireArray = [];
-                    fireLoop:
-                    for (let y = 0; y < height; y++) {
-                        const yOff = y * 256;
-                        for (let z = 0; z < 16; z++) {
-                            const zOff = z * 16;
-                            for (let x = 0; x < 16; x++) {
-                                if (blockData[x + zOff + yOff] !== FIRE) continue;
-                                if (fireArray.length >= MAX_FIRES_PER_CHUNK) break fireLoop;
-                                const wx = startX + x;
-                                const wy = y - WORLD_DIMS.yOffset;
-                                const wz = startZ + z;
-                                const att = computeFireAttachment(wx, wy, wz);
-                                if (!att.any) continue; // unsupported air cell — nothing to cling to; tick will clear it
-                                const model = createWorldFire(wx, wy, wz, att, _fireNearPlayer(wx, wy, wz));
-                                scene.add(model);
-                                fireArray.push(model);
-                                // (re)register the sim cell; idempotent so it keeps age across re-mesh.
-                                fireSystem.register(wx, wy, wz);
+                    // --- FIRE MODELS: idempotent, NON-destructive sync (load-time instantiation) ---
+                    // Fire models are owned by the fire system and managed INCREMENTALLY
+                    // (addFireModel/removeFireModel/refreshFireModel). A re-mesh must NOT wipe and
+                    // rebuild them — that caused GC churn AND reset each flame's burn timer. This loop
+                    // only (a) instantiates models + registers sim cells for FIRE blocks that don't yet
+                    // have a model (chunk just loaded/streamed in with saved fire), and (b) prunes models
+                    // whose cell is no longer FIRE (chunk reloaded with changed data). For a burning
+                    // chunk that re-meshes (e.g. a block charred), every model already exists -> no-op.
+                    {
+                        const existing = chunkFires.get(cKey);
+                        if (existing) {
+                            for (const [cellKey, model] of existing) {
+                                const p = model.position;
+                                if (getBlock(p.x, p.y, p.z) !== FIRE) {
+                                    if (model.parent) model.parent.remove(model); else scene.remove(model);
+                                    existing.delete(cellKey);
+                                }
+                            }
+                            if (existing.size === 0) chunkFires.delete(cKey);
+                        }
+                        const MAX_FIRES_PER_CHUNK = 64;
+                        fireLoop:
+                        for (let y = 0; y < height; y++) {
+                            const yOff = y * 256;
+                            for (let z = 0; z < 16; z++) {
+                                const zOff = z * 16;
+                                for (let x = 0; x < 16; x++) {
+                                    if (blockData[x + zOff + yOff] !== FIRE) continue;
+                                    const cur = chunkFires.get(cKey);
+                                    if (cur && cur.size >= MAX_FIRES_PER_CHUNK) break fireLoop;
+                                    const wx = startX + x;
+                                    const wy = y - WORLD_DIMS.yOffset;
+                                    const wz = startZ + z;
+                                    addFireModel(wx, wy, wz);        // idempotent: skips cells that already have a model
+                                    fireSystem.register(wx, wy, wz); // idempotent: keeps age across re-mesh
+                                }
                             }
                         }
                     }
-                    if (fireArray.length > 0) chunkFires.set(cKey, fireArray);
                     // Release all pools (including indexed geometry pools)
                     posPool.release(terrainPos);
                     uvPool.release(terrainUvs);
@@ -43600,6 +43755,7 @@ self.onmessage = async (e) => {
                 updateLocalArea(nx, ny, nz);
                 if (selectedBlockId === FIRE) {
                     fireSystem.register(nx, ny, nz);
+                    addFireModel(nx, ny, nz); // incremental model (idempotent with the load-time scan)
                 } else if (SETTINGS.fireWaterExtinguish && selectedBlockId === WATER) {
                     extinguishFireNeighbors(nx, ny, nz); // pour water on fire
                 }
