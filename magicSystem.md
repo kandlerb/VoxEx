@@ -14,7 +14,11 @@ This document is a build plan, not an implementation. Line numbers reference `vo
 |---|---|---|
 | **Balance** | Free-form / creative | No mana, no cooldowns, no resource HUD. (One tiny per-cast guard recommended only to stop accidental per-frame spam — see §10.) |
 | **Delivery** | Mix per spell | Explosion = instant at aim point; Laser = instant beam; Fire = traveling projectile (fireball) that arcs and bursts; Freeze = short-range cone/area. |
-| **World impact** | Permanent + spreading fire | Explosion/laser permanently carve terrain (saved to chunks). Fire ignites flammable blocks, spreads over time, then burns out to air. |
+| **World impact** | Permanent + spreading fire | Explosion/laser permanently carve terrain (saved to chunks). Fire ignites burnable blocks and spreads with no distance cap (limited only by available fuel). |
+| **Spell icons** | Procedural | Generated on a canvas via the block-tile pipeline (`initTextures`). No emoji, no imported art. |
+| **Secondary cast** | Right-click reserved | Each spell may define a primary (left-click) and secondary (right-click) cast. |
+| **Fire = real block** | Persistent, stateful | FIRE is a normal saved block with its own atlas textures (top / bottom / side orientations). It does **not** decay to air; burned-block outcomes are defined by a new burnable-block tag/process. **The full fire system is deferred to a dedicated design pass** (§7.5). |
+| **Water** | Keep as-is for now | No flow/refill work this round; carved sub-sea holes stay open. Water is a planned major future workstream. |
 | **Deliverable** | Standalone design doc (this file) | — |
 
 ---
@@ -28,7 +32,8 @@ This document is a build plan, not an implementation. Line numbers reference `vo
 - Stay inside the project's three pillars: **single file**, **voxels only (BoxGeometry / square particles)**, **performance-first**.
 
 **Non-goals (this round)**
-- Full fluid simulation. Water is static today (§8.5); carved holes under the sea stay open. A refill pass is proposed as optional, full flow sim is out of scope.
+- Full fluid simulation. Water is static today (§8.5); carved holes under the sea stay open (accepted for now). Water is a planned major future workstream — out of scope here.
+- The detailed **fire system** (burnable tag, burn outcomes, spread tick, FIRE state/textures) — being designed in a separate pass (§7.5); this doc only wires the trigger.
 - Spell crafting/progression, multiplayer, mob spellcasting.
 - Rebindable magic keys (controls menu is still a static display per CLAUDE.md).
 
@@ -83,23 +88,24 @@ const SPELL_CONFIG = [
     delivery: "instant-point",       // raycast to aim point, act there
     color: 0xff7a2a, icon: "explosion",
     params: { radius: 4, ignite: true, knockback: 6 },
-    cast: castExplosion,             // function ref
+    cast: castExplosion,             // primary (left-click)
+    castSecondary: null,             // right-click (reserved; e.g. larger/charged blast)
   },
   { id: SPELL_LASER, key: "laser", name: "Laser",
     delivery: "instant-beam",
     color: 0x44e0ff, icon: "laser",
     params: { range: 24, boreRadius: 0.6, beamMs: 140 },
-    cast: castLaser },
+    cast: castLaser, castSecondary: null },   // e.g. wider bore / continuous beam
   { id: SPELL_FIRE, key: "fire", name: "Fireball",
     delivery: "projectile",
     color: 0xff5520, icon: "fire",
     params: { speed: 22, gravity: 8, burstRadius: 2, ignite: true },
-    cast: castFireball },
+    cast: castFireball, castSecondary: null }, // e.g. flame-stream / lob
   { id: SPELL_FREEZE, key: "freeze", name: "Freeze",
     delivery: "cone",
     color: 0x9fe8ff, icon: "freeze",
     params: { range: 8, halfAngleDeg: 28, surfaceFreeze: true },
-    cast: castFreeze },
+    cast: castFreeze, castSecondary: null },  // e.g. freeze single block / ice wall
 ];
 const SPELL_BY_ID = {}; for (const s of SPELL_CONFIG) SPELL_BY_ID[s.id] = s;
 ```
@@ -178,17 +184,20 @@ The existing select/drag callbacks (`setInventorySelectCallback`, `setHotbarChan
 
 Mouse handling lives around `onMouseClick` / `onMouseUp` (the place/break path; `tryPlaceBlock` is at ~line 42841, continuous-mine logic runs in `animate` ~line 42488). In magic mode:
 
-- **Left-click** → `castSpell(selectedSpellId)` instead of starting a mine.
-- **Right-click** → ignored (or reserved for a future "alt cast").
+- **Left-click** → `castSpell(selectedSpellId, "primary")` instead of starting a mine.
+- **Right-click** → `castSpell(selectedSpellId, "secondary")` — reserved for each spell's secondary cast (falls back to no-op if the spell defines none).
 - The continuous-break block in `animate` must early-out when `magicMode` so you don't chew terrain while aiming.
 
 ```js
 // inside the mouse-down handler
 if (magicMode) {
-  if (e.button === 0) castSpell(selectedSpellId);
+  if (e.button === 0) castSpell(selectedSpellId, "primary");
+  else if (e.button === 2) castSpell(selectedSpellId, "secondary");
   return; // skip mine/place entirely
 }
 ```
+
+`castSpell(id, mode)` dispatches to `SPELL_BY_ID[id].cast` or `.castSecondary`; a `null` secondary is simply ignored.
 
 ### 4.6 HUD
 
@@ -201,32 +210,49 @@ if (magicMode) {
 
 ## 5. New block types: FIRE and ICE
 
-Spells need two new blocks. Follow the documented "adding a block" path (CLAUDE.md §"When Modifying voxEx.html").
+Spells need new blocks: **ICE** (one block) and **FIRE** (a persistent, stateful block — see the callout below). Follow the documented "adding a block" path (CLAUDE.md §"When Modifying voxEx.html").
 
-| | FIRE (id 16) | ICE (id 17) |
-|---|---|---|
-| Tags | `transparent`, `cutout`, `emissive` (non-solid — walk through) | `transparent`, `cutout`, `collidable`, `cullAdjacent` (solid, like GLASS) |
-| Collision | none | solid/walkable |
-| Light | glow via dynamic point lights, **not** blockLight (see §7.3) | passes light |
-| `lighting` | `{ sunlightAttenuation: 0, blocklightAttenuation: 0 }` | `{ sunlightAttenuation: 0, blocklightAttenuation: 0 }` (or `1/1` for a frosted look) |
-| Reference config | model on TORCH (emissive, non-solid) | model on GLASS (~line 4192) almost verbatim |
+> **FIRE is a real, saved block — not a transient effect.** It persists in the chunk array and saves/loads like any other block; it does **not** decay to air. It needs its own atlas textures for different burning orientations — **just the top**, **just the bottom**, and **just the sides**. When the ground and something above are both burning, the renderer uses the ground (top-face) variant rather than stacking. The detailed fire model — the burnable tag, what each burned block turns into, animation frames, and how orientation/state is represented — is being designed separately and is captured in §7.5. The notes below are the *structural* hooks only.
 
-**Checklist for each new block:**
+### 5.1 ICE block
 
-1. Add ID constants after `GLASS = 15` (and `UNLOADED_BLOCK = 255` stays last).
-2. Add `TILE.FIRE` / `TILE.ICE` and **bump `NUM_TILES`** from 18 → **20** in *both* copies (main ~line 4020 **and** the worker template ~line 17550).
-3. Add texture generation in `initTextures` (procedural 16×16; fire = flickery orange/yellow cutout, ice = pale blue translucent with square facets).
+| | ICE |
+|---|---|
+| Tags | `transparent`, `cutout`, `collidable`, `cullAdjacent` (solid, like GLASS) |
+| Collision | solid / walkable |
+| Light | passes light |
+| `lighting` | `{ sunlightAttenuation: 0, blocklightAttenuation: 0 }` (or `1/1` for a frosted look) |
+| Reference config | model on GLASS (~line 4192) almost verbatim |
+| Textures | 1 tile (pale-blue translucent, square facets) |
+
+### 5.2 FIRE block (structural hooks; full model deferred to §7.5)
+
+| | FIRE |
+|---|---|
+| Persistence | **saved like any block**; no auto-decay to air |
+| Tags | `transparent`, `cutout`, `emissive`, `burnable-source` (non-solid — walk through) |
+| Collision | none |
+| Light | glow via dynamic point lights, **not** blockLight (see §7.3) |
+| `lighting` | `{ sunlightAttenuation: 0, blocklightAttenuation: 0 }` |
+| Textures | **≥3 tiles** — top-face, bottom-face, side-face burning variants (more if animated) |
+| Orientation/state | **open design question** — the chunk format `{blocks, skyLight, blockLight}` has **no per-block metadata layer**, so orientation must come from either (a) separate block IDs (e.g. `FIRE_TOP` / `FIRE_SIDE` / `FIRE_BOTTOM`), or (b) the mesher deriving which faces to draw fire on from neighboring solids. Decide in the fire design pass. |
+
+### 5.3 Checklist for adding the blocks
+
+1. Add ID constants after `GLASS = 15` (and `UNLOADED_BLOCK = 255` stays last). FIRE may need several IDs if orientation is encoded as separate blocks (see 5.2).
+2. Add `TILE.*` entries and **bump `NUM_TILES`** in *both* copies (main ~line 4020 **and** the worker template ~line 17550). Baseline growth: **ICE +1, FIRE +3** (top/bottom/side) → **18 → 22 minimum**; add more for fire animation frames. Final count is set by the fire design pass.
+3. Add texture generation in `initTextures` (procedural 16×16): ice = pale-blue translucent; fire = flickery orange/yellow cutout, drawn per orientation.
 4. Add `BLOCK_CONFIG` entries (~line 4048) — the system auto-derives inventory/UV/transparency.
-5. Confirm lookup tables populate: `initBlockLookupTables()` (~line 10168) builds `BLOCK_IS_SOLID` from tags; `initBlockOptimization()` (~line 28789) builds `IS_TRANSPARENT` / `SUNLIGHT_ATTENUATION` / `BLOCKLIGHT_ATTENUATION` / `CULLS_SAME_ID` / `AO_OCCLUDES`.
+5. Confirm lookup tables populate: `initBlockLookupTables()` (~line 10168) builds `BLOCK_IS_SOLID` from tags; `initBlockOptimization()` (~line 28789) builds `IS_TRANSPARENT` / `SUNLIGHT_ATTENUATION` / `BLOCKLIGHT_ATTENUATION` / `CULLS_SAME_ID` / `AO_OCCLUDES`. Also add the new `BLOCK_IS_BURNABLE` lookup (§7.5).
 6. **Worker parity (critical):** the meshing worker keeps *hand-maintained* copies at **~lines 17563–17582**. Add:
-   - `IS_TRANSPARENT_WORKER[FIRE] = 1; IS_TRANSPARENT_WORKER[ICE] = 1;`
+   - `IS_TRANSPARENT_WORKER[ICE] = 1;` and `IS_TRANSPARENT_WORKER[...all FIRE ids...] = 1;`
    - `CULLS_SAME_ID_WORKER[ICE] = 1;`
    - (`AO_OCCLUDES_WORKER` is derived from `IS_TRANSPARENT_WORKER` in the loop right after — fire/ice will correctly not occlude AO.)
-   - Add matching `FIRE` / `ICE` numeric constants in the worker scope.
+   - Add matching `ICE` / `FIRE*` numeric constants in the worker scope.
    These blocks are **not** terrain-generated, so the injected terrain/tree functions (`__TERRAIN_FUNCS_*`, `__TREE_FUNCS_*`) need no change.
-7. Update `tools/voxex-texture-tests.html` expectations (tile count → 20; new tiles' opacity/transparency/color checks).
+7. Update `tools/voxex-texture-tests.html` expectations (new tile count; new tiles' opacity/transparency/color checks).
 
-> **Atlas note:** verify `initTextures` and the atlas strip width handle 20 tiles; the texture-tests tool renders all tiles and will catch an off-by-one in the strip.
+> **Atlas note:** verify `initTextures` and the atlas strip width handle the new tile count; the texture-tests tool renders all tiles and will catch an off-by-one in the strip.
 
 ---
 
@@ -284,7 +310,7 @@ A glowing **`BoxGeometry`** scaled to `(thin, thin, length)`, oriented along the
 
 - **Delivery:** instant. Raycast to the aim point (or `origin + dir*range`).
 - **Terrain:** carve a sphere of `radius ≈ 4` to `AIR` via the bulk editor (§8). ~250–500 blocks.
-- **Side effects:** if `ignite`, set a few `FIRE` blocks on surviving flammable faces at the crater rim (feeds §7.5 spread). Optional knockback to nearby mobs/player using existing velocity fields.
+- **Side effects:** if `ignite`, set a few `FIRE` blocks on surviving burnable faces at the crater rim (feeds §7.5 spread). Optional knockback to nearby mobs/player using existing velocity fields.
 - **Visuals:** one big particle burst (orange→smoke gradient, square particles, outward velocity + gravity), a brief expanding "shock" ring made of square particles, one bright short-lived scene light, screen-shake (small camera offset for ~150 ms).
 - **Audio:** `playExplosion()`.
 
@@ -300,9 +326,10 @@ A glowing **`BoxGeometry`** scaled to `(thin, thin, length)`, oriented along the
 
 - **Delivery:** traveling projectile. Spawn at the player's hand, `speed ≈ 22`, `gravity ≈ 8` (gentle arc).
 - **In flight:** emissive box mesh + flame/smoke trail particles + a following spell light.
-- **On impact (block or entity):** place `FIRE` blocks in a small radius (`burstRadius ≈ 2`) on/adjacent to flammable surfaces, ignite the block hit, spawn a flame burst. Does **not** carve terrain by itself — burning does (§7.5).
-- **Fire light:** handled by the projectile's scene light in flight and by a **small pool of dynamic point lights snapped to the nearest/biggest active fire clusters** afterward (cap ~4). We deliberately do **not** emit `blockLight` from fire, because spreading/changing fire would thrash the lighting engine (constant relight + remesh). This keeps fire cheap and is the recommended trade-off.
+- **On impact (block or entity):** place `FIRE` blocks in a small radius (`burstRadius ≈ 2`) on/adjacent to burnable surfaces and ignite the block hit, seeding the spread system (§7.5). The fireball itself does **not** carve terrain.
+- **Fire light:** handled by the projectile's scene light in flight and by a **small pool of dynamic point lights snapped to the nearest/biggest active fire clusters** afterward (cap ~4). We deliberately do **not** emit `blockLight` from fire, because spreading/changing fire would otherwise thrash the lighting engine (constant relight + remesh). This is the recommended trade-off, but it's revisitable in the fire design pass.
 - **Audio:** `playFireball()` on cast, soft crackle loop optional while fires burn.
+- **Note:** the fireball is the *trigger*; the actual burning behavior (what FIRE looks like, how it spreads, what burned blocks become) is the deferred fire system — see §7.5.
 
 ### 7.4 Freeze — `castFreeze()`
 
@@ -312,27 +339,25 @@ A glowing **`BoxGeometry`** scaled to `(thin, thin, length)`, oriented along the
 - **Audio:** `playFreeze()`.
 - **Optional polish (future):** make `ICE` slightly slippery by reducing ground friction when standing on it (movement code already centralizes friction).
 
-### 7.5 Fire spread & burnout (tick system)
+### 7.5 Fire system — DEFERRED to a dedicated design pass
 
-A small cellular-automaton tick, throttled (e.g. every ~0.4 s, time-budgeted), drives spreading:
+> **This subsection is intentionally not finalized.** The fireball spell (§7.3) only *triggers* fire; the burning model itself is being designed separately (in another conversation). What's locked vs. open is recorded here so that design pass has a clean starting point.
 
-```
-state: activeFires = Map(blockKey -> { x,y,z, ageMs })
-tick:
-  for each fire (cap N, e.g. 200):
-    age it; if age > burnoutMs:
-       - turn the FIRE block to AIR
-       - if the block beneath was flammable, consume it (-> AIR or -> FIRE briefly)
-       - remove from activeFires
-    else with spreadChance:
-       - pick a neighbor; if BLOCK_IS_FLAMMABLE -> replace with FIRE, add to activeFires
-  rebuild affected chunks once per tick (batched, §8)
-```
+**Locked decisions**
+- **No spread distance cap.** Fire spreads as long as adjacent fuel exists — it is bounded by available burnable blocks, not by a radius around the ignition point. (Performance is managed by per-tick *work* caps, not by limiting reach — see below and §9.)
+- **FIRE is a persistent, saved block** (§5.2). It does **not** auto-decay to air. Its orientation variants (top / bottom / side) are real textures; when ground and an upper block both burn, the ground (top) variant is shown.
+- **A new "burnable" block tag is required**, marking which blocks can catch fire and defining what each becomes when burned. This is the heart of the deferred design.
+- **Fire glow via dynamic point lights, not blockLight** (recommended for performance; revisitable).
 
-- **Flammable set:** add a `"flammable"` tag in `BLOCK_CONFIG` (WOOD, LOG, LEAVES, LONGWOOD_LOG, LONGWOOD_LEAVES, GRASS) → build a `BLOCK_IS_FLAMMABLE[256]` lookup in `initBlockLookupTables()`.
-- **Caps:** hard cap on `activeFires` and on per-tick spreads to bound cost; fire near the player only (skip distant chunks) to avoid simulating the whole world.
-- **Persistence:** terrain changes from burning are permanent (blocks already became air/fire and save normally). The transient `activeFires` map need not be serialized — on load, convert any saved `FIRE` blocks to `AIR` (or re-seed them as fresh fires). Decide and document in `saveWorld`/`loadWorld`.
-- **Light:** as in §7.3, fire glow is dynamic point lights, not blockLight, specifically so the spread tick doesn't trigger lighting storms.
+**Open questions for the fire design pass**
+- **Burnable tag + outcomes:** which blocks are burnable, and the per-block transition rule when burned (e.g. LOG → ash/air, LEAVES → gone, GRASS → dirt, etc.). Likely a `"burnable"` tag plus a `burnsTo` field in `BLOCK_CONFIG`, compiled into `BLOCK_IS_BURNABLE[256]` and a `BURNS_TO[256]` lookup in `initBlockLookupTables()`.
+- **Orientation/state representation:** separate FIRE block IDs per face vs. neighbor-derived face rendering (see §5.2) — there is no per-block metadata layer in the chunk format.
+- **Spread mechanics:** tick rate, spread probability, whether fire needs an adjacent burnable to persist, and how/whether a fire eventually goes out once fuel is consumed.
+- **Tick architecture & perf caps:** a throttled, time-budgeted tick over an `activeFires` set, with a per-tick cap on the number of fires processed/spread so an unbounded forest fire degrades gracefully (process the budget over multiple ticks) instead of stalling a frame. Batch chunk remesh once per tick (§8).
+- **Worker/streaming behavior:** what happens to active fire in chunks that unload, and whether fire keeps spreading in chunks far from the player.
+- **Persistence:** FIRE blocks save/load like any block (no convert-to-air). Decide whether the *active-fire* simulation state (which saved fires are still actively spreading) is serialized or simply re-derived/re-seeded from saved FIRE blocks on load.
+
+When that design is settled, fold the result back into this section and update the §5 FIRE block details (final tile count, IDs, lookups).
 
 ---
 
@@ -373,8 +398,8 @@ Respect `BEDROCK` (never carve), and skip already-`AIR` targets.
 Water today is **static block IDs** placed at generation (`fillWaterPass`), with a **separate `_WATER` surface mesh** and depth computed at mesh time — there is **no flow/refill**. Implications:
 
 - Exploding/lasering below the sea leaves a **permanent hole**; water will not rush in.
-- Options, in increasing effort: **(a)** accept holes (simplest, ship it); **(b)** a light post-edit flood-fill that re-fills connected sub-sea-level air with water up to sea level within the edited region; **(c)** a real cellular fluid system (large, separate project — out of scope).
-- Recommendation: ship **(a)** for v1, note **(b)** as a fast-follow. Freeze (water→ice) needs none of this since it's a 1:1 block swap.
+- **Decision (locked):** keep water exactly as-is for this round — accept the holes. Freeze (water→ice) is unaffected since it's a 1:1 block swap.
+- **Future:** water is a planned **major workstream** (flow, refill, possibly a real fluid system). For reference when that work happens, options range from a light post-edit flood-fill (re-fill connected sub-sea-level air up to sea level within the edited region) to a full cellular fluid simulation. Out of scope here.
 
 ---
 
@@ -384,7 +409,8 @@ Water today is **static block IDs** placed at generation (`fillWaterPass`), with
 - **Lighting:** chunk-level relight on bulk edits, not per block. Fire uses dynamic lights, not blockLight, to avoid relight storms.
 - **Particles:** reuse `ParticleSystem` (~line 14215, max 500) and its square shader; spell bursts must budget within that cap.
 - **Pooling:** projectiles, spell lights, beam meshes, and fire entries all use small reusable pools (no allocations in hot paths).
-- **Distance:** simulate fire/projectiles only near the player; skip distant chunks.
+- **Distance:** simulate projectiles only near the player; skip distant chunks.
+- **Fire (no spread cap):** since fire spreads with no distance limit, perf is protected by a **per-tick work budget** — cap how many active fires are processed/spread per tick and carry the rest to later ticks, so a large fire degrades to "spreads a bit slower," never a frame stall. (Details finalized in the §7.5 fire design pass.)
 
 ---
 
@@ -396,15 +422,16 @@ No mana, no cooldown by design. The only safeguard: a tiny **global minimum inte
 
 ## 11. Worker-parity & lookup-table checklist (the things that silently break)
 
-- [ ] `NUM_TILES` updated in **both** copies (main ~4020, worker ~17550).
-- [ ] FIRE/ICE constants added in **both** main and worker scopes.
+- [ ] `NUM_TILES` updated in **both** copies (main ~4020, worker ~17550) to the final count (≥22; set by the fire design pass).
+- [ ] ICE + all FIRE* constants added in **both** main and worker scopes.
 - [ ] `IS_TRANSPARENT_WORKER` / `CULLS_SAME_ID_WORKER` updated (~17563–17582) to match main `IS_TRANSPARENT` / `CULLS_SAME_ID`.
-- [ ] `BLOCK_IS_SOLID`, `IS_TRANSPARENT`, `SUNLIGHT_ATTENUATION`, `BLOCKLIGHT_ATTENUATION`, `AO_OCCLUDES`, new `BLOCK_IS_FLAMMABLE` all populated from `BLOCK_CONFIG` tags.
+- [ ] `BLOCK_IS_SOLID`, `IS_TRANSPARENT`, `SUNLIGHT_ATTENUATION`, `BLOCKLIGHT_ATTENUATION`, `AO_OCCLUDES`, new `BLOCK_IS_BURNABLE` / `BURNS_TO` all populated from `BLOCK_CONFIG` tags.
+- [ ] FIRE blocks save/load like any block (no convert-to-air); verify carves + frozen ice + fire all persist through save/load and chunk eviction.
 - [ ] No terrain/tree function edits needed (fire/ice aren't generated) — keep `__TERRAIN_FUNCS_*` / `__TREE_FUNCS_*` markers intact.
 - [ ] New DOM IDs (mode badge, spell name) exist in HTML and match JS.
 - [ ] New settings (if any: spell radii, cast interval) added to `DEFAULTS`, wired into `SETTINGS`, round-trip via save/load.
 - [ ] `VOXEX_BUILD` + recent-changes banner bumped.
-- [ ] `tools/voxex-tests.html` run (serve over localhost); `tools/voxex-texture-tests.html` updated for 20 tiles.
+- [ ] `tools/voxex-tests.html` run (serve over localhost); `tools/voxex-texture-tests.html` updated for the new tile count.
 
 ---
 
@@ -416,38 +443,40 @@ No mana, no cooldown by design. The only safeguard: a tiny **global minimum inte
 - *Deliverable:* you can press M, scroll a spell hotbar, pick spells in inventory — casting does nothing yet.
 
 **Phase 1 — Block + edit foundation**
-- Add FIRE/ICE blocks (config, textures, lookup tables, worker parity, NUM_TILES).
+- Add the ICE block (config, texture, lookup tables, worker parity, NUM_TILES). FIRE blocks land with the fire design pass.
 - Implement `bulkEdit()` (sphere/line/cone) with chunk-level relight + batched remesh.
 - *Deliverable:* internal test calls can carve a sphere / convert water→ice correctly and persistently.
 
 **Phase 2 — Explosion & Laser (instant spells)**
 - `castExplosion` (sphere carve + burst + light + shake + audio).
 - `castLaser` (beam mesh + tube carve + sparks + audio).
+- Wire primary (left-click) casting; stub the secondary (right-click) dispatch.
 - *Deliverable:* two fully working destructive spells.
 
-**Phase 3 — Projectiles & Fire**
-- Projectile system in `animate()`; `castFireball`.
-- FIRE placement on impact; flame trail + dynamic fire lights.
-- *Deliverable:* working fireball that starts fires.
-
-**Phase 4 — Fire spread & Freeze**
-- Fire spread/burnout tick + `BLOCK_IS_FLAMMABLE`; save/load handling of FIRE.
+**Phase 3 — Projectiles & Freeze**
+- Projectile system in `animate()`; `castFireball` projectile + flight visuals (ignition seed only — actual fire behavior comes in Phase 4).
 - `castFreeze` cone + water→ice + frost particles.
-- *Deliverable:* all four spells complete; fire spreads and burns out.
+- *Deliverable:* fireball flies/impacts; freeze fully working; three of four spells complete.
+
+**Phase 4 — Fire system (separate design pass first)**
+- **Blocked on the dedicated fire design (§7.5).** Once settled: add FIRE blocks (multi-texture, IDs/state), the `burnable` tag + `BLOCK_IS_BURNABLE`/`BURNS_TO`, the spread tick with per-tick work budget, and FIRE save/load.
+- *Deliverable:* fireball ignites real, spreading, persistent fire.
 
 **Phase 5 — Polish & guardrails**
-- Spam-interval guard, caps/tuning, screen-shake feel, optional ice slipperiness, optional water refill pass (§8.5b).
+- Spam-interval guard, caps/tuning, screen-shake feel, optional ice slipperiness, secondary-cast definitions.
 - Tests + texture tests + build banner; final CLAUDE.md checklist pass.
 
 ---
 
-## 13. Open questions for you
+## 13. Resolved decisions (from review)
 
-1. **Spell icons:** procedural canvas glyphs (matches block-tile pipeline) — OK, or do you want simple colored squares with a letter for v1?
-2. **Right-click in magic mode:** leave unused, or reserve now for a future secondary cast?
-3. **Water holes (§8.5):** ship with permanent holes for v1, or do you want the simple flood-fill refill in scope from the start?
-4. **Fire reach:** should fire be allowed to spread arbitrarily far (whole forests), or stay capped to a radius around the ignition point for performance/safety?
-5. **Saved fire on load:** convert leftover FIRE blocks to air, or re-ignite them?
+1. **Spell icons:** ✅ Procedural — generated via the block-tile/`initTextures` pipeline.
+2. **Right-click in magic mode:** ✅ Reserved for a per-spell **secondary cast** (`castSecondary`).
+3. **Water holes (§8.5):** ✅ Keep water as-is for now; accept permanent holes. Water is a planned major future workstream.
+4. **Fire reach:** ✅ **No spread distance cap** — fire spreads as long as fuel exists; perf handled by a per-tick work budget, not by limiting reach.
+5. **FIRE blocks:** ✅ Persistent, stateful blocks with their own atlas textures (top/bottom/side); saved like any block, **not** converted to air on load.
+
+**Routed to the dedicated fire design pass (§7.5):** the `burnable` tag and per-block burn outcomes (`burnsTo`), FIRE orientation/state representation (separate IDs vs. neighbor-derived faces), spread mechanics and tick rate, final tile count, and whether active-fire simulation state is serialized or re-derived from saved FIRE blocks.
 
 ---
 
@@ -457,9 +486,9 @@ No mana, no cooldown by design. The only safeguard: a tiny **global minimum inte
 |---|---|---|
 | Worker parity drift (new blocks render wrong / crash worker) | High if forgotten | §11 checklist; the file has prior history of `yOffset`/parity breaks |
 | Lighting hitches on big carves | Medium | Chunk-level relight, modest radii, bulk path |
-| Fire sim runaway cost | Medium | Hard caps, near-player only, dynamic lights not blockLight |
-| Atlas off-by-one with 20 tiles | Medium | texture-tests tool catches it |
-| Water holes feel broken to players | Low/Medium | Decide §8.5 policy up front; freeze unaffected |
+| Fire sim runaway cost (no spread cap) | Medium/High | Per-tick work budget (spread degrades, never stalls); dynamic lights not blockLight; finalized in §7.5 design pass |
+| Atlas off-by-one with new tile count | Medium | texture-tests tool catches it; FIRE adds ≥3 tiles |
+| Water holes (accepted for now) | Low | Decision locked (§8.5); freeze unaffected; revisit in the future water workstream |
 | Point-light budget overflow (torches + spells) | Medium | Cap spell lights ≤4, `castShadow=false`, add to scene not pool |
 
 ---
