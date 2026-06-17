@@ -8,7 +8,7 @@
 | **Author** | Engineering (drafted for Kandler) |
 | **Date drafted** | 2026-06-15 |
 | **Baseline build** | `VOXEX_BUILD = "2026-06-15.1"` (`voxEx.html:3792`) |
-| **Status** | DRAFT rev. 8 — water-extinguish (D10) + pause-gate (D11) signed off, awaiting approval |
+| **Status** | **IMPLEMENTED & RECONCILED (rev. 11)** — shipped in builds `2026-06-15.2` → `2026-06-17.5`. Final behaviour = **cling-and-spread**; fire glows via the **dynamic PointLight pool** (not baked block-light). See the "As-built reconciliation" banner below and §17 for remaining gaps. |
 | **Risk level** | **High** (touches block tables, lighting propagation, chunk meshing, collision/pathing predicates, worker parity, persistence, and the per-frame loop) |
 | **Estimated effort** | 3–4 focused sessions, phased (see §13 Rollout); player-damage descoped to a follow-up CCR |
 
@@ -23,8 +23,19 @@
 - **rev. 8** (2026-06-15) — **D10 + D11 signed off.** Water extinguishes fire: `scanFireNeighbors` reports a WATER neighbour → tick extinguishes; `trySpreadFrom` won't spread next to water; fire can't be placed next to water; placing WATER extinguishes adjacent fire (`extinguishFireNeighbors`); toggle `fireWaterExtinguish` (default true). Fire pauses with the game: `fireSystem.update` + animation/LOD gated on `isGameplayActive()`. Updated §3.2/§6.7d/§6.12/§6.13, settings, decisions (D10/D11/D4 now resolved), §10.3 L4/L12, and risks.
 - **rev. 9** (2026-06-15) — IMPLEMENTED (build `2026-06-15.2`); briefly tried an IGNITE-IN-PLACE model (blocks replaced by fire). **Reverted in rev. 10** — it destroyed blocks instead of clinging.
 - **rev. 10** (2026-06-15) — **final fire behaviour: CLING-AND-SPREAD** (per user direction). Fire lives in AIR and never enters/replaces a block. It crawls into adjacent AIR cells that touch a burnable block — `spreadFire` uses a weighted single-pass pick biased **UP** (heat rises) but spreads in all directions — so it climbs the *outside* of logs/walls. After ~2-4 s (`burnTime = fireMaxAge·[0.7,1.3]`, default `fireMaxAge=3`) it chars the burnable block(s) it touches **in place** via `convertAdjacentBurnables` (grass→dirt, all logs→burnt log, planks→burnt planks, leaves→air) and then `removeFire` empties its air cell — so the flame that burned a block goes out exactly when the block chars. A flame with nothing left to cling to (`!scan.any`) or touching water dies. `register(x,y,z)` stores `{age,burnTime}`; `createWorldFire` renders flames only against the faces it clings to; spawn loop skips unsupported cells. `fireSpreadChance` raised to 0.5 so it propagates within the burn window. Replaces rev. 9's `igniteNeighbor`/in-place model. Verified: isolated `node --check` of the simulation block + a full module-mode parse of all fire edits (lines 3785–43600) with no errors.
+- **rev. 11** (2026-06-17) — **RECONCILED AGAINST SHIPPED CODE** (audit of builds up to `2026-06-17.5`). The implementation is faithful to the rev. 10 cling-and-spread design; this revision updates the *earlier* sections of the doc that still described superseded models, so the CCR matches what was actually built. Three substantive deltas from the pre-rev-10 spec: **(1) Light — fire bakes ZERO block-light** (`lightEmission: 0`) and instead **glows via the dynamic `torchLightPool` PointLight pool** (the exact "deliberate non-integration" §6.6 had ruled out). This was a deliberate perf reversal — it lets fire→air edits skip the lighting BFS entirely. So **§1 item 2, the §1 reuse table, §6.6, §10.1, §10.2 P1, §12, §16 D1, §11.3, §13 are now STALE** where they describe baked emission; an "As built" note is added at each. **(2) Per-block burn tuning** — `BURN_TIME`/`BURN_SPREAD` tables (from per-block `burnTime`/`spreadChance` fields) + a `fireSpreadBudget` replaced the global `fireConsumeChance`/single-`fireMaxAge` model; the §6.13 code listing is the rev. 8 version and is flagged STALE. **(3) Defaults changed** (§7): `fireSpreadChance` 0.10→**1.0**, `fireMaxAge` 15→**8** (now a safety cap; per-block `BURN_TIME` drives charring), `fireMaxActive` 256→**48**; `fireConsumeChance`/`fireLightLevel` are now dead/deprecated. **Implementation gaps** (still open) captured in the new **§17**: no settings-panel UI for any `fire*` key, fire caps not added to `SETTINGS_PROFILES`, and no fire tests in `voxex-tests.html`. The cell shape is `{key,x,y,z,age,burnScale}` (not `{state,age,fuel}`), and `releaseChunkFires` deliberately does NOT eagerly unregister sim cells (lazy tick cleanup) — see §17.
 
 > **Line numbers in this document are references against baseline build `2026-06-15.1`.** Every insertion shifts the lines below it, so apply changes **top-to-bottom** and re-search the anchor strings (given alongside each line number) rather than trusting absolute numbers after the first edit.
+
+> ## ⚑ As-built reconciliation (rev. 11) — read this first
+>
+> This CCR was drafted before the final design landed. The code is **aligned with the rev. 10 cling-and-spread intent**, but several earlier sections still describe the old "ignite-in-place + baked-light" model. Where a section is marked **`> As built (rev. 11):`** the code differs from the surrounding text — trust the note. The three things to know:
+>
+> 1. **Fire does NOT bake block-light.** `lightEmission: 0`. Fire lights its surroundings through the **dynamic `torchLightPool`** (which now also scans `chunkFires`), not the §6.6 baked-emission path. The §6.6 table/accessor machinery still exists but yields 0 for fire.
+> 2. **Cling-and-spread, not consume-supporting-block.** Fire lives in AIR cells adjacent to burnable blocks, climbs (biased up), and chars adjacent burnables **in place** after a per-block timer (`BURN_TIME`), then removes its own flame. It never replaces a block with fire.
+> 3. **Per-block burn tuning + corrected defaults** (see §7). The §6.13 code block is the older `consumeFuel` listing — STALE.
+>
+> Remaining implementation gaps (UI, profiles, tests) are tracked in **§17**.
 
 ---
 
@@ -32,10 +43,10 @@
 
 Add **fire** as a first-class block that:
 
-1. Renders as a separate, oriented model (not baked into chunk geometry) in three visual states — **free-standing** (sitting on top of a block), **side** (clinging to a vertical block face), and **bottom** (hanging from the underside of a block) — mirroring the existing **torch** special-render pattern.
-2. **Emits light** (reuses/generalises the torch block-light propagation).
+1. Renders as a separate, oriented model (not baked into chunk geometry) using **composable layers** — a ground flame (block below), a flame per clung wall, and a ceiling flame (block above), shown simultaneously per neighbour (§3.2) — mirroring the existing **torch** special-render pattern.
+2. **Emits light.** *> As built (rev. 11): via the dynamic `torchLightPool` PointLight pool, **not** baked block-light (`lightEmission: 0`). See §6.6.*
 3. **Spreads** to adjacent burnable blocks on a throttled simulation tick.
-4. **Burns out / consumes** its supporting block per a `burnsTo` map:
+4. **Clings and chars (cling-and-spread).** *> As built (rev. 11): fire lives in AIR adjacent to burnable blocks, climbs (biased up), and after a per-block `BURN_TIME` chars the burnable block(s) it touches **in place**, then removes its own flame — it does **not** replace/consume the block it sits on.* The `burnsTo` map:
    - Grass → **Dirt**
    - Leaves (Oak + Longwood) → **destroyed (Air)**
    - Logs (Oak + Longwood) → **Burnt Log** (new block + texture)
@@ -48,7 +59,7 @@ The design deliberately reuses three existing, proven subsystems so the blast ra
 | Need | Existing system reused | Why |
 |------|------------------------|-----|
 | Separate per-instance rendering | Torch model + `chunkTorches` Map | Torch already renders outside chunk geometry, is tracked per-chunk, cleaned up on chunk unload, and skipped by all three mesh loops (§6.8). |
-| Light emission | `updateBlockLightAt` torch path + chunk block-light seed scan | Torch is already a level-N point block-light source with full propagation. |
+| Light emission | **`torchLightPool` dynamic PointLight pool** (as built, rev. 11) — pool generalised to scan `chunkFires` as well as `chunkTorches` | Fire bakes 0 block-light; the moving point light tracks fires. (The §6.6 baked-emission path was built but set to 0 — see §6.6 / §16 D1.) |
 | Behaviour flags | Tag-derived `*_BLOCK_IDS` Sets in `BLOCK_CONFIG` | `burnable` becomes just another tag, like `log`/`leaves`/`fluid`. |
 | Particles | `spawnTorchFlame` / `spawnTorchEmber` | Flame/smoke already exist and are settings-gated. |
 | Mob fire damage | **mob rule list** (`MOB_RULE_SETS.zombie`) + the `burnInSunlight` pattern | Zombies already have a per-mob "burning" damage rule (`ud.burning`, `ud.health`, burn-FX timer, `startMobDeath`). Fire damage is a sibling rule, not a new pass. |
@@ -108,9 +119,9 @@ Support for *existence* is **any solid OR burnable block** on any face (`any`). 
 
 ### 3.3 Fire registry & tick model
 
-A single module-scope `fireSystem` holds the set of active fire cells (`Map<"gx,gy,gz", {state, age, fuel}>`). It is:
+A single module-scope `fireSystem` holds the set of active fire cells in a `Map`. *> As built (rev. 11): the cell value is `{key, x, y, z, age, burnScale}` (numeric coords for zero-alloc hot loops; `burnScale` ∈ ~[0.8,1.2] multiplies the per-block `BURN_TIME` so flames char at slightly varied times). The earlier `{state, age, fuel}` shape is superseded.* It is:
 - **Populated** on placement/spread, and rebuilt by scanning `FIRE` blocks when a chunk loads (so saved fire resumes ticking).
-- **Ticked** on a throttled cadence (default 0.5 s, *not* per-frame) from `animate()`. Each tick: age++, maybe spread, maybe consume fuel, maybe extinguish, apply entity damage.
+- **Ticked** on a throttled cadence (default 0.5 s, *not* per-frame) from `animate()`. Each tick (cling-and-spread, as built): age++, scan the 6 neighbours once (`scanFireNeighbors`), maybe spread into an adjacent supported AIR cell (biased up), char ready adjacent burnables in place (`BURN_RESULT`), extinguish if water-adjacent / unsupported / past the `fireMaxAge` safety cap; mob damage runs as a per-mob rule (§6.14), not in this tick.
 - **Persisted implicitly** — `FIRE` is a normal block ID in `chunk.blocks`, so RLE save/load already round-trips it. `age`/`state` are transient and recomputed, so **no save-format change is required**.
 
 This keeps the hot per-frame path clean (the per-frame loop only does cheap entity-overlap damage checks against nearby fire; the expensive spread/consume logic runs at 2 Hz).
@@ -329,6 +340,8 @@ Add helper predicates next to `isLeafBlock`/`isLogBlock` (`voxEx.html:4305-4316`
 
 ### 6.6 Light emission — generalise the torch source check
 
+> **⚑ As built (rev. 11) — this section was REVERSED in implementation.** Fire ships with **`lightEmission: 0`** and bakes **no** block-light. The generalisation below (the `BLOCK_LIGHT_EMISSION` table, `getBlockEmission`, the `updateBlockLightAt` source check, and the chunk-load seed) **was implemented**, but because `lightEmission` is 0 it produces zero for fire — i.e. the machinery exists and is harmless, but fire is not a baked light source. Instead, **fire glows through the dynamic `torchLightPool`**: `rebuildTorchPositions()` now scans `chunkFires` alongside `chunkTorches` and feeds fire cell-centres into the pooled `PointLight`s (sharing the `MAX_POINT_LIGHTS` budget). This is the *opposite* of the "deliberate non-integration" note at the end of this section — that note is now stale. The motivation was performance: with fire baking 0 light, `setBlock` takes a **light-neutral fast path** for AIR↔FIRE edits and skips the block-light BFS entirely, which is what makes a spreading fire cheap. `fireLightLevel` (§7) is consequently **deprecated/unused**. Treat the rest of §6.6 as historical design; the live behaviour is dynamic-PointLight glow.
+
 Fire must emit block light. Today emission is hard-coded to `TORCH` in two places. Generalise both to a `BLOCK_LIGHT_EMISSION` table so torch behaviour is preserved and fire is added declaratively.
 
 **6.6a — Build the emission table.** **Location:** end of the block-init transparency loop, `voxEx.html:28866-28867` (just after the `if (block.lighting)` block, before the closing `}` of the `for (const block of BLOCK_CONFIG)` at 28867).
@@ -395,7 +408,9 @@ Generalise the seed so saved/loaded fire re-emits light:
 **Affects:** all block-light propagation (torch + fire). **This is the highest-correctness-risk change** — torch lighting must be regression-tested.
 **Why here:** these are the only two seed points for block light (runtime edits + chunk generation/load). Generalising rather than copy-pasting a fire path keeps a single propagation algorithm.
 
-> **Deliberate non-integration — fire gets baked block light only, NOT a dynamic `PointLight`.** Torches get *both* baked block light *and* a pooled `PointLight` via `torchLightPool.registerTorch(...)` in `setBlock` (`voxEx.html:24325`). `torchLightPool` rebuilds its positions from the `chunkTorches` map (`voxEx.html:12894-12898`), so adding fire dynamic lights would mean generalising the pool to also scan `chunkFires` — a larger change competing for the same `MAX_POINT_LIGHTS = 8` budget. For this CCR, fire relies on baked block light (the dominant component of torch lighting anyway), which the §6.6 generalisation already provides. If flickering dynamic fire light is wanted later, the integration point is `torchLightPool` (generalise to a `blockLightPool` keyed off both maps) — noted in §15.
+> **~~Deliberate non-integration — fire gets baked block light only, NOT a dynamic `PointLight`.~~** *> REVERSED — as built (rev. 11):* fire takes **exactly the opposite** path. Fire bakes 0 block-light and **does** use the pooled `PointLight` — `torchLightPool` was generalised to rebuild positions from **both** `chunkTorches` **and** `chunkFires` (sharing the `MAX_POINT_LIGHTS` budget), and the pool refreshes each interval while any fire is active so the glow tracks short-lived flames. The original rationale below is retained for history only.
+>
+> *(Historical rationale, superseded):* Torches get *both* baked block light *and* a pooled `PointLight` via `torchLightPool.registerTorch(...)`. Adding fire dynamic lights meant generalising the pool to also scan `chunkFires` — which is what was ultimately done, because keeping fire light-neutral (no baked BFS per edit) was worth more than the baked-light path.
 
 ---
 
@@ -708,6 +723,8 @@ Today `tryPlaceBlock` blindly places `selectedBlockId`. Fire needs a support che
 
 ### 6.13 Fire simulation tick (state manager)
 
+> **⚑ As built (rev. 11) — the code listing below is the rev. 8 `consumeFuel` model and is STALE.** The shipped tick implements rev. 10 **cling-and-spread** with these differences: (a) `register` stores `{key,x,y,z,age,burnScale}` (no `fuel`); (b) charring is driven by per-block **`BURN_TIME`** / **`BURN_SPREAD`** tables (built from `burnTime`/`spreadChance` fields in `BLOCK_CONFIG`) plus a global **`fireSpreadBudget`** (≈4 new flames/tick), replacing `fireConsumeChance` and the single global `fireMaxAge`; (c) instead of `consumeFuel` on the supporting block, `charReadyBurnables`/`convertAdjacentBurnables` chars **adjacent** burnables in place once `age ≥ BURN_TIME[id]·burnScale`, then `removeFire` empties the flame's own AIR cell; (d) spread (`spreadFire`/`_considerSpread`) is a weighted single-pass pick **biased up**, only into AIR cells that touch a burnable and aren't next to water. Water-extinguish, the `unloaded` defer guard, the batched per-chunk `scheduleChunkUpdate`, and the `isGameplayActive()` pause gate are all as described. Read the listing for the *structure* (throttled tick, edit cap, reused scratch, dirty-chunk batching); read this note for the *behaviour*.
+
 **Location:** new module-scope object near other systems; tick call inside `animate()` in the "Game active updates" / entity section, `voxEx.html:42640-42646` (after `updateZombies(clampedDt)`).
 
 ```javascript
@@ -834,24 +851,29 @@ Either way the cost is one Map lookup per mob per frame inside the existing loop
 
 **Location:** add defaults in `DEFAULTS` (~`voxEx.html:5284` region) and wire into `SETTINGS` (~`voxEx.html:5067`), plus DOM bindings in the settings UI (~`voxEx.html:28800+`), per the documented settings recipe (CLAUDE.md "When adding settings").
 
-| Key | Default | Purpose |
-|-----|---------|---------|
-| `fireSpread` | `true` | master toggle for spread |
-| `fireSpreadChance` | `0.10` | per-tick spread probability |
-| `fireConsumeChance` | `0.20` | per-tick fuel-consume probability |
-| `fireMaxAge` | `15` (s) | burnout time with no fuel |
-| `fireDPS` | `3` | damage/second to mobs in fire (consumed by the §6.14 mob rule) |
-| `fireMaxActive` | `256` | global active-fire cap (spread step checks this) |
-| `fireMaxEditsPerTick` | `32` | per-tick edit budget (anti-thrash, round-robin remainder) |
-| `fireLightLevel` | `14` | block-light emission; apply-callback writes `BLOCK_LIGHT_EMISSION[FIRE]` and triggers a relight (single source of truth — no separate `FIRE_LIGHT_LEVEL` const) |
-| `fireParticles` | `true` | flame/smoke particle toggle (can ride existing torch-particle settings) |
-| `fireWaterExtinguish` | `true` | a WATER neighbour douses fire and blocks spread next to water (§16 D10) |
-| `fireParticleRadius` | `20` | only fires within this many blocks of the player emit particles (perf cull, §6.13) |
-| `fireMaxEmittersPerFrame` | `24` | hard cap on fires emitting per frame-window (protects the 500-particle pool) |
-| `fireAnimationFps` | `8` | flame animation speed; drives the §6.7d `offset.x` frame stepping |
-| `fireAnimationRadius` | `24` | fires beyond this many blocks freeze on frame 0 (static LOD, §6.7d D9) |
+> **⚑ As built (rev. 11):** the **Default** column below is corrected to the shipped values. All keys exist in `DEFAULTS` + `SETTINGS` and round-trip through `saveSettings` (whole-object `JSON.stringify`), **but none has a settings-panel UI control and none of the caps were added to `SETTINGS_PROFILES`** — see §17 gaps G1/G2.
 
-These belong under a new **Gameplay → Fire** settings group (or **Graphics → Effects** for the particle/light ones). All must round-trip through save/load (`saveSettings`). **Add the four caps (`fireMaxActive`, `fireParticleRadius`, `fireMaxEmittersPerFrame`, `fireAnimationRadius`) to `SETTINGS_PROFILES`** so they scale with the Performance/Balanced/Quality profiles (smaller on low-end) — see §10.2 P3. Per the touch-settings precedent, only keys a profile lists are overwritten, so user-tuned values survive profile switches for keys left out.
+| Key | Default (as built) | CCR draft | Purpose / status |
+|-----|------|------|---------|
+| `fireSpread` | `true` | `true` | master toggle for spread |
+| `fireSpreadChance` | **`1.0`** | `0.10` | global spread-probability multiplier (per-block `BURN_SPREAD` provides the per-type eagerness; default raised so it actually propagates within the burn window) |
+| `fireSpreadBudget` | **`4`** | *(new — not in draft)* | max new flames spawned per tick (global spread cap) |
+| `fireConsumeChance` | `0.20` | `0.20` | **DEAD/compat** — unused in the cling model (charring is timer-driven via `BURN_TIME`, not probabilistic) |
+| `fireMaxAge` | **`8`** (s) | `15` | **safety cap** only — the flame's hard max lifetime; per-block `BURN_TIME` drives actual charring |
+| `fireDPS` | `3` | `3` | damage/second to mobs in fire (§6.14 mob rule) |
+| `fireMaxActive` | **`48`** | `256` | global active-fire cap (spread step checks this) |
+| `fireMaxEditsPerTick` | `32` | `32` | per-tick edit budget (anti-thrash, round-robin remainder) |
+| `fireLightLevel` | `14` | `14` | **DEPRECATED/unused** — fire no longer bakes block-light (`lightEmission: 0`); glow is dynamic PointLight (§6.6) |
+| `fireParticles` | `true` | `true` | flame/smoke particle toggle |
+| `fireWaterExtinguish` | `true` | `true` | a WATER neighbour douses fire and blocks spread next to water (§16 D10) |
+| `fireParticleRadius` | `20` | `20` | only fires within this many blocks of the player emit particles (perf cull, §6.13) |
+| `fireMaxEmittersPerFrame` | `24` | `24` | hard cap on fires emitting per frame-window (protects the 500-particle pool) |
+| `fireAnimationFps` | `8` | `8` | flame animation speed; drives the §6.7d `offset.x` frame stepping |
+| `fireAnimationRadius` | `24` | `24` | fires beyond this many blocks freeze on frame 0 (static LOD, §6.7d D9) |
+
+Per-block tuning (also as built, not in the original draft): each burnable `BLOCK_CONFIG` entry carries `burnTime` (seconds to char) and `spreadChance` (per-type eagerness), compiled into the `BURN_TIME[256]` / `BURN_SPREAD[256]` tables (e.g. grass fast+eager, logs/planks slow). These are the real charring/spread knobs; the global settings above are multipliers/caps over them.
+
+These belong under a new **Gameplay → Fire** settings group (or **Graphics → Effects** for the particle/light ones). All round-trip through save/load. **TODO (not done — §17):** add settings-panel DOM controls, and add the four caps (`fireMaxActive`, `fireParticleRadius`, `fireMaxEmittersPerFrame`, `fireAnimationRadius`) to `SETTINGS_PROFILES` so they scale with Performance/Balanced/Quality (smaller on low-end) — see §10.2 P3.
 
 ---
 
@@ -859,6 +881,7 @@ These belong under a new **Gameplay → Fire** settings group (or **Graphics →
 
 - **Blocks persist for free.** `FIRE`/`BURNT_LOG`/`BURNT_PLANKS` are ordinary `Uint8` cell values; RLE v2 + OPFS binary already store arbitrary block IDs. No codec change.
 - **Fire metadata is transient.** `age`/`state` are recomputed on load by the §6.7c scan (`fireSystem.register`), so the save format is unchanged.
+- *> As built (rev. 11): confirmed — `CURRENT_CACHE_VERSION` was **not** bumped (still 5), consistent with the recommendation below. Because fire bakes 0 block-light, there is genuinely no stale lighting to invalidate.*
 - **Cache version (`CURRENT_CACHE_VERSION = 5`, `voxEx.html:26028` & `37884`):** a bump is **not required** for existing worlds, because the new blocks don't change the lighting of any *existing* block, and the §6.6 generalisation produces identical torch results. **However**, if §6.6c changes how a previously-saved chunk's `blockLight` is interpreted (it does not, for torches), or if you want to force a relight, bump to **6** and update both occurrences plus `_cacheVersion` writes (`voxEx.html:25929`, `26104`, `37906`). **Recommendation: do not bump**, and instead verify torch lighting is byte-identical in tests (§11).
 
 ---
@@ -894,7 +917,7 @@ This was the largest and riskiest part of the original scope; descoping it (D6) 
 | `burnable` / `burnsTo` | tag→Set derivation loop (§6.4) | 3 lines | same pattern as `log`/`leaves`/`fluid` |
 | Separate-model render + lifecycle | `chunkTorches` create/release (§6.7) | `chunkFires`, `createWorldFire` | identical create-on-mesh / destroy-on-unload |
 | Mesh exclusion | the 3 mesh loops (§6.8) | `\|\| id===FIRE` ×3 | mirrors TORCH skip |
-| Block-light emission + propagation | `updateBlockLightAt` + seed scan (§6.6) | generalise to `BLOCK_LIGHT_EMISSION` | one algorithm, torch + fire |
+| Block-light emission + propagation | *> As built: the dynamic `torchLightPool` (PointLight), generalised to scan `chunkFires`* | fire `lightEmission: 0` — pool glow, not baked light | the `BLOCK_LIGHT_EMISSION` path (§6.6) exists but yields 0 for fire |
 | Flame/smoke particles | `spawnTorchFlame`/`spawnTorchEmber` + the **placed-torch distance-culled emit loop** (`voxEx.html:41675`) | radius-culled, capped emitter | same pattern as placed torches; protects the 500 pool |
 | Flame animation + distance LOD | atlas `CanvasTexture` `.clone()` + `offset`/`repeat`; `chunkFires` model list | `updateFireAnimation` + `updateFireLOD` | 3 offset writes/step; far fires freeze on frame 0 (static material), throttled swap |
 | Placement | `tryPlaceBlock` choke-point (§6.12) | support guard | covers mouse+touch+hold |
@@ -917,7 +940,7 @@ This codebase is allocation-conscious (typed arrays, object pools, scratch objec
 | G1 | **Per-fire key parsing** `key.split(',').map(Number)` (2 array allocs) ran per fire **per tick AND per emit** → heavy GC at 256 fires | tick + particles | **High** | Fixed (§6.13): cells store numeric `{key,x,y,z,age,fuel}`; hot loops iterate `cells.values()`; deletes use `f.key`. Zero per-fire parsing. |
 | G2 | **`getBlock` allocates a chunk-key string on every call** (`voxEx.html:6892`, even cache hits); the tick's 3 separate 6-neighbour scans = ~18 `getBlock`/fire/tick → ~9k key-string allocs/s at 256 fires | tick neighbour scans | **High** | Fixed (§6.13): one combined `scanFireNeighbors` per fire (≤6 `getBlock`) into a reused scratch — ~3× fewer calls; result object reused (no per-fire alloc). |
 | M1 | **`fireSystem.cells` leak on chunk unload** — orphaned entries for unloaded fires grow unbounded as the player travels | `releaseChunkFires` | **High** | Fixed (§6.7b): `releaseChunkFires` unregisters the chunk's cells. Registry lifetime = model lifetime = loaded-chunk lifetime. |
-| P1 | **Emissive-fire light cost** — every spread/consume/extinguish `setBlock` triggers a torch-level (level-14) block-light BFS flood via `updateBlockLightAt`; a spreading fire fires many floods/tick. This is the **dominant per-edit cost**, far more than a normal block edit. | `setBlock`→`updateBlockLightAt` | **High** | Bounded by `fireMaxEditsPerTick` (default lowered guidance: keep ≤16–32) + 2 Hz throttle + batched remesh. Documented as the reason to tune the edit cap conservatively; the light algorithm itself is unchanged (reused, §6.6). |
+| P1 | **Emissive-fire light cost** — *(draft concern)* every spread/consume/extinguish `setBlock` would trigger a level-14 block-light BFS flood. | `setBlock`→`updateBlockLightAt` | ~~High~~ → **ELIMINATED** | *> As built (rev. 11): this cost was **removed**, not just bounded.* Fire bakes 0 block-light (§6.6), so AIR↔FIRE edits hit a **light-neutral fast path** in `setBlock` and skip the BFS entirely. Glow comes from the dynamic PointLight pool instead. The "dominant per-edit cost" no longer exists; `fireMaxEditsPerTick`/throttle still bound mesh + sim work. |
 | P2 | **Transparent overdraw + per-frame transparency sort** — up to 7 quads/fire × `fireMaxActive` (≈1.8k transparent meshes), all `depthWrite:false` → THREE re-sorts transparent objects every frame + GPU overdraw | rendering | **Med** | `frustumCulled:true` on each fire group; bounded by `fireMaxActive` and render distance (fires only exist in loaded chunks); shared geometry/material minimises state changes. **Optional:** set a fixed `renderOrder` on fire to group draws; lower `fireMaxActive` on the Performance profile (§10.2 note below). |
 | M2/G3 | **Mesh/Group churn** — §6.7c tears down and rebuilds **all** fire models in a chunk on **any** block change there; a spreading chunk rebuilds Groups+Meshes every edit → allocation + GC | `renderChunk` rebuild | **Med** | Acceptable at the edit cap, but **elevate the §6.13 "incremental fire-model upkeep"** (diff `chunkFires` vs the chunk's FIRE cells, add/remove deltas) from optional to recommended once profiling shows churn; or pool fire Groups/Meshes like the chunk-mesh pools. Documented. |
 | M3 | **Cloned-texture VRAM** — 6 `atlas.clone()` textures | `getSharedFireResources` | Low | In THREE r160 clones share the `Source` (one GPU upload), so VRAM ≈ one extra atlas at most. **Verify** `image`/`source` sharing on the target THREE build; if a build re-uploads per clone, switch to 1 clone with per-draw `offset` (lose simultaneous-frame independence) or a tiny dedicated fire strip. |
@@ -956,7 +979,7 @@ Per CLAUDE.md, all changes must pass `tools/voxex-tests.html` (~204 tests, serve
 
 1. **Block-table invariants:** `FIRE` transparent + not solid + not opaque; `BURNT_LOG`/`BURNT_PLANKS` solid + opaque; `BURN_RESULT` maps GRASS→DIRT, LOG→BURNT_LOG, LONGWOOD_LOG→BURNT_LOG, WOOD→BURNT_PLANKS, LEAVES→AIR, LONGWOOD_LEAVES→AIR; `BURNABLE_BLOCK_IDS` membership (all 6 fuels, NOT burnt blocks).
 2. **Collision & pathing (critical — §6.5b):** assert `isSolidBlock(fireCell) === false` (player walks through fire) and `pathCellSolid(fireCell) === false` (zombies enter fire); assert `isSolidBlock` still returns `true` for normal solids and burnt blocks. This is the regression guard for the headline bug.
-3. **Lighting regression (critical):** assert torch block-light propagation is **unchanged** after §6.6 (compare a known column's `blockLight` before/after); assert FIRE seeds light at `BLOCK_LIGHT_EMISSION[FIRE]` and propagates with −1/step.
+3. **Lighting regression (critical):** assert torch block-light propagation is **unchanged** after §6.6 (compare a known column's `blockLight` before/after). *> As built (rev. 11): the "FIRE seeds light at `BLOCK_LIGHT_EMISSION[FIRE]` and propagates −1/step" assertion is **invalid** — fire bakes 0. Instead test that placing fire adds a PointLight to the pool (or simply that fire `setBlock` leaves neighbour `blockLight` unchanged, i.e. light-neutral).* (Note: no fire tests are implemented yet — §17 G3.)
 4. **Mesh exclusion:** assert a chunk containing FIRE produces **identical** terrain geometry to the same chunk with the FIRE cell set to AIR (fire contributes zero faces) — covers BOTH renderChunk paths (§6.8a greedy + §6.8b per-block). Force each path if the mesher selects between them by block density.
 5. **Texture atlas (`tools/voxex-texture-tests.html`):** now **33 tiles**; **all 12 fire frames** must contain transparency (cutout inverted check — confirms they were added to `ALLOW_TRANSPARENCY`); burnt tiles must be fully opaque; colour sanity (fire warm gradient, burnt dark). Spot-check the 4 frames of a layer differ (animation isn't static) yet share a silhouette family (loops cleanly).
 6. **Composite attachment (new, covers the user's scenarios):** assert `computeFireAttachment` returns the right multi-surface descriptor for: floor-only; floor+4 walls (boxed in); ceiling+1 wall, no floor; 2 opposite walls only; nothing solid → `any === false`. Assert `createWorldFire` builds the matching quad count (floor=2 crossed, +1 per wall, +1 ceiling).
@@ -984,7 +1007,7 @@ Per CLAUDE.md, all changes must pass `tools/voxex-tests.html` (~204 tests, serve
 - **Animation cost is O(1):** all fires share 6 materials (3 animated + 3 static); animation is `offset.x` writes on the 3 animated ones only. The distance-LOD pass (`updateFireLOD`) is throttled (~4 Hz) and only swaps material refs on models that cross `fireAnimationRadius` — no per-frame all-fire work, no UV rewrites.
 - **No GC in the fire hot loops (§10.2):** cells store numeric coords (no `key.split`); tick/emit iterate `cells.values()`; one `scanFireNeighbors` per fire into a reused scratch (fewer `getBlock` key-string allocs); `_fireDirtyChunks` stores `{cx,cz}` (no flush-time parse).
 - **No `fireSystem.cells` leak (§10.2 M1):** `releaseChunkFires` unregisters the chunk's cells on unload — registry lifetime tracks loaded chunks.
-- **Light-flood awareness (§10.2 P1):** every fire `setBlock` triggers a level-14 block-light BFS — keep `fireMaxEditsPerTick` conservative; this is the dominant per-edit cost.
+- **Light-flood awareness (§10.2 P1):** *> As built (rev. 11): N/A — fire bakes 0 block-light, so fire `setBlock` edits take the light-neutral fast path and trigger no block-light BFS. Glow is the dynamic PointLight pool. (Original concern eliminated; keep `fireMaxEditsPerTick` only for mesh/sim budgeting.)*
 - **Worker parity (parity-only, gated off):** worker `NUM_TILES`=**33**, `FIRE` constant, `IS_TRANSPARENT_WORKER[FIRE]`, and the §6.8c skip — verified but not live until `WORKER_MESH_PIPELINE_ENABLED`.
 - **Build banner:** update `VOXEX_BUILD` and prepend a `VOXEX_RECENT_CHANGES` entry (`voxEx.html:3792-3793`).
 - **CLAUDE.md:** update block count (16→19 world blocks, IDs 0–18; `UNLOADED_BLOCK` stays 255), `NUM_TILES` (18→**33**), the block-types table (add FIRE/BURNT_LOG/BURNT_PLANKS + the `burnable` tag), and add a "Fire System" subsection (note the 12-tile animated atlas region).
@@ -996,7 +1019,7 @@ Per CLAUDE.md, all changes must pass `tools/voxex-tests.html` (~204 tests, serve
 | Phase | Deliverable | Gate |
 |-------|-------------|------|
 | **P1 — Blocks & textures** | §6.1–6.4, §6.5a, §6.9, §6.11 | Atlas + inventory show fire & burnt blocks; place & break burnt blocks; texture tests green (33 tiles, all 12 fire frames cutout) |
-| **P2 — Render, walk-through, light & animation** | §6.5b (all 6 predicates), §6.6, §6.7 (incl. §6.7d animation), §6.8 (all 3 mesh loops) | Placed fire renders the correct **composite** layers (ground + each wall + ceiling), **animates** (4-frame loop), **player walks through it**, emits light, no mesh/lighting regressions |
+| **P2 — Render, walk-through, light & animation** | §6.5b (all 6 predicates), §6.6, §6.7 (incl. §6.7d animation), §6.8 (all 3 mesh loops) | Placed fire renders the correct **composite** layers (ground + each wall + ceiling), **animates** (4-frame loop), **player walks through it**, glows (*as built: via dynamic PointLight, not baked light*), no mesh/lighting regressions |
 | **P3 — Simulation** | §6.12, §6.13, §7 settings, mob damage (§6.14 mobs) | Fire spreads (burnable-only), consumes (grass→dirt, all logs→burnt log, planks→burnt planks, leaves→air), burns out, zombies path into it and take damage |
 
 > Worker parity (§6.10) is parity-only (gated off) and can land alongside P2 without a functional gate.
@@ -1042,7 +1065,7 @@ Each phase is independently shippable. **Player fire damage is NOT part of this 
 
 | ID | Decision | Resolution |
 |----|----------|-----------|
-| **D1** | Fire light level | **14** (one below sun max, matches torch). Stored in `BLOCK_LIGHT_EMISSION[FIRE]` (default from `lightEmission: 14`; the `fireLightLevel` setting overrides). |
+| **D1** | Fire light level | ~~**14**, baked into `BLOCK_LIGHT_EMISSION[FIRE]`.~~ **SUPERSEDED (rev. 11):** fire bakes **0** block-light (`lightEmission: 0`); it glows via the **dynamic `torchLightPool` PointLight** (pool generalised to scan `chunkFires`). `fireLightLevel` is deprecated/unused. Rationale: a light-neutral `setBlock` fast path makes spreading fire cheap (§6.6, §10.2 P1). |
 | **D2** | Longwood burnable + `BURNT_LOG` log tag | **Yes.** All logs (Oak + Longwood) are burnable and map to `BURNT_LOG`; all leaves (Oak + Longwood) are burnable and burn to Air. **Keep** the `"log"` tag on `BURNT_LOG`. |
 | **D3** | Fire geometry | **`PlaneGeometry`** (flat square quads). |
 | **D4** | Fire support vs spread | **Support = any solid OR burnable block; spread = burnable-only.** (rev. 7 refined "solid" → "solid OR burnable" so non-solid leaves can hold/feed fire — §3.2. Needs sign-off but is required for canopies to burn.) |
@@ -1054,3 +1077,29 @@ Each phase is independently shippable. **Player fire damage is NOT part of this 
 | **D10** | Water extinguishes fire | **Yes** (signed off). A WATER neighbour douses fire (`scan.water` → extinguish, §6.13), `trySpreadFrom` won't spread next to water, fire can't be placed next to water, and placing WATER extinguishes adjacent fire (§6.12). Toggle: `fireWaterExtinguish` (default true). |
 | **D11** | Fire pauses with the game | **Yes** (signed off). `fireSystem.update` and the animation/LOD driver are gated on `isGameplayActive()` (§6.13, §6.7d) — fire freezes behind the pause/inventory menus. |
 | **D4 (refined)** | Support = solid **OR** burnable | **Confirmed** — required for canopies to burn (leaves are burnable but non-solid, §10.3 L3). |
+| **D12** | Fire light mechanism *(rev. 11 record)* | **Dynamic PointLight, not baked.** `lightEmission: 0`; `torchLightPool` generalised to scan `chunkFires`. Reverses the original §6.6 / D1 baked-light decision for performance (light-neutral `setBlock` fast path). |
+
+---
+
+## 17. As-built gaps & follow-ups (rev. 11)
+
+The fire system is functionally complete and matches the rev. 10 design. The gaps below were identified in the rev. 11 audit and **all five (G1–G5) were subsequently implemented in build `2026-06-17.6`** (the original "Recommendation" text is kept for context; see the ✅ status on each row). Verified by isolated `node --check` of the added blocks + ID-pairing/duplicate-identifier greps; the in-browser `voxex-tests.html` suite (incl. the new fire tests) should be run over localhost to confirm end-to-end.
+
+**Resolution summary (build 2026-06-17.6):**
+- **G1 ✅** — added Settings → Gameplay → **Fire** panel (3 toggles + 9 sliders), wired in `attachSettingsEventListeners`, synced in `syncSettingsToUI`, with a Reset-to-Default; nav + category button added.
+- **G2 ✅** — `fireMaxActive` / `fireParticleRadius` / `fireMaxEmittersPerFrame` / `fireAnimationRadius` added to all three `SETTINGS_PROFILES`.
+- **G3 ✅** — `FIRE`/`BURNT_LOG`/`BURNT_PLANKS`/`BURNABLE_BLOCK_IDS`/`BURN_RESULT`/`BURN_TIME`/`isBurnable`/`isSolidBlock`/`pathCellSolid` exported on `window.VoxEx`; new fire tests added (block-table invariants, burnable/burnsTo mapping, walk-through guard, RLE persistence). (Full §11 mesh/animation/LOD coverage still partial.)
+- **G4 ✅** — `VoxelWorld.isSolidBlock` now excludes `TORCH` + `FIRE`.
+- **G5 ✅** — `unregisterChunkFires()` added and called from `purgeChunkData` (true data eviction). `releaseChunkFires` deliberately stays models-only — it also runs on re-mesh, where unregistering cells would reset burn timers.
+
+These items from the CCR were the remaining gaps after the initial fire ship; they are now closed.
+
+| ID | Gap | CCR ref | Severity | Recommendation |
+|----|-----|---------|----------|----------------|
+| **G1** | **No settings-panel UI for any `fire*` key.** All settings exist in `DEFAULTS`/`SETTINGS` and persist (whole-object save), but there are zero `fire-*` DOM controls — they can't be tuned in-game. | §7 | Med | Add a **Gameplay → Fire** settings group with bindings for the user-facing keys (spread toggle/chance, max age, particles, water-extinguish) and a **Graphics → Effects** subset for the perf caps. Follow the documented settings recipe (CLAUDE.md "When adding settings"); ensure new DOM IDs exist and match JS. |
+| **G2** | **Fire caps absent from `SETTINGS_PROFILES`.** `fireMaxActive` / `fireParticleRadius` / `fireMaxEmittersPerFrame` / `fireAnimationRadius` don't scale with Performance/Balanced/Quality. | §7, §10.2 P3 | Low-Med | Add the four caps to each profile (smaller on Performance, larger on Quality). Per the touch-settings precedent, only listed keys are overwritten, so user-tuned values for other keys survive profile switches. |
+| **G3** | **No fire tests.** `tools/voxex-tests.html` has zero fire/burn coverage; the entire §11 test plan is unimplemented, and the `window.VoxEx` test-seam exports (`FIRE`, `BURNT_LOG`, `BURNABLE_BLOCK_IDS`, `BURN_RESULT`) were never added. | §11 | Med | Implement the high-value subset first: block-table invariants (§11.1), **collision/pathing walk-through** (§11.2 — the headline regression guard), mesh-exclusion (§11.4), persistence round-trip (§11.10), and a cling-and-spread sim unit check (§11.11). Update §11.3 to the as-built light-neutral assertion (fire does **not** seed baked light). |
+| **G4** | **`VoxelWorld.isSolidBlock` doesn't exclude FIRE** (nor TORCH). 5 of the 6 §6.5b predicates include FIRE; this secondary method (`voxEx.html` ~`7472`) treats fire as solid. | §6.5b #2 | Low (latent) | Off the live player-collision (`isSolidBlock` module fn) and zombie-nav (`pathCellSolid`) paths today, so no current bug. Add `&& id !== FIRE` (and `TORCH`) for correctness/future-proofing if any caller starts using it for collision. |
+| **G5** | **`releaseChunkFires` doesn't eagerly unregister `fireSystem.cells` on chunk unload** (CCR §10.2 M1 specified it should). It clears models only and relies on lazy per-tick cleanup (`getBlock !== FIRE` → delete). | §10.2 M1, §6.7b | Low | Bounded in practice (loadWorld clears everything; the tick prunes stale cells), but a fire cell in a freshly-unloaded chunk can linger in `cells` until the next tick visits it. If registry size matters under heavy exploration, unregister the chunk's cells in `releaseChunkFires` as originally specced; otherwise document the lazy-cleanup choice and close M1. |
+
+**Doc-hygiene note:** several historical sections (§6.6, §6.13 listing, §3.3 original shape, §7 draft defaults, §16 D1) describe pre-rev-10 designs. They've been annotated with `> As built (rev. 11):` notes rather than deleted, to preserve the decision trail. If this CCR is ever used as a from-scratch build spec again, fold the as-built notes into the body.
