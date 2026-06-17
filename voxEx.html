@@ -3822,8 +3822,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.1";
+            const VOXEX_BUILD = "2026-06-17.2";
             const VOXEX_RECENT_CHANGES = [
+                "WATER DEPTH FOG (true murk): the refraction murk/absorption now key off the REAL through-water view distance (linearized scene-depth minus surface depth via tRefractionDepth + uCamNear/uCamFar) instead of the per-vertex water-column thickness. The old version applied a uniform haze across a flat bottom — it read as a flat blue surface filter; now the seabed genuinely fades into fog with depth and view angle. Exponential fog on throughWater (murk = 1-exp(-throughWater*waterMurkDensity), capped at waterMurkMax); absorption effectiveDepth = throughWater*waterDepthScale. Caustics still use column thickness for the shallow fade.",
                 "WATER DEPTH MURK: top-down water now hides the bottom as depth grows instead of staying glass-clear. The refraction shader's murk haze + Beer-Lambert depth scale are now driven by three settings (Graphics > Water): 'Water Murkiness' (waterMurkDensity, how fast haze builds with depth), 'Deep-Water Opacity' (waterMurkMax, the murk ceiling) and 'Murk Depth Scale' (waterDepthScale). Stronger defaults (density 0.22→0.30, max 0.95→0.97, depthScale 0.15→0.22): ~2-block puddles stay readable, 8+ block water reads opaque from above. Sliders apply live (no remesh) and round-trip via save/load; intentionally EXCLUDED from SETTINGS_PROFILES so they persist across profile switches (zero perf cost, and Performance disables refraction anyway). Refraction mode only — Standard/Fast water unchanged.",
                 "SKY OVERHAUL: (1) All sky settings consolidated into a new Graphics > Sky panel (sky colors moved from World > Environment, plus stars, clouds, color grading, biome fog, and a new master 'Sky Quality' low/medium/high preset). World > Environment removed. (2) Sky now PAUSES with the game — new skyClock (ms) advances only during active gameplay and drives star twinkle + cloud drift (was performance.now()), so they freeze on pause and resume with no time jump. (3) Cloud particles retuned: CLOUD_BASE_COUNT 1500→10000 so density 1.0 = ~10k (default lowered from ~15k), MAX_CLOUD_PARTICLES 50000 safety cap, legacy saves (>5) migrated to 1.0; the existing 'Default 1.0, Range 0.1-5.0' hint is now accurate. (4) Sky Quality wired into Performance/Balanced/Quality profiles. (5) DEDUPE: removed the duplicate sky settings wiring that init() bound on top of attachSettingsEventListeners() (stars/clouds/color/grading/fog/quality controls were double-bound and rebuilt twice per change); attachSettingsEventListeners() is now the single source. Sky reset merged into one btn-reset-graphics-sky handler; removed per-frame [Clouds] console.log.",
                 "Burnt planks texture now mirrors the regular plank tile (tile 4) exactly — same base/noise/plank-gap structure — recoloured to a charred palette, so it reads as the same planks, just burnt (drawBurntPlank; keep in sync with the tile-4 block).",
@@ -30822,7 +30823,9 @@ self.onmessage = async (e) => {
                         absorptionB: { value: SETTINGS.waterAbsorptionB },
                         waterDepthScale: { value: SETTINGS.waterDepthScale }, // Beer-Lambert depth multiplier
                         murkDensity: { value: SETTINGS.waterMurkDensity },    // how fast haze builds with depth
-                        murkMax: { value: SETTINGS.waterMurkMax }             // murk ceiling at max depth
+                        murkMax: { value: SETTINGS.waterMurkMax },            // murk ceiling at max depth
+                        uCamNear: { value: 0.1 },                           // for depth linearization (synced per frame)
+                        uCamFar: { value: 1000.0 }                          // for depth linearization (synced per frame)
                     },
                     vertexShader: `
                         uniform float time;
@@ -30890,6 +30893,8 @@ self.onmessage = async (e) => {
                         uniform float waterDepthScale;
                         uniform float murkDensity;
                         uniform float murkMax;
+                        uniform float uCamNear;
+                        uniform float uCamFar;
                         varying vec2 vUv;
                         varying vec3 vWorldPosition;
                         varying vec4 vScreenPos;
@@ -30987,16 +30992,33 @@ self.onmessage = async (e) => {
                             float sceneDepth = texture2D(tRefractionDepth, distortedUV).x;
                             if (sceneDepth < gl_FragCoord.z - 0.0005) {
                                 distortedUV = screenUV;
+                                sceneDepth = texture2D(tRefractionDepth, distortedUV).x; // re-sample at the corrected UV
                             }
 
                             // Sample refracted scene
                             vec3 refractedColor = texture2D(tRefraction, distortedUV).rgb;
 
+                            // TRUE THROUGH-WATER DISTANCE (the fix for "flat blue filter"):
+                            // linearize the captured scene depth (the seabed/geometry seen through
+                            // the water) and THIS fragment's depth to eye-space distances; their
+                            // difference is how far the view ray actually traveled THROUGH water.
+                            // The old murk keyed off vWaterThickness (vertical water-column depth),
+                            // which is ~uniform over a flat bottom and read as a flat surface tint.
+                            // throughWater varies per-pixel with real depth AND view angle, so the
+                            // seabed genuinely recedes into haze as it deepens / is viewed obliquely.
+                            float sceneEyeDepth = (2.0 * uCamNear * uCamFar) / (uCamFar + uCamNear - (sceneDepth * 2.0 - 1.0) * (uCamFar - uCamNear));
+                            float surfEyeDepth  = (2.0 * uCamNear * uCamFar) / (uCamFar + uCamNear - (gl_FragCoord.z * 2.0 - 1.0) * (uCamFar - uCamNear));
+                            float throughWater = max(0.0, sceneEyeDepth - surfEyeDepth); // world units (= blocks) of water along the view ray
+
                             // Use actual water thickness (from vertex attribute) for absorption
                             // vWaterThickness is normalized 0-1 where 1 = 16+ blocks deep
                             // Convert back to blocks and apply absorption scaling
                             float thicknessBlocks = vWaterThickness * 16.0;
-                            float effectiveDepth = thicknessBlocks * waterDepthScale;
+                            // Depth fog now uses the real through-water view distance (not the
+                            // uniform column thickness) so absorption + murk build along the line
+                            // of sight. thicknessBlocks is still used below for the shallow-water
+                            // caustic fade (a column-depth concept).
+                            float effectiveDepth = throughWater * waterDepthScale;
 
                             // TOP-DOWN CAUSTICS: animated light web playing across the bottom of
                             // shallow water (the underwater caustic post pass only runs when the
@@ -31022,17 +31044,18 @@ self.onmessage = async (e) => {
                             refractedColor *= transmittance;
 
                             // MURK: depth-based scattering. Absorption only darkens — murk HAZES:
-                            // the refracted scene dissolves into a soft water tone as depth grows.
-                            // Progressive curve (gentle in shallows, steep at depth): ~22% at 2
-                            // blocks, ~53% at 4, ~87% at 8, ~95% (max) by 12+ — a deep ocean
-                            // floor is effectively invisible instead of "clearly readable".
-                            float murk = 1.0 - exp(-pow(thicknessBlocks * murkDensity, 1.6));
+                            // the refracted scene dissolves into a soft water tone as the view ray
+                            // travels farther through water. Exponential fog on throughWater (real
+                            // view distance), so the seabed fades smoothly with depth/angle instead
+                            // of a flat surface tint. At murkDensity 0.30: ~45% at 2 blocks of
+                            // through-water, ~70% at 4, ~91% at 8 — capped at murkMax.
+                            float murk = 1.0 - exp(-throughWater * murkDensity);
                             // Beer-Lambert the murk itself: in-scattered light is absorbed too,
                             // so the haze color shifts blue-green with depth. A FLAT murk color
                             // here was crushing the per-channel color filtering — deep water
                             // looked uniformly gray-teal instead of filtering red first.
                             vec3 murkColor = (waterColor * 0.55 + vec3(0.04, 0.09, 0.10)) * exp(-absorption * effectiveDepth * 0.6);
-                            refractedColor = mix(refractedColor, murkColor, murk * murkMax);
+                            refractedColor = mix(refractedColor, murkColor, min(murk, murkMax));
 
                             // Sample water texture for surface detail
                             vec4 waterTex = texture2D(tWater, vUv);
@@ -43441,6 +43464,8 @@ self.onmessage = async (e) => {
                     const mat = window.waterMaterialRefraction;
                     mat.uniforms.tRefraction.value = window.refractionRenderTarget.texture;
                     mat.uniforms.tRefractionDepth.value = window.refractionRenderTarget.depthTexture;
+                    mat.uniforms.uCamNear.value = camera.near;
+                    mat.uniforms.uCamFar.value = camera.far;
                     mat.uniforms.time.value = performance.now();
                     mat.uniforms.opacity.value = SETTINGS.waterOpacity;
                     mat.uniforms.refractionStrength.value = SETTINGS.waterRefractionStrength;

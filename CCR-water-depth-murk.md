@@ -1,100 +1,128 @@
-# CCR — Water Depth Murk & Clarity Controls  ✅ IMPLEMENTED
+# CCR — Water Depth Murk / Depth Fog & Clarity Controls  ✅ IMPLEMENTED
 
 **Project:** VoxEx (`voxEx.html`, single-file Three.js voxel engine)
 **Type:** Feature (graphics / water rendering)
 **Mode affected:** Refraction water only (the default; Standard/Fast have no shader murk)
-**Status:** Implemented & verified on 2026-06-17. Build `2026-06-17.1`.
+**Status:** Implemented & verified 2026-06-17. Current build **`2026-06-17.2`**.
 
-> This document was updated post-implementation to reflect **what was actually built**. The original plan under-specified the settings wiring (it listed 3 sync sites + 1 listener block); the codebase actually has **five** parallel settings-UI functions plus reset handlers. Two bugs from that gap were caught during verification and fixed — see "Post-implementation fixes".
+> This is an as-built record. It was revised twice:
+> - **`2026-06-17.1`** — added three settings/sliders driving the existing column-thickness murk (stronger defaults).
+> - **`2026-06-17.2`** — **reworked the murk into true depth fog** keyed off real through-water view distance (the `.1` version read as a flat blue surface filter — see "Depth-fog rework").
 
 ---
 
 ## What & why
 
-Top-down water used to stay glass-clear to the seabed at any depth. The refraction shader already had a depth-murk haze + Beer-Lambert absorption, but the controlling constants were hardcoded and tuned gently. This change drives them from three settings with stronger defaults and adds live sliders.
+Top-down water used to stay glass-clear to the seabed. Two rounds of work fixed this:
 
-| Setting key | UI label | Default (was) | Range | Drives |
+1. Exposed the murk/absorption constants as three tunable settings with stronger defaults (build `.1`).
+2. **Changed what drives the murk.** The original murk (and the `.1` sliders) keyed off `vWaterThickness` — the *vertical water-column depth* baked per vertex. Across a flat-bottomed lake that value is ~uniform, so the haze applied evenly and read as **a flat blue filter on the surface**, not as fog that swallows the bottom. Build `.2` drives murk + absorption off the **real distance the view ray travels through water**, reconstructed from the refraction depth texture. The seabed now fades into haze with depth *and* view angle.
+
+### The three controls (Graphics > Water)
+
+| Setting key | UI label | Default | Range | Role (build `.2`) |
 |---|---|---|---|---|
-| `waterMurkDensity` | Water Murkiness | **0.30** (was lit `0.22`) | 0.1–0.6 | murk curve steepness |
-| `waterMurkMax` | Deep-Water Opacity | **0.97** (was lit `0.95`) | 0.5–1.0 | murk ceiling at depth |
-| `waterDepthScale` | Murk Depth Scale | **0.22** (was uniform `0.15`) | 0.05–0.5 | Beer-Lambert depth mult |
+| `waterMurkDensity` | Water Murkiness | 0.30 | 0.1–0.6 | fog rate: `murk = 1 - exp(-throughWater * density)` |
+| `waterMurkMax` | Deep-Water Opacity | 0.97 | 0.5–1.0 | ceiling: `mix(scene, murkColor, min(murk, murkMax))` |
+| `waterDepthScale` | Murk Depth Scale | 0.22 | 0.05–0.5 | Beer-Lambert color absorption: `effectiveDepth = throughWater * scale` |
 
-Murk haze when looking straight down (before absorption darkening):
+Murk haze vs. through-water view distance at the default density (0.30):
 
-| Water depth | Before | After |
-|---|---|---|
-| 2 blocks | ~22% | ~35% |
-| 4 blocks | ~53% | ~72% |
-| 6 blocks | ~75% | ~90% |
-| 8+ blocks | ~87% | ~95% (bottom hidden) |
+| Through-water distance | Murk |
+|---|---|
+| 2 blocks | ~45% |
+| 4 blocks | ~70% |
+| 8 blocks | ~91% |
+| 12+ blocks | capped at `waterMurkMax` (0.97) |
 
-Murk keys are intentionally **excluded from `SETTINGS_PROFILES`** (like the touch-control prefs) so they persist across Performance/Balanced/Quality switches — zero perf cost, and Performance disables refraction anyway.
+Murk keys are intentionally **excluded from `SETTINGS_PROFILES`** (like the touch prefs) so they persist across profile switches — zero perf cost, and Performance disables refraction anyway.
 
 ---
 
-## As-built changes (current line numbers)
+## Depth-fog rework (build `2026-06-17.2`) — the core fix
 
-### Shader — `waterMaterialRefraction` (~30700)
-1. **Uniform init** (30823–30825): `waterDepthScale` now reads `SETTINGS.waterDepthScale`; added `murkDensity: { value: SETTINGS.waterMurkDensity }` and `murkMax: { value: SETTINGS.waterMurkMax }` (comma added after the `waterDepthScale` line).
-2. **Fragment-shader uniform decls** (30891–30892): `uniform float murkDensity;` / `uniform float murkMax;`.
-3. **Murk math**: line 31029 `pow(thicknessBlocks * murkDensity, 1.6)` (was `0.22`); line 31035 `murk * murkMax` (was `0.95`). `effectiveDepth` (uses `waterDepthScale`) unchanged.
+All in the `waterMaterialRefraction` fragment shader + its per-frame sync. No new geometry/attributes; reuses the depth texture already captured for refraction foreground-rejection.
+
+1. **New uniforms** `uCamNear` / `uCamFar` (object 30826–30827; FS decls 30895–30896). Named with a `u`-prefix on purpose — `cameraNear`/`cameraFar` can collide with Three.js-injected uniform names and silently break the shader (a GLSL error `node --check` can't catch).
+2. **Per-frame sync** (43466–43467): `mat.uniforms.uCamNear.value = camera.near; mat.uniforms.uCamFar.value = camera.far;` (next to the existing `tRefractionDepth`/`time` sync).
+3. **Re-sample depth at the corrected UV** (30995): the foreground-rejection branch now re-reads `sceneDepth` after it falls back to `screenUV`, so the fog distance matches the pixel actually sampled.
+4. **Through-water distance** (31001–31011): linearize the captured scene depth and this fragment's depth to eye space, subtract:
+   ```glsl
+   float sceneEyeDepth = (2.0*uCamNear*uCamFar) / (uCamFar+uCamNear - (sceneDepth*2.0-1.0)*(uCamFar-uCamNear));
+   float surfEyeDepth  = (2.0*uCamNear*uCamFar) / (uCamFar+uCamNear - (gl_FragCoord.z*2.0-1.0)*(uCamFar-uCamNear));
+   float throughWater  = max(0.0, sceneEyeDepth - surfEyeDepth); // world units (= blocks) along the view ray
+   ```
+   (Denominator is provably > 0 for depth in [0,1]; `max(0.0, …)` guards the foreground edge case — no NaN/divide-by-zero.)
+5. **Absorption** (31021): `effectiveDepth = throughWater * waterDepthScale;` (was `thicknessBlocks * waterDepthScale`).
+6. **Murk** (31052 / 31058): `murk = 1.0 - exp(-throughWater * murkDensity);` then `mix(refractedColor, murkColor, min(murk, murkMax));` (was `1 - exp(-pow(thicknessBlocks*0.22,1.6))` / `* 0.95`).
+7. **Retained:** `thicknessBlocks = vWaterThickness * 16.0` (31016) still feeds the shallow-water **caustic** fade (`shallowAmt`, 31031) — a column-depth concept, intentionally left as-is.
+
+Result: shallow shorelines (throughWater ≈ 0) stay clear; depth and grazing angles fog out smoothly; the bottom recedes into murk instead of getting a flat tint.
+
+---
+
+## As-built — full change inventory
+
+### Shader — `waterMaterialRefraction`
+- Uniform object: `waterDepthScale`/`murkDensity`/`murkMax` from `SETTINGS` + `uCamNear`/`uCamFar` (≈30823–30827).
+- FS uniform decls: `murkDensity`, `murkMax`, `uCamNear`, `uCamFar` (≈30891–30896).
+- Through-water distance + depth-fog murk/absorption (≈30992–31058, see rework section).
 
 ### Settings storage
-4. **DEFAULTS load w/ savedSettings fallback** (5858–5861): `waterDepthScale` 0.22, `waterMurkDensity` 0.30, `waterMurkMax` 0.97.
-5. **DEFAULTS object** (6111–6114): same three keys/defaults.
+- DEFAULTS load w/ `savedSettings` fallback (≈5858–5861): `waterDepthScale` 0.22, `waterMurkDensity` 0.30, `waterMurkMax` 0.97.
+- DEFAULTS object (≈6111–6114): same.
 
-### HTML — Graphics > Water group
-6. **Three sliders** (2889–2900): `water-murk-density-slider` (0.1–0.6), `water-murk-max-slider` (0.5–1.0), `water-depth-scale-slider` (0.05–0.5), each with a `…-val` span.
+### HTML — Graphics > Water group (≈2889–2900)
+- `water-murk-density-slider` (0.1–0.6), `water-murk-max-slider` (0.5–1.0), `water-depth-scale-slider` (0.05–0.5), each with a `…-val` span.
 
 ### Settings UI — FIVE parallel functions (all required)
-7. `initSettingsUI()` — consts + value-sync (6465–6475).
-8. `syncSettingsToUI()` — consts + value-sync (22336–22346).
-9. `attachSettingsEventListeners()` — consts (23155–23160) + three `input` listeners (23236–23263). **Runs on `DOMContentLoaded` so the sliders work from the main menu** (see fix #1).
-10. `init()` — consts + value-sync (27965–27973) + three `input` listeners (28497–28500).
-11. `updateUIFromSettings()` — value-sync (28810–28812); this is what the reset buttons call to refresh slider positions (see fix #2).
+- `initSettingsUI()` — consts + value-sync.
+- `syncSettingsToUI()` — consts + value-sync.
+- `attachSettingsEventListeners()` — consts + `input` listeners. **Runs on `DOMContentLoaded` so the sliders work from the main menu.**
+- `init()` — consts + value-sync + a second copy of the listeners (double-bound at game start, idempotent — matches the other water sliders).
+- `updateUIFromSettings()` — value-sync, used by the reset buttons.
 
 ### Search + live-apply + reset
-12. **Settings-search registry** (21894–21896): three entries under `Graphics › Water`.
-13. **`applyWaterFastMode()`** (31553–31555): pushes `waterDepthScale`/`murkDensity`/`murkMax` uniforms on water-mode switch.
-14. **`btn-reset-graphics-water`** handler: resets the three `SETTINGS` keys (29010–29012) and pushes the three uniforms (29061–29063).
-15. **`btn-reset-all`**: auto-covers murk — it iterates `Object.keys(DEFAULTS)` then calls `updateUIFromSettings()`. No murk-specific code needed.
+- Settings-search registry: three entries under `Graphics › Water`.
+- `applyWaterFastMode()`: pushes `waterDepthScale`/`murkDensity`/`murkMax` uniforms on water-mode switch.
+- Per-frame render sync: pushes `uCamNear`/`uCamFar`.
+- `btn-reset-graphics-water`: resets the three SETTINGS keys + pushes their uniforms.
+- `btn-reset-all`: auto-covers murk via `Object.keys(DEFAULTS)` + `updateUIFromSettings()`.
 
 ### Build banner
-16. `VOXEX_BUILD` → `"2026-06-17.1"` (3825) + a `VOXEX_RECENT_CHANGES` entry describing the feature (3826).
+- `VOXEX_BUILD` = `"2026-06-17.2"` + two `VOXEX_RECENT_CHANGES` entries (depth-fog rework, then the original murk-controls entry).
 
 ---
 
-## Post-implementation fixes (found during verification)
+## Bugs found during verification (already fixed)
 
-The first pass wired murk into three of the five settings functions. Verification (grep-parity against the existing `waterOpacitySlider`) exposed two real bugs:
-
-1. **Dead sliders on the main menu.** `attachSettingsEventListeners()` is invoked on `DOMContentLoaded` precisely so settings work before a game loads. The murk listeners were only in `init()` (game start), so dragging a murk slider from the main menu did nothing. → Added consts + listeners to `attachSettingsEventListeners()` (item 9).
-2. **"Reset to Default" ignored murk.** `btn-reset-graphics-water` enumerates each water setting + uniform explicitly; it didn't reset the murk keys or push their uniforms, and `updateUIFromSettings()` (which the reset calls) didn't re-sync the murk slider positions. → Added the three SETTINGS resets + uniform pushes (item 14) and the `updateUIFromSettings()` value-sync (item 11).
+1. **Dead sliders on the main menu** (`.1`): murk listeners were only in `init()`, but `attachSettingsEventListeners()` (the `DOMContentLoaded` wiring) is what makes settings work before a game loads. → Added consts + listeners there.
+2. **"Reset to Default" ignored murk** (`.1`): `btn-reset-graphics-water` enumerates each water setting/uniform explicitly and didn't touch murk. → Added the three SETTINGS resets + uniform pushes, and the murk re-sync in `updateUIFromSettings()`.
+3. **Flat blue filter instead of fog** (`.1` → fixed in `.2`): the murk keyed off column thickness, not view distance. → The depth-fog rework above.
+4. **Uniform name collision risk**: `cameraNear`/`cameraFar` → renamed `uCamNear`/`uCamFar`.
 
 ---
 
 ## Verification performed
 
-- **`node --check`** on the full extracted `<script type="module">` (line 3818 → final `</script>`, ~41.2K lines): **passes**. Also rules out duplicate `const` in any single scope.
-- **Grep parity:** each new slider identifier = **11 refs** (identical to `waterOpacitySlider`); each `…Val` const = **10 refs** (identical to `waterOpacityVal`). Confirms the three controls are wired into exactly the same set of locations as the canonical water slider.
-- **DOM-id parity:** `water-murk-density-slider` `getElementById` count = **4**, matching `water-fog-slider`.
-- **File integrity:** 45,050 lines, closing `</script></body></html>` intact.
+- **`node --check`** on the full extracted module: passes (also rules out duplicate `const` in any scope).
+- **Grep parity:** each new slider identifier = 11 refs (= `waterOpacitySlider`); each `…Val` const = 10 refs (= `waterOpacityVal`); slider DOM-id `getElementById` count = 4 (= `water-fog-slider`).
+- **Uniform consistency:** `uCamNear`/`uCamFar` exist in the uniform object, the FS declarations, the linearize expressions, and the per-frame sync; no stray `cameraNear`/`cameraFar` left (the unrelated `shadow.camera.near/far` are untouched).
+- **Math safety:** linearize denominator > 0 for all valid depths; `throughWater` clamped ≥ 0.
 
-### Not yet run
-- In-browser `tools/voxex-tests.html` (~204 tests) — the sandbox localhost isn't reachable by the user's browser. **Recommend running locally over localhost as the final gate.**
+### Not run from here
+- In-browser `tools/voxex-tests.html` (~204 tests) — sandbox localhost isn't reachable by the user's browser. **Run locally as the final gate.**
+- Visual confirmation — **hard-reload, look down into water several blocks deep and pan across the surface at a low angle**; the seabed should fade into murk with distance.
 
 ---
 
 ## Known limitation (pre-existing, consistent)
 
-`applyWaterMaterialSettings()` and `btn-reset-all` only live-push the opacity/waterColor uniforms — absorption, refraction-strength, and murk uniforms are **not** pushed by those paths. Murk values still take effect on the next slider touch, on game load (the uniform block reads `SETTINGS`), or via `applyWaterFastMode()`. This matches the existing behavior of the absorption sliders, so murk is consistent — not a regression.
-
----
+`applyWaterMaterialSettings()` / `btn-reset-all` only live-push opacity/waterColor uniforms — absorption, refraction-strength, and murk uniforms aren't pushed by those paths; they take effect on the next slider touch, game load, or `applyWaterFastMode()`. Murk matches the existing absorption behavior here — not a regression.
 
 ## Safety checks (as-built)
 
-- **No worker parity needed** — all new math is in the main-thread fragment shader; the `waterDepth/16` thickness normalization is untouched.
-- No identifier collisions: `waterMurkDensity`/`waterMurkMax` are new; `waterDepthScale` previously existed only as a shader-uniform name, now also a SETTINGS key.
-- The six slider/val consts are declared in four distinct function scopes — no same-scope redeclaration (confirmed by `node --check`).
-- No per-frame work added — uniforms update only on slider `input`, profile/mode switch, or reset.
+- **No worker parity needed** — all logic is in the main-thread fragment shader + render loop; no terrain/meshing/attribute changes (the `waterDepth/16` thickness normalization is untouched and now only feeds caustics).
+- No identifier collisions: `waterMurkDensity`/`waterMurkMax` new; `waterDepthScale` was a uniform-only name, now also a SETTINGS key; depth uniforms namespaced `uCam*`.
+- No per-frame CPU work added beyond two uniform writes; the through-water math is per-fragment GPU work reusing an already-bound depth texture.
 - Single-file rule preserved; Standard/Fast water materials untouched.
