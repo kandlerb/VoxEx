@@ -3,7 +3,22 @@
 **Project:** VoxEx (`voxEx.html`, single-file Three.js voxel engine)
 **Companion to:** `CCR-chunk-remesh-consolidation.md` (the audit + design rationale). This document
 is the **build order and full code-level spec** for executing that CCR.
-**Status:** Plan — nothing here is applied yet.
+**Status:** ✅ **Phases 0–3 IMPLEMENTED & in `voxEx.html` (build 2026-06-17.19), user-verified in-browser.**
+Phase 4 (worker-thread meshing) and Phase F (light-as-texture) are deferred to separate future CCRs.
+
+> **Completion summary (2026-06-17):**
+> - **Phase 0 — coalescing scheduler:** DONE. `DIRTY_REASON`/`chunkDirtyReason` mask + neighbor-drain de-dupe.
+> - **Phase 1 — frustum/build decouple:** DONE. `BUILD_AHEAD_RADIUS` pre-meshes the near ring in all directions.
+> - **Phase 2 — banded meshing (2a/2b/2c):** DONE, **ON by default** (`SETTINGS.bandedMeshing = true`). Per-band
+>   geometry (`flushBand`), full `chunkMeshes` census incl. shadow-caster fix, per-band dirty scope.
+> - **Phase 3 — light decoupling:** DONE. 3A (light out of the merge key + corner sampling) is unconditional.
+>   3B (light-only color **refill** via `refillChunkLightColors` + per-quad lightMap + shared `cellCornerLightDamped`)
+>   is behind `SETTINGS.lightRefill` (**default OFF** — experimental, enable via `setLightRefill(true)`).
+>   Follow-up applied: wet-shoreline **damp level put back in the merge key** (crisp/blocky shoreline, by user request).
+> - **Deferred:** Phase 4 (worker parity — the worker mesher must mirror all of Phase 2+3 first) and Phase F (light texture).
+> - **Console toggles:** `setBandedMeshing(t/f)`, `setLightRefill(t/f)`. `node --check` clean; run `tools/voxex-tests.html` in-browser.
+
+**Pre-implementation status (historical):** Plan — nothing here was applied yet.
 
 > **Line numbers verified against the working tree on 2026-06-17 and WILL drift.** Grep the quoted
 > identifier before editing. Every code block below was checked against current source; where a
@@ -757,17 +772,17 @@ this plan** — write `CCR-light-texture.md` after Phases 0–4 land and are mea
 
 ## Master task checklist
 
-**Phase 0** — [ ] 0.1 mask decl · [ ] 0.2 reason param + 4 caller tags · [ ] 0.3 neighbor-drain guard · [ ] 0.4 clear · [ ] tests · [ ] banner
+**Phase 0** ✅ — [x] 0.1 mask decl · [x] 0.2 reason param + caller tags · [x] 0.3 neighbor-drain guard · [x] 0.4 clear · [x] tests · [x] banner
 
-**Phase 1** — [ ] 1.1 `BUILD_AHEAD_RADIUS` · [ ] 1.2 sweep · [ ] 1.3 sort · [ ] memory acceptance check · [ ] banner
+**Phase 1** ✅ — [x] 1.1 `BUILD_AHEAD_RADIUS` · [x] 1.2 sweep · [x] 1.3 sort · [x] memory acceptance check · [x] banner
 
-**Phase 2** — [ ] 2.1 keys/helpers + `meshedChunkKeys` routing · [ ] 2.2 mesher restructure (flush helpers + band loop) · [ ] 2.3 (optional) band tier · [ ] 2.4 per-band bounds · [ ] 2.5 full `chunkMeshes` census (14 rows) + `releaseMeshForKey` fix · [ ] 2.6 dirty-band scope · [ ] `SETTINGS.bandedMeshing` · [ ] tests · [ ] screenshot/face/leak acceptance · [ ] banner
+**Phase 2** ✅ — [x] 2.1 keys/helpers + `isChunkMeshed` routing · [x] 2.2 mesher restructure (`flushBand` + band loop) · [ ] 2.3 (optional) band tier — *skipped, small tier sufficed* · [x] 2.4 per-band bounds · [x] 2.5 `chunkMeshes` census + `releaseMeshForKey` fix (+ shadow-caster fix found in testing) · [x] 2.6 dirty-band scope · [x] `SETTINGS.bandedMeshing` (default ON) · [x] tests · [x] in-browser acceptance · [x] banner
 
-**Phase 3** — [ ] 3.1 `getMergeKey` + delete dead code + `>>8` · [ ] 3.2 corner sampling (visual-verify) · [ ] 3.3 `refillChunkLightColors` + lightMap population + drain branch (relocate 0.4 clear) · [ ] **fix drain `.every` short-circuit (📌 §3.3)** · [ ] `SETTINGS.lightRefill` · [ ] update getMergeKey tests + add refill tests · [ ] banner
+**Phase 3** ✅ — [x] 3.1 `getMergeKey` + delete dead code (`>>10` after damp re-add) · [x] 3.2 corner sampling (visual-verified) · [x] 3.3 `refillChunkLightColors` + lightMap + drain branch · [x] drain branch fixed (no `.every` short-circuit — uses explicit `every(refill)` decline-to-remesh) · [x] `SETTINGS.lightRefill` (default OFF) · [x] getMergeKey tests + band/damp tests · [x] banner · [x] follow-up: damp level back in merge key (crisp shoreline)
 
-**Phase 4** — [ ] parity 1–7 · [ ] worker round-trip parity test · [ ] flag flip 13441 · [ ] banner
+**Phase 4** ⏸ DEFERRED (future CCR) — [ ] parity 1–7 (mirror Phase 2+3 into the worker mesher) · [ ] worker round-trip parity test · [ ] flag flip 13441 · [ ] banner
 
-**Phase F** — [ ] (later) write `CCR-light-texture.md`
+**Phase F** ⏸ DEFERRED — [ ] (later) write `CCR-light-texture.md`
 
 ---
 
