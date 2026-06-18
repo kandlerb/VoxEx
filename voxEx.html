@@ -3882,8 +3882,10 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.11";
+            const VOXEX_BUILD = "2026-06-17.13";
             const VOXEX_RECENT_CHANGES = [
+                "CHUNK REMESH CCR — Phase 2c (per-band dirty scope): a block edit now rebuilds ONLY the band(s) it touches instead of all 4. New chunkDirtyBands map + ALL_BANDS_MASK + bandMaskForY(y) (dirties the edit's band plus the vertical neighbor band at a band boundary, for correct cross-boundary face/AO). scheduleChunkUpdate gained a {bands} option (default ALL); updateLocalArea (edit-center + edge/corner neighbours, same y => same band mask) and the light-neutral edit path pass the scoped mask. renderChunk reads rebuildMask and SKIPS clean bands that already have a live mesh (keeps them), rebuilding only dirty bands; whole-column changes (light propagation, neighbour/edge updates, streaming/first build) default to ALL bands so they're unaffected. Light-CHANGING edits still rebuild all light-affected bands (sunlight columns) until Phase 3 turns light into a color-only upload. Behind SETTINGS.bandedMeshing (numBands===1 path unchanged).",
+                "FIX (settings not re-baking — AO, water, any rebuildAllVisibleChunks() caller): rebuildAllVisibleChunks released only the 'cKey' terrain mesh, then re-queued. But Phase 2b changed the processChunkQueue queue-skip to isChunkMeshed() (terrain OR water OR any band). releaseMeshForKey('cKey') left 'cKey_WATER' (and every 'cKey#band' mesh in banded mode) intact, so isChunkMeshed() stayed true and the rebuild was SKIPPED — settings like AO / water effects never re-baked (worst in banded mode where the cKey release is a pure no-op). Now marks chunks dirty instead (isDirty bypasses the skip), and renderChunk/flushBand do the atomic band-aware swap (no flash). Affects every setting that re-bakes geometry, not just banded mode.",
                 "FIX (banded meshing shadows): refreshChunkShadowCasters() did parseChunkKey(meshKey) directly — for a band key 'cx,cz#b' that yielded a NaN z coord, so the distance test failed and it turned OFF castShadow on EVERY band mesh whenever the player crossed a chunk boundary (then markShadowsDirty re-rendered the shadow map with no casters => shadows vanished; a block edit rebuilt one chunk's bands with castShadow=true so they briefly returned). Now strips the band suffix via chunkBaseOfMeshKey() before parsing. Audited all other chunkMeshes iterators: safe (suffix checks / tolerant parseInt / self-skip).",
                 "FIX (banded meshing): defined the missing chunkBandMeshKeys() generator — it was referenced by releaseMeshForKey + the prune loop but never declared, throwing 'chunkBandMeshKeys is not defined' the moment banded meshing was enabled (node --check can't catch undefined references; only triggered with the flag ON). Banded meshing now runs.",
                 "DEBUG: added window.setBandedMeshing(true/false) console helper to live-toggle Phase 2 banded meshing (SETTINGS is module-scoped so it can't be set from the console directly). It releases every existing chunk mesh under the current scheme, flips SETTINGS.bandedMeshing, and re-queues all active chunks to rebuild under the new scheme — clean in both directions (no leaked band meshes).",
@@ -6621,9 +6623,17 @@
             // chunk, so an edit/light change can later rebuild one band, not the whole column.
             const BAND_SECTIONS = 5;                                  // sections per band
             const BANDS_PER_CHUNK = Math.max(1, Math.floor(SECTIONS_PER_CHUNK / BAND_SECTIONS)); // 20/5 = 4
+            const ALL_BANDS_MASK = (1 << BANDS_PER_CHUNK) - 1; // every band dirty (whole-column rebuild)
             function bandKey(cKey, band) { return cKey + "#" + band; }
             function bandOfSection(sectionIdx) { return (sectionIdx / BAND_SECTIONS) | 0; }
             function bandOfY(y) { return ((y / SECTION_HEIGHT) | 0) / BAND_SECTIONS | 0; }
+            // Bitmask of bands a block edit at world Y dirties: its own band PLUS the vertical neighbors
+            // (y±1), since a face/AO at a band boundary depends on the block in the adjacent band.
+            // Band index clamped to [0, BANDS_PER_CHUNK-1] (y±1 can fall just outside the column).
+            function bandMaskForY(y) {
+                const clamp = (b) => b < 0 ? 0 : (b >= BANDS_PER_CHUNK ? BANDS_PER_CHUNK - 1 : b);
+                return (1 << clamp(bandOfY(y))) | (1 << clamp(bandOfY(y - 1))) | (1 << clamp(bandOfY(y + 1)));
+            }
             // Yields every possible mesh key (terrain + water, all bands) for a chunk base key.
             function* chunkBandMeshKeys(cKey) { for (let b = 0; b < BANDS_PER_CHUNK; b++) { yield bandKey(cKey, b); yield bandKey(cKey, b) + "_WATER"; } }
             // Strip "#band" and "_WATER" to recover the true chunk base key (cKey). Handles unbanded
@@ -16466,6 +16476,7 @@
             // the build drain reads it to de-dupe and (future Phase 3) pick the cheapest rebuild.
             const DIRTY_REASON = { GEOMETRY: 1, LIGHT: 2, SEAM: 4, NEIGHBOR_TREE: 8 };
             const chunkDirtyReason = new Map(); // key -> OR'd DIRTY_REASON bits, cleared on rebuild
+            const chunkDirtyBands = new Map(); // key -> OR'd band bitmask (2.6); no entry => all bands. Cleared on rebuild.
             const deferredChunkUpdates = new Set(); // Chunk updates blocked while lighting is pending
             const chunkUpdateDiagnostics = {
                 pending: new Map(),
@@ -17629,9 +17640,10 @@
             //   - Adds to pendingChunkUpdates Set (O(1) insertion)
             //   - Uses string key concatenation (acceptable - event-driven)
             //   - No-op: Already well-optimized with debouncing and deferral
-            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false, immediate = false, reason = DIRTY_REASON.GEOMETRY } = {}) {
+            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false, immediate = false, reason = DIRTY_REASON.GEOMETRY, bands = ALL_BANDS_MASK } = {}) {
                 const key = `${cx},${cz}`;
                 chunkDirtyReason.set(key, (chunkDirtyReason.get(key) || 0) | reason); // Phase 0: coalesce reasons
+                chunkDirtyBands.set(key, (chunkDirtyBands.get(key) || 0) | bands);    // 2.6: coalesce dirty bands (default all)
                 if (bypassLighting) { forceLightingBypassKeys.add(key); }
                 recordChunkUpdateState(key, source, "scheduled");
                 if (!force && chunkOrNeighborsPending(cx, cz)) {
@@ -24936,7 +24948,7 @@
                     // they still rebuild the mesh (bypassLighting; existing light values stay valid).
                     const meshNeutral = (oldId === AIR || oldId === FIRE) && (id === AIR || id === FIRE);
                     if (!meshNeutral) {
-                        scheduleChunkUpdate(cx, cz, false, "block-edit-lightneutral", { bypassLighting: true });
+                        scheduleChunkUpdate(cx, cz, false, "block-edit-lightneutral", { bypassLighting: true, bands: bandMaskForY(y) });
                     }
                     return;
                 }
@@ -25102,8 +25114,13 @@
                 logDebug("Rebuilding all visible chunks for settings change...");
                 const chunksToRebuild = [...activeChunks];
                 for (const key of chunksToRebuild) {
-                    releaseMeshForKey(key); // Dispose and remove old mesh
-                    // Add to build queue to be re-rendered with new settings
+                    // Mark dirty so the rebuild actually RUNS. The processChunkQueue queue-skip only
+                    // bypasses NON-dirty meshed chunks (via isChunkMeshed). A plain releaseMeshForKey(key)
+                    // here removed only the 'cKey' terrain mesh — it left 'cKey_WATER' (and, in banded
+                    // mode, every 'cKey#band' mesh) intact, so isChunkMeshed() stayed true and the AO /
+                    // water re-bake was SKIPPED. renderChunk/flushBand do the atomic old→new swap
+                    // (no flash, band-aware), so no explicit release is needed.
+                    dirtyChunks.add(key);
                     const [cx, cz] = parseChunkKey(key);
                     if (!chunkBuildQueue.some((q) => q.key === key)) { chunkBuildQueue.push({ key, cx, cz, priority: 1 }); }
                 }
@@ -40497,14 +40514,25 @@ self.onmessage = async (e) => {
                     // section loop flushes a band-keyed mesh at each band boundary (mid-loop) + once after.
                     const numBands = SETTINGS.bandedMeshing ? BANDS_PER_CHUNK : 1;
                     const secPerBand = SECTIONS_PER_CHUNK / numBands;
-                    let curBand = 0;
+                    // Per-band dirty scope (2.6): rebuildMask bit b set => rebuild band b. No entry => -1
+                    // (all bands: streaming/first build + whole-column light/neighbor changes that schedule
+                    // with the default ALL_BANDS_MASK). _skipBand is set per band as the loop crosses into it.
+                    const rebuildMask = (numBands > 1 && chunkDirtyBands.has(cKey)) ? chunkDirtyBands.get(cKey) : -1;
+                    chunkDirtyBands.delete(cKey);
+                    let _skipBand = false;
                     // Section-aware iteration: process each 16-block vertical section
                     for (let sectionIdx = 0; sectionIdx < SECTIONS_PER_CHUNK; sectionIdx++) {
-                        if (numBands > 1 && sectionIdx > 0 && (sectionIdx % secPerBand) === 0) {
-                            flushBand(curBand++); // attach the band that just completed
-                            tVIdx = tUvIdx = tCIdx = tIIdx = tVertCount = tFaceCount = tQsIdx = 0;
-                            wVIdx = wUvIdx = wCIdx = wIIdx = wVertCount = wSIdx = wTIdx = wFaceCount = 0;
+                        if (numBands > 1 && (sectionIdx % secPerBand) === 0) {
+                            const enteringBand = (sectionIdx / secPerBand) | 0;
+                            if (sectionIdx > 0 && !_skipBand) flushBand(enteringBand - 1); // attach the band just finished (if processed)
+                            // Skip a CLEAN band only if it already has a live mesh to keep; otherwise (re)build it.
+                            _skipBand = !(rebuildMask & (1 << enteringBand)) && (chunkMeshes.has(bandKey(cKey, enteringBand)) || chunkMeshes.has(bandKey(cKey, enteringBand) + "_WATER"));
+                            if (!_skipBand) {
+                                tVIdx = tUvIdx = tCIdx = tIIdx = tVertCount = tFaceCount = tQsIdx = 0;
+                                wVIdx = wUvIdx = wCIdx = wIIdx = wVertCount = wSIdx = wTIdx = wFaceCount = 0;
+                            }
                         }
+                        if (_skipBand) continue;
                         const section = sections ? sections[sectionIdx] : null;
 
                         // Skip empty sections entirely - no blocks to process
@@ -41014,7 +41042,7 @@ self.onmessage = async (e) => {
                         meshLifecycleStats.mark("deferred-detach", { key: mKey + "_WATER", isWater: true });
                     }
                     } // end flushBand
-                    flushBand(curBand); // PHASE 2: attach the final (or only) band
+                    if (numBands === 1 || !_skipBand) flushBand(numBands - 1); // attach the final/only band (unless skipped)
 
                     // --- CREATE TORCH MODELS ---
                     // Clean up old torches first (CRITICAL: must dispose geometries to prevent leak)
@@ -41670,26 +41698,29 @@ self.onmessage = async (e) => {
             function updateLocalArea(x, y, z) {
                 const cx = Math.floor(x / WORLD_DIMS.chunkSize);
                 const cz = Math.floor(z / WORLD_DIMS.chunkSize);
+                // 2.6: a block edit only changes geometry in the band containing y (+ vertical neighbors
+                // at a band boundary). Neighbour chunks are affected at the SAME y, so the same mask.
+                const bandMask = bandMaskForY(y);
                 // Schedule center chunk update with immediate dispatch and lighting bypass.
                 // The light job for player edits is critical (same chunk) and processes before
                 // mesh build in updateChunkSystem(), so bypassing the pending check is safe.
-                scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: true, immediate: true });
+                scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: true, immediate: true, bands: bandMask });
 
                 // Check boundaries and update neighbors if necessary
                 const lx = ((x % 16) + 16) % 16;
                 const lz = ((z % 16) + 16) % 16;
 
                 // Edge neighbors need updates for seam visibility but can also wait for lighting
-                if (lx === 0) scheduleChunkUpdate(cx - 1, cz, false, "edit-west-edge");
-                if (lx === 15) scheduleChunkUpdate(cx + 1, cz, false, "edit-east-edge");
-                if (lz === 0) scheduleChunkUpdate(cx, cz - 1, false, "edit-north-edge");
-                if (lz === 15) scheduleChunkUpdate(cx, cz + 1, false, "edit-south-edge");
+                if (lx === 0) scheduleChunkUpdate(cx - 1, cz, false, "edit-west-edge", { bands: bandMask });
+                if (lx === 15) scheduleChunkUpdate(cx + 1, cz, false, "edit-east-edge", { bands: bandMask });
+                if (lz === 0) scheduleChunkUpdate(cx, cz - 1, false, "edit-north-edge", { bands: bandMask });
+                if (lz === 15) scheduleChunkUpdate(cx, cz + 1, false, "edit-south-edge", { bands: bandMask });
 
                 // Diagonal corner neighbors - lower priority
-                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1, false, "edit-nw-corner");
-                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1, false, "edit-sw-corner");
-                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, false, "edit-ne-corner");
-                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, false, "edit-se-corner");
+                if (lx === 0 && lz === 0) scheduleChunkUpdate(cx - 1, cz - 1, false, "edit-nw-corner", { bands: bandMask });
+                if (lx === 0 && lz === 15) scheduleChunkUpdate(cx - 1, cz + 1, false, "edit-sw-corner", { bands: bandMask });
+                if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, false, "edit-ne-corner", { bands: bandMask });
+                if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, false, "edit-se-corner", { bands: bandMask });
             }
             function pickVoxel(origin, dir, range) {
                 let x = Math.floor(origin.x), y = Math.floor(origin.y), z = Math.floor(origin.z);
