@@ -64,7 +64,7 @@ Phase 1 (frustum/build split) ──┘            ▲                          
 | 1 Frustum/build split | S | Low–Med | Yes (one guard) |
 | 2 Banded meshing | **L** | **High** | Yes (behind `SETTINGS.bandedMeshing`) |
 | 3 Light decoupling | M–L | Med–High | Yes (behind `SETTINGS.lightRefill`) |
-| 4 Worker mesh parity | M | Med | Yes (`WORKER_MESH_PIPELINE_ENABLED`) |
+| 4 Worker mesh parity | **XL** | **High** | Yes (`WORKER_MESH_PIPELINE_ENABLED`) — but re-scoped after audit: the worker mesher is a *separate, simpler* implementation, so parity = replacing it via single-source injection (see Phase 4) |
 
 ---
 
@@ -682,56 +682,101 @@ behind the flag, so if they regress visuals, revert the `getMergeKey`/corner-sam
 
 ---
 
-## Phase 4 — Re-enable the worker mesh pipeline
+## Phase 4 — Re-enable the worker mesh pipeline  ⚠ (XL, re-scoped after 2026-06-17 audit)
 
-**Goal:** move the build burst off the main thread by setting `WORKER_MESH_PIPELINE_ENABLED = true`
-(13441) — **only after** the worker mesher reaches parity with `renderChunk`.
+**Goal:** move the per-chunk mesh build off the main thread (`WORKER_MESH_PIPELINE_ENABLED = true`,
+~13441) so streaming bursts don't spike frame time.
 
-**Prerequisites:** Phases 2 + 3 (the worker must emit band buffers and the lightMap, else it ships
-sub-parity meshes — the exact failure that got it gated off).
+> ### ⚠ Audit finding (this is bigger than the original checklist said)
+> The worker does **not** have a slightly-behind copy of `renderChunk` — it has a **completely
+> different, much simpler mesher** (worker `onmessage` 'mesh' handler, ~18464–18800):
+> - **Per-block face iteration**, NOT greedy meshing.
+> - **Flat per-face light** (`getLocalLight(...)/15`), NOT smooth 4-corner light.
+> - **Its own** `getAOConfig`/`calculateVertexAO`/`calculateFaceAO`, `getCachedFaceVerticesIndexed`.
+> - **Simplified water** (`shore=1`, `thickness=0`, no foam), no `quadSize` attribute.
+> - **No** banding, **no** lightMap, **no** wet-shoreline damp, **no** `cellCornerLightDamped`.
+>
+> So "parity" really means **replacing the worker mesher** with the Phase 2+3 main-thread mesher.
+> Bringing two hand-maintained implementations into byte-identical agreement (and keeping them there)
+> is the exact drift trap that already bit trees. **Do it by single-source injection, not porting.**
 
-### Parity checklist (the code already documents the gaps at 19359–19366)
+### Strategy: single-source the mesher via the existing `__MESH_FUNCS__` scaffold
 
-The `applyWorkerMeshData` path (19308) and the worker mesh generator (in `buildChunkWorkerCode`)
-must all match the main-thread mesher before the flag flips:
+There's already an empty placeholder `/* __MESH_FUNCS_START__ */ … __END__ */` (~18137) intended for
+exactly this. `buildChunkWorkerCode()` (~18818) already injects terrain funcs, terrain-pass funcs, and
+**tree funcs** by `Function.toString()` between markers — the tree injection comment (~18952) explicitly
+notes it was done to **fix worker/main drift**. Phase 4 follows that proven pattern for the mesher.
 
-1. **Pooled-mesh protocol** — `applyWorkerMeshData` currently does `new THREE.Mesh(geo, chunkMaterial)`
-   (19367) and `mesh.frustumCulled = true` hard-coded (19369). Switch to `acquireChunkMesh("terrain")`
-   / `acquireChunkMesh("water")` so pooling, `customDepthMaterial`, layers, and shadow flags match
-   (40074–40094).
-2. **Tight bounds, not `computeBoundingSphere`** (19357) — the pooled buffer has stale vertices past
-   `drawRange`; computing a sphere over them corrupts culling. Use `applyTightChunkBounds` (and, post
-   Phase 2, per-band bounds).
-3. **Greedy meshing parity** — the worker mesher must run the same `greedyMeshSection` /
-   `getMergeKey` (now light-free, Phase 3) so face counts and merge topology match. This is the
-   largest piece: the worker copy in `buildChunkWorkerCode` must be brought in line (and, like the
-   terrain functions, ideally single-sourced via the injection markers rather than hand-maintained).
-4. **Per-vertex lightMap** (Phase 3) — the worker must emit the same `lightMap` so refill works on
-   worker-built meshes.
-5. **Band keys** (Phase 2) — `applyWorkerMeshData` must `set(bandKey(cKey,band), …)` and emit one
-   payload per band.
-6. **Water attributes** — shore/thickness/foam (40857–40859) must be produced and copied.
-7. **Zero-face cleanup, `chunkRenderedFaces`/diagnostics, `markShadowsDirty`, torch rebuild** — all
-   listed in the in-code warning (19362–19366); wire them in `applyWorkerMeshData`.
+**Worker/main split (important):** the worker can't touch Three.js (`geometryPool`, `acquireChunkMesh`,
+`scene`, `chunkMeshes`). So:
+- **Inject into the worker (pure buffer-fill, no Three.js):** `greedyMeshSection`, `getMergeKey`,
+  `addMergedFaceIndexed`, `getMergedFaceVertices`/`computeMergedFaceVertices` (+ the vertex cache),
+  `calculateFaceAO`/`calculateVertexAO`/`getAOConfig` (+ `AO_FACE_CONFIGS`), `calculateFaceCornerLight`/
+  `calculateVertexCornerLight`, `cellCornerLightDamped`, the `CORNER_AB_*` tables, `isWaterAdjacent`,
+  the per-block **water** face writer (`addFaceWaterIndexed`), `extractLightFromChunk`, `AO_LOOKUP` +
+  the AO/LIGHT quant lookups, the greedy scratch buffers + `clearGreedyBuffers`, `_greedyAOScratch`/
+  `_greedyLightScratch`, and the `_lmCells`/`_lmAO`/`_lmFace` lightMap arrays + `_lastDampLevel`.
+  **Delete** the worker's hand-coded `getAOConfig`/`calculateVertexAO`/`calculateFaceAO`/per-block loop.
+- **Keep on the main thread (`applyWorkerMeshData`, ~19308):** the Three.js attach — i.e. the existing
+  `flushBand` attach logic, run per band from the worker's buffers.
 
-### Flag flip (13441)
-```js
-const WORKER_MESH_PIPELINE_ENABLED = true; // only after 1–7 above + worker round-trip tests pass
-```
+### Tasks
+
+**4a — inject + parity (flag stays OFF; verifiable as a buffer byte-match)**
+1. Inject the function set above into `__MESH_FUNCS__` via `buildChunkWorkerCode()` (mirror the
+   tree-func injection block). Delete the worker's hand-coded mesh/AO helpers.
+2. **Pass SETTINGS to the worker.** The injected functions read `SETTINGS.{smoothLighting, AO,
+   greedyMeshingEnabled, bandedMeshing, lightRefill, maxGreedyQuadSize}`. The worker has no `SETTINGS`
+   — inject a per-job snapshot (or a worker-side `SETTINGS` shim updated on each `generateMesh`).
+   **Miss this and the injected funcs throw / read `undefined`.**
+3. **Reconcile the worker's `getLocal`/`getLocalLight`** with the main thread's exact semantics:
+   `extractLightFromChunk` (floor-at-3, water attenuation) and the **missing-neighbor `ownEdgeLight`
+   fallback** (40440). Any divergence = different border colors → seams between worker- and
+   main-built chunks.
+4. Have the worker run the **band loop** (`numBands` from the injected `SETTINGS.bandedMeshing`) so it
+   produces per-band buffers + the per-band lightMap, exactly like `renderChunk`.
+
+**4b — protocol + apply-path rewrite**
+5. **Worker → main payload becomes per-band:** one entry per band, each carrying
+   positions/uvs/cols/indices/**quadSize** + water (shore/thickness/**foam**) + the **lightMap**
+   (cells/ao/face/quadCount). Today it sends one terrain + one water payload with no quadSize/foam/
+   lightMap (18775+).
+6. **Rewrite `applyWorkerMeshData`** to consume per-band payloads using the **existing `flushBand`
+   attach**: `acquireChunkMesh` (not `new THREE.Mesh`), `applyTightChunkBounds`/`computeBandBounds`
+   (not `computeBoundingSphere` over stale pooled vertices — the bug noted at 19357–19366), band keys
+   (`bandKey(cKey,b)`), `geo.userData.lightMap`, the atomic old→new swap, `meshedChunkKeys`,
+   `chunkRenderedFaces`/diagnostics, torch + fire rebuild, `markShadowsDirty`, zero-face cleanup.
+
+**4c — flip**
+7. Set `WORKER_MESH_PIPELINE_ENABLED = true` (~13441) only after the parity test (below) is green.
+   Re-tune `WORKER_MESH_TIMEOUT_MS` and the apply-drain backpressure (`drainReadyMeshResults`).
 
 ### Tests
-The live **worker round-trip** test already exists in `tools/voxex-tests.html` ("live chunk-worker
-round-trip + blendedHeight parity"). Extend it to assert **mesh parity**: worker-built terrain
-`faceCount`, positions, and colors match the main-thread `renderChunk` output for the same chunk
-(within float tolerance). The flag must not flip until this passes.
+Extend the existing live **worker round-trip** test in `tools/voxex-tests.html` to assert **buffer
+byte-parity**: for the same chunk + neighbors + SETTINGS, the worker's per-band terrain/water buffers
+(positions, uvs, colors, indices, quadSize) **and lightMap** equal what `renderChunk`/`flushBand`
+produce (exact for ints, tight float tolerance). This is the gate — **4a is done when this passes
+with the flag still off** (worker computes identical buffers; main still attaches its own). Only then
+do 4b/4c.
 
 ### Acceptance criteria
-- With the flag on, chunk build cost moves off the main thread (frame-time spikes during streaming
-  drop); meshes are visually identical to the main-thread path.
-- Worker round-trip parity test green.
+- Buffer byte-parity test green (worker == main) across several biomes incl. water + shoreline + caves.
+- Flag on: visually identical to flag off (no seams between worker- and main-built chunks, including
+  at the fallback boundary where a chunk that times out is meshed on the main thread).
+- Streaming frame-time spikes drop; no geometry/lightMap leaks (`geometryPool.getStats()` flat).
 
 ### Rollback
 `WORKER_MESH_PIPELINE_ENABLED = false` — instant revert to main-thread meshing.
+
+### ⚠ Risks / open question
+- **Drift = seams.** Worker- and main-built chunks coexist (timeout fallback, transitions); any
+  divergence shows as a visible seam. Single-sourcing the *functions* removes most of it, but the
+  worker's getters, SETTINGS snapshot, and the per-band protocol must all match exactly.
+- **SETTINGS staleness:** if the user changes AO/smoothLighting/banding mid-session, in-flight worker
+  jobs use the old snapshot → transient mismatch until rebuild. Decide whether to version/invalidate.
+- **Worth-it check first.** Phases 0–3 already cut per-build cost (banding + per-band rebuilds +
+  refill). Before committing to XL effort, **profile** whether main-thread meshing is still a real
+  frame-time bottleneck (the "measure first" option). If it isn't, Phase 4 may not be worth the risk.
 
 ---
 
@@ -780,7 +825,7 @@ this plan** — write `CCR-light-texture.md` after Phases 0–4 land and are mea
 
 **Phase 3** ✅ — [x] 3.1 `getMergeKey` + delete dead code (`>>10` after damp re-add) · [x] 3.2 corner sampling (visual-verified) · [x] 3.3 `refillChunkLightColors` + lightMap + drain branch · [x] drain branch fixed (no `.every` short-circuit — uses explicit `every(refill)` decline-to-remesh) · [x] `SETTINGS.lightRefill` (default OFF) · [x] getMergeKey tests + band/damp tests · [x] banner · [x] follow-up: damp level back in merge key (crisp shoreline)
 
-**Phase 4** ⏸ DEFERRED (future CCR) — [ ] parity 1–7 (mirror Phase 2+3 into the worker mesher) · [ ] worker round-trip parity test · [ ] flag flip 13441 · [ ] banner
+**Phase 4** ⏸ DEFERRED (future CCR, re-scoped XL) — [ ] (measure first: is main-thread meshing still a bottleneck?) · [ ] 4a inject mesher via `__MESH_FUNCS__` + SETTINGS snapshot + reconcile worker getLocal/getLocalLight + worker band loop · [ ] buffer byte-parity test (gate) · [ ] 4b per-band payload protocol + rewrite `applyWorkerMeshData` (flushBand attach, pooled mesh, lightMap, torch/fire/shadows) · [ ] 4c flip 13441 + tune timeout/backpressure · [ ] banner
 
 **Phase F** ⏸ DEFERRED — [ ] (later) write `CCR-light-texture.md`
 

@@ -1,9 +1,87 @@
-# CCR — Chunk Update / Remesh Consolidation & Efficient Chunking  📋 PROPOSAL
+# CCR — Chunk Update / Remesh Consolidation & Efficient Chunking  ✅ IMPLEMENTED (Phases 0–3)
 
 **Project:** VoxEx (`voxEx.html`, single-file Three.js voxel engine)
 **Type:** Architecture / performance (chunk meshing pipeline)
-**Status:** **Audit + proposal — reviewed before any code is changed.** No code in this CCR has been applied.
+**Status:** ✅ **Phases 0–3 implemented & in `voxEx.html` (build `2026-06-17.19`), user-verified in-browser, `node --check` clean.** Phase 4 (worker meshing) and Phase F (light texture) deferred to future CCRs. Build order + full line-level spec in `CHUNK-IMPLEMENTATION-PLAN.md`. The audit/proposal below (Parts 1–6) is the original design record; **see the "AS-BUILT" section immediately below for what shipped and where it deviated.**
 **ID:** VOXEX-CCR-CHUNK-001
+
+---
+
+## AS-BUILT (reconciled 2026-06-17, build `2026-06-17.19`)
+
+What was actually implemented, and where it differs from the proposal below. The audit (Parts 1–2)
+and design rationale (Parts 3–5) are unchanged historical record; Part 6's line-level spec was the
+starting point but several details changed during implementation — those are called out here.
+
+### Shipped per phase
+
+- **Phase 0 — coalescing scheduler.** As specified: `DIRTY_REASON` bitmask + `chunkDirtyReason` map,
+  `scheduleChunkUpdate({reason})`, light/seam/tree callers tagged, neighbor-drain de-dupe guard, mask
+  cleared on rebuild. (The actual duplicate-removal is the neighbor-drain guard; the mask is mostly
+  groundwork for Phase 3's routing.)
+- **Phase 1 — frustum/build decouple.** As specified, with the corrected memory bound: builds the
+  near in-range ring in all directions up to **`BUILD_AHEAD_RADIUS = min(renderDistance, 10)`** (the
+  proposal's "bounded by eviction" claim was wrong — see Part 6 self-audit; the cap replaces it).
+- **Phase 2 — banded meshing (2a/2b/2c).** Per-band geometry via a hoisted `flushBand()` + a unified
+  band loop (`numBands===1` when off ⇒ byte-identical to pre-banding). `chunkMeshes` census routed
+  through `isChunkMeshed()` (NOT `meshedChunkKeys` — corrected from an earlier Part 6 draft). 2.6
+  per-band dirty scope via `chunkDirtyBands` + `bandMaskForY(y)`. **Shipped ON by default**
+  (`SETTINGS.bandedMeshing = true`).
+- **Phase 3 — light decoupling.** 3A (light out of the merge key + per-face `CORNER_AB` corner
+  sampling) is unconditional. 3B (light-only **color refill**: per-quad `lightMap` +
+  `refillChunkLightColors` + shared `cellCornerLightDamped` + drain-branch routing) behind
+  `SETTINGS.lightRefill` (**default OFF**, console `setLightRefill(true)`).
+
+### Deviations from the proposal (what was altered)
+
+1. **`isChunkMeshed()` instead of `meshedChunkKeys`** for "currently meshed" checks. `meshedChunkKeys`
+   means "ever meshed (data loaded)", so reusing it would block re-meshing of range-released chunks.
+   New band-aware helper added.
+2. **Phase 2.3 (extra band geometry tier) SKIPPED** — the existing small tier sufficed.
+3. **Merge-key layout changed twice.** Proposal 3.1: `(blockId<<8)|AO`. As-built it's
+   **`(blockId<<10)|(damp<<8)|AO`** — the wet-shoreline **damp level** was put back in the key (user
+   request) so the shoreline stays **crisp/blocky** instead of interpolating. (Removing light from the
+   key had softened it — an accepted side effect that the user later wanted reverted.) `_lastDampLevel`
+   in `cellCornerLightDamped` feeds it; blockId extraction is `>>10`. General light gradients (caves)
+   keep the smooth 3A look; only the damp is crisp.
+4. **3.2 corner sampling done robustly, not hand-mapped.** A per-face `CORNER_AB` table derived from
+   `computeMergedFaceVertices` (collapses to the seed cell for 1×1 / uniform quads ⇒ verifiable),
+   rather than 24 hand-written index mappings.
+5. **3.3 refill picked the full-parity option** (per-quad lightMap of 4 corner-cell indices + faceIdx
+   + AO, O(quads) refill) with a **separate faithful `buildChunkLightGetters`** (not a refactor of
+   `renderChunk`'s hot-path closures, to avoid default-path risk). Water bands **decline to refill**
+   (fall back to full remesh — water colors aren't mapped).
+6. **Defaults:** `bandedMeshing` flipped **ON** for all players; `lightRefill` left **OFF**
+   (experimental, untested-from-boot at flip time).
+
+### Bugs found during bring-up (not anticipated by the proposal)
+
+`node --check` cannot catch undefined references or wrong key parsing; these surfaced only in
+in-browser testing and are now fixed:
+
+1. **Missing `chunkBandMeshKeys` generator** — referenced by `releaseMeshForKey`/prune but never
+   defined; threw the moment banding was enabled.
+2. **`refreshChunkShadowCasters` parsed band keys as chunk coords** (`parseChunkKey("cx,cz#b")` → NaN
+   distance) → it switched OFF `castShadow` on every band mesh on chunk-boundary crossings → shadows
+   vanished. A `chunkMeshes` census site the proposal missed (it's a shadow helper, not obvious mesh
+   management). Fixed with `chunkBaseOfMeshKey()`.
+3. **`rebuildAllVisibleChunks` regression** — it released only the `cKey` terrain mesh; after Phase 2b
+   changed the queue-skip to `isChunkMeshed()`, that left water/band meshes alive so the skip blocked
+   AO/water re-bakes on settings changes. Fixed by marking chunks dirty instead of releasing.
+
+### Known limitations / parking lot
+
+- **Light-CHANGING edits still remesh** the affected bands (a sunlight column can change light far
+  below an edit), so the refill's win is on pure-light events (edge-lighting convergence, sunlight
+  settle) — not general block edits. Fully addressed only by Phase F (light texture).
+- **Banding ≈ 4× draw calls** (one geometry per band) — accepted; offset by per-band frustum culling
+  + cheaper per-edit rebuilds.
+- **Wet-shoreline gradient is per-cell discrete** (crisp, by request). A genuinely smooth gradient in
+  all directions would need per-vertex distance-to-water damp (audited, not implemented).
+- **Refill recomputes corner light 4× per quad** (once per corner cell) — correct, mildly wasteful;
+  fine for the infrequent refill path.
+- **Sandbox bash mount of `voxEx.html` is flaky/truncated** — verification done via Read/Grep + a
+  reconstruction-based `node --check`; the authoritative test is `tools/voxex-tests.html` in-browser.
 
 > Line numbers are accurate as of the working tree on **2026-06-17** and *will* drift as the
 > file changes — grep the quoted identifier before editing. This document is written to be

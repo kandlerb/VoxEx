@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.19";
+            const VOXEX_BUILD = "2026-06-17.20";
             const VOXEX_RECENT_CHANGES = [
+                "PHASE 4 'measure first': added a main-thread mesh-time profiler (diagnostic only, no behavior change). renderChunk + successful light-refill are wrapped to accumulate timing into _meshProfile; processChunkQueue records the worst single-frame mesh time. Console: meshProfile.reset() then fly into fresh terrain then meshProfile() — reports builds, avg ms/build, meshMsPerSec, and worstFrameMs (>16.7ms = meshing alone can drop a 60fps frame during streaming => Phase 4 justified). Used to decide whether moving meshing off-thread (Phase 4) is worth the XL effort. renderChunk split into a thin timing wrapper + _renderChunkImpl; refillChunkLightColors likewise.",
                 "WET SAND DAMP back to CRISP/BLOCKY: put the discrete damp level (0 dry / 1 light / 2 dark) back in the greedy merge key, so differently-damp cells stop merging and the shoreline no longer interpolates (Phase 3A had softened it once light left the key). getMergeKey layout now (blockId<<10)|(damp<<8)|AO; blockId extraction >>8 -> >>10. cellCornerLightDamped sets _lastDampLevel which the mesher passes to getMergeKey. damp = f(blocks) not light, so geometry stays light-independent and the Phase 3B refill still works (refill on a uniform-damp quad stays crisp).",
                 "DEFAULT: bandedMeshing now defaults to TRUE for all players (the tested Phase 2 path). lightRefill stays OFF by default (experimental, enable via setLightRefill(true)). Banding = ~4x draw calls, offset by per-band rebuilds + per-band frustum culling. NOTE: defaulting banding ON exercises it from INITIAL world load / pregen / world creation — paths the runtime setBandedMeshing() toggle never hit — so a FRESH world load + new-world creation should be tested before deploy. Revert: set bandedMeshing back to false in DEFAULTS (~6139) + the savedSettings fallback (~5884).",
                 "CHUNK REMESH CCR — Phase 3B (light-only color refill, behind SETTINGS.lightRefill, DEFAULT OFF): a pure LIGHT dirty (edge-lighting convergence, sunlight settle, torch place/break ripple) now refills vertex COLORS instead of re-meshing. At build (when lightRefill on) each terrain band geometry stores a compact per-quad lightMap (4 corner cell indices + faceIdx + 4 AO, indexed by color-buffer offset/12). refillChunkLightColors(cKey) rebuilds the chunk's light getters (buildChunkLightGetters) and recomputes each vertex color via the SHARED cellCornerLightDamped (so refill matches a remesh exactly — no drift), then uploads only the color attribute. processChunkQueue routes a reason===LIGHT dirty to the refill; it declines (=> full remesh) if the chunk has water (water colors aren't mapped), a band lacks a lightMap, or the flag is off. Console: setLightRefill(true/false) (rebuilds once to populate/clear lightMaps). Default path unchanged (flag off); only the cellCornerLightDamped refactor touches the always-on mesher.",
@@ -11208,6 +11209,20 @@
 
             // --- OPTIMIZATION 50: Performance Metrics Dashboard ---
             // Centralized performance tracking for debugging
+            // PHASE 4 "measure first": main-thread MESH-time profiler. renderChunk() is wrapped to add
+            // its time here; processChunkQueue records the per-frame total + the worst single frame.
+            // Read it with meshProfile() in the console (meshProfile.reset() to clear, e.g. before
+            // flying into fresh terrain). worstFrameMs > ~16.7 means meshing alone can drop a 60fps
+            // frame during streaming — i.e. moving it off-thread (Phase 4) is worth the cost.
+            const _meshProfile = {
+                buildMs: 0, builds: 0,    // cumulative renderChunk time (ms) + count
+                refillMs: 0, refills: 0,  // cumulative successful light-refill time (ms) + count (Phase 3B)
+                frameMs: 0,               // mesh time accumulated in the CURRENT frame (reset per frame)
+                maxFrameMs: 0,            // worst single-frame mesh time seen
+                framesWithBuild: 0,       // frames that did any meshing
+                startMs: 0,
+                reset() { this.buildMs = this.builds = this.refillMs = this.refills = this.frameMs = this.maxFrameMs = this.framesWithBuild = 0; this.startMs = performance.now(); },
+            };
             const perfMetrics = {
                 // Frame timing
                 frameTime: 0,
@@ -28919,6 +28934,26 @@ self.onmessage = async (e) => {
                     if (typeof rebuildAllVisibleChunks === 'function') rebuildAllVisibleChunks();
                     return "lightRefill = " + SETTINGS.lightRefill + " (rebuilding to " + (on ? "populate" : "clear") + " lightMaps)";
                 };
+                // PHASE 4 "measure first": report main-thread mesh-time. Usage: meshProfile.reset(),
+                // then fly/move into fresh terrain to trigger streaming, then meshProfile().
+                window.meshProfile = () => {
+                    const p = _meshProfile;
+                    const elapsedS = Math.max(0.001, (performance.now() - (p.startMs || performance.now())) / 1000);
+                    const s = {
+                        builds: p.builds,
+                        avgMsPerBuild: +(p.builds ? p.buildMs / p.builds : 0).toFixed(3),
+                        meshMsPerSec: +(p.buildMs / elapsedS).toFixed(2),   // avg main-thread mesh load
+                        worstFrameMs: +p.maxFrameMs.toFixed(2),             // worst single-frame mesh spike
+                        framesWithMeshing: p.framesWithBuild,
+                        refills: p.refills,
+                        avgMsPerRefill: +(p.refills ? p.refillMs / p.refills : 0).toFixed(3),
+                        windowSec: +elapsedS.toFixed(1),
+                    };
+                    console.table(s);
+                    console.info("[meshProfile] worstFrameMs = biggest single-frame mesh cost; >16.7ms means meshing alone can drop a 60fps frame during streaming (=> Phase 4 worth it). meshProfile.reset() to clear before a test run.");
+                    return s;
+                };
+                window.meshProfile.reset = () => { _meshProfile.reset(); return "meshProfile reset — now fly into fresh terrain, then call meshProfile()"; };
                 window.applyTorchSettingsToLights = applyTorchSettingsToLights;
                 window.applyWaterMaterialSettings = applyWaterMaterialSettings;
                 window.refreshSkyFogColorsFromSettings = refreshSkyFogColorsFromSettings;
@@ -40444,7 +40479,15 @@ self.onmessage = async (e) => {
             // light — no geometry rebuild. Returns false (=> caller should full-remesh) if the chunk
             // has water (water colors aren't mapped), any band lacks a lightMap, or data is missing.
             // Uses the SHARED cellCornerLightDamped so colors match a full remesh exactly.
+            // PHASE 4 measure-first: thin timing wrapper — times only SUCCESSFUL refills (the cheap
+            // alternative to a remesh) so meshProfile() can compare refill vs renderChunk cost.
             function refillChunkLightColors(cKey) {
+                const _t0 = performance.now();
+                const _ok = _refillChunkLightColorsImpl(cKey);
+                if (_ok) { const _dt = performance.now() - _t0; _meshProfile.refillMs += _dt; _meshProfile.refills++; _meshProfile.frameMs += _dt; }
+                return _ok;
+            }
+            function _refillChunkLightColorsImpl(cKey) {
                 if (chunkMeshes.has(cKey + "_WATER")) return false;
                 const terrainKeys = [];
                 if (SETTINGS.bandedMeshing) {
@@ -40484,7 +40527,15 @@ self.onmessage = async (e) => {
                 }
                 return true;
             }
+            // PHASE 4 measure-first: thin timing wrapper around the real mesher. Times the WHOLE call
+            // (incl. early returns) via try/finally; _renderChunkImpl keeps its own error handling.
             function renderChunk(cx, cz, distSq = 0) {
+                if (_meshProfile.startMs === 0) _meshProfile.startMs = performance.now();
+                const _t0 = performance.now();
+                try { return _renderChunkImpl(cx, cz, distSq); }
+                finally { const _dt = performance.now() - _t0; _meshProfile.buildMs += _dt; _meshProfile.builds++; _meshProfile.frameMs += _dt; }
+            }
+            function _renderChunkImpl(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
                     // CRITICAL: Use chunkDataPool.get() for auto-decompression
@@ -41803,6 +41854,10 @@ self.onmessage = async (e) => {
                 // (drainReadyMeshResults), the real main-thread cost. Dispatching still counts as
                 // streaming progress for the stall watchdog.
                 perfMetrics.chunkBuildTime = performance.now() - chunkBuildStartMs;
+                // PHASE 4 measure-first: fold this frame's accumulated mesh time into the worst-frame
+                // tracker, then reset for the next frame. (renderChunk + refill add to frameMs.)
+                if (_meshProfile.frameMs > 0) { _meshProfile.framesWithBuild++; if (_meshProfile.frameMs > _meshProfile.maxFrameMs) _meshProfile.maxFrameMs = _meshProfile.frameMs; }
+                _meshProfile.frameMs = 0;
                 if (builds > 0) {
                     chunkStreamLastProgressMs = performance.now(); // Feed the stall watchdog in updateChunkSystem
                 }
