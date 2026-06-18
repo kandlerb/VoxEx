@@ -247,6 +247,15 @@ Revert 1.2/1.3 and delete the constant. One-guard change.
 
 ## Phase 2 — Banded mesh output  ⚠ (architectural core)
 
+> **STATUS (build 2026-06-17.8): 2a + 2b IMPLEMENTED behind `SETTINGS.bandedMeshing` (default off).**
+> Done: helpers (`bandKey`/`bandOfY`/`chunkBaseOfMeshKey`/`chunkBandMeshKeys`/`isChunkMeshed`/
+> `computeBandBounds`), `SETTINGS.bandedMeshing`, the `flushBand()` per-band attach + band loop in
+> `renderChunk` (unified — `numBands===1` when off ⇒ identical to pre-banding), the `chunkMeshes`
+> census (release/prune/cleanup/streaming/queue/neighbor/edge-light gates), and band unit tests.
+> **NOT yet done: §2.6 per-band dirty scope** — an edit currently rebuilds ALL bands of the chunk
+> (correct, but the per-edit-cost win waits for 2.6 + Phase 3). `node --check` passed; needs
+> in-browser testing with the flag both off and on.
+
 **Goal:** emit geometry **per vertical band** (a group of sections) instead of one buffer per
 320-tall chunk, so an edit/light/seam change rebuilds one band, not the whole column.
 
