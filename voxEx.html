@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-18.1";
+            const VOXEX_BUILD = "2026-06-18.2";
             const VOXEX_RECENT_CHANGES = [
+                "PHASE 4 LEVER DIAGNOSTIC: meshProfile() now reports maxBuildMs (worst SINGLE chunk build) + a per-build time histogram (<4 / 4-8 / 8-16.7 / 16.7-33 / 33-50 / 50+ ms), so we can tell WHY a frame hitches before committing to the XL off-thread rewrite: maxBuildMs alone ≫16.7 => one heavy build => Phase 4 (off-thread meshing) is the only fix; maxBuildMs <16.7 but worstFrameMs ≫16.7 => many cheap builds packed into a frame => a cheap per-frame build cap fixes it, no worker rewrite. Diagnostic only, no behavior change. Also landed (dormant, flag off): Phase 4 foundation — worker SETTINGS/useBands snapshot + per-neighbor light send for seam-free worker meshing.",
                 "PHASE 3.5 LAZY BANDING: banding is now PER-CHUNK instead of global. Chunks stream/first-build as a single column (cheap) and convert to banded geometry only on their FIRST edit — so edits still rebuild one band, but streaming no longer pays banding's 4x first-build overhead. (meshProfile A/B showed always-on banding ~doubled streaming mesh load: 146 vs 81 ms/s.) New: bandedChunkKeys set + chunkUsesBands() predicate (replaces the global SETTINGS.bandedMeshing reads in isChunkMeshed / releaseMeshForKey / refillChunkLightColors / numBands / eviction), markChunkBanded() on the 2 center-edit sites (updateLocalArea + light-neutral edit), and an end-of-build release of the orphan single-column mesh on the unbanded->banded transition. SETTINGS.bandedMeshing now means 'band edited chunks (lazy)'. Console: setEagerBanding(true) restores the old always-band behavior for A/B re-measurement; meshProfile() to compare.",
                 "PHASE 4 'measure first': added a main-thread mesh-time profiler (diagnostic only, no behavior change). renderChunk + successful light-refill are wrapped to accumulate timing into _meshProfile; processChunkQueue records the worst single-frame mesh time. Console: meshProfile.reset() then fly into fresh terrain then meshProfile() — reports builds, avg ms/build, meshMsPerSec, and worstFrameMs (>16.7ms = meshing alone can drop a 60fps frame during streaming => Phase 4 justified). Used to decide whether moving meshing off-thread (Phase 4) is worth the XL effort. renderChunk split into a thin timing wrapper + _renderChunkImpl; refillChunkLightColors likewise.",
                 "WET SAND DAMP back to CRISP/BLOCKY: put the discrete damp level (0 dry / 1 light / 2 dark) back in the greedy merge key, so differently-damp cells stop merging and the shoreline no longer interpolates (Phase 3A had softened it once light left the key). getMergeKey layout now (blockId<<10)|(damp<<8)|AO; blockId extraction >>8 -> >>10. cellCornerLightDamped sets _lastDampLevel which the mesher passes to getMergeKey. damp = f(blocks) not light, so geometry stays light-independent and the Phase 3B refill still works (refill on a uniform-damp quad stays crisp).",
@@ -11230,8 +11231,12 @@
                 frameMs: 0,               // mesh time accumulated in the CURRENT frame (reset per frame)
                 maxFrameMs: 0,            // worst single-frame mesh time seen
                 framesWithBuild: 0,       // frames that did any meshing
+                maxBuildMs: 0,            // worst SINGLE renderChunk (one chunk) — distinguishes a lone heavy
+                                          // build (only off-thread/Phase 4 fixes) from frame-packing of many
+                                          // cheap builds (a per-frame build cap fixes that, no worker rewrite)
+                buildBuckets: [0, 0, 0, 0, 0, 0], // single-build time histogram: <4 / 4-8 / 8-16.7 / 16.7-33 / 33-50 / 50+ ms
                 startMs: 0,
-                reset() { this.buildMs = this.builds = this.refillMs = this.refills = this.frameMs = this.maxFrameMs = this.framesWithBuild = 0; this.startMs = performance.now(); },
+                reset() { this.buildMs = this.builds = this.refillMs = this.refills = this.frameMs = this.maxFrameMs = this.framesWithBuild = this.maxBuildMs = 0; this.buildBuckets = [0, 0, 0, 0, 0, 0]; this.startMs = performance.now(); },
             };
             const perfMetrics = {
                 // Frame timing
@@ -18483,6 +18488,16 @@
     // This ensures identical terrain generation between worker and main thread
     /* __TERRAIN_PASS_END__ */
 
+    // --- PHASE 4: worker SETTINGS shim ---
+    // The INJECTED mesh functions (greedyMeshSection, getMergeKey, calculateFaceAO,
+    // cellCornerLightDamped, extractLightFromChunk, ...) read SETTINGS.* on the main thread.
+    // The worker has no SETTINGS object, so we keep a per-job snapshot here, repopulated from
+    // e.data.meshSettings on every 'mesh' message. Defaults match the main-thread DEFAULTS so an
+    // un-snapshotted call still behaves sanely. workerUseBands carries the per-chunk banding decision
+    // (chunkUsesBands) computed on the main thread, since the worker can't see bandedChunkKeys.
+    let SETTINGS = { smoothLighting: true, AO: true, greedyMeshingEnabled: true, maxGreedyQuadSize: 16, lightRefill: false, bandedMeshing: true };
+    let workerUseBands = false;
+
     // ============================================================
     // MESSAGE HANDLER
     // ============================================================
@@ -18549,7 +18564,10 @@
 
             if (type === 'mesh') {
                 // Mesh generation in worker
-                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor } = e.data;
+                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor, meshSettings, useBands } = e.data;
+                // PHASE 4: refresh the worker SETTINGS shim + per-chunk banding decision from this job's snapshot.
+                if (meshSettings) SETTINGS = meshSettings;
+                workerUseBands = !!useBands;
                 const chunkSize = CHUNK_SIZE;
                 const chunkHeight = CHUNK_HEIGHT;
                 const startX = cx * chunkSize;
@@ -19214,6 +19232,11 @@
 
                         // Copy neighbor block data (can't transfer chunks still in use by main thread)
                         const neighborData = {};
+                        // PHASE 4: also copy neighbor LIGHT. The worker mesher's getLocalLight must read
+                        // the neighbor's real light for edge faces (matching main's buildChunkLightGetters),
+                        // or worker- and main-built chunks get different border colors = seams.
+                        const neighborSkyLight = {};
+                        const neighborBlockLight = {};
                         const dirs = ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se'];
                         for (const dir of dirs) {
                             if (neighbors[dir]) {
@@ -19221,6 +19244,10 @@
                                 if (nData && nData.length > 0) {
                                     neighborData[dir] = new Uint8Array(nData);
                                 }
+                                const nSky = neighbors[dir].skyLight;
+                                const nBlk = neighbors[dir].blockLight;
+                                if (nSky && nSky.length > 0) neighborSkyLight[dir] = new Uint8Array(nSky);
+                                if (nBlk && nBlk.length > 0) neighborBlockLight[dir] = new Uint8Array(nBlk);
                             }
                         }
 
@@ -19229,9 +19256,9 @@
                         if (centerSkyLight) transfer.push(centerSkyLight.buffer);
                         if (centerBlockLight) transfer.push(centerBlockLight.buffer);
                         for (const dir of dirs) {
-                            if (neighborData[dir]) {
-                                transfer.push(neighborData[dir].buffer);
-                            }
+                            if (neighborData[dir]) transfer.push(neighborData[dir].buffer);
+                            if (neighborSkyLight[dir]) transfer.push(neighborSkyLight[dir].buffer);
+                            if (neighborBlockLight[dir]) transfer.push(neighborBlockLight[dir].buffer);
                         }
 
                         this.jobQueue.push({
@@ -19244,11 +19271,24 @@
                                 centerSkyLight,
                                 centerBlockLight,
                                 neighbors: neighborData,
+                                neighborSkyLight,   // PHASE 4: per-neighbor light for seam-free edge colors
+                                neighborBlockLight,
                                 uvMapData,
                                 maxFaces,
                                 settingsAO: SETTINGS.AO,
                                 settingsWaterFogDensity: SETTINGS.waterFogDensity,
-                                settingsWaterColor: SETTINGS.waterColor
+                                settingsWaterColor: SETTINGS.waterColor,
+                                // PHASE 4: full mesh-settings snapshot for the injected mesher + the
+                                // per-chunk banding decision (worker can't see bandedChunkKeys).
+                                meshSettings: {
+                                    smoothLighting: SETTINGS.smoothLighting,
+                                    AO: SETTINGS.AO,
+                                    greedyMeshingEnabled: SETTINGS.greedyMeshingEnabled,
+                                    maxGreedyQuadSize: SETTINGS.maxGreedyQuadSize,
+                                    lightRefill: SETTINGS.lightRefill,
+                                    bandedMeshing: SETTINGS.bandedMeshing
+                                },
+                                useBands: (typeof chunkUsesBands === 'function') ? chunkUsesBands(getChunkKey(cx, cz)) : false
                             },
                             transfer: transfer
                         });
@@ -28955,9 +28995,11 @@ self.onmessage = async (e) => {
                 window.meshProfile = () => {
                     const p = _meshProfile;
                     const elapsedS = Math.max(0.001, (performance.now() - (p.startMs || performance.now())) / 1000);
+                    const bk = p.buildBuckets;
                     const s = {
                         builds: p.builds,
                         avgMsPerBuild: +(p.builds ? p.buildMs / p.builds : 0).toFixed(3),
+                        maxBuildMs: +p.maxBuildMs.toFixed(2),               // worst SINGLE chunk build
                         meshMsPerSec: +(p.buildMs / elapsedS).toFixed(2),   // avg main-thread mesh load
                         worstFrameMs: +p.maxFrameMs.toFixed(2),             // worst single-frame mesh spike
                         framesWithMeshing: p.framesWithBuild,
@@ -28966,7 +29008,17 @@ self.onmessage = async (e) => {
                         windowSec: +elapsedS.toFixed(1),
                     };
                     console.table(s);
-                    console.info("[meshProfile] worstFrameMs = biggest single-frame mesh cost; >16.7ms means meshing alone can drop a 60fps frame during streaming (=> Phase 4 worth it). meshProfile.reset() to clear before a test run.");
+                    // Per-build histogram: how long do INDIVIDUAL chunk builds take?
+                    console.table({
+                        "<4ms": bk[0], "4-8ms": bk[1], "8-16.7ms": bk[2],
+                        "16.7-33ms": bk[3], "33-50ms": bk[4], "50ms+": bk[5],
+                    });
+                    // LEVER DECISION: compare maxBuildMs to worstFrameMs.
+                    //  • maxBuildMs alone ≫ 16.7  → a SINGLE chunk build blows a frame → only off-thread
+                    //    meshing (Phase 4) fixes it.
+                    //  • maxBuildMs < 16.7 but worstFrameMs ≫ 16.7 → the spike is MANY cheap builds packed
+                    //    into one frame → a per-frame build cap fixes it cheaply (no worker rewrite).
+                    console.info("[meshProfile] LEVER: if maxBuildMs alone is ≫16.7 => single heavy builds => Phase 4 (off-thread). If maxBuildMs <16.7 but worstFrameMs ≫16.7 => frame-packing => cheap per-frame build cap. Check the histogram for how many builds land in 16.7ms+ buckets. meshProfile.reset() before a run.");
                     return s;
                 };
                 window.meshProfile.reset = () => { _meshProfile.reset(); return "meshProfile reset — now fly into fresh terrain, then call meshProfile()"; };
@@ -40549,7 +40601,14 @@ self.onmessage = async (e) => {
                 if (_meshProfile.startMs === 0) _meshProfile.startMs = performance.now();
                 const _t0 = performance.now();
                 try { return _renderChunkImpl(cx, cz, distSq); }
-                finally { const _dt = performance.now() - _t0; _meshProfile.buildMs += _dt; _meshProfile.builds++; _meshProfile.frameMs += _dt; }
+                finally {
+                    const _dt = performance.now() - _t0;
+                    _meshProfile.buildMs += _dt; _meshProfile.builds++; _meshProfile.frameMs += _dt;
+                    if (_dt > _meshProfile.maxBuildMs) _meshProfile.maxBuildMs = _dt;
+                    // Per-build histogram: which bucket does THIS single chunk build fall in?
+                    const _b = _dt < 4 ? 0 : _dt < 8 ? 1 : _dt < 16.7 ? 2 : _dt < 33 ? 3 : _dt < 50 ? 4 : 5;
+                    _meshProfile.buildBuckets[_b]++;
+                }
             }
             function _renderChunkImpl(cx, cz, distSq = 0) {
                 try {

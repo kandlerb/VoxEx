@@ -855,6 +855,110 @@ notes it was done to **fix worker/main drift**. Phase 4 follows that proven patt
 - **Keep on the main thread (`applyWorkerMeshData`, ~19308):** the Three.js attach — i.e. the existing
   `flushBand` attach logic, run per band from the worker's buffers.
 
+### 4a SCOPE DECISION (2026-06-18): worker meshes UNBANDED chunks only
+
+Phase 3.5 made banding lazy: **streaming/first-build chunks are unbanded single columns** (the hot path
+we're optimizing) and **banded geometry exists only on edited chunks** (rare, user-paced). So 4a ships
+the worker mesher for the **unbanded (`numBands===1`) case only**; **banded/edited chunks stay on the
+main thread** (dispatch already computes `useBands` — route `useBands===true` to `renderChunk`, else to
+the worker). This captures the *entire* streaming frame-time win while removing the worker band-loop,
+the per-band payload, and the per-band `applyWorkerMeshData` attach — i.e. the biggest seam/complexity
+risks. Banded worker meshing can be a later increment if ever needed. Payload is therefore a SINGLE
+terrain + water + lightMap (column-wide), and `applyWorkerMeshData` attaches one `cKey`(+`_WATER`) mesh.
+
+### 4a parity prerequisites discovered while reading (must-do or you get seams)
+
+- **Neighbor light must be sent to the worker.** Main `getLocalLight` (the verbatim copy in
+  `buildChunkLightGetters`, 40504) reads the **neighbor chunk's** `extractLightFromChunk` for edge
+  faces, and only falls back to `ownEdgeLight` (center-edge proxy, 40499) when that neighbor is
+  *missing*. The worker only receives `centerSkyLight/centerBlockLight` + neighbor **blocks** today, so
+  its edge colors would use the proxy for every border → byte-parity fails → seams. FIX: `generateMesh`
+  also sends per-neighbor `skyLight`+`blockLight` (copies, transferable); worker `getLocalLight` becomes
+  a verbatim port of `buildChunkLightGetters`' getter (neighbor `extractLightFromChunk` + `ownEdgeLight`
+  fallback). `extractLightFromChunk` (40417) is just a clamped max floored at 3 (NO attenuation math —
+  attenuation is already baked into stored light), so it ports cleanly.
+- **`extractLightFromChunk` chunk shape:** it reads `chunk.skyLight`/`chunk.blockLight`. In the worker
+  the per-neighbor light arrays must be wrapped as `{skyLight, blockLight}` objects so the ported getter
+  + `extractLightFromChunk` work unchanged.
+- **Table reconciliation (inject from MAIN values, don't trust worker copies):** inject
+  `AO_FACE_CONFIGS`, `AO_LOOKUP`, `IS_TRANSPARENT`, `CULLS_SAME_ID` as the main-thread data (JSON /
+  `new Uint8Array(...)`) so the injected funcs read byte-identical tables. The worker's module-scope
+  `AO_FACE_CONFIGS` (18101) + `AO_LOOKUP` (18098) MUST be deleted first (redeclaration = worker
+  SyntaxError = game breaks on load even with the flag off). Worker's `IS_TRANSPARENT_WORKER`/
+  `CULLS_SAME_ID_WORKER` keep their distinct names (no clash; old mesher uses them until replaced).
+- **`getBlockUV` reconciliation:** injected `greedyMeshSection` calls `getBlockUV(blockId)`. Verify
+  main `getBlockUV` (10458) returns the same `{top,bottom,side}` shape the worker feeds; if its deps
+  aren't in the worker, alias `getBlockUV` → the worker's `uvMapData` lookup (same data main sends).
+
+### 4a build sheet — line-exact & dependency-complete (derived 2026-06-18, post-3.5 line numbers)
+
+> **Atomicity note:** the worker declares its OWN `AO_LOOKUP` (18098), `AO_FACE_CONFIGS` (18101),
+> `CULLS_SAME_ID_WORKER` (18086), and inline `getAOConfig`/`calculateVertexAO`/`calculateFaceAO`
+> (18641–18668). Injecting the main-thread versions **redeclares** those names → SyntaxError unless the
+> worker's copies are deleted in the same edit. So injection + worker-mesher replacement are ONE unit;
+> there is no smaller independently-verifiable sub-step. Safe because `WORKER_MESH_PIPELINE_ENABLED`
+> (13521) stays **false** → the worker never receives a `'mesh'` job (gates at 19358/19578), so the
+> replaced mesher is dormant until the parity test (H) is green.
+
+**A. Inject into `__MESH_FUNCS__` (18162)** — all standalone hoisted main-thread funcs; mirror the
+tree-func loop in `buildChunkWorkerCode` (19008): `computeMergedFaceVertices` (17595),
+`getMergedFaceVertices` (17658), `getAOConfig` (38472), `calculateVertexAO` (38535), `calculateFaceAO`
+(38562), `calculateVertexCornerLight` (38630), `calculateFaceCornerLight` (38661), `getMergeKey`
+(38728), `addFaceWaterIndexed` (39226), `isWaterAdjacent` (39290), `addMergedFaceIndexed` (39343),
+`cellCornerLightDamped` (39457), `greedyMeshSection` (39489), `extractLightFromChunk` (40393),
+`getBlockUV` (10458). **Delete** the worker's hand-coded `getAOConfig`/`calculateVertexAO`/
+`calculateFaceAO` (18641–18668) and `getBlockUVWorker` use (reconcile to injected `getBlockUV`).
+
+**B. Data deps to provide in the worker** (inject literal/JSON, or build via injected loop). ⚠ = name
+clash with an existing worker copy that must be removed first:
+- ⚠ `AO_FACE_CONFIGS` (38427) — delete worker 18101, inject main's (9-int offset rows; worker's is the same shape but verify byte-equal).
+- ⚠ `AO_LOOKUP` (9732) — delete worker 18098; inject main's.
+- `AO_QUANT_LOOKUP` (38683) + `LIGHT_QUANT_LOOKUP` (38691) — inject the build loops.
+- `CORNER_AB_TOP..FRONT` (39442–39447, 6 consts) — worker lacks; inject.
+- `GREEDY_SLICE_SIZE` (17887) + greedy scratch `greedyMergeKeys`/`greedyAO`/`greedyLight`/`greedyLocalCoords`/`greedyProcessed` (17888+) + `clearGreedyBuffers` (17904) — inject.
+- `_greedyAOScratch`/`_greedyLightScratch` (39420) — inject.
+- `_lmCells`/`_lmAO`/`_lmFace` (17896+, sized `MAX_FACES_PER_CHUNK*4`/`*1`) — inject.
+- `_lastDampLevel` (39452, `let`) — inject as worker-module `let`.
+- ⚠ `CULLS_SAME_ID` (16495) — greedy uses the main name; worker has `CULLS_SAME_ID_WORKER` → alias or inject `CULLS_SAME_ID`.
+- ⚠ `IS_TRANSPARENT` — greedy + getMergeKey path uses main name; worker has `IS_TRANSPARENT_WORKER` → provide `IS_TRANSPARENT` (alias to the worker's table or inject).
+- `SUNLIGHT_ATTENUATION`/`BLOCKLIGHT_ATTENUATION` + any `IS_TRANSPARENT`/block-tag tables read by `extractLightFromChunk` (40393) — inject.
+- Confirm present in worker, inject if missing: `NUM_TILES`, `WORLD_DIMS` (incl. `yOffset`!), `SECTION_HEIGHT`, `BANDS_PER_CHUNK`, `BAND_SECTIONS`, `MAX_FACES_PER_CHUNK`, `FACE_DIRECTIONS`, block-id consts (AIR/WATER/TORCH/FIRE/LEAVES/LONGWOOD_LEAVES/UNLOADED_BLOCK).
+
+**C. SETTINGS shim.** Injected funcs read `SETTINGS.{smoothLighting, AO, greedyMeshingEnabled,
+maxGreedyQuadSize, lightRefill, bandedMeshing}`. Worker has no `SETTINGS` → add a worker-module
+`let SETTINGS = {…}`, repopulated from a per-job snapshot in `e.data` on each `'mesh'` message (main
+sends `meshSettings`). **Miss this → injected funcs read `undefined` and throw.**
+
+**D. getLocal/getLocalLight reconciliation.** Worker `getLocal` already returns `UNLOADED_BLOCK` for a
+missing neighbor (good). Rework worker `getLocalLight` to match main exactly: call injected
+`extractLightFromChunk` (floor-at-3 + water attenuation) instead of `Math.max(3, sky, block)`, and add
+the **missing-neighbor `ownEdgeLight` fallback** (main 40440 — clamp out-of-range samples to this
+chunk's nearest edge cell, which the worker already half-does at 18623–18628; align it to main's rule).
+Any divergence = different border vertex colors = seams between worker- and main-built chunks.
+
+**E. Worker band loop.** Replace the worker `'mesh'` handler body (18550–18834) with a mirror of
+`_renderChunkImpl`'s section/band loop (40724–41260) **minus Three.js**: `numBands` from injected
+`SETTINGS.bandedMeshing` + the per-chunk decision (worker can't see `bandedChunkKeys` → main must send
+a per-job `useBands` bool, computed via `chunkUsesBands(cKey)`); per band reset terrain+water buffers;
+per section call `greedyMeshSection` ×6 then the water per-block pass (`addFaceWaterIndexed`); at each
+band boundary slice the buffers + the per-band `_lm*` lightMap into a payload entry.
+
+**F. Per-band payload (4b).** Array, one entry/band: `{ band, terrain:{positions,uvs,colors,quadSize,
+indices,faceCount,vertexCount}, water:{positions,uvs,colors,indices,shore,thickness,foam,faceCount,
+vertexCount}, lightMap:{cells,ao,face,quadCount} }`. (Today: one terrain+water payload, no quadSize/
+foam/lightMap — 18800+.) Build the transfer list from every band's buffers.
+
+**G. `applyWorkerMeshData` rewrite (4b, 19401).** Consume per-band payloads via the existing `flushBand`
+attach: `acquireChunkMesh` (not `new THREE.Mesh`), `computeBandBounds`/`applyTightChunkBounds` (not
+`computeBoundingSphere` over stale pooled verts — bug at 19357), `bandKey(cKey,b)`, `geo.userData.lightMap`,
+atomic old→new swap, `meshedChunkKeys`, `chunkRenderedFaces`/diagnostics, torch+fire rebuild,
+`markShadowsDirty`, zero-face cleanup. Single-column case (`!useBands`) attaches one `cKey` mesh.
+
+**H. Parity test (4a GATE, `tools/voxex-tests.html`).** Same chunk+neighbors+SETTINGS: mesh on main
+(`renderChunk` → read `chunkMeshes` geo per band) vs worker (post `'mesh'`, await payload). Assert
+per-band terrain+water `positions/uvs/colors/quadSize/indices` + `lightMap{cells,ao,face}` equal —
+exact for ints, tight float tol. **4a is done when this is green with the flag still OFF.**
+
 ### Tasks
 
 **4a — inject + parity (flag stays OFF; verifiable as a buffer byte-match)**
@@ -909,9 +1013,16 @@ do 4b/4c.
   worker's getters, SETTINGS snapshot, and the per-band protocol must all match exactly.
 - **SETTINGS staleness:** if the user changes AO/smoothLighting/banding mid-session, in-flight worker
   jobs use the old snapshot → transient mismatch until rebuild. Decide whether to version/invalidate.
-- **Worth-it check — DONE (2026-06-17.20).** `meshProfile()` over fresh-terrain streaming: main-thread
-  meshing IS a bottleneck (`worstFrameMs` 35–40 ≫ 16.7 in both banded and unbanded), so Phase 4 is
-  justified by data — **but** the A/B also showed always-on banding ~doubles streaming load (146 vs 81
+- **⚠ LEVER GATE before the 4a core (added 2026-06-18.2):** an audit caught that `worstFrameMs ≫ 16.7`
+  does NOT prove Phase 4 is the right fix — it can be (a) one heavy chunk build (only off-thread meshing
+  helps) OR (b) several cheap builds packed into a frame (a per-frame build cap helps, no worker rewrite).
+  `meshProfile()` now reports `maxBuildMs` + a per-build histogram to decide: **if `maxBuildMs` alone ≫
+  16.7 → proceed with Phase 4; if `maxBuildMs` < 16.7 but `worstFrameMs` ≫ 16.7 → do the cheap build-cap
+  first and Phase 4 may be unnecessary.** Do NOT write the 4a mesher core until this is measured.
+- **Worth-it check — partial (2026-06-17.20).** `meshProfile()` over fresh-terrain streaming: main-thread
+  meshing IS a frame-time bottleneck (`worstFrameMs` 35–60 ≫ 16.7 in lazy and eager) — but see the LEVER
+  GATE above: we have not yet confirmed it's single-build vs frame-packing. The A/B also showed always-on
+  banding ~doubles streaming load (146 vs 81
   ms/s). Therefore **Phase 3.5 (lazy banding) goes first** (cheap, removes the banding tax); re-measure;
   only do Phase 4 if `worstFrameMs` is still ≫ 16.7 afterward. See Phase 3.5.
 
