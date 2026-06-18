@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.15";
+            const VOXEX_BUILD = "2026-06-17.16";
             const VOXEX_RECENT_CHANGES = [
+                "CHUNK REMESH CCR — Phase 3B (light-only color refill, behind SETTINGS.lightRefill, DEFAULT OFF): a pure LIGHT dirty (edge-lighting convergence, sunlight settle, torch place/break ripple) now refills vertex COLORS instead of re-meshing. At build (when lightRefill on) each terrain band geometry stores a compact per-quad lightMap (4 corner cell indices + faceIdx + 4 AO, indexed by color-buffer offset/12). refillChunkLightColors(cKey) rebuilds the chunk's light getters (buildChunkLightGetters) and recomputes each vertex color via the SHARED cellCornerLightDamped (so refill matches a remesh exactly — no drift), then uploads only the color attribute. processChunkQueue routes a reason===LIGHT dirty to the refill; it declines (=> full remesh) if the chunk has water (water colors aren't mapped), a band lacks a lightMap, or the flag is off. Console: setLightRefill(true/false) (rebuilds once to populate/clear lightMaps). Default path unchanged (flag off); only the cellCornerLightDamped refactor touches the always-on mesher.",
                 "CHUNK REMESH CCR — Phase 3B foundation (refactor, no behavior change): extracted cellCornerLightDamped() as the SINGLE source of truth for a cell's 4 corner lights including the wet-shoreline damp — the mesher now calls it instead of inlining the calc+damp. This is the shared helper the upcoming light-only color refill will also use, so build-time and refill-time colors can't drift. Also added SETTINGS.lightRefill (default OFF, not yet wired). Pure refactor — lighting/shoreline should look IDENTICAL to 3A.",
                 "CHUNK REMESH CCR — Phase 3A (decouple light from geometry, part 1 of 2): light is NO LONGER in the greedy merge key (getMergeKey now (blockId<<8)|AO; dead l0-l3 removed; blockId extraction >>20 -> >>8). Faces merge on blockId+AO only; a merged quad now samples each vertex's light from its CORNER CELL (greedyMeshSection: per-face CORNER_AB pattern derived from computeMergedFaceVertices; width<->u, height<->v). For a 1x1 or uniform-light quad this collapses to the seed cell => identical to before; the change only shows where light VARIES across a merged quad (smoother light gradients on large flat lit surfaces; softer wet-shoreline/torch-edge boundaries, accepted). This makes geometry light-INDEPENDENT — the prerequisite for Phase 3B (light-only color refill instead of remesh). Phase 3B NOT yet done: light changes still remesh. Behind nothing yet — applies to all meshing; verify lighting looks correct (no transposed gradients).",
                 "CHUNK REMESH CCR — Phase 2c (per-band dirty scope): a block edit now rebuilds ONLY the band(s) it touches instead of all 4. New chunkDirtyBands map + ALL_BANDS_MASK + bandMaskForY(y) (dirties the edit's band plus the vertical neighbor band at a band boundary, for correct cross-boundary face/AO). scheduleChunkUpdate gained a {bands} option (default ALL); updateLocalArea (edit-center + edge/corner neighbours, same y => same band mask) and the light-neutral edit path pass the scoped mask. renderChunk reads rebuildMask and SKIPS clean bands that already have a live mesh (keeps them), rebuilding only dirty bands; whole-column changes (light propagation, neighbour/edge updates, streaming/first build) default to ALL bands so they're unaffected. Light-CHANGING edits still rebuild all light-affected bands (sunlight columns) until Phase 3 turns light into a color-only upload. Behind SETTINGS.bandedMeshing (numBands===1 path unchanged).",
@@ -17862,6 +17863,12 @@
             const greedyAO = new Float32Array(GREEDY_SLICE_SIZE * 4);    // 4 AO values per cell
             const greedyLight = new Float32Array(GREEDY_SLICE_SIZE * 4); // 4 corner light values per cell (smooth lighting)
             const greedyLocalCoords = new Uint16Array(GREEDY_SLICE_SIZE * 3); // Store local x,y,z for each cell
+            // PHASE 3B lightMap work arrays. Populated per merged quad during greedy meshing when
+            // SETTINGS.lightRefill is on; flushBand copies each band's slice onto geo.userData.lightMap.
+            // Indexed by quad = (color buffer offset)/12, so they auto-align with the color buffer.
+            const _lmCells = new Uint32Array(MAX_FACES_PER_CHUNK * 4); // 4 corner cell indices per quad
+            const _lmAO = new Float32Array(MAX_FACES_PER_CHUNK * 4);   // 4 corner AO per quad
+            const _lmFace = new Uint8Array(MAX_FACES_PER_CHUNK);       // faceIdx per quad
 
             /**
              * Clear greedy meshing buffers for a new slice.
@@ -28903,6 +28910,13 @@ self.onmessage = async (e) => {
                     }
                     return "bandedMeshing = " + SETTINGS.bandedMeshing + " (" + activeChunks.size + " chunks re-queued)";
                 };
+                // DEBUG: live-toggle Phase 3B light-only color refill. Existing meshes have no lightMap,
+                // so a rebuild is needed to (de)populate it before the refill path can engage.
+                window.setLightRefill = (on) => {
+                    SETTINGS.lightRefill = !!on;
+                    if (typeof rebuildAllVisibleChunks === 'function') rebuildAllVisibleChunks();
+                    return "lightRefill = " + SETTINGS.lightRefill + " (rebuilding to " + (on ? "populate" : "clear") + " lightMaps)";
+                };
                 window.applyTorchSettingsToLights = applyTorchSettingsToLights;
                 window.applyWaterMaterialSettings = applyWaterMaterialSettings;
                 window.refreshSkyFogColorsFromSettings = refreshSkyFogColorsFromSettings;
@@ -39568,11 +39582,24 @@ self.onmessage = async (e) => {
                             // differ. Sample each vertex's light from its CORNER cell (width<->u,
                             // height<->v; cornerAB gives the (a,b) corner per vertex). 1x1 / uniform
                             // quads collapse to the seed cell => identical to the pre-Phase-3 result.
+                            const _lmOn = SETTINGS.lightRefill;
+                            const _q = state.cIdx / 12; // quad index (aligns with the color buffer)
                             for (let _k = 0; _k < 4; _k++) {
                                 const cu = u + cornerAB[_k * 2] * (width - 1);
                                 const cv = v + cornerAB[_k * 2 + 1] * (height - 1);
                                 _greedyLightScratch[_k] = greedyLight[(cv * uSize + cu) * 4 + _k];
+                                if (_lmOn) {
+                                    // PHASE 3B: record this vertex's corner CELL + AO for the light-only refill.
+                                    // (cu,cv,s) -> local (x,y,z) via the same slice mapping used above.
+                                    let _cx2, _cy2, _cz2;
+                                    if (sliceAxis === 'y') { _cx2 = cu; _cy2 = s; _cz2 = cv; }
+                                    else if (sliceAxis === 'x') { _cx2 = s; _cy2 = sectionBaseY + cv; _cz2 = cu; }
+                                    else { _cx2 = cu; _cy2 = sectionBaseY + cv; _cz2 = s; }
+                                    _lmCells[_q * 4 + _k] = _cx2 + _cz2 * 16 + _cy2 * 256;
+                                    _lmAO[_q * 4 + _k] = _greedyAOScratch[_k];
+                                }
                             }
+                            if (_lmOn) _lmFace[_q] = faceIdx;
 
                             // Emit merged quad
                             addMergedFaceIndexed(
@@ -40355,6 +40382,99 @@ self.onmessage = async (e) => {
                 return estimate || GEO_TIER_SMALL; // Default to small if 0
             }
 
+            // PHASE 3B: rebuild the getLocal/getLocalLight closures for a chunk (faithful copy of the
+            // ones inside renderChunk) so refillChunkLightColors can re-evaluate light with neighbor
+            // data WITHOUT re-meshing. Returns null if the chunk's data isn't loaded.
+            function buildChunkLightGetters(cx, cz) {
+                const cKey = getChunkKey(cx, cz);
+                const centerData = chunkDataPool.get(cKey);
+                if (!centerData) return null;
+                const czM1 = cz - 1, czP1 = cz + 1, cxM1 = cx - 1, cxP1 = cx + 1;
+                const nN = chunkDataPool.get(`${cx},${czM1}`);
+                const nS = chunkDataPool.get(`${cx},${czP1}`);
+                const nE = chunkDataPool.get(`${cxP1},${cz}`);
+                const nW = chunkDataPool.get(`${cxM1},${cz}`);
+                const nNW = chunkDataPool.get(`${cxM1},${czM1}`);
+                const nNE = chunkDataPool.get(`${cxP1},${czM1}`);
+                const nSW = chunkDataPool.get(`${cxM1},${czP1}`);
+                const nSE = chunkDataPool.get(`${cxP1},${czP1}`);
+                let missingNeighbor = false; // unused by refill; kept so the copied bodies match verbatim
+                const getLocal = (lx, ly, lz) => {
+                    if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 0;
+                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) { const idx = lx + lz * 16 + ly * 256; return centerData.blocks ? centerData.blocks[idx] : centerData[idx]; }
+                    if (lz < 0 && lx >= 0 && lx < 16) { const idx = lx + 15 * 16 + ly * 256; if (!nN) { missingNeighbor = true; return UNLOADED_BLOCK; } return nN.blocks ? nN.blocks[idx] : nN[idx]; }
+                    if (lz > 15 && lx >= 0 && lx < 16) { const idx = lx + 0 * 16 + ly * 256; if (!nS) { missingNeighbor = true; return UNLOADED_BLOCK; } return nS.blocks ? nS.blocks[idx] : nS[idx]; }
+                    if (lx > 15 && lz >= 0 && lz < 16) { const idx = 0 + lz * 16 + ly * 256; if (!nE) { missingNeighbor = true; return UNLOADED_BLOCK; } return nE.blocks ? nE.blocks[idx] : nE[idx]; }
+                    if (lx < 0 && lz >= 0 && lz < 16) { const idx = 15 + lz * 16 + ly * 256; if (!nW) { missingNeighbor = true; return UNLOADED_BLOCK; } return nW.blocks ? nW.blocks[idx] : nW[idx]; }
+                    if (lz < 0 && lx < 0) { const idx = 15 + 15 * 16 + ly * 256; if (!nNW) { missingNeighbor = true; return UNLOADED_BLOCK; } return nNW.blocks ? nNW.blocks[idx] : nNW[idx]; }
+                    if (lz < 0 && lx > 15) { const idx = 0 + 15 * 16 + ly * 256; if (!nNE) { missingNeighbor = true; return UNLOADED_BLOCK; } return nNE.blocks ? nNE.blocks[idx] : nNE[idx]; }
+                    if (lz > 15 && lx < 0) { const idx = 15 + 0 * 16 + ly * 256; if (!nSW) { missingNeighbor = true; return UNLOADED_BLOCK; } return nSW.blocks ? nSW.blocks[idx] : nSW[idx]; }
+                    if (lz > 15 && lx > 15) { const idx = 0 + 0 * 16 + ly * 256; if (!nSE) { missingNeighbor = true; return UNLOADED_BLOCK; } return nSE.blocks ? nSE.blocks[idx] : nSE[idx]; }
+                    return 0;
+                };
+                const ownEdgeLight = (lx, ly, lz) => {
+                    const cx2 = lx < 0 ? 0 : lx > 15 ? 15 : lx;
+                    const cz2 = lz < 0 ? 0 : lz > 15 ? 15 : lz;
+                    return extractLightFromChunk(centerData, cx2 + cz2 * 16 + ly * 256);
+                };
+                const getLocalLight = (lx, ly, lz) => {     if (ly < 0 || ly >= WORLD_DIMS.chunkHeight) return 15;
+                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) { const idx = lx + lz * 16 + ly * 256; return extractLightFromChunk(centerData, idx); }
+                    if (lz < 0 && lx >= 0 && lx < 16) { const idx = lx + 15 * 16 + ly * 256; if (!nN) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nN, idx); }
+                    if (lz > 15 && lx >= 0 && lx < 16) { const idx = lx + 0 * 16 + ly * 256; if (!nS) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nS, idx); }
+                    if (lx > 15 && lz >= 0 && lz < 16) { const idx = 0 + lz * 16 + ly * 256; if (!nE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nE, idx); }
+                    if (lx < 0 && lz >= 0 && lz < 16) { const idx = 15 + lz * 16 + ly * 256; if (!nW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nW, idx); }
+                    if (lz < 0 && lx < 0) { const idx = 15 + 15 * 16 + ly * 256; if (!nNW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nNW, idx); }
+                    if (lz < 0 && lx > 15) { const idx = 0 + 15 * 16 + ly * 256; if (!nNE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nNE, idx); }
+                    if (lz > 15 && lx < 0) { const idx = 15 + 0 * 16 + ly * 256; if (!nSW) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nSW, idx); }
+                    if (lz > 15 && lx > 15) { const idx = 0 + 0 * 16 + ly * 256; if (!nSE) { missingNeighbor = true; return ownEdgeLight(lx, ly, lz); } return extractLightFromChunk(nSE, idx); }
+                    return 15;
+                };
+                return { getLocal, getLocalLight };
+            }
+            // PHASE 3B: refill ONLY the vertex colors of a chunk's terrain band meshes from current
+            // light — no geometry rebuild. Returns false (=> caller should full-remesh) if the chunk
+            // has water (water colors aren't mapped), any band lacks a lightMap, or data is missing.
+            // Uses the SHARED cellCornerLightDamped so colors match a full remesh exactly.
+            function refillChunkLightColors(cKey) {
+                if (chunkMeshes.has(cKey + "_WATER")) return false;
+                const terrainKeys = [];
+                if (SETTINGS.bandedMeshing) {
+                    for (let b = 0; b < BANDS_PER_CHUNK; b++) {
+                        if (chunkMeshes.has(bandKey(cKey, b) + "_WATER")) return false;
+                        if (chunkMeshes.has(bandKey(cKey, b))) terrainKeys.push(bandKey(cKey, b));
+                    }
+                } else if (chunkMeshes.has(cKey)) {
+                    terrainKeys.push(cKey);
+                }
+                if (terrainKeys.length === 0) return false;
+                for (const mk of terrainKeys) { const g = chunkMeshes.get(mk).geometry; if (!g.userData.lightMap) return false; }
+                const [cx, cz] = parseChunkKey(cKey);
+                const getters = buildChunkLightGetters(cx, cz);
+                if (!getters) return false;
+                const { getLocal, getLocalLight } = getters;
+                for (const mk of terrainKeys) {
+                    const geo = chunkMeshes.get(mk).geometry;
+                    const lm = geo.userData.lightMap;
+                    const colArr = geo.attributes.color.array;
+                    for (let q = 0; q < lm.quadCount; q++) {
+                        const f = FACE_DIRECTIONS[lm.face[q]];
+                        const nx = f[3], ny = f[4], nz = f[5];
+                        for (let k = 0; k < 4; k++) {
+                            const ci = lm.cells[q * 4 + k];
+                            const x = ci & 15, z = (ci >> 4) & 15, y = (ci >> 8);
+                            const cl = cellCornerLightDamped(nx, ny, nz, x, y, z, getLocal, getLocalLight);
+                            const c = lm.ao[q * 4 + k] * cl[k];
+                            const o = q * 12 + k * 3;
+                            colArr[o] = c; colArr[o + 1] = c; colArr[o + 2] = c;
+                        }
+                    }
+                    const colAttr = geo.attributes.color;
+                    colAttr.clearUpdateRanges();
+                    colAttr.addUpdateRange(0, lm.quadCount * 12);
+                    colAttr.needsUpdate = true;
+                }
+                return true;
+            }
             function renderChunk(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
@@ -40952,6 +41072,20 @@ self.onmessage = async (e) => {
 
                         // Update bounds using pre-computed tight bounds from section data
                         applyTightChunkBounds(terrainGeo, tightBounds);
+
+                        // PHASE 3B: copy this band's per-quad lightMap slice onto the geometry so a
+                        // later light-only change can refill colors (refillChunkLightColors) instead of
+                        // re-meshing. tFaceCount = quads in this band; _lm* are indexed by quad.
+                        if (SETTINGS.lightRefill) {
+                            terrainGeo.userData.lightMap = {
+                                quadCount: tFaceCount,
+                                cells: _lmCells.slice(0, tFaceCount * 4),
+                                ao: _lmAO.slice(0, tFaceCount * 4),
+                                face: _lmFace.slice(0, tFaceCount),
+                            };
+                        } else if (terrainGeo.userData.lightMap) {
+                            terrainGeo.userData.lightMap = null; // stale (flag turned off) — force remesh path
+                        }
 
                         // Attach to mesh (attributes already have DynamicDrawUsage from pool)
                         const terrainMesh = acquireChunkMesh("terrain");
@@ -41631,15 +41765,20 @@ self.onmessage = async (e) => {
                     // handle the swap atomically to prevent the "flash" artifact where chunk disappears
                     // momentarily during mesh rebuild. Old mesh stays visible until new mesh is ready.
                     if (isDirty) { dirtyChunks.delete(job.key); }
+                    const _reasonMask = chunkDirtyReason.get(job.key) || 0; // PHASE 3B: read before clearing
                     chunkDirtyReason.delete(job.key); // Phase 0: rebuild captured all accumulated reasons
                     // OPTIMIZATION: Pass distance for LOD calculation
                     const jobDistSq = job.dist || 0;
-                    // PIPELINED (Item 1): dispatch the worker mesh job and move on — no await.
-                    // The completed mesh is applied later by drainReadyMeshResults(), so state
-                    // recording is deferred to the apply path (the mesh has not landed yet). The
-                    // sync fallback path renders inline and records state immediately.
-                    // NOTE: gated by WORKER_MESH_PIPELINE_ENABLED until worker mesher parity lands.
-                    if (WORKER_MESH_PIPELINE_ENABLED && SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                    // PHASE 3B: a pure LIGHT dirty (no geometry change) can REFILL colors instead of
+                    // re-meshing. refillChunkLightColors declines (returns false) if there's no lightMap
+                    // yet, the chunk has water, or the flag is off — then we fall through to a rebuild.
+                    if (SETTINGS.lightRefill && _reasonMask === DIRTY_REASON.LIGHT && refillChunkLightColors(job.key)) {
+                        chunkDirtyBands.delete(job.key); // refill covered all bands; clear the per-band scope
+                        recordChunkUpdateState(job.key, "light-refill", "rendered");
+                        chunkUpdateDiagnostics.pending.delete(job.key);
+                    } else if (WORKER_MESH_PIPELINE_ENABLED && SETTINGS.useWorkersForMesh && chunkWorkerPool) {
+                        // PIPELINED: dispatch the worker mesh job; the apply drain finishes it.
+                        // NOTE: gated by WORKER_MESH_PIPELINE_ENABLED until worker mesher parity lands.
                         dispatchMeshJob(jobCx, jobCz, job.key, jobDistSq);
                     } else {
                         renderChunk(jobCx, jobCz, jobDistSq);
