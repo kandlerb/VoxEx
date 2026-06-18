@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.20";
+            const VOXEX_BUILD = "2026-06-18.1";
             const VOXEX_RECENT_CHANGES = [
+                "PHASE 3.5 LAZY BANDING: banding is now PER-CHUNK instead of global. Chunks stream/first-build as a single column (cheap) and convert to banded geometry only on their FIRST edit — so edits still rebuild one band, but streaming no longer pays banding's 4x first-build overhead. (meshProfile A/B showed always-on banding ~doubled streaming mesh load: 146 vs 81 ms/s.) New: bandedChunkKeys set + chunkUsesBands() predicate (replaces the global SETTINGS.bandedMeshing reads in isChunkMeshed / releaseMeshForKey / refillChunkLightColors / numBands / eviction), markChunkBanded() on the 2 center-edit sites (updateLocalArea + light-neutral edit), and an end-of-build release of the orphan single-column mesh on the unbanded->banded transition. SETTINGS.bandedMeshing now means 'band edited chunks (lazy)'. Console: setEagerBanding(true) restores the old always-band behavior for A/B re-measurement; meshProfile() to compare.",
                 "PHASE 4 'measure first': added a main-thread mesh-time profiler (diagnostic only, no behavior change). renderChunk + successful light-refill are wrapped to accumulate timing into _meshProfile; processChunkQueue records the worst single-frame mesh time. Console: meshProfile.reset() then fly into fresh terrain then meshProfile() — reports builds, avg ms/build, meshMsPerSec, and worstFrameMs (>16.7ms = meshing alone can drop a 60fps frame during streaming => Phase 4 justified). Used to decide whether moving meshing off-thread (Phase 4) is worth the XL effort. renderChunk split into a thin timing wrapper + _renderChunkImpl; refillChunkLightColors likewise.",
                 "WET SAND DAMP back to CRISP/BLOCKY: put the discrete damp level (0 dry / 1 light / 2 dark) back in the greedy merge key, so differently-damp cells stop merging and the shoreline no longer interpolates (Phase 3A had softened it once light left the key). getMergeKey layout now (blockId<<10)|(damp<<8)|AO; blockId extraction >>8 -> >>10. cellCornerLightDamped sets _lastDampLevel which the mesher passes to getMergeKey. damp = f(blocks) not light, so geometry stays light-independent and the Phase 3B refill still works (refill on a uniform-damp quad stays crisp).",
                 "DEFAULT: bandedMeshing now defaults to TRUE for all players (the tested Phase 2 path). lightRefill stays OFF by default (experimental, enable via setLightRefill(true)). Banding = ~4x draw calls, offset by per-band rebuilds + per-band frustum culling. NOTE: defaulting banding ON exercises it from INITIAL world load / pregen / world creation — paths the runtime setBandedMeshing() toggle never hit — so a FRESH world load + new-world creation should be tested before deploy. Revert: set bandedMeshing back to false in DEFAULTS (~6139) + the savedSettings fallback (~5884).",
@@ -6647,12 +6648,21 @@
             // Strip "#band" and "_WATER" to recover the true chunk base key (cKey). Handles unbanded
             // keys unchanged (no "#") so it is safe on both paths. CRITICAL for torch/fire release.
             function chunkBaseOfMeshKey(meshKey) { return meshKey.replace("_WATER", "").replace(/#\d+$/, ""); }
+            // PHASE 3.5 LAZY BANDING: banding is PER-CHUNK, not global. A chunk renders as a single column
+            // (cheap, no banding overhead) until it is first EDITED, then converts to banded geometry so
+            // subsequent edits rebuild one band. bandedChunkKeys holds the base cKeys that render banded.
+            const bandedChunkKeys = new Set();
+            let _eagerBanding = false; // debug: force always-band (pre-3.5 behavior) for the meshProfile A/B
+            // Single source of "does this chunk use banded geometry?" — master switch AND (eager OR edited).
+            function chunkUsesBands(cKey) { return SETTINGS.bandedMeshing && (_eagerBanding || bandedChunkKeys.has(cKey)); }
+            // Mark a chunk banded on its FIRST edit (center chunk of an edit only — NOT seam neighbors).
+            function markChunkBanded(cx, cz) { if (SETTINGS.bandedMeshing) bandedChunkKeys.add(getChunkKey(cx, cz)); }
             // "Does this chunk currently have a LIVE mesh?" — checks the unbanded key (default path) AND
             // any band key (banded path). NOTE: never use meshedChunkKeys for this — that set means
             // "meshed at least once (data loaded)" and isn't cleared on a range-release.
             function isChunkMeshed(cKey) {
                 if (chunkMeshes.has(cKey) || chunkMeshes.has(cKey + "_WATER")) return true;
-                if (SETTINGS.bandedMeshing) { for (let b = 0; b < BANDS_PER_CHUNK; b++) { if (chunkMeshes.has(bandKey(cKey, b)) || chunkMeshes.has(bandKey(cKey, b) + "_WATER")) return true; } }
+                if (chunkUsesBands(cKey)) { for (let b = 0; b < BANDS_PER_CHUNK; b++) { if (chunkMeshes.has(bandKey(cKey, b)) || chunkMeshes.has(bandKey(cKey, b) + "_WATER")) return true; } }
                 return false;
             }
             // Per-band world-space bounds for applyTightChunkBounds ({minX,minY,minZ,maxX,maxY,maxZ}).
@@ -24976,6 +24986,7 @@
                     // they still rebuild the mesh (bypassLighting; existing light values stay valid).
                     const meshNeutral = (oldId === AIR || oldId === FIRE) && (id === AIR || id === FIRE);
                     if (!meshNeutral) {
+                        markChunkBanded(cx, cz); // PHASE 3.5: light-neutral but geometry/texture changed → band it
                         scheduleChunkUpdate(cx, cz, false, "block-edit-lightneutral", { bypassLighting: true, bands: bandMaskForY(y) });
                     }
                     return;
@@ -28920,6 +28931,7 @@ self.onmessage = async (e) => {
                     for (const key of Array.from(chunkMeshes.keys())) releaseMeshForKey(key);
                     SETTINGS.bandedMeshing = !!on;
                     meshedChunkKeys.clear();
+                    bandedChunkKeys.clear(); // PHASE 3.5: reset lazy-banding state (fresh, consistent start)
                     invalidateFrustumCache();
                     for (const key of Array.from(activeChunks)) {
                         const [cx, cz] = parseChunkKey(key);
@@ -28927,6 +28939,10 @@ self.onmessage = async (e) => {
                     }
                     return "bandedMeshing = " + SETTINGS.bandedMeshing + " (" + activeChunks.size + " chunks re-queued)";
                 };
+                // PHASE 3.5 DEBUG: force every chunk to render banded (the pre-3.5 "always band" behavior)
+                // for the meshProfile() A/B. _eagerBanding=true reproduces the old ~146 ms/s streaming load;
+                // false (default) is lazy banding. Rebuilds all visible chunks so the change takes effect.
+                window.setEagerBanding = (on) => { _eagerBanding = !!on; if (typeof rebuildAllVisibleChunks === 'function') rebuildAllVisibleChunks(); return "eagerBanding = " + _eagerBanding; };
                 // DEBUG: live-toggle Phase 3B light-only color refill. Existing meshes have no lightMap,
                 // so a rebuild is needed to (de)populate it before the refill path can engage.
                 window.setLightRefill = (on) => {
@@ -40333,7 +40349,7 @@ self.onmessage = async (e) => {
                 // Torches/fires belong to the CHUNK, not a band. Unbanded: release as before. Banded:
                 // only release when no other band/mesh of this chunk is still live (else lights vanish early).
                 let releaseChunkLevel = true;
-                if (SETTINGS.bandedMeshing) { for (const k of chunkBandMeshKeys(chunkBase)) { if (k !== key && chunkMeshes.has(k)) { releaseChunkLevel = false; break; } } }
+                if (chunkUsesBands(chunkBase)) { for (const k of chunkBandMeshKeys(chunkBase)) { if (k !== key && chunkMeshes.has(k)) { releaseChunkLevel = false; break; } } }
                 if (releaseChunkLevel) { releaseChunkTorches(chunkBase); releaseChunkFires(chunkBase); }
                 const mesh = chunkMeshes.get(key);
                 if (!mesh) return;
@@ -40490,7 +40506,7 @@ self.onmessage = async (e) => {
             function _refillChunkLightColorsImpl(cKey) {
                 if (chunkMeshes.has(cKey + "_WATER")) return false;
                 const terrainKeys = [];
-                if (SETTINGS.bandedMeshing) {
+                if (chunkUsesBands(cKey)) {
                     for (let b = 0; b < BANDS_PER_CHUNK; b++) {
                         if (chunkMeshes.has(bandKey(cKey, b) + "_WATER")) return false;
                         if (chunkMeshes.has(bandKey(cKey, b))) terrainKeys.push(bandKey(cKey, b));
@@ -40712,8 +40728,12 @@ self.onmessage = async (e) => {
                     // PHASE 2: banded meshing. numBands===1 ⇒ single column ⇒ behaviourally identical
                     // to the pre-banding path (mKey===cKey, whole-chunk tight bounds). When on, the
                     // section loop flushes a band-keyed mesh at each band boundary (mid-loop) + once after.
-                    const numBands = SETTINGS.bandedMeshing ? BANDS_PER_CHUNK : 1;
+                    const useBands = chunkUsesBands(cKey);
+                    const numBands = useBands ? BANDS_PER_CHUNK : 1;
                     const secPerBand = SECTIONS_PER_CHUNK / numBands;
+                    // PHASE 3.5 lazy banding: this chunk just became banded (first edit) but still has its
+                    // single-column mesh. Release it AFTER the bands attach (end of build) — no 1-frame hole.
+                    const _transitioningToBanded = useBands && (chunkMeshes.has(cKey) || chunkMeshes.has(cKey + "_WATER"));
                     // Per-band dirty scope (2.6): rebuildMask bit b set => rebuild band b. No entry => -1
                     // (all bands: streaming/first build + whole-column light/neighbor changes that schedule
                     // with the default ALL_BANDS_MASK). _skipBand is set per band as the loop crosses into it.
@@ -41257,6 +41277,8 @@ self.onmessage = async (e) => {
                     }
                     } // end flushBand
                     if (numBands === 1 || !_skipBand) flushBand(numBands - 1); // attach the final/only band (unless skipped)
+                    // PHASE 3.5: bands are attached; drop the now-orphan single-column mesh from before the transition.
+                    if (_transitioningToBanded) { releaseMeshForKey(cKey); releaseMeshForKey(cKey + "_WATER"); }
 
                     // --- CREATE TORCH MODELS ---
                     // Clean up old torches first (CRITICAL: must dispose geometries to prevent leak)
@@ -41626,7 +41648,8 @@ self.onmessage = async (e) => {
                             // Remove terrain + water meshes (and all bands when banded)
                             releaseMeshForKey(targetKey);
                             releaseMeshForKey(targetKey + "_WATER");
-                            if (SETTINGS.bandedMeshing) { for (const k of chunkBandMeshKeys(targetKey)) releaseMeshForKey(k); }
+                            if (chunkUsesBands(targetKey)) { for (const k of chunkBandMeshKeys(targetKey)) releaseMeshForKey(k); }
+                            bandedChunkKeys.delete(targetKey); // PHASE 3.5: re-streamed chunk starts unbanded
                             chunkRenderedFaces.delete(targetKey);
                             meshPrunedDuringUpdate = true;
                         }
@@ -41637,7 +41660,7 @@ self.onmessage = async (e) => {
                 // Strip _WATER suffix to check if the base chunk is needed
                 // If it's not in our "Needed" list, KILL IT IMMEDIATELY
                 const meshKeys = Array.from(chunkMeshes.keys());
-                for (const key of meshKeys) { const baseKey = chunkBaseOfMeshKey(key); if (!chunksInRange.has(baseKey)) { releaseMeshForKey(key); meshPrunedDuringUpdate = true; }}
+                for (const key of meshKeys) { const baseKey = chunkBaseOfMeshKey(key); if (!chunksInRange.has(baseKey)) { releaseMeshForKey(key); bandedChunkKeys.delete(baseKey); meshPrunedDuringUpdate = true; }}
                 if (meshPrunedDuringUpdate) { invalidateFrustumCache(); }
                 // --- 7. Smart Queueing ---
                 // Sort by distance (closest first)
@@ -41927,6 +41950,7 @@ self.onmessage = async (e) => {
                 // Schedule center chunk update with immediate dispatch and lighting bypass.
                 // The light job for player edits is critical (same chunk) and processes before
                 // mesh build in updateChunkSystem(), so bypassing the pending check is safe.
+                markChunkBanded(cx, cz); // PHASE 3.5: this chunk is edited → render it banded from now on
                 scheduleChunkUpdate(cx, cz, true, "edit-center", { bypassLighting: true, immediate: true, bands: bandMask });
 
                 // Check boundaries and update neighbors if necessary

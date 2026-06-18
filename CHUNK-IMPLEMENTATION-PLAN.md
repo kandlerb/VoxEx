@@ -4,7 +4,10 @@
 **Companion to:** `CCR-chunk-remesh-consolidation.md` (the audit + design rationale). This document
 is the **build order and full code-level spec** for executing that CCR.
 **Status:** ✅ **Phases 0–3 IMPLEMENTED & in `voxEx.html` (build 2026-06-17.19), user-verified in-browser.**
-Phase 4 (worker-thread meshing) and Phase F (light-as-texture) are deferred to separate future CCRs.
+⭐ **Phase 3.5 (lazy banding) PLANNED — do next** (cheap, data-driven: the 2026-06-17.20 `meshProfile()`
+A/B showed always-on banding ~doubles streaming mesh load). Phase 4 (worker-thread meshing, justified by
+the same data but XL) deferred until after Phase 3.5 re-measurement; Phase F (light-as-texture) is a
+separate future CCR.
 
 > **Completion summary (2026-06-17):**
 > - **Phase 0 — coalescing scheduler:** DONE. `DIRTY_REASON`/`chunkDirtyReason` mask + neighbor-drain de-dupe.
@@ -682,6 +685,138 @@ behind the flag, so if they regress visuals, revert the `getMergeKey`/corner-sam
 
 ---
 
+## Phase 3.5 — Lazy banding (data-driven, do BEFORE Phase 4)  ⭐ (S, low risk)
+
+**Origin:** the Phase 4 "measure first" profiler (`meshProfile()`, build 2026-06-17.20) was run
+during fresh-terrain streaming, banded vs unbanded:
+
+| metric | banded (always-on, current default) | unbanded |
+|---|---|---|
+| `meshMsPerSec` (total main-thread mesh load) | **145.6** | **80.9** |
+| `worstFrameMs` | 40 | 35 |
+| builds / window | 450 / 39.5 s | 8184 / 38.8 s |
+
+**Finding:** *always-on* banding ~**doubles** main-thread mesh load during streaming (146 vs 81 ms/s).
+Cause: streaming does **first builds**, which rebuild *all 4 bands* and get **zero** banding benefit
+(no clean band to skip) while paying ~4× the flush/upload/greedy overhead. Banding's only payoff is
+per-**edit** (rebuild 1 band instead of the column) — and during exploration almost nothing is edited.
+So we pay banding's streaming tax on chunks that will never be edited.
+
+**Goal:** keep the per-edit win, drop the streaming tax. Build streaming / first-build chunks as a
+**single column** (unbanded, `numBands = 1`); convert a chunk to **banded** geometry only the first
+time it is **edited**. Most chunks stay cheap-unbanded; only edited chunks pay for (and benefit from)
+banding. Expected: streaming `meshMsPerSec` drops toward the 81 number; edit rebuilds stay per-band.
+
+> This is a *fraction* of Phase 4's effort and addresses the larger share of the measured streaming
+> cost. Do it first; re-measure; only then decide whether Phase 4 (off-thread) is still warranted.
+
+### Design — banding becomes per-chunk, not global
+
+Today `numBands` is global: `SETTINGS.bandedMeshing ? BANDS_PER_CHUNK : 1` (40715). We make it
+per-chunk, keyed off a new set of "this chunk has been edited" base keys.
+
+- **New state** (declare beside `chunkDirtyBands`, ~16501):
+  ```js
+  const bandedChunkKeys = new Set();   // base cKeys that render as bands (entered on first edit)
+  let _eagerBanding = false;           // debug: force always-band (old behavior) for A/B re-measure
+  ```
+- **Predicate** (single source of "does this chunk use bands"):
+  ```js
+  function chunkUsesBands(cKey) { return SETTINGS.bandedMeshing && (_eagerBanding || bandedChunkKeys.has(cKey)); }
+  ```
+  `SETTINGS.bandedMeshing` keeps its role as the master switch; its meaning changes from **"band
+  every chunk"** to **"band edited chunks (lazy)"**. (There is no reason to keep always-band: lazy is
+  strictly better — same edit benefit, no streaming cost. `_eagerBanding` exists only to re-create the
+  old behavior for the verification A/B, not as a user setting.)
+
+### Edit sites (all line numbers are pre-edit anchors)
+
+1. **`numBands` (40715)** — the core switch + capture the unbanded→banded transition:
+   ```js
+   const useBands = chunkUsesBands(cKey);
+   const numBands = useBands ? BANDS_PER_CHUNK : 1;
+   const secPerBand = SECTIONS_PER_CHUNK / numBands;
+   // Transition: this chunk just became banded but still has its old single-column mesh.
+   // Release it AFTER the bands attach (below) so there is no 1-frame hole.
+   const _transitioningToBanded = useBands && (chunkMeshes.has(cKey) || chunkMeshes.has(cKey + "_WATER"));
+   ```
+   (`_skipBand` already (re)builds *all* bands on a first banded build because none of the `cKey#band`
+   meshes exist yet — so the partial `rebuildMask` from the triggering edit is harmless; the first
+   banded build is always whole-column.)
+
+2. **End of build, after the final `flushBand(numBands - 1)` (41259)** — atomic swap-out of the stale
+   single-column mesh (only reached if the build ran to completion; the early-returns above never get
+   here, so we never delete the old mesh without a replacement):
+   ```js
+   if (_transitioningToBanded) { releaseMeshForKey(cKey); releaseMeshForKey(cKey + "_WATER"); }
+   ```
+   `releaseMeshForKey` sees `chunkUsesBands(chunkBase)===true` and live band meshes → keeps the chunk's
+   torches/fires (its "last band" guard), just removes the orphan single mesh and decrements the count.
+
+3. **Mark a chunk banded on its FIRST edit — center chunk only.** Add a helper and call it from the two
+   genuine center-edit schedule sites. Neighbors (seam rebuilds) stay unbanded — they are user-paced,
+   one cheap whole-column build, and banding them is not where the cost is.
+   ```js
+   function markChunkBanded(cx, cz) { if (SETTINGS.bandedMeshing) bandedChunkKeys.add(getChunkKey(cx, cz)); }
+   ```
+   - `updateLocalArea` (41921) — add `markChunkBanded(cx, cz);` right before the `scheduleChunkUpdate(cx, cz, true, "edit-center", …)` call (41930). Do **not** add it to the four edge/corner neighbor schedules.
+   - The light-neutral edit path (24979, `"block-edit-lightneutral"`) — add `markChunkBanded(cx, cz);` immediately before its `scheduleChunkUpdate`.
+
+4. **Replace the five remaining global `SETTINGS.bandedMeshing` "is-this-chunk-banded" reads with `chunkUsesBands(...)`** (the master-switch read in `setBandedMeshing` and `markChunkBanded` stays as `SETTINGS.bandedMeshing`):
+   - `isChunkMeshed` (6655): `if (SETTINGS.bandedMeshing)` → `if (chunkUsesBands(cKey))`. Keep the leading `chunkMeshes.has(cKey)` check (covers unbanded + the transition frame).
+   - `releaseMeshForKey` (40336): `if (SETTINGS.bandedMeshing)` → `if (chunkUsesBands(chunkBase))`.
+   - `refillChunkLightColors` (40493): `if (SETTINGS.bandedMeshing)` → `if (chunkUsesBands(cKey))` (refill is OFF by default, but keep it correct).
+   - Eviction prune (41629): `if (SETTINGS.bandedMeshing) { for (k of chunkBandMeshKeys(targetKey)) releaseMeshForKey(k); }` → `if (chunkUsesBands(targetKey)) {…}` **and** `bandedChunkKeys.delete(targetKey);` so a re-streamed chunk starts unbanded again.
+   - `chunkUsesBands` must be **hoisted above** its first use (6655) — declare it near the other band helpers (~6646), and declare `bandedChunkKeys`/`_eagerBanding` even earlier (the helper closes over them; module-scoped `const`/`let` are fine as long as the *call* runs after init, which it does — all calls are runtime).
+
+5. **Cleanup-on-unload (41640)** — the scheme-agnostic prune loop already releases band keys by base
+   key; add `bandedChunkKeys.delete(baseKey)` in its `!chunksInRange.has(baseKey)` branch so the set
+   does not leak entries for unloaded chunks (memory hygiene; idempotent if hit per band key).
+
+6. **`setBandedMeshing` toggle (28919)** — add `bandedChunkKeys.clear();` next to `meshedChunkKeys.clear();`
+   (both directions: a fresh, consistent start). Add the A/B debug toggle next to it:
+   ```js
+   window.setEagerBanding = (on) => { _eagerBanding = !!on; return rebuildAllVisibleChunks(), "eagerBanding = " + _eagerBanding; };
+   ```
+
+### What does NOT change
+- Key scheme (`cKey` unbanded, `cKey#band`(+`_WATER`) banded), `flushBand`, per-band dirty scope,
+  `bandMaskForY`, geometry pool, shadow-caster fix, Phase 3 light paths — all untouched.
+- No new persisted `SETTINGS`/`DEFAULTS` key (we repurpose `bandedMeshing`; `_eagerBanding` is a
+  non-persisted debug `let`). No `SETTINGS_PROFILES` change.
+- Banded→unbanded never happens in place (a chunk only goes unbanded via toggle/unload, both of which
+  release everything), so no reverse-transition handling is needed.
+
+### Risks
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| Orphan single-column mesh left after transition (double-draw / leak) | Low | release at end-of-build (Edit 2); `geometryPool.getStats()` + leak detector stay flat in a place-blocks soak |
+| Torch/fire dropped during transition release | Low | `releaseMeshForKey` last-band guard already keeps chunk-level resources while any band is live (verified Phase 2) |
+| Missed `SETTINGS.bandedMeshing` site still assumes global banding | Med | the 5-site list in Edit 4 is exhaustive per `grep 'SETTINGS\.bandedMeshing'`; re-grep after editing |
+| `chunkUsesBands` used before declaration | Low | declare set/flag/predicate in the band-helper block (6629–6667); all *calls* are runtime |
+| Edit at a chunk seam leaves the neighbor unbanded forever (whole-column rebuild per repeated border edit) | Low | acceptable — edits are user-paced; if a border-wall workflow proves costly, mark the +Y/seam neighbor banded too (follow-up) |
+
+### Verification / acceptance gate
+1. `node --check` (reconstruction method) + re-grep `SETTINGS\.bandedMeshing` to confirm only the
+   master-switch sites remain; the rest are `chunkUsesBands`.
+2. `tools/voxex-tests.html` — full suite green (no regression). Add a focused check if the `?test=1`
+   seam exposes it: after one `setBlock`, the edited chunk has `cKey#0..3` mesh keys and **no** bare
+   `cKey` mesh; a freshly streamed (unedited) chunk has a bare `cKey` mesh and **no** band keys.
+3. **Primary gate — re-measure with `meshProfile()`** (same fly-into-fresh-terrain test):
+   - Lazy (new default): `meshMsPerSec` should fall from ~146 toward ~81; `worstFrameMs` should drop.
+   - `setEagerBanding(true)` reproduces the old ~146 number (confirms the lever).
+   - Manual edit check: place/break a block, confirm only the affected band rebuilds (debug overlay /
+     a temporary build-count log) and the chunk stays visually correct (AO, shoreline damp, seams).
+4. Bump `VOXEX_BUILD` + prepend a `VOXEX_RECENT_CHANGES` line.
+
+### Decision after Phase 3.5
+- If lazy banding pulls `worstFrameMs` under ~16.7 ms during streaming → **Phase 4 becomes optional /
+  low-priority** (the hitch is gone without an off-thread rewrite).
+- If streaming still hitches (`worstFrameMs` ≫ 16.7) → the residual is inherent mesh cost → **proceed
+  to Phase 4** with the data justifying the XL effort.
+
+---
+
 ## Phase 4 — Re-enable the worker mesh pipeline  ⚠ (XL, re-scoped after 2026-06-17 audit)
 
 **Goal:** move the per-chunk mesh build off the main thread (`WORKER_MESH_PIPELINE_ENABLED = true`,
@@ -774,9 +909,11 @@ do 4b/4c.
   worker's getters, SETTINGS snapshot, and the per-band protocol must all match exactly.
 - **SETTINGS staleness:** if the user changes AO/smoothLighting/banding mid-session, in-flight worker
   jobs use the old snapshot → transient mismatch until rebuild. Decide whether to version/invalidate.
-- **Worth-it check first.** Phases 0–3 already cut per-build cost (banding + per-band rebuilds +
-  refill). Before committing to XL effort, **profile** whether main-thread meshing is still a real
-  frame-time bottleneck (the "measure first" option). If it isn't, Phase 4 may not be worth the risk.
+- **Worth-it check — DONE (2026-06-17.20).** `meshProfile()` over fresh-terrain streaming: main-thread
+  meshing IS a bottleneck (`worstFrameMs` 35–40 ≫ 16.7 in both banded and unbanded), so Phase 4 is
+  justified by data — **but** the A/B also showed always-on banding ~doubles streaming load (146 vs 81
+  ms/s). Therefore **Phase 3.5 (lazy banding) goes first** (cheap, removes the banding tax); re-measure;
+  only do Phase 4 if `worstFrameMs` is still ≫ 16.7 afterward. See Phase 3.5.
 
 ---
 
@@ -825,7 +962,9 @@ this plan** — write `CCR-light-texture.md` after Phases 0–4 land and are mea
 
 **Phase 3** ✅ — [x] 3.1 `getMergeKey` + delete dead code (`>>10` after damp re-add) · [x] 3.2 corner sampling (visual-verified) · [x] 3.3 `refillChunkLightColors` + lightMap + drain branch · [x] drain branch fixed (no `.every` short-circuit — uses explicit `every(refill)` decline-to-remesh) · [x] `SETTINGS.lightRefill` (default OFF) · [x] getMergeKey tests + band/damp tests · [x] banner · [x] follow-up: damp level back in merge key (crisp shoreline)
 
-**Phase 4** ⏸ DEFERRED (future CCR, re-scoped XL) — [ ] (measure first: is main-thread meshing still a bottleneck?) · [ ] 4a inject mesher via `__MESH_FUNCS__` + SETTINGS snapshot + reconcile worker getLocal/getLocalLight + worker band loop · [ ] buffer byte-parity test (gate) · [ ] 4b per-band payload protocol + rewrite `applyWorkerMeshData` (flushBand attach, pooled mesh, lightMap, torch/fire/shadows) · [ ] 4c flip 13441 + tune timeout/backpressure · [ ] banner
+**Phase 3.5 (lazy banding)** 🟢 CODE COMPLETE (build 2026-06-18.1) — [x] `bandedChunkKeys` set + `_eagerBanding` + `chunkUsesBands` predicate + `markChunkBanded` (helper block ~6650) · [x] `numBands`→`useBands`/transition-capture + end-of-build orphan release · [x] `markChunkBanded` on both center-edit sites (`updateLocalArea` + light-neutral) · [x] swapped the 5 global `bandedMeshing` reads → `chunkUsesBands` (isChunkMeshed/releaseMeshForKey/refillChunkLightColors/numBands/eviction) · [x] unload cleanup `bandedChunkKeys.delete` · [x] `setBandedMeshing` clears the set + `setEagerBanding` A/B toggle · [x] node --check + re-grep (only master-switch reads remain) · [x] banner · [ ] **in-browser: `tools/voxex-tests.html` green** · [ ] **re-measure `meshProfile()` vs `setEagerBanding(true)` (acceptance gate)** · [ ] manual edit check (only touched band rebuilds; AO/shoreline/seams correct)
+
+**Phase 4** ⏸ DEFERRED (future CCR, re-scoped XL) — [x] measure first (DONE 2026-06-17.20: meshing IS a bottleneck; do Phase 3.5 first, then re-measure) · [ ] 4a inject mesher via `__MESH_FUNCS__` + SETTINGS snapshot + reconcile worker getLocal/getLocalLight + worker band loop · [ ] buffer byte-parity test (gate) · [ ] 4b per-band payload protocol + rewrite `applyWorkerMeshData` (flushBand attach, pooled mesh, lightMap, torch/fire/shadows) · [ ] 4c flip 13441 + tune timeout/backpressure · [ ] banner
 
 **Phase F** ⏸ DEFERRED — [ ] (later) write `CCR-light-texture.md`
 
