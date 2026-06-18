@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.18";
+            const VOXEX_BUILD = "2026-06-17.19";
             const VOXEX_RECENT_CHANGES = [
+                "WET SAND DAMP back to CRISP/BLOCKY: put the discrete damp level (0 dry / 1 light / 2 dark) back in the greedy merge key, so differently-damp cells stop merging and the shoreline no longer interpolates (Phase 3A had softened it once light left the key). getMergeKey layout now (blockId<<10)|(damp<<8)|AO; blockId extraction >>8 -> >>10. cellCornerLightDamped sets _lastDampLevel which the mesher passes to getMergeKey. damp = f(blocks) not light, so geometry stays light-independent and the Phase 3B refill still works (refill on a uniform-damp quad stays crisp).",
                 "DEFAULT: bandedMeshing now defaults to TRUE for all players (the tested Phase 2 path). lightRefill stays OFF by default (experimental, enable via setLightRefill(true)). Banding = ~4x draw calls, offset by per-band rebuilds + per-band frustum culling. NOTE: defaulting banding ON exercises it from INITIAL world load / pregen / world creation — paths the runtime setBandedMeshing() toggle never hit — so a FRESH world load + new-world creation should be tested before deploy. Revert: set bandedMeshing back to false in DEFAULTS (~6139) + the savedSettings fallback (~5884).",
                 "CHUNK REMESH CCR — Phase 3B (light-only color refill, behind SETTINGS.lightRefill, DEFAULT OFF): a pure LIGHT dirty (edge-lighting convergence, sunlight settle, torch place/break ripple) now refills vertex COLORS instead of re-meshing. At build (when lightRefill on) each terrain band geometry stores a compact per-quad lightMap (4 corner cell indices + faceIdx + 4 AO, indexed by color-buffer offset/12). refillChunkLightColors(cKey) rebuilds the chunk's light getters (buildChunkLightGetters) and recomputes each vertex color via the SHARED cellCornerLightDamped (so refill matches a remesh exactly — no drift), then uploads only the color attribute. processChunkQueue routes a reason===LIGHT dirty to the refill; it declines (=> full remesh) if the chunk has water (water colors aren't mapped), a band lacks a lightMap, or the flag is off. Console: setLightRefill(true/false) (rebuilds once to populate/clear lightMaps). Default path unchanged (flag off); only the cellCornerLightDamped refactor touches the always-on mesher.",
                 "CHUNK REMESH CCR — Phase 3B foundation (refactor, no behavior change): extracted cellCornerLightDamped() as the SINGLE source of truth for a cell's 4 corner lights including the wet-shoreline damp — the mesher now calls it instead of inlining the calc+damp. This is the shared helper the upcoming light-only color refill will also use, so build-time and refill-time colors can't drift. Also added SETTINGS.lightRefill (default OFF, not yet wired). Pure refactor — lighting/shoreline should look IDENTICAL to 3A.",
@@ -38673,14 +38674,15 @@ self.onmessage = async (e) => {
              * @param {number} light - Normalized light level (0-1)
              * @returns {number} 27-bit merge key: (blockId << 11) | (light << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
              */
-            function getMergeKey(blockId, ao, light) {
-                // PHASE 3: light is NO LONGER in the merge key — it moved to a per-vertex attribute so
-                // light-only changes can refill colors without re-meshing. Faces now merge on
-                // blockId + AO only; merged quads sample per-vertex light from their corner cells
-                // (see greedyMeshSection). `light` kept for call-shape compatibility but UNUSED.
-                // Layout (10 bits): (blockId << 8) | AO byte. A real face has blockId>=1 => key>=256,
-                // so the `=== 0` empty-cell sentinel in the greedy pass still holds.
-                return (blockId << 8)
+            function getMergeKey(blockId, ao, light, damp = 0) {
+                // PHASE 3: light is NOT in the merge key — it's a per-vertex attribute so light-only
+                // changes can refill colors without re-meshing. `light` kept for call-shape; UNUSED.
+                // `damp` IS in the key (wet-shoreline level 0/1/2): differently-damp cells must not
+                // merge, so the shoreline darkening stays crisp instead of interpolating. damp depends
+                // on BLOCKS (water adjacency), not light, so geometry stays light-independent.
+                // Layout: (blockId << 10) | (damp[0-2] << 8) | AO byte. Real face blockId>=1 =>
+                // key>=1024, so the `=== 0` empty-cell sentinel in the greedy pass still holds.
+                return (blockId << 10) | ((damp & 3) << 8)
                      | (AO_QUANT_LOOKUP[Math.round(ao[0] * 100)] << 6)
                      | (AO_QUANT_LOOKUP[Math.round(ao[1] * 100)] << 4)
                      | (AO_QUANT_LOOKUP[Math.round(ao[2] * 100)] << 2)
@@ -39392,18 +39394,24 @@ self.onmessage = async (e) => {
             const CORNER_AB_LEFT   = [0,0, 1,0, 1,1, 0,1];
             const CORNER_AB_BACK   = [0,0, 1,0, 1,1, 0,1];
             const CORNER_AB_FRONT  = [1,0, 0,0, 0,1, 1,1];
+            // Wet-shoreline damp level (0 dry / 1 light / 2 dark) of the most recent cellCornerLightDamped()
+            // call. Fed into the merge key so differently-damp cells DON'T merge — keeps the shoreline
+            // darkening crisp/blocky (it interpolated smoothly once light left the key). damp = f(blocks),
+            // not light, so geometry stays light-independent and the Phase 3B refill still works.
+            let _lastDampLevel = 0;
             // PHASE 3: SINGLE SOURCE OF TRUTH for a cell's 4 corner lights INCLUDING the wet-shoreline
             // damp. Used by the mesher (at build time) AND by refillChunkLightColors (on a light-only
             // change), so the two paths can never drift. Returns calculateFaceCornerLight's array with
             // the damp applied in place (top faces only). Pure function of block + light data.
             function cellCornerLightDamped(nx, ny, nz, x, y, z, getLocal, getLocalLight) {
                 const cornerLight = calculateFaceCornerLight(nx, ny, nz, x, y, z, getLocal, getLocalLight);
+                _lastDampLevel = 0; // reset per cell; set below for damp top faces, fed into the merge key
                 // WET SHORELINE: top faces of land blocks near water render damp (two-step gradient).
                 if (ny === 1) {
                     let dampFactor = 0;
                     // DARK damp: this block directly touches water on ANY of its 6 faces.
                     if (isWaterAdjacent(getLocal, x, y, z)) {
-                        dampFactor = 0.78;
+                        dampFactor = 0.78; _lastDampLevel = 2;
                     } else {
                         // LIGHT damp: ONLY when touching a block that is itself in direct water contact.
                         const n0 = getLocal(x + 1, y, z), n1 = getLocal(x - 1, y, z),
@@ -39415,7 +39423,7 @@ self.onmessage = async (e) => {
                             (n3 !== AIR && n3 !== WATER && isWaterAdjacent(getLocal, x, y, z - 1)) ||
                             (n4 !== AIR && n4 !== WATER && isWaterAdjacent(getLocal, x, y + 1, z)) ||
                             (n5 !== AIR && n5 !== WATER && isWaterAdjacent(getLocal, x, y - 1, z))) {
-                            dampFactor = 0.89;
+                            dampFactor = 0.89; _lastDampLevel = 1;
                         }
                     }
                     if (dampFactor > 0) {
@@ -39505,7 +39513,7 @@ self.onmessage = async (e) => {
                             // PHASE 3: light is NOT in the merge key (blockId + AO only), so cells with
                             // different light CAN merge; the merged quad samples per-vertex light from
                             // its corner cells (greedyLight, below). cornerLight still passed for shape.
-                            greedyMergeKeys[idx] = getMergeKey(blockId, ao, cornerLight);
+                            greedyMergeKeys[idx] = getMergeKey(blockId, ao, cornerLight, _lastDampLevel);
                             greedyAO[idx * 4 + 0] = ao[0];
                             greedyAO[idx * 4 + 1] = ao[1];
                             greedyAO[idx * 4 + 2] = ao[2];
@@ -39560,8 +39568,8 @@ self.onmessage = async (e) => {
                             }
 
                             // Get block data for UV lookup.
-                            // Merge key layout (Phase 3): (blockId << 8) | AO byte — see getMergeKey().
-                            const blockId = mergeKey >> 8;
+                            // Merge key layout: (blockId << 10) | (damp << 8) | AO byte — see getMergeKey().
+                            const blockId = mergeKey >> 10;
                             const uv = getBlockUV(blockId);
                             const uvCoord = faceIdx === 0 ? uv.top : faceIdx === 1 ? uv.bottom : uv.side;
 
