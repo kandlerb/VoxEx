@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.14";
+            const VOXEX_BUILD = "2026-06-17.15";
             const VOXEX_RECENT_CHANGES = [
+                "CHUNK REMESH CCR — Phase 3B foundation (refactor, no behavior change): extracted cellCornerLightDamped() as the SINGLE source of truth for a cell's 4 corner lights including the wet-shoreline damp — the mesher now calls it instead of inlining the calc+damp. This is the shared helper the upcoming light-only color refill will also use, so build-time and refill-time colors can't drift. Also added SETTINGS.lightRefill (default OFF, not yet wired). Pure refactor — lighting/shoreline should look IDENTICAL to 3A.",
                 "CHUNK REMESH CCR — Phase 3A (decouple light from geometry, part 1 of 2): light is NO LONGER in the greedy merge key (getMergeKey now (blockId<<8)|AO; dead l0-l3 removed; blockId extraction >>20 -> >>8). Faces merge on blockId+AO only; a merged quad now samples each vertex's light from its CORNER CELL (greedyMeshSection: per-face CORNER_AB pattern derived from computeMergedFaceVertices; width<->u, height<->v). For a 1x1 or uniform-light quad this collapses to the seed cell => identical to before; the change only shows where light VARIES across a merged quad (smoother light gradients on large flat lit surfaces; softer wet-shoreline/torch-edge boundaries, accepted). This makes geometry light-INDEPENDENT — the prerequisite for Phase 3B (light-only color refill instead of remesh). Phase 3B NOT yet done: light changes still remesh. Behind nothing yet — applies to all meshing; verify lighting looks correct (no transposed gradients).",
                 "CHUNK REMESH CCR — Phase 2c (per-band dirty scope): a block edit now rebuilds ONLY the band(s) it touches instead of all 4. New chunkDirtyBands map + ALL_BANDS_MASK + bandMaskForY(y) (dirties the edit's band plus the vertical neighbor band at a band boundary, for correct cross-boundary face/AO). scheduleChunkUpdate gained a {bands} option (default ALL); updateLocalArea (edit-center + edge/corner neighbours, same y => same band mask) and the light-neutral edit path pass the scoped mask. renderChunk reads rebuildMask and SKIPS clean bands that already have a live mesh (keeps them), rebuilding only dirty bands; whole-column changes (light propagation, neighbour/edge updates, streaming/first build) default to ALL bands so they're unaffected. Light-CHANGING edits still rebuild all light-affected bands (sunlight columns) until Phase 3 turns light into a color-only upload. Behind SETTINGS.bandedMeshing (numBands===1 path unchanged).",
                 "FIX (settings not re-baking — AO, water, any rebuildAllVisibleChunks() caller): rebuildAllVisibleChunks released only the 'cKey' terrain mesh, then re-queued. But Phase 2b changed the processChunkQueue queue-skip to isChunkMeshed() (terrain OR water OR any band). releaseMeshForKey('cKey') left 'cKey_WATER' (and every 'cKey#band' mesh in banded mode) intact, so isChunkMeshed() stayed true and the rebuild was SKIPPED — settings like AO / water effects never re-baked (worst in banded mode where the cKey release is a pure no-op). Now marks chunks dirty instead (isDirty bypasses the skip), and renderChunk/flushBand do the atomic band-aware swap (no flash). Affects every setting that re-bakes geometry, not just banded mode.",
@@ -5879,6 +5880,7 @@
                 greedyMeshingEnabled: savedSettings.greedyMeshingEnabled !== undefined ? savedSettings.greedyMeshingEnabled : true,
                 maxGreedyQuadSize: savedSettings.maxGreedyQuadSize !== undefined ? savedSettings.maxGreedyQuadSize : 16, // Max quad width/height
                 bandedMeshing: savedSettings.bandedMeshing !== undefined ? savedSettings.bandedMeshing : false, // Phase 2: per-band geometry output (experimental)
+                lightRefill: savedSettings.lightRefill !== undefined ? savedSettings.lightRefill : false, // Phase 3B: light-only color refill instead of remesh (experimental; not yet wired)
                 // Graphics - Basic
                 AO: savedSettings.AO !== undefined ? savedSettings.AO : true,
                 smoothLighting: savedSettings.smoothLighting !== undefined ? savedSettings.smoothLighting : true,
@@ -6133,6 +6135,7 @@
                 enableSectionLOD: true,
                 greedyMeshingEnabled: true,    // Merge adjacent faces into larger quads (60-90% fewer faces)
                 bandedMeshing: false,          // Phase 2: per-band geometry output (experimental; default off)
+                lightRefill: false,            // Phase 3B: light-only color refill instead of remesh (experimental; default off)
                 maxGreedyQuadSize: 16,         // Max quad width/height (1-16)
                 // Graphics - Basic
                 AO: true,
@@ -39374,6 +39377,41 @@ self.onmessage = async (e) => {
             const CORNER_AB_LEFT   = [0,0, 1,0, 1,1, 0,1];
             const CORNER_AB_BACK   = [0,0, 1,0, 1,1, 0,1];
             const CORNER_AB_FRONT  = [1,0, 0,0, 0,1, 1,1];
+            // PHASE 3: SINGLE SOURCE OF TRUTH for a cell's 4 corner lights INCLUDING the wet-shoreline
+            // damp. Used by the mesher (at build time) AND by refillChunkLightColors (on a light-only
+            // change), so the two paths can never drift. Returns calculateFaceCornerLight's array with
+            // the damp applied in place (top faces only). Pure function of block + light data.
+            function cellCornerLightDamped(nx, ny, nz, x, y, z, getLocal, getLocalLight) {
+                const cornerLight = calculateFaceCornerLight(nx, ny, nz, x, y, z, getLocal, getLocalLight);
+                // WET SHORELINE: top faces of land blocks near water render damp (two-step gradient).
+                if (ny === 1) {
+                    let dampFactor = 0;
+                    // DARK damp: this block directly touches water on ANY of its 6 faces.
+                    if (isWaterAdjacent(getLocal, x, y, z)) {
+                        dampFactor = 0.78;
+                    } else {
+                        // LIGHT damp: ONLY when touching a block that is itself in direct water contact.
+                        const n0 = getLocal(x + 1, y, z), n1 = getLocal(x - 1, y, z),
+                              n2 = getLocal(x, y, z + 1), n3 = getLocal(x, y, z - 1),
+                              n4 = getLocal(x, y + 1, z), n5 = getLocal(x, y - 1, z);
+                        if ((n0 !== AIR && n0 !== WATER && isWaterAdjacent(getLocal, x + 1, y, z)) ||
+                            (n1 !== AIR && n1 !== WATER && isWaterAdjacent(getLocal, x - 1, y, z)) ||
+                            (n2 !== AIR && n2 !== WATER && isWaterAdjacent(getLocal, x, y, z + 1)) ||
+                            (n3 !== AIR && n3 !== WATER && isWaterAdjacent(getLocal, x, y, z - 1)) ||
+                            (n4 !== AIR && n4 !== WATER && isWaterAdjacent(getLocal, x, y + 1, z)) ||
+                            (n5 !== AIR && n5 !== WATER && isWaterAdjacent(getLocal, x, y - 1, z))) {
+                            dampFactor = 0.89;
+                        }
+                    }
+                    if (dampFactor > 0) {
+                        cornerLight[0] = Math.max(0.067, cornerLight[0] * dampFactor);
+                        cornerLight[1] = Math.max(0.067, cornerLight[1] * dampFactor);
+                        cornerLight[2] = Math.max(0.067, cornerLight[2] * dampFactor);
+                        cornerLight[3] = Math.max(0.067, cornerLight[3] * dampFactor);
+                    }
+                }
+                return cornerLight;
+            }
             function greedyMeshSection(faceIdx, sectionBaseY, sectionEndY, getLocal, getLocalLight, startX, startZ, buffers, state) {
                 // Initialize inputFaceCount if not present
                 if (state.inputFaceCount === undefined) state.inputFaceCount = 0;
@@ -39443,43 +39481,9 @@ self.onmessage = async (e) => {
                             // Calculate AO
                             const ao = calculateFaceAO(nx, ny, nz, x, y, z, blockId, getLocal, faceIdx);
 
-                            // Per-corner light (smooth lighting; falls back to flat internally)
-                            const cornerLight = calculateFaceCornerLight(nx, ny, nz, x, y, z, getLocal, getLocalLight);
-
-                            // WET SHORELINE: top faces of land blocks near water render damp in a
-                            // TWO-STEP gradient — ring 1 (cardinal water neighbor) dims ~22%,
-                            // ring 2 (diagonal water, or water two blocks away) dims ~11%, then
-                            // normal. Applied BEFORE the merge key is built (cornerLight feeds
-                            // the key), so differently-damp runs can never merge into one quad.
-                            // Top faces only (ny === 1); ring 2 probes only run when ring 1 is dry.
-                            if (ny === 1) {
-                                let dampFactor = 0;
-                                // DARK damp: this block directly touches water on ANY of its 6 faces.
-                                if (isWaterAdjacent(getLocal, x, y, z)) {
-                                    dampFactor = 0.78;
-                                } else {
-                                    // LIGHT damp: ONLY when touching a block that is itself DARK damp
-                                    // (a land block in direct water contact). Light damp does not
-                                    // propagate further — no chains of lightly-damp blocks.
-                                    const n0 = getLocal(x + 1, y, z), n1 = getLocal(x - 1, y, z),
-                                          n2 = getLocal(x, y, z + 1), n3 = getLocal(x, y, z - 1),
-                                          n4 = getLocal(x, y + 1, z), n5 = getLocal(x, y - 1, z);
-                                    if ((n0 !== AIR && n0 !== WATER && isWaterAdjacent(getLocal, x + 1, y, z)) ||
-                                        (n1 !== AIR && n1 !== WATER && isWaterAdjacent(getLocal, x - 1, y, z)) ||
-                                        (n2 !== AIR && n2 !== WATER && isWaterAdjacent(getLocal, x, y, z + 1)) ||
-                                        (n3 !== AIR && n3 !== WATER && isWaterAdjacent(getLocal, x, y, z - 1)) ||
-                                        (n4 !== AIR && n4 !== WATER && isWaterAdjacent(getLocal, x, y + 1, z)) ||
-                                        (n5 !== AIR && n5 !== WATER && isWaterAdjacent(getLocal, x, y - 1, z))) {
-                                        dampFactor = 0.89;
-                                    }
-                                }
-                                if (dampFactor > 0) {
-                                    cornerLight[0] = Math.max(0.067, cornerLight[0] * dampFactor);
-                                    cornerLight[1] = Math.max(0.067, cornerLight[1] * dampFactor);
-                                    cornerLight[2] = Math.max(0.067, cornerLight[2] * dampFactor);
-                                    cornerLight[3] = Math.max(0.067, cornerLight[3] * dampFactor);
-                                }
-                            }
+                            // Per-corner light incl. wet-shoreline damp — SHARED with refillChunkLightColors
+                            // (Phase 3) so build-time and refill-time colors can never drift.
+                            const cornerLight = cellCornerLightDamped(nx, ny, nz, x, y, z, getLocal, getLocalLight);
 
                             // Store in greedy buffers
                             const idx = v * uSize + u;
