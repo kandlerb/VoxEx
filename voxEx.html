@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.6";
+            const VOXEX_BUILD = "2026-06-17.7";
             const VOXEX_RECENT_CHANGES = [
+                "CHUNK REMESH CCR — Phase 0 (coalescing scheduler) + Phase 1 (frustum/build decouple). PHASE 0: new per-chunk dirty-reason bitmask (DIRTY_REASON {GEOMETRY/LIGHT/SEAM/NEIGHBOR_TREE} + chunkDirtyReason Map) OR'd in scheduleChunkUpdate via a new {reason} option; light/seam/tree callers tagged (edge-lighting, edge-lighting-capflush, light-propagation, sunlight-task → LIGHT; neighbor-update → NEIGHBOR_TREE); the processChunkQueue neighbor drain now skips keys already scheduled by the primary path (queued/pending/dirty) so a streaming neighbor doesn't get a duplicate full-column rebuild; reason mask cleared on rebuild. Groundwork for the future Phase 3 light-only color refill. PHASE 1: the visibility sweep now pre-meshes the near in-range ring in ALL directions (BUILD_AHEAD_RADIUS = min(renderDistance,10)) instead of only the view cone — built meshes still carry mesh.frustumCulled so Three.js DRAW-culls them off-screen, so rotating reveals already-built geometry instead of triggering a build wave (fixes 'culled chunks slow to load'); far ring stays frustum-gated to bound memory; culled near-ring builds are deprioritized in the queue sort. See CCR-chunk-remesh-consolidation.md + CHUNK-IMPLEMENTATION-PLAN.md.",
                 "FIRE follow-ups (FireImplementation.md §17 gaps): (G1) new Settings > Gameplay > Fire panel — toggles (spread / water-extinguish / particles) + sliders (spread rate, spread budget, max flame lifetime, mob DPS, max active fires, particle radius, max emitters/frame, animation fps, animation radius); wired in attachSettingsEventListeners, synced in syncSettingsToUI, with a Reset-to-Default; all keys already round-trip via saveSettings. (G2) fire caps (fireMaxActive/fireParticleRadius/fireMaxEmittersPerFrame/fireAnimationRadius) added to SETTINGS_PROFILES so they scale Performance(24/12/12/16)/Balanced(48/20/24/24)/Quality(64/28/32/40). (G3) fire test-seam exports (FIRE/BURNT_LOG/BURNT_PLANKS/BURNABLE_BLOCK_IDS/BURN_RESULT/BURN_TIME/isBurnable/isSolidBlock/pathCellSolid on window.VoxEx) + new fire tests in voxex-tests.html (block-table invariants, burnable/burnsTo mapping, walk-through guard via VoxelWorld.isSolidBlock, RLE persistence). (G4) VoxelWorld.isSolidBlock now excludes TORCH+FIRE (parity with the live isSolidBlock/pathCellSolid predicates). (G5) purgeChunkData now eagerly drops a chunk's fireSystem.cells via unregisterChunkFires() on TRUE data eviction (NOT on re-mesh — releaseChunkFires stays models-only so burn timers aren't reset).",
                 "SETTINGS MENU CCR: (1) SCROLL FIX — onMouseWheel no longer hijacks the wheel while a menu is open (gated on #blocker visibility, so the inventory still cycles the hotbar); nested scroll containers collapsed so #instructions is the single scroller (removed .settings-panel max-height/overflow, dropped #instructions children from the touch-mode override, added overscroll-behavior:contain + touch-action:pan-y). (2) INLINE GROUP TOGGLES — the master Enabled toggle now sits on the group HEADER bar for 15 expandable groups (volumetric/GI/diffuse/specular, water refraction/ripples/wading/splash/bubbles/wake, torch/block-break/footstep particles, stars, clouds) so a feature can be flipped without expanding it; the header checkbox uses onclick=event.stopPropagation() so it does not collapse the group (id preserved => no JS rewiring); water-wake (toggle-only) became a plain .setting-item row. (3) DEDUPE (D1) — removed ~100 duplicate setting-control listeners that init() bound on top of attachSettingsEventListeners() (each fired twice in-game, double-running rebuildAllVisibleChunks/relight/shader-uniform writes); attachSettingsEventListeners() is now the single source. Element consts + init-state kept; values now initialised by syncSettingsToUI() on panel open. (4) RESETS — updateUIFromSettings() now delegates to the comprehensive syncSettingsToUI() (R2) so resets refresh every control incl. detail inputs; Reset-All now applies the same live side-effects as the per-panel resets — shadows/water/sky/stars/clouds/touch (R1). (5) MISC — shadowMapType added to the SETTINGS literal so it round-trips (R3); reset persistence standardised on saveSettings() (R5); Controls Back button + ESC branch now choose pause-menu vs seed-menu via isInGame (N1).",
                 "WATER LESS BLUE + MURKIER: default waterColor retuned from vibrant blue 0x4488ff to muted teal 0x4A7A78; murk defaults raised (waterMurkDensity 0.30→0.40, waterMurkMax 0.97→0.98). Also the deep-haze murkColor is now desaturated 35% toward gray IN-SHADER so heavy murk reads as natural murky water instead of neon blue (decouples murkiness from blueness — applies regardless of the saved water color). NOTE: waterColor + murk strengths are SAVED settings, so existing saves keep their old values until 'Reset to Default' (Graphics > Water) or a fresh config; the in-shader desaturation applies immediately to everyone.",
@@ -16424,6 +16425,10 @@
             const queuedChunkKeys = new Set(); // Use a Set for O(1) lookup speed instead of .some() which is O(N)
             const pendingChunkUpdates = new Set(); // Debounced Chunk Update System
             const dirtyChunks = new Set(); // Tracks chunks that need a rebuild while keeping their current mesh visible
+            // COALESCING (Phase 0): per-chunk dirty-reason bitmask. Schedule paths OR their reason here;
+            // the build drain reads it to de-dupe and (future Phase 3) pick the cheapest rebuild.
+            const DIRTY_REASON = { GEOMETRY: 1, LIGHT: 2, SEAM: 4, NEIGHBOR_TREE: 8 };
+            const chunkDirtyReason = new Map(); // key -> OR'd DIRTY_REASON bits, cleared on rebuild
             const deferredChunkUpdates = new Set(); // Chunk updates blocked while lighting is pending
             const chunkUpdateDiagnostics = {
                 pending: new Map(),
@@ -16811,7 +16816,7 @@
                     // Schedule mesh rebuild for updated chunk
                     // Check for both terrain and water meshes (water-only chunks have no terrain mesh)
                     if (chunkMeshes.has(key) || chunkMeshes.has(key + "_WATER")) {
-                        scheduleChunkUpdate(cx, cz, false, "neighbor-update");
+                        scheduleChunkUpdate(cx, cz, false, "neighbor-update", { reason: DIRTY_REASON.NEIGHBOR_TREE });
                     }
 
                     processed++;
@@ -17278,7 +17283,7 @@
                                 chunk._edgeMeshDirty = false;
                                 lastEdgeRemeshMs.set(key, nowMs);
                                 const capCC = parseChunkKeySimple(key);
-                                scheduleChunkUpdate(capCC.cx, capCC.cz, true, "edge-lighting-capflush", { bypassLighting: true });
+                                scheduleChunkUpdate(capCC.cx, capCC.cz, true, "edge-lighting-capflush", { bypassLighting: true, reason: DIRTY_REASON.LIGHT });
                             }
                         }
                         continue; // Converged (N no-change passes) — stop
@@ -17344,7 +17349,7 @@
                         if (nowMs - (lastEdgeRemeshMs.get(key) || 0) >= EDGE_REMESH_DEBOUNCE_MS) {
                             chunk._edgeMeshDirty = false;
                             lastEdgeRemeshMs.set(key, nowMs);
-                            scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true });
+                            scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true, reason: DIRTY_REASON.LIGHT });
                         }
                     }
 
@@ -17587,8 +17592,9 @@
             //   - Adds to pendingChunkUpdates Set (O(1) insertion)
             //   - Uses string key concatenation (acceptable - event-driven)
             //   - No-op: Already well-optimized with debouncing and deferral
-            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false, immediate = false } = {}) {
+            function scheduleChunkUpdate(cx, cz, force = false, source = "generic", { bypassLighting = false, immediate = false, reason = DIRTY_REASON.GEOMETRY } = {}) {
                 const key = `${cx},${cz}`;
+                chunkDirtyReason.set(key, (chunkDirtyReason.get(key) || 0) | reason); // Phase 0: coalesce reasons
                 if (bypassLighting) { forceLightingBypassKeys.add(key); }
                 recordChunkUpdateState(key, source, "scheduled");
                 if (!force && chunkOrNeighborsPending(cx, cz)) {
@@ -24267,7 +24273,7 @@
                             if (chunks.has(chunkKey) && !pendingChunkUpdates.has(chunkKey)) {
                                 const [cx, cz] = parseChunkKey(chunkKey);
                                 dirtyChunks.add(chunkKey);
-                                scheduleChunkUpdate(cx, cz, true, "light-propagation", { bypassLighting: true, immediate: true });
+                                scheduleChunkUpdate(cx, cz, true, "light-propagation", { bypassLighting: true, immediate: true, reason: DIRTY_REASON.LIGHT });
                             }
                         });
                         tracked.clear();
@@ -24532,7 +24538,7 @@
                 scheduleChunkRebuilds(rebuildTargets) {
                     for (let i = 0; i < rebuildTargets.length; i++) {
                         const [cx, cz] = parseChunkKey(rebuildTargets[i]);
-                        scheduleChunkUpdate(cx, cz, false, "sunlight-task");
+                        scheduleChunkUpdate(cx, cz, false, "sunlight-task", { reason: DIRTY_REASON.LIGHT });
                     }
                 }
                 // Enqueue a light removal operation
@@ -41198,6 +41204,11 @@ self.onmessage = async (e) => {
                 const cosThresholdSq = cosThreshold * cosThreshold;
                 const INNER_RADIUS = 6;
                 const innerRadiusSq = INNER_RADIUS * INNER_RADIUS;
+                // Phase 1: pre-mesh the near ring in ALL directions (not just the view cone) so rotation
+                // reveals built geometry instead of triggering a build wave. Capped so the always-built
+                // disc (~π·r²) stays under maxAllowedMeshes at the default maxCachedChunks (350): π·10²≈314.
+                const BUILD_AHEAD_RADIUS = Math.min(currentRenderRadius, 10);
+                const buildAheadRadiusSq = BUILD_AHEAD_RADIUS * BUILD_AHEAD_RADIUS;
                 // Normalize camera direction once (horizontal only)
                 const camDirX = cameraDirTmp.x;
                 const camDirZ = cameraDirTmp.z;
@@ -41245,9 +41256,16 @@ self.onmessage = async (e) => {
                             chunksInRange.add(key);
                             // FRUSTUM CULLING with inner radius exception
                             totalChecked++;
-                            if (!isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir)) { culled++; continue; }
-                            neededKeys.add(key);
-                            if (!chunkMeshes.has(key) && !queuedChunkKeys.has(key)) { needed.push({ key, cx, cz, dist: distSq }); }
+                            const inFrustum = isChunkInFrustum(cx, cz, playerPos, normCamX, normCamZ, distSq, innerRadiusSq, cosThresholdSq, hasHorizontalCameraDir);
+                            if (inFrustum) { neededKeys.add(key); } else { culled++; }
+                            // Phase 1: build meshes for the near in-range ring even when frustum-culled.
+                            // Built meshes carry mesh.frustumCulled = SETTINGS.enableFrustumCulling, so Three.js
+                            // DRAW-culls them off-screen — the manual test only ever throttled BUILDS. Far ring
+                            // stays frustum-gated to bound memory; culled near-ring builds are deprioritized.
+                            const buildEvenIfCulled = distSq <= buildAheadRadiusSq;
+                            if ((inFrustum || buildEvenIfCulled) && !chunkMeshes.has(key) && !queuedChunkKeys.has(key)) {
+                                needed.push({ key, cx, cz, dist: distSq, deprioritize: !inFrustum });
+                            }
                         }
                     }
                     // Refresh cache snapshot when recomputed
@@ -41309,7 +41327,7 @@ self.onmessage = async (e) => {
                 if (meshPrunedDuringUpdate) { invalidateFrustumCache(); }
                 // --- 7. Smart Queueing ---
                 // Sort by distance (closest first)
-                if (recomputedFrustum) { needed.sort((a, b) => a.dist - b.dist); }
+                if (recomputedFrustum) { needed.sort((a, b) => ((a.deprioritize ? 1 : 0) - (b.deprioritize ? 1 : 0)) || (a.dist - b.dist)); }
                 // Double check using the fast Set lookup
                 for (const job of needed) {
                     if (!queuedChunkKeys.has(job.key)) {
@@ -41493,6 +41511,7 @@ self.onmessage = async (e) => {
                     // handle the swap atomically to prevent the "flash" artifact where chunk disappears
                     // momentarily during mesh rebuild. Old mesh stays visible until new mesh is ready.
                     if (isDirty) { dirtyChunks.delete(job.key); }
+                    chunkDirtyReason.delete(job.key); // Phase 0: rebuild captured all accumulated reasons
                     // OPTIMIZATION: Pass distance for LOD calculation
                     const jobDistSq = job.dist || 0;
                     // PIPELINED (Item 1): dispatch the worker mesh job and move on — no await.
@@ -41528,6 +41547,9 @@ self.onmessage = async (e) => {
                     const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
                     for (const key of toUpdate) {
                         chunkNeighborUpdateQueue.delete(key);
+                        // COALESCE (Phase 0): already scheduled by the primary path? That rebuild covers
+                        // the neighbor change — a second build here is a duplicate full-column rebuild.
+                        if (queuedChunkKeys.has(key) || pendingChunkUpdates.has(key) || dirtyChunks.has(key)) continue;
                         const [cx, cz] = parseChunkKey(key);
                         if (chunkOrNeighborsPending(cx, cz)) { chunkNeighborUpdateQueue.add(key); chunkUpdateDiagnostics.neighborStats.requeued++; continue; }
                         chunkUpdateDiagnostics.neighborStats.processed++;
