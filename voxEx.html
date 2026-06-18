@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-17.13";
+            const VOXEX_BUILD = "2026-06-17.14";
             const VOXEX_RECENT_CHANGES = [
+                "CHUNK REMESH CCR — Phase 3A (decouple light from geometry, part 1 of 2): light is NO LONGER in the greedy merge key (getMergeKey now (blockId<<8)|AO; dead l0-l3 removed; blockId extraction >>20 -> >>8). Faces merge on blockId+AO only; a merged quad now samples each vertex's light from its CORNER CELL (greedyMeshSection: per-face CORNER_AB pattern derived from computeMergedFaceVertices; width<->u, height<->v). For a 1x1 or uniform-light quad this collapses to the seed cell => identical to before; the change only shows where light VARIES across a merged quad (smoother light gradients on large flat lit surfaces; softer wet-shoreline/torch-edge boundaries, accepted). This makes geometry light-INDEPENDENT — the prerequisite for Phase 3B (light-only color refill instead of remesh). Phase 3B NOT yet done: light changes still remesh. Behind nothing yet — applies to all meshing; verify lighting looks correct (no transposed gradients).",
                 "CHUNK REMESH CCR — Phase 2c (per-band dirty scope): a block edit now rebuilds ONLY the band(s) it touches instead of all 4. New chunkDirtyBands map + ALL_BANDS_MASK + bandMaskForY(y) (dirties the edit's band plus the vertical neighbor band at a band boundary, for correct cross-boundary face/AO). scheduleChunkUpdate gained a {bands} option (default ALL); updateLocalArea (edit-center + edge/corner neighbours, same y => same band mask) and the light-neutral edit path pass the scoped mask. renderChunk reads rebuildMask and SKIPS clean bands that already have a live mesh (keeps them), rebuilding only dirty bands; whole-column changes (light propagation, neighbour/edge updates, streaming/first build) default to ALL bands so they're unaffected. Light-CHANGING edits still rebuild all light-affected bands (sunlight columns) until Phase 3 turns light into a color-only upload. Behind SETTINGS.bandedMeshing (numBands===1 path unchanged).",
                 "FIX (settings not re-baking — AO, water, any rebuildAllVisibleChunks() caller): rebuildAllVisibleChunks released only the 'cKey' terrain mesh, then re-queued. But Phase 2b changed the processChunkQueue queue-skip to isChunkMeshed() (terrain OR water OR any band). releaseMeshForKey('cKey') left 'cKey_WATER' (and every 'cKey#band' mesh in banded mode) intact, so isChunkMeshed() stayed true and the rebuild was SKIPPED — settings like AO / water effects never re-baked (worst in banded mode where the cKey release is a pure no-op). Now marks chunks dirty instead (isDirty bypasses the skip), and renderChunk/flushBand do the atomic band-aware swap (no flash). Affects every setting that re-bakes geometry, not just banded mode.",
                 "FIX (banded meshing shadows): refreshChunkShadowCasters() did parseChunkKey(meshKey) directly — for a band key 'cx,cz#b' that yielded a NaN z coord, so the distance test failed and it turned OFF castShadow on EVERY band mesh whenever the player crossed a chunk boundary (then markShadowsDirty re-rendered the shadow map with no casters => shadows vanished; a block edit rebuilt one chunk's bands with castShadow=true so they briefly returned). Now strips the band suffix via chunkBaseOfMeshKey() before parsing. Audited all other chunkMeshes iterators: safe (suffix checks / tolerant parseInt / self-skip).",
@@ -38655,20 +38656,13 @@ self.onmessage = async (e) => {
              * @returns {number} 27-bit merge key: (blockId << 11) | (light << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
              */
             function getMergeKey(blockId, ao, light) {
-                // AO values come from AO_LOOKUP (strictly {1.0, 0.85, 0.7, 0.5}); light is
-                // normalized 0-1, either a scalar (flat lighting) or a 4-entry corner
-                // array (smooth lighting). Layout (28 bits):
-                // (blockId << 20) | (qL0 << 17) | (qL1 << 14) | (qL2 << 11) | (qL3 << 8) | AO byte
-                let l0, l1, l2, l3;
-                if (typeof light === "number") {
-                    l0 = l1 = l2 = l3 = LIGHT_QUANT_LOOKUP[Math.round(light * 100)];
-                } else {
-                    l0 = LIGHT_QUANT_LOOKUP[Math.round(light[0] * 100)];
-                    l1 = LIGHT_QUANT_LOOKUP[Math.round(light[1] * 100)];
-                    l2 = LIGHT_QUANT_LOOKUP[Math.round(light[2] * 100)];
-                    l3 = LIGHT_QUANT_LOOKUP[Math.round(light[3] * 100)];
-                }
-                return (blockId << 20) | (l0 << 17) | (l1 << 14) | (l2 << 11) | (l3 << 8)
+                // PHASE 3: light is NO LONGER in the merge key — it moved to a per-vertex attribute so
+                // light-only changes can refill colors without re-meshing. Faces now merge on
+                // blockId + AO only; merged quads sample per-vertex light from their corner cells
+                // (see greedyMeshSection). `light` kept for call-shape compatibility but UNUSED.
+                // Layout (10 bits): (blockId << 8) | AO byte. A real face has blockId>=1 => key>=256,
+                // so the `=== 0` empty-cell sentinel in the greedy pass still holds.
+                return (blockId << 8)
                      | (AO_QUANT_LOOKUP[Math.round(ao[0] * 100)] << 6)
                      | (AO_QUANT_LOOKUP[Math.round(ao[1] * 100)] << 4)
                      | (AO_QUANT_LOOKUP[Math.round(ao[2] * 100)] << 2)
@@ -39370,12 +39364,29 @@ self.onmessage = async (e) => {
              * @param {Object} state - Current indices {vIdx, uvIdx, cIdx, qsIdx, iIdx, vertCount, faceCount, inputFaceCount}
              * @returns {Object} Updated state
              */
+            // PHASE 3: per-vertex (a = width-fraction, b = height-fraction) corner pattern per face,
+            // derived directly from computeMergedFaceVertices winding. Index: [vertex*2]=a, [vertex*2+1]=b.
+            // Lets a merged quad sample each vertex's light from the correct corner CELL (width<->u,
+            // height<->v in every slice). For a 1x1 or uniform-light quad this collapses to the seed cell.
+            const CORNER_AB_TOP    = [0,1, 1,1, 1,0, 0,0];
+            const CORNER_AB_BOTTOM = [0,0, 1,0, 1,1, 0,1];
+            const CORNER_AB_RIGHT  = [1,0, 0,0, 0,1, 1,1];
+            const CORNER_AB_LEFT   = [0,0, 1,0, 1,1, 0,1];
+            const CORNER_AB_BACK   = [0,0, 1,0, 1,1, 0,1];
+            const CORNER_AB_FRONT  = [1,0, 0,0, 0,1, 1,1];
             function greedyMeshSection(faceIdx, sectionBaseY, sectionEndY, getLocal, getLocalLight, startX, startZ, buffers, state) {
                 // Initialize inputFaceCount if not present
                 if (state.inputFaceCount === undefined) state.inputFaceCount = 0;
                 const face = FACE_DIRECTIONS[faceIdx];
                 const dx = face[0], dy = face[1], dz = face[2];
                 const nx = face[3], ny = face[4], nz = face[5];
+                // Select this face's corner pattern (matches computeMergedFaceVertices winding).
+                const cornerAB = ny > 0 ? CORNER_AB_TOP
+                               : ny < 0 ? CORNER_AB_BOTTOM
+                               : nx > 0 ? CORNER_AB_RIGHT
+                               : nx < 0 ? CORNER_AB_LEFT
+                               : nz > 0 ? CORNER_AB_BACK
+                               :          CORNER_AB_FRONT;
 
                 // Determine slice orientation based on face normal
                 let sliceAxis, uSize, vSize, sliceStart, sliceEnd;
@@ -39472,8 +39483,9 @@ self.onmessage = async (e) => {
 
                             // Store in greedy buffers
                             const idx = v * uSize + u;
-                            // Corner lights are part of the merge key, so cells only merge
-                            // when their light pattern matches (gradients fragment correctly)
+                            // PHASE 3: light is NOT in the merge key (blockId + AO only), so cells with
+                            // different light CAN merge; the merged quad samples per-vertex light from
+                            // its corner cells (greedyLight, below). cornerLight still passed for shape.
                             greedyMergeKeys[idx] = getMergeKey(blockId, ao, cornerLight);
                             greedyAO[idx * 4 + 0] = ao[0];
                             greedyAO[idx * 4 + 1] = ao[1];
@@ -39501,8 +39513,9 @@ self.onmessage = async (e) => {
                             const mergeKey = greedyMergeKeys[idx];
                             const maxSize = SETTINGS.maxGreedyQuadSize || 16;
 
-                            // Expand right (u direction)
-                            // Light is now quantized in merge key, so matching keys have compatible light
+                            // Expand right (u direction). Merge on blockId+AO only (Phase 3); light is
+                            // sampled per-vertex from corner cells at emit time, so light gradients no
+                            // longer fragment quads.
                             let width = 1;
                             while (u + width < uSize && width < maxSize) {
                                 const nextIdx = v * uSize + (u + width);
@@ -39528,9 +39541,8 @@ self.onmessage = async (e) => {
                             }
 
                             // Get block data for UV lookup.
-                            // Merge key layout: (blockId << 20) | (qL0<<17) | (qL1<<14) | (qL2<<11) | (qL3<<8) | AO byte
-                            // — see getMergeKey().
-                            const blockId = mergeKey >> 20;
+                            // Merge key layout (Phase 3): (blockId << 8) | AO byte — see getMergeKey().
+                            const blockId = mergeKey >> 8;
                             const uv = getBlockUV(blockId);
                             const uvCoord = faceIdx === 0 ? uv.top : faceIdx === 1 ? uv.bottom : uv.side;
 
@@ -39542,17 +39554,21 @@ self.onmessage = async (e) => {
                             const wy = localY - WORLD_DIMS.yOffset;
                             const wz = startZ + localZ;
 
-                            // Get AO and corner-light values for this quad (cells only
-                            // merge with identical patterns, so the seed cell's values
-                            // are valid across the whole quad)
+                            // AO is still in the merge key, so all cells in the quad share it — the
+                            // seed cell's AO is valid across the whole quad.
                             _greedyAOScratch[0] = greedyAO[idx * 4 + 0];
                             _greedyAOScratch[1] = greedyAO[idx * 4 + 1];
                             _greedyAOScratch[2] = greedyAO[idx * 4 + 2];
                             _greedyAOScratch[3] = greedyAO[idx * 4 + 3];
-                            _greedyLightScratch[0] = greedyLight[idx * 4 + 0];
-                            _greedyLightScratch[1] = greedyLight[idx * 4 + 1];
-                            _greedyLightScratch[2] = greedyLight[idx * 4 + 2];
-                            _greedyLightScratch[3] = greedyLight[idx * 4 + 3];
+                            // PHASE 3: light is NOT in the merge key, so cells across the quad can
+                            // differ. Sample each vertex's light from its CORNER cell (width<->u,
+                            // height<->v; cornerAB gives the (a,b) corner per vertex). 1x1 / uniform
+                            // quads collapse to the seed cell => identical to the pre-Phase-3 result.
+                            for (let _k = 0; _k < 4; _k++) {
+                                const cu = u + cornerAB[_k * 2] * (width - 1);
+                                const cv = v + cornerAB[_k * 2 + 1] * (height - 1);
+                                _greedyLightScratch[_k] = greedyLight[(cv * uSize + cu) * 4 + _k];
+                            }
 
                             // Emit merged quad
                             addMergedFaceIndexed(

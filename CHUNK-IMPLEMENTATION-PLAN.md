@@ -247,14 +247,23 @@ Revert 1.2/1.3 and delete the constant. One-guard change.
 
 ## Phase 2 — Banded mesh output  ⚠ (architectural core)
 
-> **STATUS (build 2026-06-17.8): 2a + 2b IMPLEMENTED behind `SETTINGS.bandedMeshing` (default off).**
-> Done: helpers (`bandKey`/`bandOfY`/`chunkBaseOfMeshKey`/`chunkBandMeshKeys`/`isChunkMeshed`/
-> `computeBandBounds`), `SETTINGS.bandedMeshing`, the `flushBand()` per-band attach + band loop in
-> `renderChunk` (unified — `numBands===1` when off ⇒ identical to pre-banding), the `chunkMeshes`
-> census (release/prune/cleanup/streaming/queue/neighbor/edge-light gates), and band unit tests.
-> **NOT yet done: §2.6 per-band dirty scope** — an edit currently rebuilds ALL bands of the chunk
-> (correct, but the per-edit-cost win waits for 2.6 + Phase 3). `node --check` passed; needs
-> in-browser testing with the flag both off and on.
+> **STATUS (build 2026-06-17.13): Phase 2 COMPLETE (2a + 2b + 2c) behind `SETTINGS.bandedMeshing`
+> (default off). Verified in-browser by the user; `node --check` clean on the full module.**
+> Done: helpers (`bandKey`/`bandOfY`/`bandMaskForY`/`chunkBaseOfMeshKey`/`chunkBandMeshKeys`/
+> `isChunkMeshed`/`computeBandBounds`/`ALL_BANDS_MASK`), `SETTINGS.bandedMeshing`, the `flushBand()`
+> per-band attach + band loop in `renderChunk` (unified — `numBands===1` when off ⇒ identical to
+> pre-banding), the `chunkMeshes` census (release/prune/cleanup/streaming/queue/neighbor/edge-light/
+> **shadow-caster** gates), band unit tests, AND §2.6 per-band dirty scope (`chunkDirtyBands` +
+> `scheduleChunkUpdate {bands}` option; `updateLocalArea` + light-neutral edits pass `bandMaskForY(y)`;
+> `renderChunk` skips clean bands that already have a mesh).
+>
+> Bugs found & fixed during bring-up: missing `chunkBandMeshKeys` generator; `refreshChunkShadowCasters`
+> parsed band keys as chunk keys (NaN dist → shadows vanished); `rebuildAllVisibleChunks` released only
+> `cKey` so the `isChunkMeshed` queue-skip blocked AO/water re-bakes. Console toggle: `setBandedMeshing(true/false)`.
+>
+> **Remaining limitation:** light-CHANGING edits still rebuild all light-affected bands (sunlight
+> columns) — the per-edit win there waits for Phase 3 (light → color-only upload). Light-NEUTRAL
+> edits (fire/char) + the geometry portion of edits get the band win now.
 
 **Goal:** emit geometry **per vertical band** (a group of sections) instead of one buffer per
 320-tall chunk, so an edit/light/seam change rebuilds one band, not the whole column.
