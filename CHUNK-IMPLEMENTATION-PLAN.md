@@ -1013,12 +1013,12 @@ do 4b/4c.
   worker's getters, SETTINGS snapshot, and the per-band protocol must all match exactly.
 - **SETTINGS staleness:** if the user changes AO/smoothLighting/banding mid-session, in-flight worker
   jobs use the old snapshot → transient mismatch until rebuild. Decide whether to version/invalidate.
-- **⚠ LEVER GATE before the 4a core (added 2026-06-18.2):** an audit caught that `worstFrameMs ≫ 16.7`
-  does NOT prove Phase 4 is the right fix — it can be (a) one heavy chunk build (only off-thread meshing
-  helps) OR (b) several cheap builds packed into a frame (a per-frame build cap helps, no worker rewrite).
-  `meshProfile()` now reports `maxBuildMs` + a per-build histogram to decide: **if `maxBuildMs` alone ≫
-  16.7 → proceed with Phase 4; if `maxBuildMs` < 16.7 but `worstFrameMs` ≫ 16.7 → do the cheap build-cap
-  first and Phase 4 may be unnecessary.** Do NOT write the 4a mesher core until this is measured.
+- **✅ LEVER GATE RESOLVED (2026-06-18.2) → Phase 4 confirmed.** `meshProfile()` over fresh terrain:
+  `maxBuildMs` 34.7 **==** `worstFrameMs` 34.7, ~1 build/frame (600 builds / 596 meshing-frames), and
+  **176/600 (29%) of single builds individually exceed 16.7 ms**. So the spike is one heavy chunk build,
+  NOT frame-packing → a per-frame build cap can't help (already ~1/frame) → **off-thread meshing is the
+  only fix.** 4a core is cleared to proceed. (Edge-slice neighbor-light worry withdrawn: real dispatch
+  ~15 chunks/s ⇒ full-array light copy is negligible.)
 - **Worth-it check — partial (2026-06-17.20).** `meshProfile()` over fresh-terrain streaming: main-thread
   meshing IS a frame-time bottleneck (`worstFrameMs` 35–60 ≫ 16.7 in lazy and eager) — but see the LEVER
   GATE above: we have not yet confirmed it's single-build vs frame-packing. The A/B also showed always-on

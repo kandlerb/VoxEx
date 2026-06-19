@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-18.2";
+            const VOXEX_BUILD = "2026-06-18.3";
             const VOXEX_RECENT_CHANGES = [
+                "PHASE 4a WORKER MESHER (flag still OFF — dormant until parity-tested). Single-sourced the main-thread mesher into the worker via buildChunkWorkerCode injection: 15 functions (greedyMeshSection/addMergedFaceIndexed/getMergeKey/AO+corner-light/cellCornerLightDamped/addFaceWaterIndexed/extractLightFromChunk/...) injected by Function.toString() + the AO/CORNER_AB/quant/IS_TRANSPARENT/CULLS_SAME_ID tables injected as JSON of the LIVE main-thread values (byte-parity); worker's old hand-coded AO_FACE_CONFIGS/AO_LOOKUP/per-block mesher REMOVED. Worker 'mesh' handler now runs the single-column greedy+water mesher (mirror of renderChunk numBands===1), with getLocalLight verbatim-ported from buildChunkLightGetters using newly-sent neighbor sky/block light (seam-free edges), and emits a payload with quadSize + foam + lightMap. SCOPE: worker meshes UNBANDED chunks only (the streaming hot path); banded/edited chunks stay on main. Because WORKER_MESH_PIPELINE_ENABLED is still false, this only affects whether the WORKER INITIALIZES cleanly (it also does terrain gen) — if terrain streams normally, the injection is sound. Next: byte-parity test (gate), then applyWorkerMeshData rewrite + dispatch routing, then flip.",
                 "PHASE 4 LEVER DIAGNOSTIC: meshProfile() now reports maxBuildMs (worst SINGLE chunk build) + a per-build time histogram (<4 / 4-8 / 8-16.7 / 16.7-33 / 33-50 / 50+ ms), so we can tell WHY a frame hitches before committing to the XL off-thread rewrite: maxBuildMs alone ≫16.7 => one heavy build => Phase 4 (off-thread meshing) is the only fix; maxBuildMs <16.7 but worstFrameMs ≫16.7 => many cheap builds packed into a frame => a cheap per-frame build cap fixes it, no worker rewrite. Diagnostic only, no behavior change. Also landed (dormant, flag off): Phase 4 foundation — worker SETTINGS/useBands snapshot + per-neighbor light send for seam-free worker meshing.",
                 "PHASE 3.5 LAZY BANDING: banding is now PER-CHUNK instead of global. Chunks stream/first-build as a single column (cheap) and convert to banded geometry only on their FIRST edit — so edits still rebuild one band, but streaming no longer pays banding's 4x first-build overhead. (meshProfile A/B showed always-on banding ~doubled streaming mesh load: 146 vs 81 ms/s.) New: bandedChunkKeys set + chunkUsesBands() predicate (replaces the global SETTINGS.bandedMeshing reads in isChunkMeshed / releaseMeshForKey / refillChunkLightColors / numBands / eviction), markChunkBanded() on the 2 center-edit sites (updateLocalArea + light-neutral edit), and an end-of-build release of the orphan single-column mesh on the unbanded->banded transition. SETTINGS.bandedMeshing now means 'band edited chunks (lazy)'. Console: setEagerBanding(true) restores the old always-band behavior for A/B re-measurement; meshProfile() to compare.",
                 "PHASE 4 'measure first': added a main-thread mesh-time profiler (diagnostic only, no behavior change). renderChunk + successful light-refill are wrapped to accumulate timing into _meshProfile; processChunkQueue records the worst single-frame mesh time. Console: meshProfile.reset() then fly into fresh terrain then meshProfile() — reports builds, avg ms/build, meshMsPerSec, and worstFrameMs (>16.7ms = meshing alone can drop a 60fps frame during streaming => Phase 4 justified). Used to decide whether moving meshing off-thread (Phase 4) is worth the XL effort. renderChunk split into a thin timing wrapper + _renderChunkImpl; refillChunkLightColors likewise.",
@@ -18099,48 +18100,10 @@
     AO_OCCLUDES_WORKER[LEAVES] = 1;
     AO_OCCLUDES_WORKER[LONGWOOD_LEAVES] = 1;
 
-    // AO lookup table
-    const AO_LOOKUP = [1.0, 0.85, 0.7, 0.5];
-
-    // AO face configurations for each face direction
-    const AO_FACE_CONFIGS = {
-        top: [
-            [-1, 1, 0, 0, 1, 1, -1, 1, 1],
-            [1, 1, 0, 0, 1, 1, 1, 1, 1],
-            [1, 1, 0, 0, 1, -1, 1, 1, -1],
-            [-1, 1, 0, 0, 1, -1, -1, 1, -1]
-        ],
-        bottom: [
-            [-1, -1, 0, 0, -1, -1, -1, -1, -1],
-            [1, -1, 0, 0, -1, -1, 1, -1, -1],
-            [1, -1, 0, 0, -1, 1, 1, -1, 1],
-            [-1, -1, 0, 0, -1, 1, -1, -1, 1]
-        ],
-        right: [
-            [1, -1, 0, 1, 0, 1, 1, -1, 1],
-            [1, -1, 0, 1, 0, -1, 1, -1, -1],
-            [1, 1, 0, 1, 0, -1, 1, 1, -1],
-            [1, 1, 0, 1, 0, 1, 1, 1, 1]
-        ],
-        left: [
-            [-1, -1, 0, -1, 0, -1, -1, -1, -1],
-            [-1, -1, 0, -1, 0, 1, -1, -1, 1],
-            [-1, 1, 0, -1, 0, 1, -1, 1, 1],
-            [-1, 1, 0, -1, 0, -1, -1, 1, -1]
-        ],
-        back: [
-            [-1, 0, 1, 0, -1, 1, -1, -1, 1],
-            [1, 0, 1, 0, -1, 1, 1, -1, 1],
-            [1, 0, 1, 0, 1, 1, 1, 1, 1],
-            [-1, 0, 1, 0, 1, 1, -1, 1, 1]
-        ],
-        front: [
-            [1, 0, -1, 0, -1, -1, 1, -1, -1],
-            [-1, 0, -1, 0, -1, -1, -1, -1, -1],
-            [-1, 0, -1, 0, 1, -1, -1, 1, -1],
-            [1, 0, -1, 0, 1, -1, 1, 1, -1]
-        ]
-    };
+    // PHASE 4: AO_LOOKUP + AO_FACE_CONFIGS are now INJECTED from the main thread (between the
+    // __MESH_FUNCS__ markers below) so the worker mesher uses byte-identical tables. The old
+    // hand-maintained worker copies were removed to avoid redeclaring the injected module-scope consts.
+    // (AO_OCCLUDES_WORKER above stays — it's worker-local and the legacy per-block mesher still uses it.)
 
     // Face vertex cache for indexed geometry (4 vertices per face)
     const faceVertexCacheIndexed = new Map();
@@ -18564,7 +18527,7 @@
 
             if (type === 'mesh') {
                 // Mesh generation in worker
-                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor, meshSettings, useBands } = e.data;
+                const { centerBlocks, centerSkyLight, centerBlockLight, neighbors, neighborSkyLight, neighborBlockLight, uvMapData, maxFaces, settingsAO, settingsWaterFogDensity, settingsWaterColor, meshSettings, useBands } = e.data;
                 // PHASE 4: refresh the worker SETTINGS shim + per-chunk banding decision from this job's snapshot.
                 if (meshSettings) SETTINGS = meshSettings;
                 workerUseBands = !!useBands;
@@ -18620,76 +18583,48 @@
                     return 0;
                 };
 
-                // Build local light getter
+                // PHASE 4: set the per-job UV map for the injected getBlockUV.
+                _workerUvMap = uvMapData;
+
+                // Build local light getter — VERBATIM port of buildChunkLightGetters (main thread) so
+                // worker edge colors match main exactly. Center + each neighbor read via the injected
+                // extractLightFromChunk (clamped max, floor 3). A MISSING neighbor falls back to this
+                // chunk's nearest edge cell (ownEdgeLight); a neighbor present but with no skyLight array
+                // yields 15 (extractLightFromChunk's own rule), matching main's legacy-format behavior.
+                const _centerLight = { skyLight: centerSkyLight, blockLight: centerBlockLight };
+                const _nLight = {};
+                for (const _d of ['n', 's', 'e', 'w', 'nw', 'ne', 'sw', 'se']) {
+                    _nLight[_d] = neighbors[_d]
+                        ? { skyLight: neighborSkyLight ? neighborSkyLight[_d] : null, blockLight: neighborBlockLight ? neighborBlockLight[_d] : null }
+                        : null;
+                }
+                const ownEdgeLight = (lx, ly, lz) => {
+                    const cx2 = lx < 0 ? 0 : lx > 15 ? 15 : lx;
+                    const cz2 = lz < 0 ? 0 : lz > 15 ? 15 : lz;
+                    return extractLightFromChunk(_centerLight, cx2 + cz2 * 16 + ly * 256);
+                };
                 const getLocalLight = (lx, ly, lz) => {
                     if (ly < 0 || ly >= chunkHeight) return 15;
-                    // Center chunk
-                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) {
-                        const idx = lx + lz * 16 + ly * 256;
-                        const sky = centerSkyLight ? centerSkyLight[idx] : 15;
-                        const block = centerBlockLight ? centerBlockLight[idx] : 0;
-                        // Math.max varargs handles the min-3 floor in one call.
-                        return Math.max(3, sky, block);
-                    }
-                    // Out-of-chunk samples: clamp to THIS chunk's nearest edge cell.
-                    // The old "return 15 (simplified)" baked bright light-15 lines
-                    // along EVERY chunk border of every worker-built mesh — they were
-                    // masked only by the main thread's full-quality remesh churn, and
-                    // became permanently visible in caves once remeshing was reduced.
-                    // The edge cell preserves light continuity on the surface (it is
-                    // sky-lit anyway) and underground (it is dark) alike.
-                    const ecx = lx < 0 ? 0 : lx > 15 ? 15 : lx;
-                    const ecz = lz < 0 ? 0 : lz > 15 ? 15 : lz;
-                    const eidx = ecx + ecz * 16 + ly * 256;
-                    const esky = centerSkyLight ? centerSkyLight[eidx] : 15;
-                    const eblock = centerBlockLight ? centerBlockLight[eidx] : 0;
-                    return Math.max(3, esky, eblock);
+                    if (lx >= 0 && lx < 16 && lz >= 0 && lz < 16) { const idx = lx + lz * 16 + ly * 256; return extractLightFromChunk(_centerLight, idx); }
+                    if (lz < 0 && lx >= 0 && lx < 16) { const idx = lx + 15 * 16 + ly * 256; if (!_nLight.n) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.n, idx); }
+                    if (lz > 15 && lx >= 0 && lx < 16) { const idx = lx + 0 * 16 + ly * 256; if (!_nLight.s) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.s, idx); }
+                    if (lx > 15 && lz >= 0 && lz < 16) { const idx = 0 + lz * 16 + ly * 256; if (!_nLight.e) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.e, idx); }
+                    if (lx < 0 && lz >= 0 && lz < 16) { const idx = 15 + lz * 16 + ly * 256; if (!_nLight.w) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.w, idx); }
+                    if (lz < 0 && lx < 0) { const idx = 15 + 15 * 16 + ly * 256; if (!_nLight.nw) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.nw, idx); }
+                    if (lz < 0 && lx > 15) { const idx = 0 + 15 * 16 + ly * 256; if (!_nLight.ne) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.ne, idx); }
+                    if (lz > 15 && lx < 0) { const idx = 15 + 0 * 16 + ly * 256; if (!_nLight.sw) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.sw, idx); }
+                    if (lz > 15 && lx > 15) { const idx = 0 + 0 * 16 + ly * 256; if (!_nLight.se) return ownEdgeLight(lx, ly, lz); return extractLightFromChunk(_nLight.se, idx); }
+                    return 15;
                 };
 
-                // Helper to check if block is a leaf
-                const isLeafBlockWorker = (id) => id === LEAVES || id === LONGWOOD_LEAVES;
-
-                // Get UV from map data
-                const getBlockUVWorker = (blockId) => {
-                    if (uvMapData && uvMapData[blockId]) return uvMapData[blockId];
-                    return { top: [0, 0], bottom: [0, 0], side: [0, 0] };
-                };
-
-                // AO helper functions
-                const getAOConfig = (nx, ny, nz) => {
-                    if (ny > 0) return AO_FACE_CONFIGS.top;
-                    if (ny < 0) return AO_FACE_CONFIGS.bottom;
-                    if (nx > 0) return AO_FACE_CONFIGS.right;
-                    if (nx < 0) return AO_FACE_CONFIGS.left;
-                    if (nz > 0) return AO_FACE_CONFIGS.back;
-                    return AO_FACE_CONFIGS.front;
-                };
-
-                const calculateVertexAO = (lx, ly, lz, offsets) => {
-                    // AO_OCCLUDES_WORKER (not IS_TRANSPARENT_WORKER): leaves count as
-                    // occluders so canopies have internal depth (parity with main thread).
-                    const s1 = AO_OCCLUDES_WORKER[getLocal(lx + offsets[0], ly + offsets[1], lz + offsets[2])];
-                    const s2 = AO_OCCLUDES_WORKER[getLocal(lx + offsets[3], ly + offsets[4], lz + offsets[5])];
-                    const c = AO_OCCLUDES_WORKER[getLocal(lx + offsets[6], ly + offsets[7], lz + offsets[8])];
-                    return AO_LOOKUP[s1 + s2 + c];
-                };
-
-                const calculateFaceAO = (nx, ny, nz, lx, ly, lz, blockId) => {
-                    if (!settingsAO || blockId === WATER) return [1, 1, 1, 1];
-                    const config = getAOConfig(nx, ny, nz);
-                    return [
-                        calculateVertexAO(lx, ly, lz, config[0]),
-                        calculateVertexAO(lx, ly, lz, config[1]),
-                        calculateVertexAO(lx, ly, lz, config[2]),
-                        calculateVertexAO(lx, ly, lz, config[3])
-                    ];
-                };
-
-                // Allocate output buffers (indexed geometry: 4 verts per face)
-                // (no normal buffers — chunk materials use flatShading)
+                // PHASE 4: AO/light/UV helpers are now the INJECTED main-thread functions (getAOConfig,
+                // calculateFaceAO, calculateFaceCornerLight, cellCornerLightDamped, getMergeKey,
+                // greedyMeshSection, addMergedFaceIndexed, addFaceWaterIndexed, getBlockUV). Output buffers
+                // mirror renderChunk's pooled buffers (now incl. quadSize for terrain + foam for water).
                 const terrainPos = new Float32Array(maxFaces * 12);
                 const terrainUvs = new Float32Array(maxFaces * 8);
                 const terrainCols = new Float32Array(maxFaces * 12);
+                const terrainQuadSize = new Float32Array(maxFaces * 8);
                 const terrainIndices = new Uint32Array(maxFaces * 6);
 
                 const waterPos = new Float32Array(maxFaces * 12);
@@ -18698,94 +18633,71 @@
                 const waterIndices = new Uint32Array(maxFaces * 6);
                 const waterShore = new Float32Array(maxFaces * 4);
                 const waterThickness = new Float32Array(maxFaces * 4);
+                const waterFoam = new Float32Array(maxFaces * 4);
 
-                let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0;
+                let tVIdx = 0, tUvIdx = 0, tCIdx = 0, tQsIdx = 0, tIIdx = 0, tVertCount = 0, tFaceCount = 0;
                 let wVIdx = 0, wUvIdx = 0, wCIdx = 0, wIIdx = 0, wVertCount = 0, wSIdx = 0, wTIdx = 0, wFaceCount = 0;
+                const terrainBuffers = { pos: terrainPos, norm: null, uvs: terrainUvs, cols: terrainCols, quadSize: terrainQuadSize, indices: terrainIndices };
 
-                // Process all blocks
-                for (let y = 0; y < chunkHeight; y++) {
-                    const yOffset = y * 256;
-                    for (let z = 0; z < 16; z++) {
-                        const zOffset = z * 16;
-                        for (let x = 0; x < 16; x++) {
-                            const idx = x + zOffset + yOffset;
-                            const id = centerBlocks[idx];
-                            if (id === AIR || id === TORCH || id === FIRE) continue;
+                // PHASE 4: single-column mesher mirroring _renderChunkImpl's numBands===1 path. We iterate
+                // all SECTIONS_PER_CHUNK sections at FULL section bounds (no section analysis in the worker —
+                // greedyMeshSection skips AIR cells, so full bounds produce byte-identical output to main's
+                // analyzed bounds, just iterating a few extra empty slices). Terrain = greedy per face per
+                // section; water = per-block (special shore/thickness/foam attrs), exactly like main.
+                for (let s = 0; s < SECTIONS_PER_CHUNK; s++) {
+                    const sStartY = s * SECTION_HEIGHT;
+                    const sEndY = sStartY + SECTION_HEIGHT;
 
-                            const wx = startX + x;
-                            const wy = y - WORLD_DIMS.yOffset;
-                            const wz = startZ + z;
-                            const uv = getBlockUVWorker(id);
-                            const isWater = id === WATER;
+                    // --- Terrain: greedy meshing per face direction (injected greedyMeshSection) ---
+                    let terrainState = { vIdx: tVIdx, uvIdx: tUvIdx, cIdx: tCIdx, qsIdx: tQsIdx, iIdx: tIIdx, vertCount: tVertCount, faceCount: tFaceCount, inputFaceCount: 0 };
+                    for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                        terrainState = greedyMeshSection(faceIdx, sStartY, sEndY, getLocal, getLocalLight, startX, startZ, terrainBuffers, terrainState);
+                    }
+                    tVIdx = terrainState.vIdx; tUvIdx = terrainState.uvIdx; tCIdx = terrainState.cIdx;
+                    tQsIdx = terrainState.qsIdx; tIIdx = terrainState.iIdx; tVertCount = terrainState.vertCount; tFaceCount = terrainState.faceCount;
 
-                            for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
-                                const face = FACE_DIRECTIONS[faceIdx];
-                                const lx = x + face[0];
-                                const ly = y + face[1];
-                                const lz = z + face[2];
-                                const nx = face[3], ny = face[4], nz = face[5];
-                                const uvCoord = faceIdx === 0 ? uv.top : faceIdx === 1 ? uv.bottom : uv.side;
-                                const nid = getLocal(lx, ly, lz);
-
-                                const draw = isWater
-                                    ? (nid === AIR || isLeafBlockWorker(nid))
-                                    : (IS_TRANSPARENT_WORKER[nid] && !(nid === id && CULLS_SAME_ID_WORKER[id]));
-
-                                if (draw) {
-                                    const pos = isWater ? waterPos : terrainPos;
-                                    const uvs = isWater ? waterUvs : terrainUvs;
-                                    const cols = isWater ? waterCols : terrainCols;
-                                    const indices = isWater ? waterIndices : terrainIndices;
-                                    let vIdx = isWater ? wVIdx : tVIdx;
-                                    let uvIdx = isWater ? wUvIdx : tUvIdx;
-                                    let cIdx = isWater ? wCIdx : tCIdx;
-                                    let iIdx = isWater ? wIIdx : tIIdx;
-                                    const vertCount = isWater ? wVertCount : tVertCount;
-
-                                    // Write vertices (4 per face)
-                                    // (no normal writes — chunk materials use flatShading)
-                                    const verts = getCachedFaceVerticesIndexed(nx, ny, nz);
-                                    pos[vIdx] = verts[0] + wx; pos[vIdx+1] = verts[1] + wy; pos[vIdx+2] = verts[2] + wz;
-                                    pos[vIdx+3] = verts[3] + wx; pos[vIdx+4] = verts[4] + wy; pos[vIdx+5] = verts[5] + wz;
-                                    pos[vIdx+6] = verts[6] + wx; pos[vIdx+7] = verts[7] + wy; pos[vIdx+8] = verts[8] + wz;
-                                    pos[vIdx+9] = verts[9] + wx; pos[vIdx+10] = verts[10] + wy; pos[vIdx+11] = verts[11] + wz;
-
-                                    // Calculate AO and light
-                                    const ao = calculateFaceAO(nx, ny, nz, x, y, z, id);
-                                    const lightLevel = getLocalLight(lx, ly, lz) / 15.0;
-
-                                    // Write colors (4 vertices)
-                                    const c1 = ao[0] * lightLevel, c2 = ao[1] * lightLevel;
-                                    const c3 = ao[2] * lightLevel, c4 = ao[3] * lightLevel;
-                                    cols[cIdx] = c1; cols[cIdx+1] = c1; cols[cIdx+2] = c1;
-                                    cols[cIdx+3] = c2; cols[cIdx+4] = c2; cols[cIdx+5] = c2;
-                                    cols[cIdx+6] = c3; cols[cIdx+7] = c3; cols[cIdx+8] = c3;
-                                    cols[cIdx+9] = c4; cols[cIdx+10] = c4; cols[cIdx+11] = c4;
-
-                                    // Write UVs (4 vertices)
-                                    const tileW = 1 / NUM_TILES;
-                                    const u0 = uvCoord[0], u1 = uvCoord[0] + tileW;
-                                    const v0 = uvCoord[1], v1 = uvCoord[1] + 1.0;
-                                    uvs[uvIdx] = u0; uvs[uvIdx+1] = v0;
-                                    uvs[uvIdx+2] = u1; uvs[uvIdx+3] = v0;
-                                    uvs[uvIdx+4] = u1; uvs[uvIdx+5] = v1;
-                                    uvs[uvIdx+6] = u0; uvs[uvIdx+7] = v1;
-
-                                    // Write indices (6 per face = 2 triangles)
-                                    indices[iIdx] = vertCount; indices[iIdx+1] = vertCount + 1; indices[iIdx+2] = vertCount + 3;
-                                    indices[iIdx+3] = vertCount + 1; indices[iIdx+4] = vertCount + 2; indices[iIdx+5] = vertCount + 3;
-
-                                    // Update counters
-                                    if (isWater) {
-                                        wVIdx = vIdx + 12; wUvIdx = uvIdx + 8; wCIdx = cIdx + 12;
-                                        wIIdx = iIdx + 6; wVertCount += 4; wFaceCount++;
-                                        // Water shore/thickness (simplified)
-                                        waterShore[wSIdx] = 1; waterShore[wSIdx+1] = 1; waterShore[wSIdx+2] = 1; waterShore[wSIdx+3] = 1;
-                                        waterThickness[wTIdx] = 0; waterThickness[wTIdx+1] = 0; waterThickness[wTIdx+2] = 0; waterThickness[wTIdx+3] = 0;
-                                        wSIdx += 4; wTIdx += 4;
-                                    } else {
-                                        tVIdx = vIdx + 12; tUvIdx = uvIdx + 8; tCIdx = cIdx + 12;
-                                        tIIdx = iIdx + 6; tVertCount += 4; tFaceCount++;
+                    // --- Water: per-block (mirror of _renderChunkImpl's water pass) ---
+                    for (let y = sStartY; y < sEndY; y++) {
+                        const yOffset = y * 256;
+                        for (let z = 0; z < 16; z++) {
+                            const zOffset = z * 16;
+                            for (let x = 0; x < 16; x++) {
+                                const id = centerBlocks[x + zOffset + yOffset];
+                                if (id !== WATER) continue;
+                                const wx = startX + x;
+                                const wy = y - WORLD_DIMS.yOffset;
+                                const wz = startZ + z;
+                                const uv = getBlockUV(id);
+                                const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
+                                    const face = FACE_DIRECTIONS[faceIdx];
+                                    const lx = x + face[0];
+                                    const ly = y + face[1];
+                                    const lz = z + face[2];
+                                    const nx = face[3], ny = face[4], nz = face[5];
+                                    const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
+                                    const nid = getLocal(lx, ly, lz);
+                                    if (nid === AIR || isLeafBlock(nid)) {
+                                        let waterDepth = 0;
+                                        for (let dy = y - 1; dy >= 0; dy--) {
+                                            if (getLocal(x, dy, z) !== WATER) break;
+                                            waterDepth++;
+                                        }
+                                        const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                        let shoreDist = 4;
+                                        if (hasAirAbove) {
+                                            const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                            for (const [dx, dz] of directions) {
+                                                for (let d = 1; d <= 4; d++) {
+                                                    const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                    if (checkId === UNLOADED_BLOCK) break;
+                                                    if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) { shoreDist = Math.min(shoreDist, d); break; }
+                                                    if (checkId === AIR) { shoreDist = Math.min(shoreDist, d); break; }
+                                                }
+                                            }
+                                        }
+                                        addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, null, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
+                                        wVIdx += 12; wUvIdx += 8; wCIdx += 12; wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
                                     }
                                 }
                             }
@@ -18793,12 +18705,12 @@
                     }
                 }
 
-                // Create COPIES of arrays (not views) - subarray() shares the underlying buffer
-                // which causes "buffer already transferred" errors if multiple chunks share buffers
-                // (no normal buffers — chunk materials use flatShading)
+                // Create COPIES of arrays (not views) — subarray() shares the underlying buffer,
+                // which causes "buffer already transferred" errors if chunks share buffers.
                 const tPosOut = new Float32Array(terrainPos.subarray(0, tVIdx));
                 const tUvsOut = new Float32Array(terrainUvs.subarray(0, tUvIdx));
                 const tColsOut = new Float32Array(terrainCols.subarray(0, tCIdx));
+                const tQsOut = new Float32Array(terrainQuadSize.subarray(0, tQsIdx));
                 const tIdxOut = new Uint32Array(terrainIndices.subarray(0, tIIdx));
 
                 const wPosOut = new Float32Array(waterPos.subarray(0, wVIdx));
@@ -18807,26 +18719,43 @@
                 const wIdxOut = new Uint32Array(waterIndices.subarray(0, wIIdx));
                 const wShoreOut = new Float32Array(waterShore.subarray(0, wSIdx));
                 const wThickOut = new Float32Array(waterThickness.subarray(0, wTIdx));
+                const wFoamOut = new Float32Array(waterFoam.subarray(0, wSIdx));
 
-                // Build transfer list - each array now has its own unique buffer
+                // PHASE 3B lightMap (per-quad corner cells/AO/face) for the light-only refill path —
+                // only when SETTINGS.lightRefill is on (else null, exactly like flushBand).
+                let lightMapOut = null;
+                if (SETTINGS.lightRefill) {
+                    lightMapOut = {
+                        quadCount: tFaceCount,
+                        cells: new Uint32Array(_lmCells.subarray(0, tFaceCount * 4)),
+                        ao: new Float32Array(_lmAO.subarray(0, tFaceCount * 4)),
+                        face: new Uint8Array(_lmFace.subarray(0, tFaceCount)),
+                    };
+                }
+
+                // Build transfer list — each array has its own unique buffer.
                 const transferList = [
-                    tPosOut.buffer, tUvsOut.buffer, tColsOut.buffer, tIdxOut.buffer,
+                    tPosOut.buffer, tUvsOut.buffer, tColsOut.buffer, tQsOut.buffer, tIdxOut.buffer,
                     wPosOut.buffer, wUvsOut.buffer, wColsOut.buffer, wIdxOut.buffer,
-                    wShoreOut.buffer, wThickOut.buffer
+                    wShoreOut.buffer, wThickOut.buffer, wFoamOut.buffer
                 ];
+                if (lightMapOut) { transferList.push(lightMapOut.cells.buffer, lightMapOut.ao.buffer, lightMapOut.face.buffer); }
 
                 self.postMessage({
                     type: 'mesh',
                     jobId: jobId,
                     cx: cx,
                     cz: cz,
+                    useBands: workerUseBands,
                     terrain: {
                         positions: tPosOut,
                         uvs: tUvsOut,
                         colors: tColsOut,
+                        quadSize: tQsOut,
                         indices: tIdxOut,
                         faceCount: tFaceCount,
-                        vertexCount: tVertCount
+                        vertexCount: tVertCount,
+                        lightMap: lightMapOut
                     },
                     water: {
                         positions: wPosOut,
@@ -18835,6 +18764,7 @@
                         indices: wIdxOut,
                         shore: wShoreOut,
                         thickness: wThickOut,
+                        foam: wFoamOut,
                         faceCount: wFaceCount,
                         vertexCount: wVertCount
                     }
@@ -19041,7 +18971,77 @@
 
                 const treeBefore = workerCode.substring(0, treeStartIdx + treeStartMarker.length);
                 const treeAfter = workerCode.substring(treeEndIdx);
-                return treeBefore + '\n' + treeCode + '\n    ' + treeAfter;
+                workerCode = treeBefore + '\n' + treeCode + '\n    ' + treeAfter;
+
+                // ============================================================
+                // INJECT MESH FUNCTIONS — SINGLE SOURCE (Phase 4)
+                // The worker mesher (greedy + AO + smooth corner light + water + lightMap) is the SAME
+                // code as the main thread, injected via Function.toString() + JSON of the live data
+                // tables (byte-parity). The worker 'mesh' handler calls these. Do NOT hand-edit a worker
+                // copy — edit the main-thread sources. Markers MUST stay intact.
+                // ============================================================
+                let meshCode = '    // === MESH FUNCS + DATA — INJECTED FROM MAIN THREAD (Phase 4) ===\n';
+                // logDebug stub (initMergedVertexCache logs; the worker has no logDebug).
+                meshCode += '    const logDebug = function(){};\n';
+                // Data tables — JSON of the LIVE main-thread values guarantees byte-identical lookups.
+                meshCode += '    const AO_FACE_CONFIGS = ' + JSON.stringify(AO_FACE_CONFIGS) + ';\n';
+                meshCode += '    const AO_LOOKUP = ' + JSON.stringify(AO_LOOKUP) + ';\n';
+                meshCode += '    const AO_QUANT_LOOKUP = new Uint8Array(' + JSON.stringify(Array.from(AO_QUANT_LOOKUP)) + ');\n';
+                meshCode += '    const LIGHT_QUANT_LOOKUP = new Uint8Array(' + JSON.stringify(Array.from(LIGHT_QUANT_LOOKUP)) + ');\n';
+                meshCode += '    const IS_TRANSPARENT = new Uint8Array(' + JSON.stringify(Array.from(IS_TRANSPARENT)) + ');\n';
+                meshCode += '    const CULLS_SAME_ID = new Uint8Array(' + JSON.stringify(Array.from(CULLS_SAME_ID)) + ');\n';
+                meshCode += '    const CORNER_AB_TOP = ' + JSON.stringify(CORNER_AB_TOP) + ';\n';
+                meshCode += '    const CORNER_AB_BOTTOM = ' + JSON.stringify(CORNER_AB_BOTTOM) + ';\n';
+                meshCode += '    const CORNER_AB_RIGHT = ' + JSON.stringify(CORNER_AB_RIGHT) + ';\n';
+                meshCode += '    const CORNER_AB_LEFT = ' + JSON.stringify(CORNER_AB_LEFT) + ';\n';
+                meshCode += '    const CORNER_AB_BACK = ' + JSON.stringify(CORNER_AB_BACK) + ';\n';
+                meshCode += '    const CORNER_AB_FRONT = ' + JSON.stringify(CORNER_AB_FRONT) + ';\n';
+                meshCode += '    const GREEDY_SLICE_SIZE = ' + GREEDY_SLICE_SIZE + ';\n';
+                meshCode += '    const MAX_FACES_PER_CHUNK = ' + MAX_FACES_PER_CHUNK + ';\n';
+                meshCode += '    const SECTION_HEIGHT = ' + SECTION_HEIGHT + ';\n';
+                meshCode += '    const SECTIONS_PER_CHUNK = ' + SECTIONS_PER_CHUNK + ';\n';
+                // Greedy scratch + lightMap work arrays (same sizes/types as main thread).
+                meshCode += '    const greedyMergeKeys = new Uint32Array(GREEDY_SLICE_SIZE);\n';
+                meshCode += '    const greedyProcessed = new Uint8Array(GREEDY_SLICE_SIZE);\n';
+                meshCode += '    const greedyAO = new Float32Array(GREEDY_SLICE_SIZE * 4);\n';
+                meshCode += '    const greedyLight = new Float32Array(GREEDY_SLICE_SIZE * 4);\n';
+                meshCode += '    const greedyLocalCoords = new Uint16Array(GREEDY_SLICE_SIZE * 3);\n';
+                meshCode += '    const _lmCells = new Uint32Array(MAX_FACES_PER_CHUNK * 4);\n';
+                meshCode += '    const _lmAO = new Float32Array(MAX_FACES_PER_CHUNK * 4);\n';
+                meshCode += '    const _lmFace = new Uint8Array(MAX_FACES_PER_CHUNK);\n';
+                meshCode += '    const _greedyAOScratch = [0,0,0,0];\n';
+                meshCode += '    const _greedyLightScratch = [0,0,0,0];\n';
+                meshCode += '    let _lastDampLevel = 0;\n';
+                meshCode += '    const mergedVertexCache = new Map();\n';
+                // getBlockUV: worker reads the per-job UV map (set in the mesh handler) — matches main getBlockUV output.
+                meshCode += '    let _workerUvMap = null;\n';
+                meshCode += '    function getBlockUV(blockId) { return (_workerUvMap && _workerUvMap[blockId]) ? _workerUvMap[blockId] : { top:[0,0], bottom:[0,0], side:[0,0] }; }\n';
+                // Functions (verbatim main-thread source via toString).
+                const meshFuncs = [
+                    computeMergedFaceVertices, getMergedFaceVertices, initMergedVertexCache,
+                    getAOConfig, calculateVertexAO, calculateFaceAO,
+                    calculateVertexCornerLight, calculateFaceCornerLight,
+                    getMergeKey, isWaterAdjacent, addFaceWaterIndexed, addMergedFaceIndexed,
+                    cellCornerLightDamped, extractLightFromChunk, clearGreedyBuffers, greedyMeshSection
+                ];
+                for (const fn of meshFuncs) {
+                    const indentedSource = fn.toString().split('\n').map(line => '    ' + line).join('\n');
+                    meshCode += indentedSource + '\n\n';
+                }
+                // Pre-fill the merged-vertex cache (getMergedFaceVertices reads it for sizes 1-16).
+                meshCode += '    initMergedVertexCache();\n';
+
+                const meshStartMarker = '/* __MESH_FUNCS_START__ */';
+                const meshEndMarker = '/* __MESH_FUNCS_END__ */';
+                const meshStartIdx = workerCode.indexOf(meshStartMarker);
+                const meshEndIdx = workerCode.indexOf(meshEndMarker);
+                if (meshStartIdx === -1 || meshEndIdx === -1) {
+                    console.warn('[WorkerPool] Mesh function markers not found, using static code');
+                    return workerCode;
+                }
+                const meshBefore = workerCode.substring(0, meshStartIdx + meshStartMarker.length);
+                const meshAfter = workerCode.substring(meshEndIdx);
+                return meshBefore + '\n' + meshCode + '\n    ' + meshAfter;
             }
 
             /**
