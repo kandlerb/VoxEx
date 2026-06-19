@@ -1,8 +1,8 @@
-# CCR — Chunk Update / Remesh Consolidation & Efficient Chunking  ✅ IMPLEMENTED (Phases 0–3)
+# CCR — Chunk Update / Remesh Consolidation & Efficient Chunking  ✅ IMPLEMENTED (Phases 0–4)
 
 **Project:** VoxEx (`voxEx.html`, single-file Three.js voxel engine)
 **Type:** Architecture / performance (chunk meshing pipeline)
-**Status:** ✅ **Phases 0–3 implemented & in `voxEx.html` (build `2026-06-17.19`), user-verified in-browser, `node --check` clean.** Phase 4 (worker meshing) and Phase F (light texture) deferred to future CCRs. Build order + full line-level spec in `CHUNK-IMPLEMENTATION-PLAN.md`. The audit/proposal below (Parts 1–6) is the original design record; **see the "AS-BUILT" section immediately below for what shipped and where it deviated.**
+**Status:** ✅ **Phases 0–3, 3.5, and 4 implemented & in `voxEx.html` (build `2026-06-18.11`), user-verified in-browser, `node --check` clean.** Off-thread worker meshing is LIVE; only Phase F (light-as-texture) remains deferred to a future CCR. Build order + full line-level spec in `CHUNK-IMPLEMENTATION-PLAN.md`. The audit/proposal below (Parts 1–6) is the original design record; **see the "AS-BUILT" section immediately below for what shipped and where it deviated.**
 **ID:** VOXEX-CCR-CHUNK-001
 
 ---
@@ -13,7 +13,32 @@ What was actually implemented, and where it differs from the proposal below. The
 and design rationale (Parts 3–5) are unchanged historical record; Part 6's line-level spec was the
 starting point but several details changed during implementation — those are called out here.
 
-### Shipped per phase
+### Phase 3.5 + Phase 4 (added 2026-06-18, after the original 0–3 reconciliation)
+
+- **Phase 3.5 — lazy banding.** Banding became **per-chunk**, not global: a chunk streams as a single
+  column (cheap) and converts to banded geometry only on its **first edit** (`bandedChunkKeys` +
+  `chunkUsesBands()` replacing the 5 global `SETTINGS.bandedMeshing` reads; `markChunkBanded()` on the
+  two center-edit sites). A `meshProfile()` A/B showed always-on banding ~doubled streaming mesh load
+  (first builds pay banding's 4× overhead for no benefit — banding only helps *edits*).
+- **Phase 4 — off-thread worker meshing. LIVE (`WORKER_MESH_PIPELINE_ENABLED = true`).** Re-scoped to
+  **unbanded chunks only**: streaming chunks mesh in the worker; banded/edited + torch/fire chunks stay
+  on main. The worker mesher is **single-sourced** from the main-thread functions via
+  `buildChunkWorkerCode()` injection (the `__MESH_FUNCS__` scaffold) — ~20 functions by
+  `Function.toString()` + AO/corner-light/quant/transparency tables as JSON of live values (byte-parity)
+  + greedy scratch + `mergedVertexCache` + `logDebug` stub + `getBlockUV` reconcile; the worker's old
+  hand-coded AO tables + per-block mesher were deleted. **Gated by a byte-parity test** (no-neighbor +
+  8-neighbor) comparing worker buffers to a headless main mesh. `applyWorkerMeshData` rewritten to the
+  pooled-mesh / tight-bounds / lightMap attach (the old version referenced a nonexistent material +
+  `computeBoundingSphere` over pooled buffers). **Spec deviations:** no per-band worker payload / band
+  loop (unbanded-only ⇒ mirrors `renderChunk`'s `numBands===1`); torch/fire not built in the worker
+  (`hasTorchFire` chunks fall back to `renderChunk`); parity oracle is a headless `meshChunkHeadless`
+  (test-only) since `renderChunk` needs a live scene. **Two bugs surfaced only when the long-dormant
+  pipeline first ran** (fixed): fast-flight dispatch starvation (per-frame cap sized for sync builds
+  starved the pool → stall) and `ensureChunk` synchronously meshing collision-touched chunks (~65ms
+  spikes). **Result:** main-thread mesh load **~203 → ~4 ms/s (−98%)**, over-budget single builds
+  **176 → ~2**, no stall, no seams.
+
+### Shipped per phase (Phases 0–3)
 
 - **Phase 0 — coalescing scheduler.** As specified: `DIRTY_REASON` bitmask + `chunkDirtyReason` map,
   `scheduleChunkUpdate({reason})`, light/seam/tree callers tagged, neighbor-drain de-dupe guard, mask

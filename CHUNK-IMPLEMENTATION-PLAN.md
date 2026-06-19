@@ -3,11 +3,13 @@
 **Project:** VoxEx (`voxEx.html`, single-file Three.js voxel engine)
 **Companion to:** `CCR-chunk-remesh-consolidation.md` (the audit + design rationale). This document
 is the **build order and full code-level spec** for executing that CCR.
-**Status:** ✅ **Phases 0–3 IMPLEMENTED & in `voxEx.html` (build 2026-06-17.19), user-verified in-browser.**
-⭐ **Phase 3.5 (lazy banding) PLANNED — do next** (cheap, data-driven: the 2026-06-17.20 `meshProfile()`
-A/B showed always-on banding ~doubles streaming mesh load). Phase 4 (worker-thread meshing, justified by
-the same data but XL) deferred until after Phase 3.5 re-measurement; Phase F (light-as-texture) is a
-separate future CCR.
+**Status:** ✅ **Phases 0–3, 3.5, and 4 ALL IMPLEMENTED & in `voxEx.html` (build 2026-06-18.11), user-verified
+in-browser.** Off-thread chunk meshing is LIVE (`WORKER_MESH_PIPELINE_ENABLED = true`). Phase F
+(light-as-texture) remains a separate future CCR.
+
+> **Phase 4 result (2026-06-18):** main-thread mesh load **~203 → ~4 ms/s (−98%)**; single builds over the
+> 16.7ms frame budget **176 → ~2**; no streaming stall; no seams; worker buffers byte-parity-validated vs
+> `renderChunk` (no-neighbor + 8-neighbor tests green). The win the lever measurement predicted, realized.
 
 > **Completion summary (2026-06-17):**
 > - **Phase 0 — coalescing scheduler:** DONE. `DIRTY_REASON`/`chunkDirtyReason` mask + neighbor-drain de-dupe.
@@ -1073,11 +1075,13 @@ this plan** — write `CCR-light-texture.md` after Phases 0–4 land and are mea
 
 **Phase 3** ✅ — [x] 3.1 `getMergeKey` + delete dead code (`>>10` after damp re-add) · [x] 3.2 corner sampling (visual-verified) · [x] 3.3 `refillChunkLightColors` + lightMap + drain branch · [x] drain branch fixed (no `.every` short-circuit — uses explicit `every(refill)` decline-to-remesh) · [x] `SETTINGS.lightRefill` (default OFF) · [x] getMergeKey tests + band/damp tests · [x] banner · [x] follow-up: damp level back in merge key (crisp shoreline)
 
-**Phase 3.5 (lazy banding)** 🟢 CODE COMPLETE (build 2026-06-18.1) — [x] `bandedChunkKeys` set + `_eagerBanding` + `chunkUsesBands` predicate + `markChunkBanded` (helper block ~6650) · [x] `numBands`→`useBands`/transition-capture + end-of-build orphan release · [x] `markChunkBanded` on both center-edit sites (`updateLocalArea` + light-neutral) · [x] swapped the 5 global `bandedMeshing` reads → `chunkUsesBands` (isChunkMeshed/releaseMeshForKey/refillChunkLightColors/numBands/eviction) · [x] unload cleanup `bandedChunkKeys.delete` · [x] `setBandedMeshing` clears the set + `setEagerBanding` A/B toggle · [x] node --check + re-grep (only master-switch reads remain) · [x] banner · [ ] **in-browser: `tools/voxex-tests.html` green** · [ ] **re-measure `meshProfile()` vs `setEagerBanding(true)` (acceptance gate)** · [ ] manual edit check (only touched band rebuilds; AO/shoreline/seams correct)
+**Phase 3.5 (lazy banding)** ✅ DONE (build 2026-06-18.1) — [x] `bandedChunkKeys` set + `_eagerBanding` + `chunkUsesBands` predicate + `markChunkBanded` · [x] `numBands`→`useBands`/transition-capture + end-of-build orphan release · [x] `markChunkBanded` on both center-edit sites · [x] swapped the 5 global `bandedMeshing` reads → `chunkUsesBands` · [x] unload cleanup · [x] `setBandedMeshing` clears set + `setEagerBanding` A/B · [x] node --check · [x] in-browser tests green · [x] `meshProfile()` re-measured (lazy ~34% less avg load than eager; confirmed banding inflates streaming) · [x] banner
 
-**Phase 4** ⏸ DEFERRED (future CCR, re-scoped XL) — [x] measure first (DONE 2026-06-17.20: meshing IS a bottleneck; do Phase 3.5 first, then re-measure) · [ ] 4a inject mesher via `__MESH_FUNCS__` + SETTINGS snapshot + reconcile worker getLocal/getLocalLight + worker band loop · [ ] buffer byte-parity test (gate) · [ ] 4b per-band payload protocol + rewrite `applyWorkerMeshData` (flushBand attach, pooled mesh, lightMap, torch/fire/shadows) · [ ] 4c flip 13441 + tune timeout/backpressure · [ ] banner
+**Phase 4 (worker meshing)** ✅ DONE — LIVE (build 2026-06-18.11). Re-scoped to **unbanded chunks only**. [x] measure-first lever gate (single heavy builds ⇒ off-thread is the fix) · [x] 4a mesher single-sourced via `__MESH_FUNCS__` injection (~20 funcs + tables-as-JSON + scratch + mergedVertexCache/logDebug + getBlockUV reconcile; worker's old AO/per-block mesher deleted) + SETTINGS snapshot + neighbor sky/block light send + `getLocalLight` verbatim port · [x] **byte-parity test (gate) GREEN** — no-neighbor + 8-neighbor, terrain+water buffers · [x] 4b `applyWorkerMeshData` rewrite (pooled `acquireChunkMesh`, `applyTightChunkBounds`, lightMap, count fixes, atomic swap, `markShadowsDirty`) + `hasTorchFire`→main fallback · [x] routing (`generateMeshViaWorker` returns null for banded → main) · [x] 4c flip `WORKER_MESH_PIPELINE_ENABLED=true` · [x] **stall fix** (dispatch was capped at ~1-2/frame while flying — sized for sync builds; now burst-level since worker dispatch is ~free; apply-drain budget scales when backlogged) · [x] **worstFrame fix** (`ensureChunk` collision-meshing routed to worker, not sync `renderChunk`) · [x] banner. RESULT: main-thread mesh load −98%, no stall, no seams.
 
-**Phase F** ⏸ DEFERRED — [ ] (later) write `CCR-light-texture.md`
+> **Phase 4 AS-BUILT deviations from the original spec:** (1) **Unbanded-only** — the worker meshes single-column (unbanded) chunks; banded/edited chunks stay on main. So there is **no per-band worker payload** (the spec's 4b per-band protocol) and **no worker band loop** — the worker mirrors `renderChunk`'s `numBands===1` path. (2) **Parity oracle** is a headless `meshChunkHeadless` (test-only, in the `?test=1` seam), not `renderChunk` directly (renderChunk needs a live scene the test harness lacks). (3) **Torch/fire**: not built in the worker; `hasTorchFire` chunks fall back to `renderChunk` (covers saved-world torches in never-edited chunks). (4) Two integration bugs only surfaced once the long-dormant pipeline actually ran: the fast-flight dispatch starvation stall, and `ensureChunk`'s synchronous collision-mesh spike — both fixed.
+
+**Phase F** ⏸ DEFERRED — [ ] (later) write `CCR-light-texture.md` (light as a sampled texture — would also let the worker skip lightMap and shrink the neighbor-light send to edge slices)
 
 ---
 
