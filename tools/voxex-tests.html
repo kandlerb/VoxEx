@@ -1015,6 +1015,118 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: lightRefill byte-parity (Phase 3B — refill==mesh, worker lightMap==main)", () => {
+        // Closes the lightRefill-investigation.md acceptance criteria #1 and #2. The shared
+        // cellCornerLightDamped + verbatim buildChunkLightGetters mean a light-only refill must
+        // reproduce the meshed colors EXACTLY for a fixed block+light state, and the worker's
+        // recorded lightMap must equal the main/headless lightMap byte-for-byte. Far synthetic
+        // chunk keys so they can't collide with the live game's streamed chunks. No neighbors =>
+        // both paths take the ownEdgeLight fallback, so the comparison is well-defined. The water
+        // pool exercises the wet-shoreline damp path (the trickiest light/block coupling).
+        function makeRefillTestChunk() {
+            const SIZE = 16 * 16 * 320;
+            const bi = (x, y, z) => x + z * 16 + y * 256;
+            const blocks = new Uint8Array(SIZE);
+            for (let y = 0; y <= 40; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = (y === 40 ? GRASS : STONE);
+            for (let z = 4; z < 10; z++) for (let x = 4; x < 10; x++) { blocks[bi(x, 40, z)] = WATER; blocks[bi(x, 39, z)] = WATER; }
+            blocks[bi(2, 42, 2)] = DIRT; blocks[bi(3, 42, 2)] = DIRT; blocks[bi(2, 43, 2)] = LOG;
+            const chunk = { blocks, skyLight: new Uint8Array(SIZE), blockLight: new Uint8Array(SIZE), sections: VoxEx.createSectionData() };
+            VoxEx.calculateChunkSunlight(chunk, 16, 320);
+            VoxEx.analyzeChunkSections(chunk);
+            return chunk;
+        }
+
+        // CRITERION #1: refillChunkLightColors reproduces the freshly-meshed colors exactly.
+        it("refillChunkLightColors == fresh mesh colors for an unchanged light state (no neighbors)", () => {
+            const { chunkDataPool, chunkMeshes, SETTINGS, meshChunkHeadless, refillChunkLightColors, getChunkKey } = VoxEx;
+            const CX = 33000, CZ = 33000, KEY = getChunkKey(CX, CZ);
+            expect(typeof refillChunkLightColors).toBe('function'); // seam wired
+            const prevRefill = SETTINGS.lightRefill;
+            SETTINGS.lightRefill = true; // greedyMeshSection records the lightMap only when on
+            try {
+                chunkDataPool.chunks.set(KEY, makeRefillTestChunk());
+                const main = meshChunkHeadless(CX, CZ);          // oracle: the mesher's ao*light colors
+                expect(main).toBeTruthy();
+                const lm = main.terrain.lightMap;
+                expect(lm).toBeTruthy();
+                expect(lm.quadCount).toBe(main.terrain.faceCount);
+                const meshedColors = main.terrain.colors;
+                const N = lm.quadCount * 12;
+                expect(meshedColors.length).toBe(N);
+
+                // Mock geometry: zeroed color buffer + the recorded lightMap. refill rewrites colors
+                // in place. Set->refill->compare->delete runs synchronously, so no rAF frame (which
+                // could touch a non-Three mesh in chunkMeshes) can interleave.
+                const colorArr = new Float32Array(N);
+                const geo = { userData: { lightMap: lm }, attributes: { color: { array: colorArr, clearUpdateRanges() {}, addUpdateRange() {}, needsUpdate: false } } };
+                chunkMeshes.set(KEY, { geometry: geo });
+                const ok = refillChunkLightColors(KEY);
+                expect(ok).toBe(true);
+
+                let maxDiff = 0, firstBad = -1;
+                for (let i = 0; i < N; i++) {
+                    const d = Math.abs(colorArr[i] - meshedColors[i]);
+                    if (d > maxDiff) maxDiff = d;
+                    if (d > 1e-6 && firstBad < 0) firstBad = i;
+                }
+                if (firstBad >= 0) throw new Error('refill!=mesh at color[' + firstBad + ']: refill=' + colorArr[firstBad] + ' mesh=' + meshedColors[firstBad] + ' (maxDiff=' + maxDiff + ')');
+                expect(maxDiff).toBeLessThan(1e-6);
+            } finally {
+                chunkMeshes.delete(KEY);
+                chunkDataPool.chunks.delete(KEY);
+                SETTINGS.lightRefill = prevRefill;
+            }
+        });
+
+        // CRITERION #2: the worker's recorded lightMap == the main/headless lightMap (cells exact,
+        // face exact, AO floats tight). This is the parity the Phase 4 mesh test never checked
+        // (it ran with lightRefill off => worker lightMap was null).
+        it("worker lightMap (cells/ao/face) == headless lightMap with lightRefill ON", async () => {
+            const { chunkDataPool, uvMap, SETTINGS, meshChunkHeadless } = VoxEx;
+            const SEED = "lm_parity";
+            const CX = 34000, CZ = 34000, KEY = CX + "," + CZ;
+            const prevRefill = SETTINGS.lightRefill;
+            let worker = null, url = null;
+            try {
+                SETTINGS.lightRefill = true; // headless oracle records its lightMap only when on
+                chunkDataPool.chunks.set(KEY, makeRefillTestChunk());
+                const main = meshChunkHeadless(CX, CZ);
+                expect(main).toBeTruthy();
+                const mlm = main.terrain.lightMap;
+                expect(mlm).toBeTruthy();
+                expect(mlm.quadCount).toBe(main.terrain.faceCount);
+
+                url = URL.createObjectURL(new Blob([VoxEx.buildChunkWorkerCode()], { type: 'application/javascript' }));
+                worker = new Worker(url);
+                const req = (msg, okType) => new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker ' + okType + ' timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === okType) { clearTimeout(to); resolve(e.data); } else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker error: ' + e.data.error)); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage(msg);
+                });
+                await req({ type: 'init', jobId: 1, seedStr: SEED }, 'ready');
+                const meshSettings = { smoothLighting: SETTINGS.smoothLighting, AO: SETTINGS.AO, greedyMeshingEnabled: true, maxGreedyQuadSize: SETTINGS.maxGreedyQuadSize, lightRefill: true, bandedMeshing: SETTINGS.bandedMeshing, waterFogDensity: SETTINGS.waterFogDensity, waterColor: SETTINGS.waterColor };
+                const r = await req({ type: 'mesh', jobId: 2, cx: CX, cz: CZ, centerBlocks: new Uint8Array(chunkDataPool.chunks.get(KEY).blocks), centerSkyLight: new Uint8Array(chunkDataPool.chunks.get(KEY).skyLight), centerBlockLight: new Uint8Array(chunkDataPool.chunks.get(KEY).blockLight), neighbors: {}, neighborSkyLight: {}, neighborBlockLight: {}, uvMapData: uvMap, maxFaces: 16384, settingsAO: SETTINGS.AO, meshSettings, useBands: false }, 'mesh');
+
+                const wlm = r.terrain.lightMap;
+                expect(wlm).toBeTruthy();             // worker must EMIT a lightMap when lightRefill on
+                expect(wlm.quadCount).toBe(mlm.quadCount);
+                const cmp = (label, w, m, len, tol) => {
+                    expect(w.length).toBe(len);
+                    for (let i = 0; i < len; i++) { if (Math.abs(w[i] - m[i]) > tol) throw new Error(label + ' mismatch at ' + i + ': worker=' + w[i] + ' main=' + m[i]); }
+                };
+                cmp('lightMap.cells', wlm.cells, mlm.cells, mlm.quadCount * 4, 0); // exact: corner cell indices
+                cmp('lightMap.face', wlm.face, mlm.face, mlm.quadCount, 0);        // exact: face index
+                cmp('lightMap.ao', wlm.ao, mlm.ao, mlm.quadCount * 4, 1e-6);       // AO floats
+            } finally {
+                if (worker) worker.terminate();
+                if (url) URL.revokeObjectURL(url);
+                chunkDataPool.chunks.delete(KEY);
+                SETTINGS.lightRefill = prevRefill;
+            }
+        });
+    });
+
     describe("Tier 4: worker biome-resolver parity (no tree-gen cache pollution)", () => {
         // Regression for the worker-vs-main height-cliff bug: the worker once carried a
         // divergent static biome selector (getRawBiomeCellValue/getBiomeCellValue) that shared

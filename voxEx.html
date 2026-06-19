@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-18.11";
+            const VOXEX_BUILD = "2026-06-19.01";
             const VOXEX_RECENT_CHANGES = [
+                "LIGHTREFILL PARITY TESTS (test-only; no production behavior change). Closes lightRefill-investigation.md criteria #1/#2. Code audit found (C) color-parity and (A) stale-AO DISPROVEN — refill==mesh for a fixed state (shared cellCornerLightDamped + verbatim buildChunkLightGetters, no light-path cache, aligned corner-cell indexing) and dirty reasons coalesce so AO can't go stale on an edit; (B) worker lightMap is the live untested suspect (worker meshing is ON; streaming chunks carry a never-byte-compared worker lightMap that refill reads). Added: meshChunkHeadless now records a lightMap oracle when SETTINGS.lightRefill is on; refillChunkLightColors+buildChunkLightGetters exposed on the ?test=1 seam; tools/voxex-tests.html suite 'Tier 4: lightRefill byte-parity' asserts refill==fresh-mesh colors (#1) and worker lightMap cells/ao/face==headless (#2). Both additions live inside the ?test=1 guard — production paths untouched.",
                 "PHASE 4 COMPLETE: off-thread chunk meshing is live + tuned. Final fix — the residual ~65ms worstFrame spike was ensureChunk() synchronously renderChunk-ing chunks that collision touched (flying into unloaded terrain probes many/frame); now it generates the DATA (collision needs only that) and routes the MESH to the worker. Net result vs pre-Phase-4: main-thread mesh load ~203 → ~4 ms/sec (-98%), per-build frame-droppers (builds >16.7ms) 176 → ~2, no streaming stall, no seams, byte-parity validated. Worker meshes UNBANDED/streaming chunks; banded(edited)/torch/fire chunks stay on main. Revert = WORKER_MESH_PIPELINE_ENABLED=false.",
                 "PHASE 4 STALL FIX: fast-flight streaming stalled with worker meshing on ('chunks ahead never load'). Cause: processChunkQueue capped dispatch at min(2, estimatedChunksAllowed) while moving fast — sized for 13ms SYNC builds, but worker DISPATCH is ~free, so it starved the pool and the queue grew unbounded. Fix: when worker-meshing, dispatch at burst level (baseCap*2) regardless of movement; and the apply-drain budget rises to 12ms when readyMeshResults backs up (>12). Throughput now governed by the apply-drain, not an undersized dispatch cap.",
                 "PHASE 4 FLIPPED ON: WORKER_MESH_PIPELINE_ENABLED = true. Off-thread chunk meshing is now LIVE for UNBANDED (streaming/never-edited) chunks — the per-build cost that was blowing frames (maxBuildMs 17-35ms) now runs in the worker instead of the main thread. Banded/edited chunks + saved-torch/fire chunks still mesh on the main thread (renderChunk). The worker mesher is byte-parity-validated vs main (no-neighbor + 8-neighbor). VERIFY IN-GAME: fly fresh terrain (watch for seams at worker/main borders, missing/late chunks), meshProfile() should show worstFrameMs DROP, re-run voxex-tests.html. REVERT: set WORKER_MESH_PIPELINE_ENABLED back to false (line ~13532).",
@@ -44981,8 +44982,16 @@ self.onmessage = async (e) => {
                             }
                         }
                     }
+                    // PHASE 3B lightMap ORACLE (test-only): greedyMeshSection records _lmCells/_lmAO/
+                    // _lmFace into module scratch when SETTINGS.lightRefill is on (the section loop above
+                    // ran synchronously, so the scratch holds THIS chunk's quads). Slice it out exactly
+                    // like flushBand/the worker do, so this serves as the byte-parity oracle for the
+                    // worker lightMap AND for refillChunkLightColors. Null when lightRefill is off.
+                    const lightMap = SETTINGS.lightRefill
+                        ? { quadCount: tFaceCount, cells: _lmCells.slice(0, tFaceCount * 4), ao: _lmAO.slice(0, tFaceCount * 4), face: _lmFace.slice(0, tFaceCount) }
+                        : null;
                     return {
-                        terrain: { positions: tPos.subarray(0, tVIdx), uvs: tUvs.subarray(0, tUvIdx), colors: tCols.subarray(0, tCIdx), quadSize: tQs.subarray(0, tQsIdx), indices: tIdx.subarray(0, tIIdx), faceCount: tFaceCount },
+                        terrain: { positions: tPos.subarray(0, tVIdx), uvs: tUvs.subarray(0, tUvIdx), colors: tCols.subarray(0, tCIdx), quadSize: tQs.subarray(0, tQsIdx), indices: tIdx.subarray(0, tIIdx), faceCount: tFaceCount, lightMap },
                         water: { positions: wPos.subarray(0, wVIdx), uvs: wUvs.subarray(0, wUvIdx), colors: wCols.subarray(0, wCIdx), indices: wIdx.subarray(0, wIIdx), shore: wShore.subarray(0, wSIdx), thickness: wThick.subarray(0, wTIdx), foam: wFoam.subarray(0, wSIdx), faceCount: wFaceCount }
                     };
                 }
@@ -45038,6 +45047,8 @@ self.onmessage = async (e) => {
                     //     worker↔main byte-parity test; safe — only reachable via the ?test=1 seam) ---
                     renderChunk, chunkMeshes, chunkDataPool, uvMap, SETTINGS, MAX_FACES_PER_CHUNK,
                     meshChunkHeadless,
+                    // --- Phase 3B lightRefill parity test hooks ---
+                    refillChunkLightColors, buildChunkLightGetters,
                     // --- shadows (single source of truth: frustum=2r, map=32r => texel locked to 1/16 block) ---
                     SHADOW_RENDER_DISTANCES, deriveShadowConfig,
                     // --- touch controls pure logic (mobileControlsPlan.md Phase 9) ---
