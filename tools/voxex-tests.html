@@ -32,6 +32,7 @@ h1 { color: #4caf50; margin-bottom: 4px; }
 <h1>VoxEx Test Suite</h1>
 <p class="subtitle">Standalone tests for pure functions extracted from voxEx.html (~43K lines)</p>
 <button id="run-btn" onclick="runAllTests()">Run All Tests</button>
+<div id="progress"></div>
 <div id="summary"></div>
 <div id="results"></div>
 <div id="terrain-viz-container"></div>
@@ -45,13 +46,29 @@ const suites = [];
 let currentSuite = null;
 function describe(name, fn) { currentSuite = { name, tests: [], passed: 0, failed: 0 }; suites.push(currentSuite); fn(); currentSuite = null; }
 function it(name, fn) { currentSuite.tests.push({ name, fn, passed: true, error: null }); }
-async function runRegistered() {
+async function runRegistered(onProgress) {
+    const total = suites.reduce((n, s) => n + s.tests.length, 0);
+    let done = 0;
     for (const s of suites) {
         for (const t of s.tests) {
+            if (onProgress) onProgress(done, total, s.name, t.name);
+            // Yield so the progress bar actually repaints between tests (sync tests don't yield on their own).
+            await new Promise(r => setTimeout(r, 0));
             try { await t.fn(); } catch (e) { t.passed = false; t.error = e.message; }
-            if (t.passed) s.passed++; else s.failed++;
+            done++;
         }
     }
+    if (onProgress) onProgress(done, total, 'Done', '');
+}
+function updateProgress(done, total, suiteName, testName) {
+    const el = document.getElementById('progress');
+    if (!el) return;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    const barColor = (suiteName === 'Done') ? '#4caf50' : '#42a5f5';
+    el.innerHTML =
+        `<div style="background:#333;border-radius:6px;overflow:hidden;height:22px;margin-bottom:6px">` +
+        `<div style="background:${barColor};height:100%;width:${pct}%;transition:width .08s"></div></div>` +
+        `<div style="font-size:12px;color:#aaa">${done}/${total} (${pct}%) — ${suiteName}${testName ? ': ' + testName : ''}</div>`;
 }
 function expect(actual) {
     return {
@@ -75,12 +92,37 @@ function expect(actual) {
 function renderResults() {
     const container = document.getElementById('results');
     const summaryEl = document.getElementById('summary');
+    // Derive counts from the tests array (NOT suite.passed/failed accumulators) so a re-entrant run
+    // can never show inflated tallies like "(4/2)".
     let totalPass = 0, totalFail = 0;
-    let html = '';
+    const failures = [];
     for (const suite of suites) {
-        totalPass += suite.passed; totalFail += suite.failed;
-        const cls = suite.failed > 0 ? 'fail' : 'pass';
-        html += `<div class="suite ${cls}"><div class="suite-title">${suite.name} (${suite.passed}/${suite.tests.length})</div>`;
+        for (const test of suite.tests) {
+            if (test.passed) totalPass++;
+            else { totalFail++; failures.push({ suite: suite.name, test: test.name, error: test.error }); }
+        }
+    }
+    const total = totalPass + totalFail;
+
+    // (1) FAILURES-FIRST block at the very top — every failing test, with its suite + error.
+    let html = '';
+    if (failures.length) {
+        html += `<div class="suite fail"><div class="suite-title">⚠ ${failures.length} FAILED — fix these first</div>`;
+        for (const f of failures) {
+            html += `<div class="test fail">${f.suite} › ${f.test}</div>`;
+            if (f.error) html += `<div class="test-detail">${f.error}</div>`;
+        }
+        html += '</div>';
+    }
+
+    // (2) Full results, with failing suites sorted to the top.
+    const sorted = suites.slice().sort((a, b) =>
+        (b.tests.some(t => !t.passed) ? 1 : 0) - (a.tests.some(t => !t.passed) ? 1 : 0));
+    for (const suite of sorted) {
+        const p = suite.tests.filter(t => t.passed).length;
+        const f = suite.tests.length - p;
+        const cls = f > 0 ? 'fail' : 'pass';
+        html += `<div class="suite ${cls}"><div class="suite-title">${suite.name} (${p}/${suite.tests.length})</div>`;
         for (const test of suite.tests) {
             html += `<div class="test ${test.passed ? 'pass' : 'fail'}">${test.name}</div>`;
             if (test.error) html += `<div class="test-detail">${test.error}</div>`;
@@ -88,7 +130,6 @@ function renderResults() {
         html += '</div>';
     }
     container.innerHTML = html;
-    const total = totalPass + totalFail;
     const cls = totalFail > 0 ? 'has-fail' : 'all-pass';
     summaryEl.innerHTML = `<div class="summary ${cls}">${totalPass}/${total} tests passed${totalFail > 0 ? ` (${totalFail} failed)` : ' - All green!'}</div>`;
 }
@@ -121,7 +162,11 @@ const GEO_TIER_SMALL = 4096, GEO_TIER_MEDIUM = 8192, GEO_TIER_LARGE = 16384;
 // ============================================================
 // ALL TEST SUITES
 // ============================================================
+let _testsRunning = false;
 async function runAllTests() {
+    if (_testsRunning) return; // re-entrancy guard: a 2nd concurrent run was double-counting suites
+    _testsRunning = true;
+    try {
     suites.length = 0;
     VoxEx = await loadRealCode();
     // Bind real code into locals used by suites:
@@ -831,6 +876,145 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: worker MESH byte-parity (Phase 4a — gate, flag stays off until green)", () => {
+        // Proves the worker mesher (single-sourced via buildChunkWorkerCode injection) produces
+        // byte-identical buffers to main's renderChunk for the SAME unbanded chunk + SETTINGS. Uses a
+        // far chunk key so it can't collide with the live game's streamed chunks. No neighbors => both
+        // sides take the UNLOADED_BLOCK / ownEdgeLight fallback, so the comparison is well-defined.
+        it("worker terrain+water buffers == renderChunk (synthetic chunk, greedy on, no neighbors)", async () => {
+            const SEED = "mesh_parity";
+            const CX = 31000, CZ = 31000, KEY = CX + "," + CZ;
+            const { chunkDataPool, uvMap, SETTINGS, meshChunkHeadless } = VoxEx;
+            const SIZE = 16 * 16 * 320;
+            const bi = (x, y, z) => x + z * 16 + y * 256;
+
+            // Synthetic chunk: stone base, grass top, a water pool, a few floating blocks (AO/light variety).
+            const blocks = new Uint8Array(SIZE);
+            for (let y = 0; y <= 40; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = (y === 40 ? GRASS : STONE);
+            for (let z = 4; z < 10; z++) for (let x = 4; x < 10; x++) { blocks[bi(x, 40, z)] = WATER; blocks[bi(x, 39, z)] = WATER; }
+            blocks[bi(2, 42, 2)] = DIRT; blocks[bi(3, 42, 2)] = DIRT; blocks[bi(2, 43, 2)] = LOG;
+            const chunk = { blocks, skyLight: new Uint8Array(SIZE), blockLight: new Uint8Array(SIZE), sections: VoxEx.createSectionData() };
+            VoxEx.calculateChunkSunlight(chunk, 16, 320);
+            VoxEx.analyzeChunkSections(chunk);
+
+            let worker = null, url = null;
+            try {
+                // --- MAIN oracle: headless mesh (mirrors renderChunk's unbanded buffer-fill, no scene) ---
+                chunkDataPool.chunks.set(KEY, chunk);
+                const main = meshChunkHeadless(CX, CZ);
+                expect(main).toBeTruthy();
+                const mainT = { fc: main.terrain.faceCount, pos: main.terrain.positions, uv: main.terrain.uvs, col: main.terrain.colors, qs: main.terrain.quadSize, idx: main.terrain.indices };
+                const mainW = { fc: main.water.faceCount, pos: main.water.positions, uv: main.water.uvs, col: main.water.colors, idx: main.water.indices, shore: main.water.shore, thick: main.water.thickness, foam: main.water.foam };
+
+                // --- WORKER ---
+                url = URL.createObjectURL(new Blob([VoxEx.buildChunkWorkerCode()], { type: 'application/javascript' }));
+                worker = new Worker(url);
+                const req = (msg, okType) => new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker ' + okType + ' timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === okType) { clearTimeout(to); resolve(e.data); } else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker error: ' + e.data.error)); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage(msg);
+                });
+                await req({ type: 'init', jobId: 1, seedStr: SEED }, 'ready');
+                const meshSettings = { smoothLighting: SETTINGS.smoothLighting, AO: SETTINGS.AO, greedyMeshingEnabled: true, maxGreedyQuadSize: SETTINGS.maxGreedyQuadSize, lightRefill: SETTINGS.lightRefill, bandedMeshing: SETTINGS.bandedMeshing, waterFogDensity: SETTINGS.waterFogDensity, waterColor: SETTINGS.waterColor };
+                const r = await req({ type: 'mesh', jobId: 2, cx: CX, cz: CZ, centerBlocks: new Uint8Array(chunk.blocks), centerSkyLight: new Uint8Array(chunk.skyLight), centerBlockLight: new Uint8Array(chunk.blockLight), neighbors: {}, neighborSkyLight: {}, neighborBlockLight: {}, uvMapData: uvMap, maxFaces: 16384, settingsAO: SETTINGS.AO, meshSettings, useBands: false }, 'mesh');
+
+                // --- COMPARE (exact for indices, tight tol for floats) ---
+                const cmp = (label, w, m, len, tol) => {
+                    expect(w.length).toBe(len);
+                    for (let i = 0; i < len; i++) {
+                        if (Math.abs(w[i] - m[i]) > tol) throw new Error(label + ' mismatch at index ' + i + ': worker=' + w[i] + ' main=' + m[i]);
+                    }
+                };
+                expect(r.terrain.faceCount).toBe(mainT.fc);
+                expect(mainT.fc).toBeGreaterThan(0);
+                cmp('terrain.positions', r.terrain.positions, mainT.pos, mainT.fc * 12, 1e-4);
+                cmp('terrain.uvs', r.terrain.uvs, mainT.uv, mainT.fc * 8, 1e-5);
+                cmp('terrain.colors', r.terrain.colors, mainT.col, mainT.fc * 12, 1e-4);
+                cmp('terrain.quadSize', r.terrain.quadSize, mainT.qs, mainT.fc * 8, 1e-4);
+                cmp('terrain.indices', r.terrain.indices, mainT.idx, mainT.fc * 6, 0);
+
+                expect(r.water.faceCount).toBe(mainW.fc);
+                if (mainW.fc > 0) {
+                    cmp('water.positions', r.water.positions, mainW.pos, mainW.fc * 12, 1e-4);
+                    cmp('water.uvs', r.water.uvs, mainW.uv, mainW.fc * 8, 1e-5);
+                    cmp('water.colors', r.water.colors, mainW.col, mainW.fc * 12, 1e-4);
+                    cmp('water.indices', r.water.indices, mainW.idx, mainW.fc * 6, 0);
+                    cmp('water.shore', r.water.shore, mainW.shore, mainW.fc * 4, 1e-4);
+                    cmp('water.thickness', r.water.thickness, mainW.thick, mainW.fc * 4, 1e-4);
+                    cmp('water.foam', r.water.foam, mainW.foam, mainW.fc * 4, 1e-4);
+                }
+            } finally {
+                if (worker) worker.terminate();
+                if (url) URL.revokeObjectURL(url);
+            }
+        });
+
+        it("worker == main WITH 8 neighbors (exercises the neighbor-light edge path — the seam risk)", async () => {
+            const SEED = "mesh_parity_nbr";
+            const CX = 32000, CZ = 32000;
+            const { chunkDataPool, uvMap, SETTINGS, meshChunkHeadless } = VoxEx;
+            const SIZE = 16 * 16 * 320;
+            const bi = (x, y, z) => x + z * 16 + y * 256;
+            // Solid stone to topY, grass cap. The CENTER is taller (40) than the NEIGHBORS (38), so the
+            // center's X/Z border faces at y=39,40 draw against neighbor AIR — those faces sample the
+            // NEIGHBOR's light (exposed sky, ~15), which differs from this chunk's own buried edge cell
+            // (~3). If the worker's getLocalLight port reads neighbors wrong, or falls back to
+            // ownEdgeLight, the edge colors diverge and this test fails.
+            const makeChunk = (topY) => {
+                const blocks = new Uint8Array(SIZE);
+                for (let y = 0; y <= topY; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = (y === topY ? GRASS : STONE);
+                const ch = { blocks, skyLight: new Uint8Array(SIZE), blockLight: new Uint8Array(SIZE), sections: VoxEx.createSectionData() };
+                VoxEx.calculateChunkSunlight(ch, 16, 320);
+                VoxEx.analyzeChunkSections(ch);
+                return ch;
+            };
+            const dirs = { n: [0, -1], s: [0, 1], e: [1, 0], w: [-1, 0], nw: [-1, -1], ne: [1, -1], sw: [-1, 1], se: [1, 1] };
+            const center = makeChunk(40);
+            const nbr = {};
+            for (const d in dirs) nbr[d] = makeChunk(38);
+            chunkDataPool.chunks.set(CX + "," + CZ, center);
+            for (const d in dirs) { const o = dirs[d]; chunkDataPool.chunks.set((CX + o[0]) + "," + (CZ + o[1]), nbr[d]); }
+
+            let worker = null, url = null;
+            try {
+                const main = meshChunkHeadless(CX, CZ);
+                expect(main).toBeTruthy();
+                const mainT = main.terrain;
+                expect(mainT.faceCount).toBeGreaterThan(0);
+                const nBlocks = {}, nSky = {}, nBlk = {};
+                for (const d in dirs) { nBlocks[d] = new Uint8Array(nbr[d].blocks); nSky[d] = new Uint8Array(nbr[d].skyLight); nBlk[d] = new Uint8Array(nbr[d].blockLight); }
+
+                url = URL.createObjectURL(new Blob([VoxEx.buildChunkWorkerCode()], { type: 'application/javascript' }));
+                worker = new Worker(url);
+                const req = (msg, okType) => new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker ' + okType + ' timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === okType) { clearTimeout(to); resolve(e.data); } else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker error: ' + e.data.error)); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage(msg);
+                });
+                await req({ type: 'init', jobId: 1, seedStr: SEED }, 'ready');
+                const meshSettings = { smoothLighting: SETTINGS.smoothLighting, AO: SETTINGS.AO, greedyMeshingEnabled: true, maxGreedyQuadSize: SETTINGS.maxGreedyQuadSize, lightRefill: SETTINGS.lightRefill, bandedMeshing: SETTINGS.bandedMeshing, waterFogDensity: SETTINGS.waterFogDensity, waterColor: SETTINGS.waterColor };
+                const r = await req({ type: 'mesh', jobId: 2, cx: CX, cz: CZ, centerBlocks: new Uint8Array(center.blocks), centerSkyLight: new Uint8Array(center.skyLight), centerBlockLight: new Uint8Array(center.blockLight), neighbors: nBlocks, neighborSkyLight: nSky, neighborBlockLight: nBlk, uvMapData: uvMap, maxFaces: 16384, settingsAO: SETTINGS.AO, meshSettings, useBands: false }, 'mesh');
+
+                const cmp = (label, w, m, len, tol) => {
+                    expect(w.length).toBe(len);
+                    for (let i = 0; i < len; i++) { if (Math.abs(w[i] - m[i]) > tol) throw new Error(label + ' mismatch at index ' + i + ': worker=' + w[i] + ' main=' + m[i]); }
+                };
+                expect(r.terrain.faceCount).toBe(mainT.faceCount);
+                cmp('terrain.positions', r.terrain.positions, mainT.positions, mainT.faceCount * 12, 1e-4);
+                cmp('terrain.uvs', r.terrain.uvs, mainT.uvs, mainT.faceCount * 8, 1e-5);
+                cmp('terrain.colors', r.terrain.colors, mainT.colors, mainT.faceCount * 12, 1e-4); // the seam-critical buffer
+                cmp('terrain.quadSize', r.terrain.quadSize, mainT.quadSize, mainT.faceCount * 8, 1e-4);
+                cmp('terrain.indices', r.terrain.indices, mainT.indices, mainT.faceCount * 6, 0);
+                expect(r.water.faceCount).toBe(main.water.faceCount);
+            } finally {
+                if (worker) worker.terminate();
+                if (url) URL.revokeObjectURL(url);
+            }
+        });
+    });
+
     describe("Tier 4: worker biome-resolver parity (no tree-gen cache pollution)", () => {
         // Regression for the worker-vs-main height-cliff bug: the worker once carried a
         // divergent static biome selector (getRawBiomeCellValue/getBiomeCellValue) that shared
@@ -1011,10 +1195,11 @@ async function runAllTests() {
         it("neither => false", () => { expect(g(false, false)).toBe(false); });
     });
 
-    await runRegistered();
+    await runRegistered(updateProgress);
     renderResults();
     renderTerrainVisualizations();
     renderMountainTuning();
+    } finally { _testsRunning = false; }
 }
 
 // ============================================================
