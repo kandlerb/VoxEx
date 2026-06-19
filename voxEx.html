@@ -3882,8 +3882,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-19.01";
+            const VOXEX_BUILD = "2026-06-19.02";
             const VOXEX_RECENT_CHANGES = [
+                "WORKER POOL CAP 4 → 8 (streaming throughput on many-core machines). Symptom: on a 14-core box, terrain loaded slowly with worker meshing ON (FPS fine, world popped in late) — meshProfile showed builds:0 (main thread idle) yet streaming lagged. Cause: ChunkWorkerPool does BOTH terrain gen (generateTerrainViaWorker) and meshing (generateMeshViaWorker), but the auto pool size was min(4, cores-1), so ~10 cores sat idle while 4 workers did double duty. Fix: auto cap raised to min(8, cores-1) — baseCap=max(buildQueueLimit,poolSize) and the worker-mesh dispatch (baseCap*2) scale off poolSize, so this widens the whole gen+mesh pipeline; apply-drain budget self-tunes (4→12ms). Low-core machines unchanged (2c→1, 4c→3). NOT lightRefill-related (that was a red herring; slowness persisted with it off).",
                 "LIGHTREFILL PARITY TESTS (test-only; no production behavior change). Closes lightRefill-investigation.md criteria #1/#2. Code audit found (C) color-parity and (A) stale-AO DISPROVEN — refill==mesh for a fixed state (shared cellCornerLightDamped + verbatim buildChunkLightGetters, no light-path cache, aligned corner-cell indexing) and dirty reasons coalesce so AO can't go stale on an edit; (B) worker lightMap is the live untested suspect (worker meshing is ON; streaming chunks carry a never-byte-compared worker lightMap that refill reads). Added: meshChunkHeadless now records a lightMap oracle when SETTINGS.lightRefill is on; refillChunkLightColors+buildChunkLightGetters exposed on the ?test=1 seam; tools/voxex-tests.html suite 'Tier 4: lightRefill byte-parity' asserts refill==fresh-mesh colors (#1) and worker lightMap cells/ao/face==headless (#2). Both additions live inside the ?test=1 guard — production paths untouched.",
                 "PHASE 4 COMPLETE: off-thread chunk meshing is live + tuned. Final fix — the residual ~65ms worstFrame spike was ensureChunk() synchronously renderChunk-ing chunks that collision touched (flying into unloaded terrain probes many/frame); now it generates the DATA (collision needs only that) and routes the MESH to the worker. Net result vs pre-Phase-4: main-thread mesh load ~203 → ~4 ms/sec (-98%), per-build frame-droppers (builds >16.7ms) 176 → ~2, no streaming stall, no seams, byte-parity validated. Worker meshes UNBANDED/streaming chunks; banded(edited)/torch/fire chunks stay on main. Revert = WORKER_MESH_PIPELINE_ENABLED=false.",
                 "PHASE 4 STALL FIX: fast-flight streaming stalled with worker meshing on ('chunks ahead never load'). Cause: processChunkQueue capped dispatch at min(2, estimatedChunksAllowed) while moving fast — sized for 13ms SYNC builds, but worker DISPATCH is ~free, so it starved the pool and the queue grew unbounded. Fix: when worker-meshing, dispatch at burst level (baseCap*2) regardless of movement; and the apply-drain budget rises to 12ms when readyMeshResults backs up (>12). Throughput now governed by the apply-drain, not an undersized dispatch cap.",
@@ -19082,12 +19083,20 @@
             class ChunkWorkerPool {
                 /**
                  * Create a worker pool.
-                 * @param {number} [poolSize] - Number of workers (0 or undefined = auto: CPU cores - 1, min 1, max 4)
+                 * @param {number} [poolSize] - Number of workers (0 or undefined = auto: CPU cores - 1, min 1, max 8)
                  */
                 constructor(poolSize) {
                     const cores = navigator.hardwareConcurrency || 4;
-                    // poolSize of 0 means "auto" - calculate based on CPU cores
-                    this.poolSize = (poolSize && poolSize > 0) ? Math.min(8, Math.max(1, poolSize)) : Math.min(4, Math.max(1, cores - 1));
+                    // poolSize of 0 means "auto" - calculate based on CPU cores.
+                    // Cap raised 4 -> 8 (2026-06-19): the pool does DOUBLE duty — terrain GEN
+                    // (generateTerrainViaWorker) AND meshing (generateMeshViaWorker) both run here, so on
+                    // many-core machines a cap of 4 left most cores idle and starved fresh-terrain
+                    // streaming ("terrain loads slowly"). baseCap (=max(buildQueueLimit,poolSize)) and the
+                    // per-frame dispatch (baseCap*2 when worker-meshing) scale off poolSize, so raising it
+                    // widens the whole gen+mesh pipeline; the apply-drain budget self-tunes (4→12ms). Low-
+                    // core machines are unchanged (cores-1 still wins: 2c→1, 4c→3). 8 leaves headroom for
+                    // the main thread (render + apply-drain + audio).
+                    this.poolSize = (poolSize && poolSize > 0) ? Math.min(8, Math.max(1, poolSize)) : Math.min(8, Math.max(1, cores - 1));
                     this.workers = [];
                     this.jobQueue = [];
                     this.pendingJobs = new Map(); // jobId -> {resolve, reject, cx, cz}
