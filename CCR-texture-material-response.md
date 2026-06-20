@@ -277,6 +277,245 @@ Options, recommended first:
 
 **Cost / risk.** One extra translucent draw per chunk that contains glass (same class of cost as water), plus transparency **sorting** between glass and water when both are present (depthWrite off on both). Touches the mesher, the mesh pool/lifecycle, and worker parity — the biggest change in this CCR, but well-precedented since water proves the whole path. The Phase-1 `roughnessMap`/`uShininessStrength` system carries straight over (the glass material samples the same atlas roughness, so the dark/pale glass texels keep their authored shininess). New setting `glassOpacity` (range ~0.1–0.6) follows the same DEFAULTS/SETTINGS/UI/round-trip wiring as `waterOpacity`.
 
+### Phase 2a.1 — Glass body opacity rework: real per-pixel alpha mix + specular punch-through *(BUILT 2026-06-19 build .08; supersedes the build .06 shader-marker approach — pending in-browser test/tuning)*
+
+> **AS-BUILT:** Both parts shipped exactly as planned below. Part 1: body opacity baked into texture alpha (`a0 = round(glassOpacity*255)`), exact body texel offsets recorded in `_glassBodyTexels`, `_glassAtlas` refs stashed after atlas `tex` creation, `setGlassBodyAlpha()` re-bakes live; the build-.06 `uGlassBodyOpacity` override removed; the 3 poke sites re-pointed. Part 2: punch-through wrap injects after `#include <opaque_fragment>` (`gl_FragColor.a += specLuma * uGlintReflect`), driven by the repurposed `specularFresnel` (UI relabeled "Glass Reflection", range 0–2). All new JS blocks syntax-checked in isolation; `uGlassBodyOpacity` is gone from live code. Optional Fresnel rim NOT added (left as a tuning follow-up).
+
+**Why.** Build .06 set body opacity with a *shader marker*: body texels tagged alpha 0, then `diffuseColor.a = (diffuseColor.a < 0.5) ? uGlassBodyOpacity : 1.0` after `<map_fragment>`. In practice the body reads wrong (all-opaque or invisible) — fragile and unverifiable. Kandler wants a genuine **mix**: opaque frame + opaque accent/glint pixels, and a ~90%-transparent body that still reflects/refracts. Do **both** parts.
+
+#### Is this the best way? (options weighed)
+
+| Approach | Look | Cost / risk | Verdict |
+|---|---|---|---|
+| **Texture-alpha base + shader punch-through glint** *(chosen)* | Opaque frame/accents + ~10% body + a bright sun-glint that sweeps the body | Base is texture-only (robust); glint is one additive shader inject. **Key property: if the shader half fails, base alpha is still correct** (alpha lives in the texture, not the shader) | **Best balance** |
+| Shader-uniform alpha (build .06) | Same target | Cheap live slider (no re-upload) but the alpha lives in a fragile inject — current bug | Rejected (fragile) |
+| `MeshPhysicalMaterial` `transmission`/`ior`/`clearcoat`/`specularIntensity` | True refraction + controllable reflectivity (best-looking glass) | Needs a transmission render pass (renders scene-behind to a buffer) → real perf cost + bigger rewrite | **Premium, deferred** (note in Phase 3) |
+
+The chosen path keeps the robust base in the texture and uses the shader only for the *additive* glint, so a shader bug can't make glass disappear.
+
+#### Part 1 — real per-pixel alpha mix baked into the texture *(robust base; no shader alpha trick)*
+
+**P1-1. Bake real body alpha + record body texel indices** — replace the build-.06 marker loop. **Before** (lines **30340–30355**):
+
+```js
+                // ... GLASS body alpha mask ... Body texels (the #bcd9e3 tint) get alpha 0 ...
+                {
+                    const gX0 = TILE.GLASS * TILE_SIZE;
+                    for (let py = 0; py < TILE_SIZE; py++) {
+                        const rowBase = py * cvs.width;
+                        for (let px = 0; px < TILE_SIZE; px++) {
+                            const di = (rowBase + gX0 + px) * 4;
+                            if (Math.abs(atlasData[di] - 0xbc) + Math.abs(atlasData[di + 1] - 0xd9) + Math.abs(atlasData[di + 2] - 0xe3) <= 10) {
+                                atlasData[di + 3] = 0; // body marker (frame/glints keep 255)
+                            }
+                        }
+                    }
+                    ctx.putImageData(atlasImageData, 0, 0);
+                }
+```
+
+**After** — alpha = the real opacity, and remember which texels are body so the live slider can re-bake exactly them:
+
+```js
+                // CCR 2a.1: bake the REAL body opacity into the texture alpha (frame/accents stay 255).
+                // Record body texel indices so setGlassBodyAlpha() can re-bake just them on the slider.
+                _glassBodyTexels = [];
+                {
+                    const gX0 = TILE.GLASS * TILE_SIZE;
+                    const a0 = Math.round((SETTINGS.glassOpacity ?? 0.1) * 255);
+                    for (let py = 0; py < TILE_SIZE; py++) {
+                        const rowBase = py * cvs.width;
+                        for (let px = 0; px < TILE_SIZE; px++) {
+                            const di = (rowBase + gX0 + px) * 4;
+                            if (Math.abs(atlasData[di] - 0xbc) + Math.abs(atlasData[di + 1] - 0xd9) + Math.abs(atlasData[di + 2] - 0xe3) <= 10) {
+                                atlasData[di + 3] = a0;      // body = real opacity
+                                _glassBodyTexels.push(di);   // exact body indices (robust vs. opacity==1.0)
+                            }
+                        }
+                    }
+                    ctx.putImageData(atlasImageData, 0, 0);
+                }
+```
+
+**P1-2. Stash atlas refs for the live re-bake** — immediately after `const tex = new THREE.CanvasTexture(cvs); registerPixelTexture(tex);` (~line **30357**) add:
+
+```js
+                _glassAtlas = { ctx, tex, imageData: atlasImageData }; // for setGlassBodyAlpha() live re-bake
+```
+
+**P1-3. New module-scope state + helper** (near the other `let glassMaterial;` decl, ~line **13569**):
+
+```js
+            let _glassAtlas = null;        // { ctx, tex, imageData } captured in initTextures
+            let _glassBodyTexels = [];     // atlas byte-offsets of glass BODY texels (RGBA stride)
+            // CCR 2a.1: re-bake glass body opacity into the texture alpha (frame/accents untouched).
+            function setGlassBodyAlpha(opacity) {
+                if (!_glassAtlas || !_glassBodyTexels.length) return;
+                const a = Math.max(0, Math.min(255, Math.round(opacity * 255)));
+                const d = _glassAtlas.imageData.data;
+                for (let k = 0; k < _glassBodyTexels.length; k++) d[_glassBodyTexels[k] + 3] = a;
+                _glassAtlas.ctx.putImageData(_glassAtlas.imageData, 0, 0);
+                _glassAtlas.tex.needsUpdate = true; // re-uploads the atlas (debounce if it hitches on drag)
+            }
+```
+
+**P1-4. Remove the build-.06 shader alpha override** — delete the wrap at **31300–31312** (keep `applyCylindricalFog(glassMaterial);` at 31299; glass keeps fog + `uShininessStrength` through it). **Delete:**
+
+```js
+                // CCR Phase 2a: wrap the fog onBeforeCompile to add per-pixel glass alpha. ...
+                {
+                    const _glassFogCompile = glassMaterial.onBeforeCompile;
+                    glassMaterial.onBeforeCompile = (shader) => {
+                        _glassFogCompile(shader);
+                        shader.uniforms.uGlassBodyOpacity = { value: SETTINGS.glassOpacity };
+                        shader.fragmentShader = shader.fragmentShader
+                            .replace('void main() {', 'uniform float uGlassBodyOpacity;\nvoid main() {')
+                            .replace('#include <map_fragment>', '#include <map_fragment>\n    diffuseColor.a = (diffuseColor.a < 0.5) ? uGlassBodyOpacity : 1.0;');
+                    };
+                }
+```
+*(Part 2 re-adds a wrap, but only for the additive glint — never for alpha.)*
+
+**P1-5. `glassMaterial` unchanged** — it already has `opacity: 1.0` (line **30485**) and `alphaTest: 0`; the texture alpha is now the per-pixel opacity. ✅ Keep `transparent:true`, `depthWrite:false`, `side:DoubleSide`. **Ensure `tex.premultiplyAlpha` stays the default `false`** (non-premultiplied) or the low-alpha body RGB blends wrong.
+
+**P1-6. Re-wire the 3 sites that poke the removed uniform → call `setGlassBodyAlpha`:**
+- Slider handler, **line 23423**: `…uniforms.uGlassBodyOpacity.value = SETTINGS.glassOpacity;` → `setGlassBodyAlpha(SETTINGS.glassOpacity);`
+- `applyWaterMaterialSettings`, **lines 16378–16381** (the `if (glassMaterial && glassMaterial.userData.shader) …uGlassBodyOpacity…` block) → `setGlassBodyAlpha(SETTINGS.glassOpacity);`
+- Reset Materials handler, **line 28563**: same swap → `setGlassBodyAlpha(SETTINGS.glassOpacity);`
+
+**P1-7. Slider range** — keep **max < 1.0** (e.g. 0–0.8, current) so body alpha never hits 255 (frame value); `_glassBodyTexels` makes this safe regardless, but it keeps "glass" from going fully solid. Default 0.1.
+
+Part 1 alone delivers the mix (opaque frame/accents + ~90%-transparent body) with **zero shader-alpha fragility**. The body still catches a faint glint (whole tile is low-roughness); accents are the static opaque highlights.
+
+#### Part 2 — specular punch-through *(the moving glassy reflection; additive, can't break the base)*
+
+Real glass reflects more than its transparency implies (transmission ≠ reflection). Without this the body glint blends at ~10% (faint). Fix: where the sun specular is strong, raise the **alpha** so that bright spot shows — the specular color is already in `gl_FragColor.rgb` (it's part of `outgoingLight`), so raising alpha reveals it; no rgb math needed (and no tonemapping-order issue, since alpha isn't tonemapped).
+
+**P2-1. Add a punch-through wrap** after `applyCylindricalFog(glassMaterial);` (where P1-4's wrap was):
+
+```js
+                // CCR 2a.1 Part 2: additive glint punch-through (NOT alpha base — that's in the texture).
+                // After <opaque_fragment>, reflectedLight + gl_FragColor are in scope (three.js r160).
+                {
+                    const _glassFog = glassMaterial.onBeforeCompile;
+                    glassMaterial.onBeforeCompile = (shader) => {
+                        _glassFog(shader); // fog + uShininessStrength + stash userData.shader
+                        shader.uniforms.uGlintReflect = { value: SETTINGS.specularFresnel };
+                        shader.fragmentShader = shader.fragmentShader
+                            .replace('void main() {', 'uniform float uGlintReflect;\nvoid main() {')
+                            .replace('#include <opaque_fragment>',
+                                `#include <opaque_fragment>
+                                float _glSpec = dot(reflectedLight.directSpecular + reflectedLight.indirectSpecular, vec3(0.299, 0.587, 0.114));
+                                gl_FragColor.a = clamp(gl_FragColor.a + _glSpec * uGlintReflect, 0.0, 1.0);`);
+                    };
+                }
+```
+
+*Optional Fresnel rim* (glass edges catch more — strong glass cue) — add before the `gl_FragColor.a` line: `float _glFres = pow(1.0 - max(dot(normal, normalize(vViewPosition)), 0.0), 5.0);` then `+ _glFres * uGlintReflect` in the boost. `normal`/`vViewPosition` are in scope.
+
+**P2-2. Repurpose `specularFresnel` → `uGlintReflect` (it's currently dead):**
+- Live update: Fresnel `change` handler, **lines 23356–23358** — after `SETTINGS.specularFresnel = val; saveSettings();` add: `if (glassMaterial && glassMaterial.userData.shader) glassMaterial.userData.shader.uniforms.uGlintReflect.value = val;`
+- UI relabel, **line 2865**: `Fresnel Strength` → `Glass Reflection`. Default stays 0.5 (try 0.6–1.5 in-browser); range maybe widen to 0–2.
+- Reset Materials already resets `specularFresnel`; add a `uGlintReflect` poke there too.
+
+#### Other shader settings considered (and why not now)
+
+- **`MeshStandardMaterial` F0 is fixed at 0.04** (dielectric) → its raw glint is dim; Part 2's alpha boost is what makes it read. For genuinely brighter/real reflections, `MeshPhysicalMaterial` (`specularIntensity`, `clearcoat`, or `transmission`/`ior` for true refraction) — deferred (perf + rewrite), noted in the options table.
+- **`premultiplyAlpha`**: must stay `false` (default) — premultiplied + low body alpha would darken the body RGB.
+- **`depthWrite:false` + `DoubleSide`**: triangles inside ONE glass mesh aren't depth-sorted, so a glass *box* (multiple stacked panes) can show sorting glitches; single panes are fine. Acceptable for v1; the alternative (`depthWrite:true`) would stop you seeing through glass at all.
+- **Tonemapping/colorspace**: only `gl_FragColor.a` is touched (after `<opaque_fragment>`), and alpha is not tonemapped — so injection order is safe. (If we later boost `.rgb`, it must go *before* `<tonemapping_fragment>`.)
+
+#### Correctness check (verified against r160 + current code)
+
+- `#include <opaque_fragment>` is present in `MeshStandardMaterial` and is where `gl_FragColor` is first set (`vec4(outgoingLight, diffuseColor.a)`); `reflectedLight` (and `totalSpecular`) are in scope there and after. ✅
+- The body color-key (`#bcd9e3`, tol 10) matches the painted body texels exactly (`fillLogicalPixel` writes solid hex, no AA). ✅
+- `_glassBodyTexels` (explicit indices) makes the live re-bake robust even if frame and body alphas ever coincide. ✅
+- All three uniform-poke sites (16378, 23423, 28563) are re-pointed to `setGlassBodyAlpha`; the now-unused `uGlassBodyOpacity` is fully removed. ✅
+
+#### Will it look right? (honest)
+
+- **Body**: ~10% tinted, see-through — a clear pane. At 0.1 it's *subtle* (can read as almost-absent in flat light); the slider goes to 0.8 if you want frostier. Mipmaps make **distant** glass body drift slightly more opaque (frame/body alpha average) — usually reads fine, occasionally a touch solid at range.
+- **Frame + accent specks**: solid, crisp — the static "edges + glints."
+- **Part 2 glint**: a brighter, more-opaque highlight that sweeps the body as the sun moves — the "reflects like glass" cue. Magnitude depends on sun + roughness; **tune `uGlintReflect` in-browser** (0.04 dielectric F0 means it needs a healthy multiplier). The optional Fresnel rim adds edge sparkle.
+- **Caveats**: glass-box self-sorting (above); and at very low opacity the body's own diffuse tint nearly vanishes in shade — that's physically reasonable for clear glass.
+
+**Rollout.** Ship **Part 1** first (texture-only, robust) and confirm in-browser; then add **Part 2** (additive — can't break the base). Removes `uGlassBodyOpacity`; repurposes `specularFresnel` → `uGlintReflect`. Reset Materials resets both.
+
+### Phase 2a.2 — Glass refraction: the "looking-through-glass bends/compresses the view" effect *(BUILT 2026-06-19 build .09 — pending in-browser test/tuning)*
+
+> **AS-BUILT:** Shipped as planned with the audit fixes applied. `refractionScale` setting + slider (Graphics › Performance › Rendering, recreates the RT on "change"); `REFRACTION_SCALE` now reads it. Capture gate fires for glass too; `_GLASS` hidden during capture. Glass `onBeforeCompile` extended with a **compile-gated** (`SETTINGS.glassRefractionEnabled`) screen-space refraction inject (vertex `vGlassScreen`; fragment after `<opaque_fragment>`: `refract()` IOR 1.5 + depth-modulated offset + foreground reject; body mask = `diffuseColor.a`; composite `bg + totalDiffuse*uGlassTint + totalSpecular*uGlintReflect`). Per-frame uniform feed guarded on `glassRefractionEnabled && uniforms.tRefraction`. New Materials controls: Refraction toggle (sets `glassMaterial.needsUpdate`) + Refraction Strength; Reset Materials resets both. **Full module syntax-checks clean** (41,537 lines). NOT wired into `SETTINGS_PROFILES` (opt-in via toggle, off by default). Optional Fresnel rim still not added. **Tuning (build .10):** the depth-modulation was multiplying the offset *down* (invisible even at max); fixed to ADD to the bend (`*= 1.0 + clamp(throughGlass*0.02, 0, 2.0)`) so the base offset is always full. Strength slider max 0.1→**0.5** (default 0.03→**0.2**); `glassRefractionEnabled` now defaults **on** (≈free since water already captures the RT). Caveat surfaced: head-on viewing is physically ~no bend — refraction shows at an angle and grows with depth.
+
+**Resolution question (answered).** `REFRACTION_SCALE` (0.5, ~line 27265) is applied **on top of** the pixel ratio: `_refractW = innerWidth × (devicePixelRatio × SETTINGS.pixelRatio) × REFRACTION_SCALE` (~27272), while the main framebuffer is `renderer.setPixelRatio(devicePixelRatio × pixelRatio)` (~27230). So they **compound** — at the default `pixelRatio 0.5`, the refraction RT is **0.25× native** (a quarter of the main framebuffer's pixels). For water that's deliberate (wave distortion hides the blur); for glass (which should read crisp) 0.25× is likely too soft.
+
+**Decision:** expose it as `refractionScale` (slider 0.25–1.0, **default 0.5** to preserve current cost; compounds with pixelRatio exactly like the existing `volumetricScale`/`causticScale`). Shared by water + glass. Raise toward 1.0 for crisp glass — the capture then renders at the full main-framebuffer res (more cost, also sharpens water). So: no, we don't *need* the extra half — it's now a dial; 0.5 is the cheap default.
+
+**Pipeline reused (already built for water).** Capture the opaque scene (refractive meshes hidden) into `refractionRenderTarget` (RGBA + `DepthTexture`, ~27274), throttled every ~2 frames / on camera move (~43570). Sample it at a distorted screen-UV with depth-based foreground rejection (~30686–30743). Glass plugs into all of it.
+
+**Changes (with line numbers):**
+
+1. **`refractionScale` setting.** `const REFRACTION_SCALE = 0.5;` (27265) → `const REFRACTION_SCALE = SETTINGS.refractionScale ?? 0.5;`. Add `refractionScale: 0.5` to DEFAULTS (~6264, by `volumetricScale`) + SETTINGS (~6009) + the 3 profiles; add a slider in Graphics › Performance › Rendering next to Volumetric/Caustic Resolution; on change, resize `refractionRenderTarget` (mirror the pixelRatio resize path ~44430).
+
+2. **Capture fires for glass too + hide `_GLASS`.**
+   - Gate (~43552): `const refractionEnabled = (SETTINGS.waterRefractionEnabled || SETTINGS.glassRefractionEnabled) && !SETTINGS.waterFastMode;`
+   - Hide loop (~43578) — also hide glass during the capture so it doesn't self-refract:
+     ```js
+     if ((key.endsWith("_WATER") || key.endsWith("_GLASS")) && mesh && mesh.visible) { mesh.visible = false; hiddenWaterMeshes.push(mesh); }
+     ```
+
+3. **Feed glass the refraction uniforms** each frame (next to water's, ~43607):
+   ```js
+   // guard on the uniform existing — it's only injected when glassRefractionEnabled was on at compile time
+   if (SETTINGS.glassRefractionEnabled && glassMaterial && glassMaterial.userData.shader && glassMaterial.userData.shader.uniforms.tRefraction) {
+       const gu = glassMaterial.userData.shader.uniforms;
+       gu.tRefraction.value = window.refractionRenderTarget.texture;
+       gu.tRefractionDepth.value = window.refractionRenderTarget.depthTexture;
+       gu.uCamNear.value = camera.near; gu.uCamFar.value = camera.far;
+       gu.uGlassRefract.value = SETTINGS.glassRefractionStrength;
+   }
+   ```
+
+4. **Glass shader inject** — extend the existing glass `onBeforeCompile` wrap (the Part-2 punch-through, ~31324). **Compile-time gate on `SETTINGS.glassRefractionEnabled`** (recompile on toggle, like blocky shadows) so the samplers/uniforms only exist when on; OFF ⇒ falls straight back to the 2a.1 alpha body.
+   - **Vertex:** after `#include <project_vertex>`, `vGlassScreen = gl_Position;` (+ `varying vec4 vGlassScreen;`).
+   - **Fragment, after the Part-2 `#include <opaque_fragment>` block** (`gl_FragColor`, `normal`, `vViewPosition`, `reflectedLight`, `totalDiffuse`, `totalSpecular` all in scope in r160):
+     ```glsl
+     vec2 screenUV = (vGlassScreen.xy / vGlassScreen.w) * 0.5 + 0.5;
+     // slab refraction: bend the camera->fragment ray through the face normal by IOR
+     vec3 R = refract(normalize(-vViewPosition), normalize(normal), 1.0/1.5); // IOR 1.5
+     vec2 off = R.xy * uGlassRefract;
+     // depth-modulate so the bend + apparent compression grow with through-glass distance ("back looks closer")
+     float dRaw   = texture2D(tRefractionDepth, screenUV).x;
+     float bgEye  = (2.0*uCamNear*uCamFar)/(uCamFar+uCamNear-(dRaw*2.0-1.0)*(uCamFar-uCamNear));
+     float frgEye = (2.0*uCamNear*uCamFar)/(uCamFar+uCamNear-(gl_FragCoord.z*2.0-1.0)*(uCamFar-uCamNear));
+     off *= clamp((bgEye - frgEye) * 0.15, 0.0, 1.5);
+     vec2 dUV = clamp(screenUV + off, 0.001, 0.999);
+     if (texture2D(tRefractionDepth, dUV).x < gl_FragCoord.z - 0.0005) dUV = screenUV; // foreground reject
+     vec3 bg = texture2D(tRefraction, dUV).rgb;
+     // body texels = refracted view (transmission) + faint lit tint + the glint (reflection) ON TOP
+     // body flag = the baked low texture alpha. Use diffuseColor.a (set by <map_fragment> = texAlpha×opacity,
+     // opacity=1.0, and NOT touched by lighting) — `texColor` is NOT a stock three.js variable.
+     float isBody = 1.0 - step(0.99, diffuseColor.a);
+     vec3 glassBody = bg + totalDiffuse * uGlassTint + totalSpecular * uGlintReflect;
+     gl_FragColor.rgb = mix(gl_FragColor.rgb, glassBody, isBody);
+     gl_FragColor.a   = max(gl_FragColor.a, isBody); // body becomes opaque-composited, like water refraction
+     ```
+   - Uniforms registered in the wrap: `tRefraction`, `tRefractionDepth`, `uCamNear`, `uCamFar`, `uGlassRefract`, `uGlassTint` (+ the existing `uGlintReflect`).
+
+5. **Settings (Graphics › Materials):** `glassRefractionEnabled` (toggle, Quality-tier; the toggle handler must set `glassMaterial.needsUpdate = true` to recompile with/without the inject) + `glassRefractionStrength` (~0–0.1, default ~0.03). Reset Materials resets them. Profiles: off in Performance/Balanced, on in Quality.
+
+**Correctness & logic pass.**
+- **r160 anchors:** `<project_vertex>` (sets gl_Position) and `<opaque_fragment>` (sets gl_FragColor; `normal`/`vViewPosition`/`reflectedLight`/`totalDiffuse`/`totalSpecular` in scope right after) are the correct injection points — the same ones used by 2a.1 Part 2 and the water material. ✅
+- **Depth compare validity:** `gl_FragCoord.z` (glass, main render) and the captured `tRefractionDepth` are both NDC depth in the **same camera projection**, so foreground-reject + the eye-space linearization are valid even though the RT is a different resolution (depth is resolution-independent; `screenUV` is normalized). This is exactly what water does. ✅
+- **Capture order:** the refraction RT is captured at the TOP of `renderFrame`, before the main scene render where glass draws — so glass samples a current capture the same frame. ✅
+- **Self-refraction:** glass hidden during the capture ⇒ a pane samples the scene BEHIND it, not itself. Glass-behind-glass isn't refracted (edge case). ✅
+- **Alpha-model switch (the subtle one):** with refraction ON the body is **opaque-composited** (`a = 1`, like water); the 2a.1 texture body-alpha (~0.1) is reused only as the *body mask* (`isBody`), never for blending. Frame/accents (texAlpha 1 ⇒ isBody 0) keep their lit opaque color. With refraction OFF (compile-gated out) the body falls back to the 2a.1 alpha-blend. No conflict. ✅
+- **Glint preserved (the one real bug risk):** the composite **adds** `totalSpecular` on top of `bg` (reflection over transmission) rather than overwriting with the background — so glass still glints. Tint uses `totalDiffuse` (lit), so there's no double-count of the specular. ✅
+- **Body mask variable (audit fix):** use `diffuseColor.a` for `isBody`, NOT `texColor` (not a stock var). After `<map_fragment>` `diffuseColor.a = texAlpha × opacity` (opacity 1.0) and lighting never touches it, so it's the clean baked body alpha at the inject point. (Part-2 boosts `gl_FragColor.a`, not `diffuseColor.a`, so the mask stays clean.) ✅
+- **Uniform-feed guard (audit fix):** the per-frame feed must guard on `SETTINGS.glassRefractionEnabled` AND `uniforms.tRefraction` existing — when refraction is compiled OUT, those uniforms don't exist and an unguarded `gu.tRefraction.value=…` would throw. ✅
+- **First frame:** `userData.shader` doesn't exist until glass first compiles (during the main render), so the feed skips frame 0 and glass samples the compile-time `tRefraction` value — set that initial value to `refractionRenderTarget.texture` in the wrap (like water) so there's no black-sample flash. ✅
+- **Fallback safety:** refraction is compile-gated + additive; if disabled or the inject fails, glass = the proven 2a.1 alpha glass. ✅
+
+**Will it really look right?** The bend/displacement: **yes** — identical math to the water refraction already shipping here and to Minecraft glass shaders (angled views bend, head-on faces stay ~straight, depth-aware so foreground objects don't smear onto the glass). The **"back looks closer" compression**: the `refract()` offset + depth-modulation **approximate** it convincingly (the displaced sample plus the depth-scaled offset pull the background "inward"), but honestly — screen-space refraction can't truly remap depth, so it's a strong *approximation*, not physically exact; expect it to read as real refraction and to need `glassRefractionStrength` tuning. Caveats (all already true for water): half-res softness unless `refractionScale` is raised, mild screen-edge smear (off-screen geometry can't be sampled), throttled-capture lag for fast-moving things behind glass. Shader-inject is the main risk, but it's compile-gated and falls back to 2a.1 glass.
+
 ### Phase 3 — Environment reflections *(wanted; ship behind a non-default toggle first — decision #2)*
 
 Add a small `scene.environment` (PMREM of the existing sky, or a cheap static cubemap). This is the single change that makes low-roughness/metal pixels actually **reflect the sky** — glass, water, stone mica, bedrock specks all gain real reflections, and `metalness` becomes a usable lever (so the metal entries in Section 4 light up). Cost: a PMREM render; amortize by regenerating only every N seconds as the sky color shifts, or use a static low-res cubemap.
