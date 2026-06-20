@@ -516,6 +516,82 @@ Real glass reflects more than its transparency implies (transmission ≠ reflect
 
 **Will it really look right?** The bend/displacement: **yes** — identical math to the water refraction already shipping here and to Minecraft glass shaders (angled views bend, head-on faces stay ~straight, depth-aware so foreground objects don't smear onto the glass). The **"back looks closer" compression**: the `refract()` offset + depth-modulation **approximate** it convincingly (the displaced sample plus the depth-scaled offset pull the background "inward"), but honestly — screen-space refraction can't truly remap depth, so it's a strong *approximation*, not physically exact; expect it to read as real refraction and to need `glassRefractionStrength` tuning. Caveats (all already true for water): half-res softness unless `refractionScale` is raised, mild screen-edge smear (off-screen geometry can't be sampled), throttled-capture lag for fast-moving things behind glass. Shader-inject is the main risk, but it's compile-gated and falls back to 2a.1 glass.
 
+### Phase 2a.3 — Glass shadows: cast a shadow through glass again *(BUILT 2026-06-20.11 — Option A)*
+
+**As-built (build .11):** Option A shipped — both steps applied verbatim. S1 (glass mesh creation ~line 41752): `gMesh.customDepthMaterial = chunkDepthMaterial; gMesh.castShadow = SETTINGS.shadows; gMesh.receiveShadow = false;` (the reuse branch keeps these from first creation, so no re-set needed). S2 (`refreshChunkShadowCasters` ~line 11799): dropped `_GLASS` from the skip — now only `_WATER` is skipped, so glass `castShadow` is distance-managed like terrain. Glass is excluded from BOTH opaque mesher paths (lines 39856, 41255), so no double shadow. The standalone glass mesh is per-block 1×1 (quadSize=1) → no merged-quad UV stretch. NEEDS IN-BROWSER TEST: place glass in sun, confirm frame/glint shadow with clear body + no smear; toggle shadows off/on.
+
+
+**Why.** When glass was a cutout in the opaque chunk mesh it cast a frame/speck-pattern shadow via the alpha-tested depth material. Moving it to a separate translucent mesh (2a) set `castShadow=false` and added `_GLASS` to the shadow-caster skip, so glass now casts nothing. Restore it — properly.
+
+**What exists to reuse.** `chunkDepthMaterial` (≈line 30536): `MeshDepthMaterial`, `RGBADepthPacking`, `map: tex` (atlas), `alphaTest: 0.5` — the cutout-shadow material terrain/leaves use. Hash helpers (`fract(sin(dot(...)))`, e.g. ~27470) for a dithered variant. The shadow-caster manager `refreshChunkShadowCasters` (~11792) sets `mesh.castShadow` by distance but **skips `_GLASS`** (~11798). Glass mesh is created with `castShadow=false`, no `customDepthMaterial` (~41742–41744).
+
+**Option A — alpha-tested cutout shadow *(RECOMMENDED; restores the old look)* — detailed plan.** Glass already cast this exact shadow as an opaque-mesh cutout via `chunkDepthMaterial` (you saw it); reattaching that material to the standalone glass mesh reproduces it. Two changes (+ one optional).
+
+**S1 — glass mesh: cast the cutout shadow.** In the new-mesh branch of the glass block. **Before (~41741–41744):**
+
+```js
+                                    gMesh = new THREE.Mesh(gGeo, glassMaterial);
+                                    gMesh.name = "CHUNK_GLASS_" + cKey;
+                                    gMesh.castShadow = false;
+                                    gMesh.receiveShadow = false;
+```
+
+**After:**
+
+```js
+                                    gMesh = new THREE.Mesh(gGeo, glassMaterial);
+                                    gMesh.name = "CHUNK_GLASS_" + cKey;
+                                    // CCR 2a.3: cast the cutout shadow — chunkDepthMaterial's alphaTest 0.5 keeps frame/glint
+                                    // texels (alpha 255) and discards the clear body (baked alpha ~0.1). Distance-gated like
+                                    // terrain; refreshChunkShadowCasters keeps castShadow in sync afterwards.
+                                    const _gShadowChunks = Math.ceil(shadowConfig.radius / WORLD_DIMS.chunkSize);
+                                    gMesh.castShadow = SETTINGS.shadows && distSq <= _gShadowChunks * _gShadowChunks;
+                                    gMesh.customDepthMaterial = chunkDepthMaterial;
+                                    gMesh.receiveShadow = false; // S3: set true if you want glass to darken in shade
+```
+
+*(`shadowConfig`, `WORLD_DIMS`, `distSq` are all in scope in `renderChunk` — same as the terrain attach.)*
+
+**S2 — let the shadow-caster manager handle glass.** **Before (~11798):**
+
+```js
+                    if (mKey.endsWith("_WATER") || mKey.endsWith("_GLASS")) continue; // water/glass never cast shadows
+```
+
+**After:**
+
+```js
+                    if (mKey.endsWith("_WATER")) continue; // water never casts; glass DOES (CCR 2a.3), distance-managed below
+```
+
+**S3 (optional)** — `gMesh.receiveShadow = true` in S1 so glass darkens when another block shades it. Skip if it reads oddly on the translucent body.
+
+**Correctness / logic pass.**
+- **Proven path (improved):** glass already cast a cutout shadow through `chunkDepthMaterial` (you observed it), so the path works — but that old shadow **stretched** because opaque-mesh glass was greedy-merged. The standalone mesh reuses the same depth material but emits **per-block 1×1 faces**, so it produces the *correct* per-block shadow (see the stretch bullet below). ✅
+- **Alpha mask:** `chunkDepthMaterial` (`map: tex`, `alphaTest: 0.5`) samples the glass tile; frame/glint (alpha 255) cast, body (baked ~0.1 < 0.5) discards ⇒ clear body passes light. ✅
+- **Shared material:** assigning the shared `chunkDepthMaterial` as `customDepthMaterial` is fine (materials can be shared; the `_GLASS` release path disposes only the geometry, never this material). ✅
+- **Reuse branch:** on re-mesh (oldGlassMesh path) `castShadow`/`customDepthMaterial` persist from creation; `refreshChunkShadowCasters` re-evaluates `castShadow` by distance each pass. ✅
+- **Distance gating:** S1 sets the initial gate; S2 hands ongoing management to `refreshChunkShadowCasters` (only nearby glass casts → shadow-map budget unchanged). ✅
+- **Independent of 2a.2 refraction:** shadows are the depth/shadow pass; the refraction inject is in the main material. No interaction. ✅
+- **The "stretched glass shadow" — root cause + why Option A FIXES it (confirmed in code).** The old stretch came from glass being **greedy-merged** in the opaque mesh. The mesher always writes a **one-tile UV span** plus a `quadSize`, and the main material's fog shader repeats the tile per block in-shader (`localU = mod(vMapUv.x, tileWidth)/tileWidth; tiledU = fract(localU * vQuadSize.x)`, ~line 31246–31250). But `chunkDepthMaterial` is a plain `MeshDepthMaterial` with **no tiling shader**, so for a merged quad (`quadSize > 1`) it samples that one-tile UV **stretched across the whole merged quad** → one stretched frame. *Leaves are greedy-merged too and also stretch in shadow — you just don't notice, because a stretched random-hole pattern still looks like leaves; a stretched structured frame is obvious. That's why "leaves don't do that."* **The standalone glass mesh sidesteps it entirely:** it emits per-block faces via the **non-greedy** `addFaceIndexed`, which writes `writeQuadSizeIndexed(…, 1, 1)` (line ~39529, "all quads are 1×1") + a one-tile UV — so with `quadSize = (1,1)` there's no repeat, and `chunkDepthMaterial` samples each glass tile **exactly once per block** → correct per-block frame shadows, **no stretch**. So Option A inherently fixes it; no extra work needed. ✅
+- **(General alternative, not needed here):** if glass were ever greedy-merged for efficiency, the real fix is to give `chunkDepthMaterial` the same `quadSize` UV-tiling injection the main material has (clone it + `onBeforeCompile` porting the `tileWidth`/`vQuadSize` tiling) — which would also fix the (invisible) leaf-shadow stretch. The standalone glass mesh makes this unnecessary for glass.
+
+**Will it look right?** Yes — and **better than before**: a correct per-block frame + glint-speck shadow (the old *stretch* is gone — the glass mesh is per-block 1×1, not greedy-merged; see the stretch bullet above), with the clear body letting light through. No new settings (follows `SETTINGS.shadows`). It's binary (no faint body dimming — that's Option B).
+
+**Option B — faint full-pane shadow (the "proper" upgrade; glass dims the light it transmits).** Standard shadow maps are binary (a fragment casts or doesn't — no 10%-opacity shadow), so a soft full-pane shadow needs **alpha-hashed (dithered) shadows**:
+- A glass-specific depth material (clone `chunkDepthMaterial`) with an `onBeforeCompile` that, after the map sample, stochastically discards body fragments: `if (diffuseColor.a < 0.5 && hash(gl_FragCoord.xy) > uGlassShadowDensity) discard;` (frame/glints always cast). `uGlassShadowDensity ≈ 0.2` ⇒ ~20% of body fragments cast ⇒ a faint stippled shadow that reads as a dim rectangle. The dither noise is smoothed by the existing soft-shadow blur (`shadowRadius`) + pixel-snapped shadow update.
+- New setting `glassShadowStrength` (Graphics › Materials; 0 = frame-only like A, up to ~0.5).
+- Risk: dither can shimmer at low shadow-map res / hard shadows; gate it behind the setting and default it low. Build on A (A is the `glassShadowStrength = 0` case).
+
+**Option C — colored "stained-glass" shadow (stretch, deferred).** A tinted shadow (glass colors the light it passes) is NOT possible with three.js's depth-only shadow map. It needs a separate light-transmission pass (render glass into a colored-light buffer and modulate the receiver), like the refraction RT but for light. Real but heavy — note as a future Phase 3+ alongside env reflections.
+
+**Correctness / notes.**
+- `chunkDepthMaterial` is shared with terrain — reusing the instance as glass's `customDepthMaterial` is fine (materials can be shared). Glass faces are 1×1 (not greedy-merged), so their UVs sit inside the glass tile and the atlas-alpha sample is exact. ✅
+- Glass `castShadow` should still be distance-gated (only nearby glass casts) — letting `refreshChunkShadowCasters` manage it (Option A step 2) gives that for free; at creation, set it like terrain (`SETTINGS.shadows && distSq <= shadowChunks²`) so it's correct before the first manager pass.
+- Independent of refraction: shadows are about the depth/shadow pass; the 2a.2 refraction inject is in the main material and unaffected.
+
+**Will it look right?** Option A restores exactly what was there (frame + speck shadow) — reliable. Option B adds the realistic faint pane-dimming you're describing, at the cost of dither shimmer to tune. Recommend shipping **A** first (tiny, safe), then layering **B** behind `glassShadowStrength` if you want the body to dim the light too.
+
 ### Phase 3 — Environment reflections *(wanted; ship behind a non-default toggle first — decision #2)*
 
 Add a small `scene.environment` (PMREM of the existing sky, or a cheap static cubemap). This is the single change that makes low-roughness/metal pixels actually **reflect the sky** — glass, water, stone mica, bedrock specks all gain real reflections, and `metalness` becomes a usable lever (so the metal entries in Section 4 light up). Cost: a PMREM render; amortize by regenerating only every N seconds as the sky color shifts, or use a static low-res cubemap.
