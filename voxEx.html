@@ -3930,8 +3930,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-20.13";
+            const VOXEX_BUILD = "2026-06-20.14";
             const VOXEX_RECENT_CHANGES = [
+                "SOFT SHADOW SWIM FIX — light-space texel snap. Soft (non-blocky) sun/moon shadows still crawled slightly as the player moved because the camera was snapped on WORLD axes (round x/y/z independently) while the shadow-map texel grid is LIGHT-space (rotated by the sun) — the two never line up, leaving a varying sub-texel offset. Fixed by snapping in light space: the sun always arcs in the X-Y plane (shadowLightDir.z===0), so the basis is degeneracy-free (forward=(LX,LY,0), right=worldZ, up=(LY,-LX,0)); camPos is snapped along right+up to the texel grid with the forward/depth component left continuous, and the redundant world re-snap of the sun/moon POSITION (which knocked the aligned target back off-grid) was removed. Verified: unsnapped reconstruction == camPos to FP precision, snapped right/up projections are exact integer texel multiples. Blocky-shadow path untouched (it never snapped the camera). NEEDS IN-BROWSER TEST: with Blocky Shadows OFF, walk around and confirm soft shadows hold still (only the sun's motion moves them).",
                 "ENVIRONMENT REFLECTIONS (CCR-MATRESP-001 Phase 3) — makes Phase 1's per-pixel roughness finally PAY OFF: shiny terrain texels (stone mica, bedrock specks, snow/sand sparkle) now mirror the live sky gradient. DESIGN: analytic sky reflection, NOT a PMREM/cubemap — reuses the water sky-reflection pattern (skyReflHorizon/Zenith synced per frame from skyMaterial), so it's near-free (a reflect()+pow()+mix() per pixel, no extra render target), tracks day/night automatically, and needs no external asset. Chunk shader (applyCylindricalFog onBeforeCompile, compile-gated on SETTINGS.envReflectionEnabled && material===chunkMaterial): after <opaque_fragment>, derive the geometric world normal (flatShading, via dFdx/dFdy), reflect the view ray, sample the sky gradient by reflected-ray Y, blend by (1-roughnessFactor)*Schlick-Fresnel*strength, gated by vColor luminance so dark caves don't reflect sky. Glass EXCLUDED (own glint+refraction). New settings envReflectionEnabled (default OFF — non-default per decision #2, NOT in profiles) + envReflectionStrength (0.5, 0-1); new 'Environment Reflections' group in Graphics>Materials (header toggle + strength slider); per-frame sky sync in updateDayNight (dims underground too); live strength via updateLightingMaterials; toggle recompiles chunkMaterial; Reset Materials resets both. Note: needs Reflections (Shininess) ON — uShininessStrength 0 => roughnessFactor 1 => no reflection (matte=no reflection, by design). NEEDS IN-BROWSER TEST: enable in Graphics>Materials, look at stone/bedrock/snow in sun, tune strength; watch perf with it on (it's per terrain pixel).",
                 "GLASS SHADOW CUTOUT FIX (CCR-MATRESP-001 Phase 2a.3) — build .11 glass shadows came out SOLID (no light through the clear body). Root cause: three.js getDepthMaterial() (WebGLShadowMap r160, lines 305-307) OVERWRITES the custom depth material's alphaTest/map with the MESH's material values every frame — and glassMaterial.alphaTest was 0 (it's a blended translucent material), so the shadow pass discarded nothing → solid. (Leaves work only because the terrain material has alphaTest 0.1.) Fix: (1) glassMaterial.alphaTest 0 → 0.5 so the shadow pass discards the low-alpha body (≈0.1) and keeps frame/glints (1.0); (2) strip `#include <alphatest_fragment>` in the glass COLOR shader so the body still renders translucent/refractive (alphaTest is for the shadow pass ONLY); (3) NEW glassDepthMaterial — a separate MeshDepthMaterial instance (identical to chunkDepthMaterial) so terrain's per-frame alphaTest=0.1 overwrite can't thrash a shared uniform (0.1 wouldn't cut the 0.1 body → would re-solid the shadow); glass mesh customDepthMaterial now points at it. Result: clear body lets light through, frame/specks cast. Glass opacity > 0.5 casts a fuller shadow (intuitive). NEEDS IN-BROWSER TEST: place glass in sun → frame/glint shadow with light through the body.",
                 "GLASS SHADOWS (CCR-MATRESP-001 Phase 2a.3) — glass casts a shadow again, and a CORRECT per-block one. The standalone translucent glass mesh now gets customDepthMaterial = chunkDepthMaterial (the same map + alphaTest 0.5 cutout depth material the opaque chunk mesh uses): the baked-opaque frame/glint texels (alpha 1.0 ≥ 0.5) cast a shadow while the low-alpha body (0.1 < 0.5) is discarded → light passes through the pane, only the frame/specks throw shadow. castShadow inits to SETTINGS.shadows and is then distance-managed by refreshChunkShadowCasters (the _GLASS skip there was dropped; _WATER still skipped). FIXES THE OLD STRETCH: when glass was a cutout inside the greedy-merged opaque mesh, chunkDepthMaterial (no per-block UV tiling, unlike the main fog shader) stretched one atlas tile across each merged quad → smeared shadow. The glass mesh is NON-greedy (addFaceIndexed writes per-block 1×1 faces, quadSize=1), so each tile is sampled exactly once → no stretch. (Leaves still stretch the same way but their random hole pattern hides it.) receiveShadow stays false (translucent body shouldn't darken). NEEDS IN-BROWSER TEST: place glass in sun, confirm frame/glint shadow with clear body + no smear; toggle shadows off/on.",
@@ -42769,28 +42770,37 @@ self.onmessage = async (e) => {
                         // NO rounding; soft mode keeps the snap exactly as before (no regression).
                         const snapCamera = !SETTINGS.blockyShadows;
                         if (snapCamera) {
-                            shadowTargetPos.set(snapTargetX, snapTargetY, snapTargetZ);
+                            // LIGHT-SPACE TEXEL SNAP (fixes residual player-movement shadow swim).
+                            // The shadow-map texel grid lives in LIGHT space (rotated by the sun), so
+                            // the old per-axis WORLD snap (round x/y/z independently) left a sub-texel
+                            // offset that varied as you walked — the soft shadow crawled. The sun always
+                            // arcs in the X-Y plane (shadowLightDir.z === 0), so the light basis is
+                            // degeneracy-free: forward = (LX,LY,0), right = world Z (0,0,1),
+                            // up = (LY,-LX,0). Snap camPos along right + up to the texel grid and keep
+                            // the forward (depth) component continuous. These axes match three.js's own
+                            // shadow-camera basis up to sign, which texel-rounding ignores.
+                            const LX = shadowLightDir.x, LY = shadowLightDir.y;
+                            const projR = camPos.z;                       // right axis (world Z)
+                            const projU = camPos.x * LY - camPos.y * LX;  // up axis (perp to lightDir in XY)
+                            const projF = camPos.x * LX + camPos.y * LY;  // forward/depth — left continuous
+                            const snapR = Math.round(projR / texelWorldSize) * texelWorldSize;
+                            const snapU = Math.round(projU / texelWorldSize) * texelWorldSize;
+                            shadowTargetPos.set(snapU * LY + projF * LX, -snapU * LX + projF * LY, snapR);
                         } else {
                             shadowTargetPos.set(camPos.x, camPos.y, camPos.z);
                         }
-                        // Sun position: target + offset, snapped to the SAME grid (soft mode only)
+                        // Sun position = target + offset along the light dir. NO extra world re-snap:
+                        // the offset is purely along forward, so it can't shift the light-space right/up
+                        // grid — the old per-axis re-round of the position is exactly what RE-INTRODUCED
+                        // the swim (it knocked the light-aligned target back off the texel grid).
                         shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, sunOffset);
-                        if (snapCamera) {
-                            shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                            shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                            shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
-                        }
                         sun.target.position.copy(shadowTargetPos);
                         sun.position.copy(shadowDesiredPos);
                         sun.target.updateMatrixWorld();
                         sun.updateMatrixWorld();
-                        // Moon: same treatment
+                        // Moon: same snapped target, opposite offset (its light basis is the SAME lines
+                        // with flipped sign, so the snap holds for it too).
                         shadowDesiredPos.copy(shadowTargetPos).addScaledVector(shadowLightDir, -sunOffset);
-                        if (snapCamera) {
-                            shadowDesiredPos.x = Math.round(shadowDesiredPos.x / texelWorldSize) * texelWorldSize;
-                            shadowDesiredPos.y = Math.round(shadowDesiredPos.y / texelWorldSize) * texelWorldSize;
-                            shadowDesiredPos.z = Math.round(shadowDesiredPos.z / texelWorldSize) * texelWorldSize;
-                        }
                         moon.target.position.copy(shadowTargetPos);
                         moon.position.copy(shadowDesiredPos);
                         moon.target.updateMatrixWorld();
