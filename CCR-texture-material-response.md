@@ -607,11 +607,57 @@ Glass excluded from both opaque mesher paths (lines 39856, 41255) → no double 
 
 **Will it look right?** Option A restores exactly what was there (frame + speck shadow) — reliable. Option B adds the realistic faint pane-dimming you're describing, at the cost of dither shimmer to tune. Recommend shipping **A** first (tiny, safe), then layering **B** behind `glassShadowStrength` if you want the body to dim the light too.
 
-### Phase 3 — Environment reflections *(wanted; ship behind a non-default toggle first — decision #2)*
+### Phase 3 — Environment reflections *(BUILT 2026-06-20.13 — analytic sky reflection, default-off toggle; pending in-browser test)*
 
-Add a small `scene.environment` (PMREM of the existing sky, or a cheap static cubemap). This is the single change that makes low-roughness/metal pixels actually **reflect the sky** — glass, water, stone mica, bedrock specks all gain real reflections, and `metalness` becomes a usable lever (so the metal entries in Section 4 light up). Cost: a PMREM render; amortize by regenerating only every N seconds as the sky color shifts, or use a static low-res cubemap.
+**As-built (build .13).** Shipped exactly as designed below. Edits in `voxEx.html`: settings `envReflectionEnabled` (false) + `envReflectionStrength` (0.5) in SETTINGS/DEFAULTS/savedSettings round-trip; chunk shader inject in `applyCylindricalFog` onBeforeCompile gated `SETTINGS.envReflectionEnabled && material === chunkMaterial` (uniforms `skyReflHorizon`/`skyReflZenith`/`uEnvReflStrength` + the analytic reflection after `<opaque_fragment>`); per-frame sky-color sync in `updateDayNight` (after the underground lerp, so reflections dim in caves too); live strength + recompile-on-toggle via `updateLightingMaterials`/the toggle handler; new "Environment Reflections" group in Graphics › Materials (header toggle + strength slider), included in Reset Materials. NOT added to `SETTINGS_PROFILES` (stays off across profile switches). Verified: no dup/shadowed ids, DOM ids wired, glass correctly excluded (`applyCylindricalFog` runs on both materials, guard limits to chunk). Could not run `node --check` (bash mount served an unreliable partial snapshot this session); each edit verified via authoritative reads. Pending Kandler in-browser test + perf check (it's per-terrain-pixel when on).
 
-**Rollout per decision #2:** introduce as a **non-default** setting (off in every shipping profile initially). Playtest perf + look in-game, *then* decide whether it earns a place as a Quality-profile default. Do **not** wire it into `SETTINGS_PROFILES` as a default until that test passes.
+
+This is the change that makes Phase 1's low-roughness pixels actually **reflect the sky** — stone mica, bedrock specks, snow sparkle, sand quartz, glass glints stop being just "less matte" and start mirroring the sky gradient.
+
+**Design decision — analytic sky reflection, NOT a PMREM/cubemap.** The original sketch said "`scene.environment` (PMREM of the sky, or a static cubemap)". Rejected, because the codebase already solved this more cheaply for **water**: the water/refraction material samples an *analytic* sky gradient in-shader — `skyRefl = mix(skyReflZenith, skyReflHorizon, grazing)` — with `skyReflHorizon`/`skyReflZenith` synced **every frame** from the live `skyMaterial` colors (voxEx.html ~30929 + ~43764). That approach:
+
+- is **near-free** (a `reflect()`, a `pow()`, a `mix()` per pixel — no extra render target, no PMREM pass, no cubemap memory), which fits priority #3 (run on almost any device);
+- **tracks day/night automatically** (a static cubemap would look wrong at night; a dynamic PMREM would need a throttled re-render). The sky gradient colors are already lerped per frame;
+- needs **no external asset** (priority #1, single self-contained file);
+- reuses an **already-proven pattern** in the same file.
+
+A true PMREM would additionally reflect the sun disc, clouds and stars — but that detail is invisible on small voxel speckle accents and not worth the per-frame render. Defer PMREM to a possible Phase 3b if a mirror-grade surface ever wants it.
+
+**How it works (chunk material, in `applyCylindricalFog`'s `onBeforeCompile`, gated `SETTINGS.envReflectionEnabled && material === chunkMaterial`):** after `<opaque_fragment>` (gl_FragColor linear, `roughnessFactor` + `vWorldPositionCyl` + `cameraPosition` all in scope), compute the geometric world normal from derivatives (chunk uses `flatShading`, no normal attr — same `cross(dFdx,dFdy)` the fog/shadow code already uses), reflect the view ray, sample the sky gradient by the reflected ray's `y`, and blend it in by `(1 - roughnessFactor) * Fresnel * uEnvReflStrength`, gated by a `vColor`-luminance term so cave/occluded surfaces (no sky access) don't reflect bright sky:
+
+```glsl
+#include <opaque_fragment>
+{   // Phase 3: analytic sky-gradient reflection on shiny (low-roughness) texels
+    vec3 _erV = normalize(cameraPosition - vWorldPositionCyl);
+    vec3 _erN = normalize(cross(dFdx(vWorldPositionCyl), dFdy(vWorldPositionCyl)));
+    if (dot(_erN, _erV) < 0.0) _erN = -_erN;              // face the viewer
+    vec3 _erR = reflect(-_erV, _erN);                      // reflected view ray
+    vec3 _erSky = mix(skyReflHorizon, skyReflZenith, clamp(_erR.y * 0.5 + 0.5, 0.0, 1.0));
+    float _erFres = 0.04 + 0.96 * pow(1.0 - max(dot(_erV, _erN), 0.0), 5.0); // Schlick F0=0.04
+    float _erGate = 1.0;
+    #ifdef USE_COLOR
+        _erGate = smoothstep(0.18, 0.65, dot(vColor, vec3(0.3333))); // sky-exposure proxy (dark caves ~0)
+    #endif
+    float _erAmt = clamp((1.0 - roughnessFactor) * _erFres * uEnvReflStrength * _erGate, 0.0, 1.0);
+    gl_FragColor.rgb = mix(gl_FragColor.rgb, _erSky, _erAmt);
+}
+```
+
+Uniforms `skyReflHorizon`/`skyReflZenith`/`uEnvReflStrength` are added in the same compile block; the two sky colors are synced per frame from `skyMaterial.uniforms.bottomColor`/`topColor` (mirroring the water sync at ~43764), and `uEnvReflStrength` is poked live from `updateLightingMaterials`. Toggling the setting sets `chunkMaterial.needsUpdate = true` (compile-gated inject).
+
+**Scope v1 = terrain only.** Glass already has its own glint + refraction composite; folding env reflection into the shared `applyCylindricalFog` for glass too risks ordering conflicts with the glass refraction `<opaque_fragment>` replace, so the inject is gated `material === chunkMaterial`. Glass env-reflection can be a small follow-on.
+
+**Correctness pass.**
+
+- *Scope guard.* `material === chunkMaterial` — `chunkMaterial` is module-scope and assigned before `applyCylindricalFog(chunkMaterial)` runs; the closure captures `material`, so glass (which routes through the same fn) is correctly excluded. ✅
+- *Var scope.* At `<opaque_fragment>`: `gl_FragColor` (set by the include), `roughnessFactor` (function-local from `<roughnessmap_fragment>`, already lerped by `uShininessStrength`), `vWorldPositionCyl`/`vColor` (varyings), `cameraPosition` (used already at ~31317). All in scope. ✅
+- *Colorspace.* Injected **before** `<tonemapping_fragment>`/`<colorspace_fragment>`, so `gl_FragColor.rgb` is linear and the `skyMaterial` colors (linear `THREE.Color`) mix correctly; tonemap+sRGB convert the combined result. ✅
+- *Normal sign.* `flatShading` has no normal attr; the derivative normal can point either way, so `if (dot(_erN,_erV)<0) _erN=-_erN` faces it toward the camera before `reflect()`. ✅
+- *No double-count.* This dims the surface toward the sky color (energy-conserving `mix`), it does not add unbounded light; `_erAmt` is clamped 0-1 and scaled by Fresnel (≤1) × (1−roughness) × gate. ✅
+- *Off path.* When disabled, nothing is injected and no uniforms added; the per-frame sync and `updateLightingMaterials` poke are guarded on `chunkMaterial.userData.shader.uniforms.skyReflHorizon` existing, so they no-op. ✅
+- *Worker/determinism.* Pure render-side; no terrain-gen change, no worker parity needed. ✅
+
+**Rollout per decision #2:** ships as a **non-default** setting (off in every profile). NOT wired into `SETTINGS_PROFILES`. Playtest perf + look, then decide whether it earns a Quality-profile default.
 
 ### Phase 4 — Settings cleanup & profiles *(mostly resolved in Section 0)*
 
