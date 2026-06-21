@@ -518,7 +518,22 @@ Real glass reflects more than its transparency implies (transmission ≠ reflect
 
 ### Phase 2a.3 — Glass shadows: cast a shadow through glass again *(BUILT 2026-06-20.11 — Option A)*
 
-**As-built (build .11):** Option A shipped — both steps applied verbatim. S1 (glass mesh creation ~line 41752): `gMesh.customDepthMaterial = chunkDepthMaterial; gMesh.castShadow = SETTINGS.shadows; gMesh.receiveShadow = false;` (the reuse branch keeps these from first creation, so no re-set needed). S2 (`refreshChunkShadowCasters` ~line 11799): dropped `_GLASS` from the skip — now only `_WATER` is skipped, so glass `castShadow` is distance-managed like terrain. Glass is excluded from BOTH opaque mesher paths (lines 39856, 41255), so no double shadow. The standalone glass mesh is per-block 1×1 (quadSize=1) → no merged-quad UV stretch. NEEDS IN-BROWSER TEST: place glass in sun, confirm frame/glint shadow with clear body + no smear; toggle shadows off/on.
+**As-built (build .11, then CUTOUT FIX in .12):** Option A shipped in .11 (S1 = glass mesh `customDepthMaterial` + `castShadow=SETTINGS.shadows`; S2 = dropped `_GLASS` from the `refreshChunkShadowCasters` skip). But .11 produced a SOLID shadow (no light through the body). 
+
+**Root cause (the .11 miss):** three.js `getDepthMaterial()` (WebGLShadowMap.js r160, lines 305-307) OVERWRITES the custom depth material's `alphaTest`/`map`/`alphaMap` with the **mesh's own material** values on every shadow draw:
+```js
+result.alphaMap = material.alphaMap;
+result.alphaTest = material.alphaTest;   // <- glassMaterial.alphaTest (was 0)
+result.map = material.map;
+```
+`glassMaterial` is a blended translucent material with `alphaTest: 0`, so the depth pass got `alphaTest 0` → discarded nothing → solid. (Leaves cut out only because the *terrain* material carries `alphaTest: 0.1`.) The `chunkDepthMaterial.alphaTest: 0.5` we set was simply ignored.
+
+**Fix (build .12):**
+1. `glassMaterial.alphaTest` 0 → 0.5 (~line 30593) — this is what three.js copies onto the depth material, so the shadow pass now discards the low-alpha body (≈0.1) and keeps frame/glints (1.0).
+2. Strip `#include <alphatest_fragment>` in the glass COLOR-pass `onBeforeCompile` (~line 31463) — the 0.5 alphaTest is for the SHADOW pass only; without this strip the color pass would discard the translucent body (holes). No-op back when alphaTest was 0.
+3. New dedicated `glassDepthMaterial` (~line 30550, module-scope decl ~13611) — identical `MeshDepthMaterial` (RGBA packing, map atlas, alphaTest 0.5) but a SEPARATE instance from `chunkDepthMaterial`. Required because three.js sets the depth material's `alphaTest` from whichever mesh is drawing: if glass shared `chunkDepthMaterial`, terrain's per-frame `alphaTest=0.1` write would leak onto glass (and `0.1` is NOT `< 0.1`, so the body would stop cutting out → solid again). Glass mesh `customDepthMaterial` now points at `glassDepthMaterial` (~line 41760).
+
+Glass excluded from both opaque mesher paths (lines 39856, 41255) → no double shadow. Per-block 1×1 mesh (quadSize=1) → no UV stretch. Behavior: body opacity < 0.5 → frame/specks shadow with light through; ≥ 0.5 → fuller shadow (intuitive). NEEDS IN-BROWSER TEST: place glass in sun → frame/glint shadow with light through the clear body; toggle shadows off/on.
 
 
 **Why.** When glass was a cutout in the opaque chunk mesh it cast a frame/speck-pattern shadow via the alpha-tested depth material. Moving it to a separate translucent mesh (2a) set `castShadow=false` and added `_GLASS` to the shadow-caster skip, so glass now casts nothing. Restore it — properly.

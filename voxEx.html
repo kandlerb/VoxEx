@@ -3912,8 +3912,9 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-20.11";
+            const VOXEX_BUILD = "2026-06-20.12";
             const VOXEX_RECENT_CHANGES = [
+                "GLASS SHADOW CUTOUT FIX (CCR-MATRESP-001 Phase 2a.3) — build .11 glass shadows came out SOLID (no light through the clear body). Root cause: three.js getDepthMaterial() (WebGLShadowMap r160, lines 305-307) OVERWRITES the custom depth material's alphaTest/map with the MESH's material values every frame — and glassMaterial.alphaTest was 0 (it's a blended translucent material), so the shadow pass discarded nothing → solid. (Leaves work only because the terrain material has alphaTest 0.1.) Fix: (1) glassMaterial.alphaTest 0 → 0.5 so the shadow pass discards the low-alpha body (≈0.1) and keeps frame/glints (1.0); (2) strip `#include <alphatest_fragment>` in the glass COLOR shader so the body still renders translucent/refractive (alphaTest is for the shadow pass ONLY); (3) NEW glassDepthMaterial — a separate MeshDepthMaterial instance (identical to chunkDepthMaterial) so terrain's per-frame alphaTest=0.1 overwrite can't thrash a shared uniform (0.1 wouldn't cut the 0.1 body → would re-solid the shadow); glass mesh customDepthMaterial now points at it. Result: clear body lets light through, frame/specks cast. Glass opacity > 0.5 casts a fuller shadow (intuitive). NEEDS IN-BROWSER TEST: place glass in sun → frame/glint shadow with light through the body.",
                 "GLASS SHADOWS (CCR-MATRESP-001 Phase 2a.3) — glass casts a shadow again, and a CORRECT per-block one. The standalone translucent glass mesh now gets customDepthMaterial = chunkDepthMaterial (the same map + alphaTest 0.5 cutout depth material the opaque chunk mesh uses): the baked-opaque frame/glint texels (alpha 1.0 ≥ 0.5) cast a shadow while the low-alpha body (0.1 < 0.5) is discarded → light passes through the pane, only the frame/specks throw shadow. castShadow inits to SETTINGS.shadows and is then distance-managed by refreshChunkShadowCasters (the _GLASS skip there was dropped; _WATER still skipped). FIXES THE OLD STRETCH: when glass was a cutout inside the greedy-merged opaque mesh, chunkDepthMaterial (no per-block UV tiling, unlike the main fog shader) stretched one atlas tile across each merged quad → smeared shadow. The glass mesh is NON-greedy (addFaceIndexed writes per-block 1×1 faces, quadSize=1), so each tile is sampled exactly once → no stretch. (Leaves still stretch the same way but their random hole pattern hides it.) receiveShadow stays false (translucent body shouldn't darken). NEEDS IN-BROWSER TEST: place glass in sun, confirm frame/glint shadow with clear body + no smear; toggle shadows off/on.",
                 "GLASS REFRACTION tuning (CCR-MATRESP-001 Phase 2a.2): the displacement was invisible because the depth-modulation MULTIPLIED the offset DOWN (×clamp(throughGlass*0.15) → ~0.009 UV even at max). Fixed: depth now ADDS to the bend (×(1+clamp(throughGlass*0.02,0,2))) and never shrinks the base offset. Strength slider max 0.1→0.5 (step 0.025), default 0.03→0.2. glassRefractionEnabled now defaults ON (nearly free — water refraction already captures the RT). NOTE: screen-space refraction is angle-dependent — looking through glass HEAD-ON is physically ~no bend; the effect shows at an angle and grows with through-glass depth.",
                 "GLASS REFRACTION (CCR-MATRESP-001 Phase 2a.2) — looking through glass now bends/compresses the view, reusing the water refraction pipeline. Reuses the existing refractionRenderTarget (opaque scene captured with refractive meshes hidden, color+depth, throttled). Changes: capture gate now fires for glass too + hides _GLASS during capture; glass onBeforeCompile gains a COMPILE-GATED (SETTINGS.glassRefractionEnabled) screen-space refraction inject — body texels (mask = diffuseColor.a) show the displaced scene behind (refract() with IOR 1.5, depth-modulated for the 'back looks closer' compression, depth foreground-reject) + faint tint + the glint on top; frame/accents untouched; falls back to 2a.1 alpha glass when off. Per-frame uniform feed is guarded. REFRACTION_SCALE is now a setting `refractionScale` (slider, Graphics>Performance>Rendering, 0.25-1.0, default 0.5; COMPOUNDS with pixelRatio so 0.5×0.5=0.25 native — raise for crisp glass; shared by water+glass, recreates the RT on change). New Materials controls: Refraction toggle (recompiles glass) + Refraction Strength. Reset Materials resets them. Full module syntax-checks clean. NEEDS IN-BROWSER TEST + tuning: enable glass Refraction (Quality), look through glass, tune Refraction Strength + Refraction Resolution. Honest: screen-space can't truly remap depth so the compression is a strong approximation; off-screen geometry can't refract (mild edge smear).",
@@ -13607,7 +13608,8 @@
             let torchLight = null; // Torch point light
             let outlineMesh;
             let chunkMaterial;
-            let chunkDepthMaterial; // Alpha-tested shadow depth material (cutout shadows for glass/leaves)
+            let chunkDepthMaterial; // Alpha-tested shadow depth material (cutout shadows for leaves)
+            let glassDepthMaterial; // Phase 2a.3: SEPARATE alpha-tested depth material for glass — a distinct instance so terrain's per-frame `alphaTest=0.1` overwrite (three.js getDepthMaterial) can't thrash the shared uniform and break the glass cutout
             let waterMaterial;
             let glassMaterial; // CCR-MATRESP-001 Phase 2a: translucent glass (separate blended mesh, like water)
             let _glassAtlas = null;    // CCR 2a.1: { ctx, tex, imageData } captured in initTextures for live body-alpha re-bake
@@ -30539,6 +30541,17 @@ self.onmessage = async (e) => {
                     map: tex,
                     alphaTest: 0.5,
                 });
+                // Phase 2a.3: glass casts a CUTOUT shadow (frame/glint texels opaque, low-alpha body
+                // discarded so light passes). three.js getDepthMaterial() forces depthMat.alphaTest =
+                // mesh.material.alphaTest each frame, so this only works because glassMaterial.alphaTest
+                // is 0.5 (see below). A SEPARATE instance from chunkDepthMaterial is required: terrain
+                // overwrites the shared depth material's alphaTest to chunkMaterial's 0.1 per frame, and
+                // body alpha 0.1 is NOT < 0.1 → the body would stop being cut out → solid glass shadow.
+                glassDepthMaterial = new THREE.MeshDepthMaterial({
+                    depthPacking: THREE.RGBADepthPacking,
+                    map: tex,
+                    alphaTest: 0.5,
+                });
                 // Create two water materials - Standard (quality) and Lambert (fast)
                 const waterMaterialStandard = new THREE.MeshStandardMaterial({
                     map: tex,
@@ -30580,7 +30593,7 @@ self.onmessage = async (e) => {
                     transparent: true,
                     opacity: 1.0, // per-pixel alpha comes from the TEXTURE (body texels baked low, frame/glints 255)
                     color: 0xffffff,
-                    alphaTest: 0, // body texels alpha 0, frame/glints alpha 255 — the shader sets final alpha, no discard
+                    alphaTest: 0.5, // Phase 2a.3: drives the SHADOW cutout — three.js copies this onto the depth material (getDepthMaterial), so the low-alpha body (≈0.1) is discarded in the shadow pass while frame/glints (1.0) cast. The COLOR pass must NOT discard the body, so <alphatest_fragment> is stripped in onBeforeCompile below.
                     depthWrite: false, // translucent: don't occlude what's behind in the depth buffer
                     depthTest: true,
                     roughness: 1.0, // per-pixel roughnessMap is authoritative (glass tile is very low roughness)
@@ -31445,6 +31458,10 @@ self.onmessage = async (e) => {
                         }
                         shader.fragmentShader = shader.fragmentShader
                             .replace('void main() {', _gFragHead + 'void main() {')
+                            // Phase 2a.3: glassMaterial.alphaTest=0.5 exists ONLY so the SHADOW depth pass
+                            // cuts out the low-alpha body. In the COLOR pass we must keep the translucent
+                            // body, so neutralize the stock discard (no-op when alphaTest was 0).
+                            .replace('#include <alphatest_fragment>', '')
                             .replace('#include <opaque_fragment>', _gFragBody);
                     };
                 }
@@ -41742,14 +41759,15 @@ self.onmessage = async (e) => {
                                     gMesh = new THREE.Mesh(gGeo, glassMaterial);
                                     gMesh.name = "CHUNK_GLASS_" + cKey;
                                     // CCR-MATRESP-001 Phase 2a.3: glass casts a CUTOUT shadow.
-                                    // customDepthMaterial = chunkDepthMaterial (map + alphaTest 0.5):
-                                    // the baked-opaque frame/glint texels (alpha 1.0) cast shadow,
-                                    // the low-alpha body (0.1 < 0.5) is discarded -> light passes through.
+                                    // customDepthMaterial = glassDepthMaterial (its OWN instance, not the
+                                    // shared chunkDepthMaterial — see its definition for why). three.js
+                                    // copies glassMaterial.alphaTest(0.5)+map onto it each frame, so the
+                                    // baked-opaque frame/glint texels (alpha 1.0) cast shadow while the
+                                    // low-alpha body (≈0.1 < 0.5) is discarded -> light passes through.
                                     // The glass mesh is per-block (1x1 faces, quadSize=1, NON-greedy), so
-                                    // each tile is sampled once -> no merged-quad UV stretch (unlike the
-                                    // old opaque-mesh glass). castShadow is then distance-managed by
-                                    // refreshChunkShadowCasters().
-                                    gMesh.customDepthMaterial = chunkDepthMaterial;
+                                    // each tile is sampled once -> no merged-quad UV stretch. castShadow
+                                    // is then distance-managed by refreshChunkShadowCasters().
+                                    gMesh.customDepthMaterial = glassDepthMaterial;
                                     gMesh.castShadow = SETTINGS.shadows;
                                     gMesh.receiveShadow = false;
                                     gMesh.frustumCulled = SETTINGS.enableFrustumCulling;
