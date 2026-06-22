@@ -3926,11 +3926,16 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.9";
+            const VOXEX_BUILD = "2026-06-22.10";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
+            // Bump TERRAIN_GEN_VERSION whenever terrain/biome/tree generation changes so saved chunks
+            // regenerate on next load rather than reloading stale terrain that mismatches new chunks.
+            // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
+            const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "PERF BATCH — ISSUES #490/#489/#485/#487/#479/#484/#473 (build 2026-06-22.10). #490: deleted dead updateFrustumPlanes() block (computed a Matrix4 but never stored it; frustumPlanes/PlanesValid/lastFrustumCameraMatrix never read — confirmed no callers). #489: replaced 3x new THREE.Vector2(clampX,clampY)+.copy() in updateVolumetricLighting with .set(clampX,clampY) directly on destination uniform (reusable volumetricTempVec2 already existed; saved ≤4 allocs/frame). #485: added _heldTorchPos module-scope scratch Vector3 near volumetricTempVec3; both held-torch getWorldPosition calls now reuse it (was 2x new THREE.Vector3() per frame while torch active). #487: added _springResult={value,velocity} module-scope scratch; springDamper() now writes into it and returns it instead of allocating a new object per call (~30-60 allocs/frame eliminated; all callers consume both fields before next call — sequential use verified at all 3 call sites). #479: removed Array.from() wrappers from ChunkCompressor.compress() — Uint16Arrays now stored directly in IndexedDB (structured clone handles typed arrays; decompress() already uses new Uint16Array(x) which accepts both formats, so old records still load). #484: deleted AO cache machinery (AO_CACHE_SIZE/aoCache/aoCacheValid/initAOCache/clearAOCache/getAOCacheKey) — removed from main thread, worker code emitter, and injection list; hit rate was ~0 (each face visited once per chunk render), worker bypassed it (aoCacheValid=false), and Float32 pack formula exceeded exact-integer range causing precision loss. calculateFaceAO now computes directly. #473: added TERRAIN_GEN_VERSION=1 constant; stamped in ChunkCompressor.compress() records; exposed in decompress() result; both loadChunkFromCache() and batchLoadChunksFromCache() reject records with mismatched version (0 for old records → regen). 282/282 tests green.",
                 "PARTICLE SPAWN RANGE INVARIANT COMMENT (build 2026-06-22.9). Added clarifying comment in ParticleSystem.spawn() explaining why clearUpdateRanges() is correct in a multi-spawn batch: each successive spawn produces a prefix range starting at 0, so the last call's range [0,(idx+1)*N] is a superset of all prior ranges — one glBufferSubData call, correct coverage. Accumulating ranges without clearing would instead queue N redundant prefix uploads. No behavior change; addresses Important latent-fragility note from CCR-FX-001 review. 282/282 tests green.",
                 "PARTICLE/FX PER-FRAME CLEANUP (VOXEX-CCR-FX-001, build 2026-06-22.8). Part A — Particle buffer uploads: replaced blanket full-array needsUpdate=true on all three buffers with bounded addUpdateRange uploads. (1) init(): setUsage(DynamicDrawUsage) on all three attributes. (2) spawn(): clearUpdateRanges()+addUpdateRange(0,(idx+1)*itemSize) for position+color (idx=pre-increment activeCount, so idx+1 covers the new top slot); sets _sizesDirty=true instead of flagging size unconditionally. (3) update(): snapshots startCount=activeCount before the loop; after the loop, touched=max(startCount,activeCount) is the high-water mark covering both live and just-hidden despawn slots; uploads position+color bounded to touched*itemSize; uploads size only when _sizesDirty, then clears it. Gate is 'touched>0' not 'activeCount>0', fixing the latent ghost-particle bug on the frame the last particle despawns (old code skipped the upload that frame, leaving stale GPU data). (4) despawn(): sets _sizesDirty=true (size buffer changed by swap-copy or slot hide). Part B — Placed-torch spawner: Phase 1: timing moved from position-keyed Maps (placedTorchLastSmoke/Flame, now replaced by tombstone comments) onto torch._lastSmokeTime/_lastFlameTime — zero per-frame string allocations, drops the two Maps and the buggy insertion-order eviction block. Phase 2: outer loop changed from for-of-chunkTorches (O(all torch-chunks)) to a 5×5 chunk window (cr=ceil(24/16)=2) via Map.get per cell — O(nearby), bounds the pathological many-torch case. 3D distSq gate unchanged. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
                 "SUNLIGHT COLUMN PRIMING COST (VOXEX-CCR-LIGHT-002 Lever 1, build 2026-06-22.7). Replaced the body of primeSunlightColumn() to hoist the loop-invariant chunk lookup out of the 320-iteration column walk. Previously each of 320 cells called getBlock()/getSkyLight()/setSkyLight(), which each rebuilt a template-string key and (for setSkyLight, which has no _lastChunk cache) re-did a chunkDataPool.get() Map lookup — totalling ≥640 string allocations + up to ~320 extra pool lookups per transparent edit (block break). Fix: resolve the chunk ONCE via chunkDataPool.get() before the loop, then read chunk.blocks[idx] and chunk.skyLight[idx] directly using idx = colBase + ((cy + yOffset) << 8) (loop-invariant colBase = (x&15)+((z&15)<<4)); write sky[idx] = target directly (target is already in [1,15], matching setSkyLight's clamp). Tail reuses the pre-computed cx/cz for getChunkKey(cx,cz) instead of Math.floor(x/chunkSize). Result-identical on the reachable edit path: same chunkDataPool.get() resolution, same idx formula, same [1,15] range, same enqueueAdd/enqueueRemove calls, same anyChange/tracker.mark/ensureQueued tail. Early return false for missing/legacy-format chunks (unreachable on the edit path per VoxelWorld.setBlock upgrade at 7426–7441). Lever 2 (scope walk to below edit height) deferred. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
@@ -10639,20 +10644,10 @@
                 // Bounding sphere/box are set by applyChunkBounds
             }
 
-            // --- OPTIMIZATION 21: Frustum Plane Caching ---
-            // Cache frustum planes to avoid recalculation every frame
-            const frustumPlanes = [];
-            let frustumPlanesValid = false;
-            let lastFrustumCameraMatrix = null;
-
-            function updateFrustumPlanes(camera) {
-                if (!camera || !camera.projectionMatrix) return;
-                const m = camera.projectionMatrix.clone().multiply(camera.matrixWorldInverse);
-                // Extract frustum planes (simplified)
-                frustumPlanesValid = true;
-            }
-
             // --- OPTIMIZATION 22: Block Type Lookup Table ---
+            // (OPTIMIZATION 21 removed by VOXEX-CCR-PERF-004: updateFrustumPlanes() was dead code —
+            //  computed a Matrix4 but never stored it; frustumPlanes/frustumPlanesValid/lastFrustumCameraMatrix
+            //  were never read. Three.js's own THREE.Frustum is used for actual frustum culling.)
             // Fast lookup for block properties using typed arrays
             const BLOCK_IS_SOLID = new Uint8Array(256);
             const BLOCK_IS_OPAQUE = new Uint8Array(256);
@@ -14285,8 +14280,9 @@
              * @param {number} target - Target value
              * @param {number} halflife - Time to reach halfway to target (seconds)
              * @param {number} dt - Delta time in seconds
-             * @returns {{value: number, velocity: number}} New value and velocity
+             * @returns {{value: number, velocity: number}} Shared scratch — consume both fields before next call.
              */
+            const _springResult = { value: 0, velocity: 0 }; // VOXEX-CCR-PERF-005: shared scratch, zero allocations
             function springDamper(current, velocity, target, halflife, dt) {
                 // Compute damping coefficient from halflife
                 const y = (4.0 * Math.LN2) / halflife;
@@ -14299,11 +14295,11 @@
                 // Exponential decay factor (critically damped)
                 const eydt = Math.exp(-halfY * dt);
 
-                // Compute new position and velocity
-                const newValue = eydt * (j0 + j1 * dt) + target;
-                const newVelocity = eydt * (velocity - j1 * halfY * dt);
+                // Compute new position and velocity (write into shared scratch — caller must consume before next call)
+                _springResult.value = eydt * (j0 + j1 * dt) + target;
+                _springResult.velocity = eydt * (velocity - j1 * halfY * dt);
 
-                return { value: newValue, velocity: newVelocity };
+                return _springResult;
             }
 
             /**
@@ -19212,13 +19208,9 @@
                 meshCode += '    const _greedyLightScratch = [0,0,0,0];\n';
                 meshCode += '    let _lastDampLevel = 0;\n';
                 meshCode += '    const mergedVertexCache = new Map();\n';
-                // AO cache machinery referenced by the injected calculateFaceAO / calculateVertexAO.
-                // aoCacheValid=false => it computes AO directly (no cache read/write), byte-identical to a
-                // cached result. _aoResult/_lightResult are the shared hot-path return arrays; AO_OCCLUDES
-                // is the occluder table (leaves occlude) the injected calculateVertexAO reads.
-                meshCode += '    const AO_CACHE_SIZE = ' + AO_CACHE_SIZE + ';\n';
-                meshCode += '    let aoCache = null;\n';
-                meshCode += '    let aoCacheValid = false;\n';
+                // _aoResult/_lightResult: shared hot-path return arrays for AO and light.
+                // AO_OCCLUDES: occluder table (leaves count as occluders; glass/water/torch don't).
+                // AO cache removed (VOXEX-CCR-PERF-007) — hit rate was ~0 (each face visited once per render).
                 meshCode += '    const _aoResult = [1, 1, 1, 1];\n';
                 meshCode += '    const _lightResult = [1, 1, 1, 1];\n';
                 meshCode += '    const AO_OCCLUDES = new Uint8Array(' + JSON.stringify(Array.from(AO_OCCLUDES)) + ');\n';
@@ -19228,7 +19220,7 @@
                 // Functions (verbatim main-thread source via toString).
                 const meshFuncs = [
                     computeMergedFaceVertices, getMergedFaceVertices, initMergedVertexCache,
-                    getAOConfig, getAOCacheKey, calculateVertexAO, calculateFaceAO,
+                    getAOConfig, calculateVertexAO, calculateFaceAO,
                     calculateVertexCornerLight, calculateFaceCornerLight,
                     getMergeKey, isWaterAdjacent, isFoamLand, waterHash,
                     writeFaceVerticesIndexed, writeFaceColorsIndexed, writeFaceColorsWaterIndexed, writeFaceUVsIndexed, writeFaceIndices,
@@ -25583,14 +25575,15 @@
                             // Persist the lighting-validity version. Without this, every
                             // cache load sees version 0 and force-recalculates lighting.
                             cacheVersion: chunkData._cacheVersion || 0,
-                            blocks: Array.from(this._compressArray(chunkData.blocks)),
-                            skyLight: Array.from(this._compressArray(chunkData.skyLight)),
-                            blockLight: chunkData.blockLight ? Array.from(this._compressArray(chunkData.blockLight)) : null,
+                            terrainGenVersion: TERRAIN_GEN_VERSION, // VOXEX-CCR-CACHE-001: stamp for stale-terrain detection
+                            blocks: this._compressArray(chunkData.blocks),
+                            skyLight: this._compressArray(chunkData.skyLight),
+                            blockLight: chunkData.blockLight ? this._compressArray(chunkData.blockLight) : null,
                             renderState: chunkData.renderState || 0,
                             genState: chunkData.genState || 0,
                         };
                     }
-                    return Array.from(this._compressArray(chunkData)); // Old format: Uint8Array
+                    return this._compressArray(chunkData); // Old format: Uint8Array — stored as Uint16Array directly
                 },
 
                 decompress(compressedData) { // Decompresses chunk data (handles both old and new format)
@@ -25610,6 +25603,8 @@
                             // Restore persisted cache version (0 for records saved before
                             // this field existed -> triggers a one-time lighting recalc + re-save)
                             _cacheVersion: compressedData.cacheVersion || 0,
+                            // Terrain gen version — 0 for old records (triggers regen on mismatch)
+                            terrainGenVersion: compressedData.terrainGenVersion || 0,
                         };
                     }
                     return this._decompressArray(new Uint16Array(compressedData)); // Old format: just a Uint16Array
@@ -26793,6 +26788,13 @@ self.onmessage = async (e) => {
                                     blockLight: new Uint8Array(decompressed.length),
                                 };
                             }
+                            // VOXEX-CCR-CACHE-001: reject chunks saved by a different generator version
+                            if ((decompressed.terrainGenVersion || 0) !== TERRAIN_GEN_VERSION) {
+                                logDebug(`[Cache] Terrain gen version mismatch for ${chunkKey}: ${decompressed.terrainGenVersion || 0} vs ${TERRAIN_GEN_VERSION} — regenerating`);
+                                idbCacheStats.recordMiss();
+                                resolve(null);
+                                return;
+                            }
                             // Track cache hit statistics
                             const bytesRead = decompressed.blocks ? decompressed.blocks.length * 3 : 0; // blocks + skyLight + blockLight
                             idbCacheStats.recordHit(bytesRead);
@@ -26858,6 +26860,13 @@ self.onmessage = async (e) => {
                                 skyLight: new Uint8Array(decompressed.length).fill(15),
                                 blockLight: new Uint8Array(decompressed.length),
                             };
+                        }
+                        // VOXEX-CCR-CACHE-001: reject stale terrain from old generator versions
+                        if (!decompressed || (decompressed.terrainGenVersion || 0) !== TERRAIN_GEN_VERSION) {
+                            logDebug(`[Cache] Terrain gen version mismatch for ${key} — regenerating`);
+                            idbCacheStats.recordMiss();
+                            if (performance.now() - sliceStart > 4) { await new Promise(r => setTimeout(r, 0)); sliceStart = performance.now(); }
+                            continue;
                         }
                         results.set(key, decompressed);
                         // Track cache hit statistics
@@ -39013,50 +39022,9 @@ self.onmessage = async (e) => {
                 return AO_FACE_CONFIGS.front;
             }
 
-            // OPTIMIZATION: AO Cache for chunk rendering
-            /** AO cache size for full chunk with 6 face directions */
-            const AO_CACHE_SIZE = 16 * 320 * 16 * 6;
-
-            /** @type {Float32Array|null} */
-            let aoCache = null;
-
-            /** Whether the AO cache is currently valid */
-            let aoCacheValid = false;
-
-            /**
-             * Initialize the AO cache for a new chunk render.
-             * @returns {void}
-             */
-            function initAOCache() {
-                if (!aoCache) {
-                    // Use Float32Array for 4 AO values per entry (packed as single values)
-                    // Each entry stores: ao0 * 1000000 + ao1 * 10000 + ao2 * 100 + ao3 (values 0.25-1.0)
-                    aoCache = new Float32Array(AO_CACHE_SIZE);
-                }
-                aoCache.fill(-1); // -1 means uncached
-                aoCacheValid = true;
-            }
-
-            /**
-             * Invalidate the AO cache.
-             * @returns {void}
-             */
-            function clearAOCache() {
-                aoCacheValid = false;
-            }
-
-            /**
-             * Calculate cache key for AO values.
-             * @param {LocalCoord} lx - Local X coordinate
-             * @param {LocalCoord} ly - Local Y coordinate
-             * @param {LocalCoord} lz - Local Z coordinate
-             * @param {number} faceIdx - Face index (0-5)
-             * @returns {number} Cache key
-             */
-            function getAOCacheKey(lx, ly, lz, faceIdx) {
-                // Pack coordinates and face into single key
-                return ((lx & 15) + ((lz & 15) << 4) + (ly << 8)) * 6 + faceIdx;
-            }
+            // AO cache removed by VOXEX-CCR-PERF-007: hit rate was ~0 (each face processed once per chunk
+            // render), the worker bypassed it (aoCacheValid=false, initAOCache never called), and the
+            // Float32 pack formula exceeded exact-integer range (~101M > 2^24=16.7M), causing precision loss.
 
             /**
              * Calculate AO value for a single vertex based on adjacent blocks.
@@ -39099,46 +39067,11 @@ self.onmessage = async (e) => {
                     return [1, 1, 1, 1];
                 }
 
-                // OPTIMIZATION: Use AO cache if valid and within chunk bounds
-                if (aoCacheValid && lx >= 0 && lx < 16 && lz >= 0 && lz < 16 && ly >= 0 && ly < 320 && faceIdx !== undefined) {
-                    const cacheKey = getAOCacheKey(lx, ly, lz, faceIdx);
-                    if (cacheKey < AO_CACHE_SIZE) {
-                        const cached = aoCache[cacheKey];
-                        if (cached >= 0) {
-                            // Unpack cached values (stored as packed float)
-                            const packed = Math.round(cached * 1000000);
-                            _aoResult[0] = Math.floor(packed / 1000000) / 100;
-                            _aoResult[1] = Math.floor((packed % 1000000) / 10000) / 100;
-                            _aoResult[2] = Math.floor((packed % 10000) / 100) / 100;
-                            _aoResult[3] = (packed % 100) / 100;
-                            return _aoResult;
-                        }
-                    }
-                }
-
                 const config = getAOConfig(nx, ny, nz);
-                const ao0 = calculateVertexAO(lx, ly, lz, config[0], getter);
-                const ao1 = calculateVertexAO(lx, ly, lz, config[1], getter);
-                const ao2 = calculateVertexAO(lx, ly, lz, config[2], getter);
-                const ao3 = calculateVertexAO(lx, ly, lz, config[3], getter);
-
-                // Cache the result if within bounds
-                if (aoCacheValid && lx >= 0 && lx < 16 && lz >= 0 && lz < 16 && ly >= 0 && ly < 320 && faceIdx !== undefined) {
-                    const cacheKey = getAOCacheKey(lx, ly, lz, faceIdx);
-                    if (cacheKey < AO_CACHE_SIZE) {
-                        // Pack AO values (multiply by 100 to preserve precision, range 25-100)
-                        const packed = Math.round(ao0 * 100) * 1000000 +
-                                      Math.round(ao1 * 100) * 10000 +
-                                      Math.round(ao2 * 100) * 100 +
-                                      Math.round(ao3 * 100);
-                        aoCache[cacheKey] = packed / 1000000;
-                    }
-                }
-
-                _aoResult[0] = ao0;
-                _aoResult[1] = ao1;
-                _aoResult[2] = ao2;
-                _aoResult[3] = ao3;
+                _aoResult[0] = calculateVertexAO(lx, ly, lz, config[0], getter);
+                _aoResult[1] = calculateVertexAO(lx, ly, lz, config[1], getter);
+                _aoResult[2] = calculateVertexAO(lx, ly, lz, config[2], getter);
+                _aoResult[3] = calculateVertexAO(lx, ly, lz, config[3], getter);
                 return _aoResult;
             }
 
@@ -41157,9 +41090,6 @@ self.onmessage = async (e) => {
                     const firstMeshForChunk = !meshedChunkKeys.has(cKey);
                     let missingNeighbor = false; // Tracks whether we treated any neighbor as solid due to being unloaded
 
-                    // OPTIMIZATION: Initialize AO cache for this chunk
-                    initAOCache();
-
                     const useDeferredLight = shouldUseDeferredLighting(distSq);
 
                     // Calculate section LOD threshold based on distance
@@ -42039,8 +41969,6 @@ self.onmessage = async (e) => {
                     shorePool.release(waterShore);
                     shorePool.release(waterFoam);
                     thicknessPool.release(waterThickness);
-                    // OPTIMIZATION: Clear AO cache after chunk is done
-                    clearAOCache();
                     meshedChunkKeys.add(cKey);
                     // Mark mesh as ready after successful build
                     chunkDataPool.setMeshState(cKey, MESH_STATE.READY);
@@ -43383,14 +43311,14 @@ self.onmessage = async (e) => {
                             const handTorch = playerBodyMesh.userData.thirdPersonTorch;
                             const handFlame = handTorch.children[1]; // flame is second child
                             if (handFlame) {
-                                flameWorldPos = new THREE.Vector3();
+                                flameWorldPos = _heldTorchPos;
                                 handFlame.getWorldPosition(flameWorldPos);
                             }
                         } else if (window.torchModel) {
                             // In first-person, use viewmodel torch flame position
                             const flame = window.torchModel.children[1];
                             if (flame) {
-                                flameWorldPos = new THREE.Vector3();
+                                flameWorldPos = _heldTorchPos;
                                 flame.getWorldPosition(flameWorldPos);
                             }
                         }
@@ -43503,6 +43431,7 @@ self.onmessage = async (e) => {
             // Update volumetric lighting shader uniforms with light positions
             const volumetricTempVec3 = new THREE.Vector3();
             const volumetricTempVec2 = new THREE.Vector2();
+            const _heldTorchPos = new THREE.Vector3(); // scratch for held-torch getWorldPosition (VOXEX-CCR-PERF-003)
             const MAX_VOLUMETRIC_POINT_LIGHTS = 4; // OPTIMIZED: Match MAX_POINT_LIGHTS in shader
 
             // OPTIMIZATION: Reusable vectors to avoid per-frame allocations
@@ -43801,11 +43730,10 @@ self.onmessage = async (e) => {
                     torchLight.getWorldPosition(volumetricTempVec3);
                     const screenPos = worldToScreen(volumetricTempVec3);
                     // Clamp screen position to edges if off-screen (for ambient contribution)
-                    const clampedPos = new THREE.Vector2(
+                    uniforms.pointLightPositions.value[pointLightIndex].set(
                         Math.max(-0.2, Math.min(1.2, screenPos.x)),
                         Math.max(-0.2, Math.min(1.2, screenPos.y))
                     );
-                    uniforms.pointLightPositions.value[pointLightIndex].copy(clampedPos);
                     uniforms.pointLightColors.value[pointLightIndex].setHex(SETTINGS.torchColor);
                     // Held-torch volumetric glow: was 1.2 — the strongest volumetric
                     // source in the game, parked near screen center, which read as a
@@ -43834,11 +43762,10 @@ self.onmessage = async (e) => {
 
                             const screenPos = worldToScreen(torchPos);
                             // Clamp screen position so off-screen lights still contribute
-                            const clampedPos = new THREE.Vector2(
+                            uniforms.pointLightPositions.value[pointLightIndex].set(
                                 Math.max(-0.2, Math.min(1.2, screenPos.x)),
                                 Math.max(-0.2, Math.min(1.2, screenPos.y))
                             );
-                            uniforms.pointLightPositions.value[pointLightIndex].copy(clampedPos);
                             uniforms.pointLightColors.value[pointLightIndex].setHex(SETTINGS.torchColor);
                             // Intensity falls off with distance, scaled by visibility
                             const distIntensity = 1.0 - Math.sqrt(distSq) / 64;
@@ -43867,11 +43794,10 @@ self.onmessage = async (e) => {
 
                         const screenPos = worldToScreen(volumetricTempVec3);
                         // Clamp screen position so off-screen zombies still contribute
-                        const clampedPos = new THREE.Vector2(
+                        uniforms.pointLightPositions.value[pointLightIndex].set(
                             Math.max(-0.2, Math.min(1.2, screenPos.x)),
                             Math.max(-0.2, Math.min(1.2, screenPos.y))
                         );
-                        uniforms.pointLightPositions.value[pointLightIndex].copy(clampedPos);
                         // Zombie eye glow color (yellowish-orange)
                         uniforms.pointLightColors.value[pointLightIndex].setHex(0xd9c002);
                         const distIntensity = 0.8 - Math.sqrt(distSq) / 80;
@@ -45581,7 +45507,7 @@ self.onmessage = async (e) => {
                     const getters = buildChunkLightGetters(cx, cz);
                     if (!getters) return null;
                     const { getLocal, getLocalLight } = getters;
-                    if (typeof clearAOCache === 'function') clearAOCache(); // force direct AO (no stale cache) — matches the worker (aoCacheValid=false)
+                    // AO cache removed (VOXEX-CCR-PERF-007) — calculateFaceAO now computes directly
                     const startX = cx * WORLD_DIMS.chunkSize, startZ = cz * WORLD_DIMS.chunkSize;
                     const mf = MAX_FACES_PER_CHUNK;
                     const tPos = new Float32Array(mf * 12), tUvs = new Float32Array(mf * 8), tCols = new Float32Array(mf * 12), tQs = new Float32Array(mf * 8), tIdx = new Uint32Array(mf * 6);
