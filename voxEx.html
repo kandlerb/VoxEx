@@ -3926,11 +3926,12 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.2";
+            const VOXEX_BUILD = "2026-06-22.3";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 3;
             const VOXEX_RECENT_CHANGES = [
+                "COLLISION VERTICAL-GAP FIX (CCR-COLLIDE-001, build 2026-06-22.3). The player walked horizontally through solid blocks sitting in the MIDDLE of the body while airborne. Cause: collide() sampled only TWO Y planes (floor(feet+0.1) and floor(eye+0.1)). The player box is 0.6 wide but 1.8 TALL, so at fractional feet (the whole jump/fall arc) the body spans three cells and the middle one was never tested — a block there was walked through. FIX: replaced the two fixed samples with a for-loop over every integer cell yBottom..yTop (4 XZ corners each, <=12 isSolidBlock checks vs 8). yBottom/yTop are bit-identical to the old y0/y1 so integer-feet/standing/step behavior is unchanged; it only fills the interior cells. This matches zombieCollides()'s existing full-span scan. TDD: added 3 headless tests (collision: collide() scans the full vertical span) — the mid-body case was RED before the fix, all 281 green after. Exposed collide/checkGround/voxelWorld/playerEyeHeight on the ?test=1 seam (inert in prod). NEEDS IN-BROWSER TEST: float a block 2 cells above flat ground (head cell clear), jump up into it — should now stop; confirm you still pass UNDER it when walking, can walk under a 2-high gap, and crouch-fit a 2-high gap.",
                 "WORKER TOGGLE UI-INIT FIX (build 2026-06-22.2): 'Enable Terrain Workers' / 'Enable Mesh Workers' showed UNCHECKED on a fresh load even though both default true. Cause: the load-time 'INITIALIZE UI VALUES - Performance' block set every perf control EXCEPT the worker toggles + pool slider (only syncSettingsToUI did, and the title-screen menu — driven by the early classic-script navigateToPanel — can't see the module-scoped syncSettingsToUI, so its `typeof syncSettingsToUI==='function'` guard is false there). Fix: added `checked` to both checkbox <input>s (HTML default) AND added worker toggle + pool-slider init to the INITIALIZE block. SETTINGS.useWorkers/useWorkersForMesh defaults were already true — purely a checkbox-display bug. No SETTINGS_VERSION bump (defaults unchanged). NEEDS IN-BROWSER TEST: clear cache, reload, open Settings>Performance>Workers from BOTH the title screen and the in-game pause menu — both boxes should be checked.",
                 "MENU OVERLAY LAG FIX (CCR-menu-overlay-lag, build 2026-06-22.1). The Settings menu stuttered (worst on the weak testing laptop) while the main pause menu, seed menu, and world-creation menu ran fine. Root cause: #blocker — the full-screen container hosting the pause/controls/settings menus — had `backdrop-filter: blur(4px)` (desktop) / `blur(2px)` (touch). A backdrop-filter ancestor forces the whole subtree onto a slow path: main-thread (synchronous) scrolling + a re-rasterized blur region on every repaint. Only Settings felt it because it's the one menu in #blocker that's large and SCROLLABLE (#instructions overflow-y:auto); the pause menu is short (no scroll) and the seed/create-world panels are separate top-level overlays with NO backdrop-filter. In-game it compounded (renderFrame() runs every frame behind the menu, so the blur recomputed ~60×/s). FIX (CSS-only, no JS/IDs touched): removed `backdrop-filter` from #blocker (line ~278) and the touch variant (line ~250); darkened the scrim rgba(0,0,0,0.6)→0.78 and made the #instructions card opaque rgba(20,20,20,0.9)→0.97 so menus still read clearly without the frost. Optional in-game-only hardening (idle/throttle renderFrame behind a menu; make the held-torch flicker use the paused-aware skyClock) is documented in the CCR but NOT applied. NEEDS IN-BROWSER TEST: open Settings from BOTH the start screen and the in-game pause menu, scroll Graphics>Lighting/Water/Effects/Sky with wheel/trackpad/touch — confirm smooth; verify menu readability against a bright daytime scene.",
                 "GLASS REFRACTION RETIRED (CCR-MATRESP-001 Phase 2a.2, build 2026-06-21.4). In-browser testing showed the screen-space refraction was broken off-center: the whole background slid when looking left/right, you could see 'around' the pane moving up/down, and peripheral/grazing blocks smeared into gray squares. Root cause is inherent to screen-space refraction (view-space refraction xy used as a screen offset → slides with rotation; offset amplified up to 3× by the depth term → samples off-screen; off-screen UV clamped to the hazy edge → gray smears, blockified by the 0.25×-native capture; never depth-correct → parallax 'see-around'). Decision = Option A: retire refraction, ship the stable Phase 2a.1 translucent glass (real per-pixel alpha — clear body, opaque frame + glints — plus the specular glint punch-through). Removed: the glass onBeforeCompile refraction inject (uniforms/varying/fragment code), the per-frame glass uniform feed, and the glassRefractionEnabled/glassRefractionStrength settings + their two Materials UI controls; reverted the refraction capture gate + hide-list to WATER-ONLY (glass is no longer hidden during capture, so water correctly refracts glass again). KEPT untouched: refractionScale (shared) and the entire water refraction pipeline. Glass now renders correctly at all view angles. NEEDS IN-BROWSER TEST: look through glass off-center — should be clean see-through with opaque frame/glints, no shift or smears.",
@@ -42612,16 +42613,24 @@ self.onmessage = async (e) => {
                 // OPTIMIZATION: Pre-compute floor values once instead of repeatedly in loop
                 const x0 = Math.floor(p.x - r), x1 = Math.floor(p.x + r);
                 const z0 = Math.floor(p.z - r), z1 = Math.floor(p.z + r);
-                const y0 = Math.floor(p.y - playerEyeHeight + 0.1), y1 = Math.floor(p.y + 0.1);
-                // OPTIMIZATION: Unrolled loop - 8 checks, avoids array iteration overhead
-                if (isSolidBlock(x0, y0, z0)) return true;
-                if (isSolidBlock(x0, y0, z1)) return true;
-                if (isSolidBlock(x0, y1, z0)) return true;
-                if (isSolidBlock(x0, y1, z1)) return true;
-                if (isSolidBlock(x1, y0, z0)) return true;
-                if (isSolidBlock(x1, y0, z1)) return true;
-                if (isSolidBlock(x1, y1, z0)) return true;
-                if (isSolidBlock(x1, y1, z1)) return true;
+                // Test EVERY block cell the player's vertical AABB overlaps, not just the
+                // feet/eye planes. The box is 0.6 wide (< 1 block, so the 4 XZ corners cover
+                // it exactly) but 1.8 tall (> 1 block), so at fractional feet it spans up to
+                // three cells — the entire airborne arc of every jump/fall — and the old
+                // two-plane sampler walked solid blocks in the MIDDLE cell straight through
+                // (CCR-COLLIDE-001). yBottom/yTop are bit-identical to the old y0/y1 (the
+                // +0.1 at the feet is the existing step tolerance for the block being stood
+                // on), so this only fills in the interior cells; it never widens the
+                // envelope. Mirrors zombieCollides()'s full-span scan.
+                const yBottom = Math.floor(p.y - playerEyeHeight + 0.1);
+                const yTop = Math.floor(p.y + 0.1);
+                // Unrolled 4-corner body; loop runs 1-3 times (<= 12 isSolidBlock checks).
+                for (let y = yBottom; y <= yTop; y++) {
+                    if (isSolidBlock(x0, y, z0)) return true;
+                    if (isSolidBlock(x1, y, z0)) return true;
+                    if (isSolidBlock(x0, y, z1)) return true;
+                    if (isSolidBlock(x1, y, z1)) return true;
+                }
                 return false;
             }
             function checkGround(pos) {
@@ -45576,6 +45585,12 @@ self.onmessage = async (e) => {
                     initBlockLookupTables, initBlockOptimization,
                     // --- raycast / classes ---
                     pickVoxel, VoxelWorld,
+                    // --- player collision (mid-body vertical-gap regression, CCR-COLLIDE-001).
+                    //     collide() resolves through module getBlock -> the global voxelWorld
+                    //     instance, so tests stub voxelWorld.getBlock; playerEyeHeight is a live
+                    //     getter (1.8 standing) since it lerps during crouch. ---
+                    collide, checkGround, voxelWorld,
+                    get playerEyeHeight() { return playerEyeHeight; },
                     // --- worker ---
                     buildChunkWorkerCode,
                     // --- Phase 4a mesh-parity test hooks (main mesher + scene internals, used by the
