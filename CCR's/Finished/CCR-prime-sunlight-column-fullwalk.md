@@ -3,7 +3,7 @@
 **ID:** VOXEX-CCR-LIGHT-002
 **File:** `voxEx.html` (single-file rule honored — all changes stay in this file)
 **Date:** 2026-06-22
-**Status:** 🟢 **Implemented — build 2026-06-22.7. Lever 1 shipped; Lever 2 deferred. 282/282 tests green.**
+**Status:** 🟢 **Implemented — build `2026-06-22.7`.** Lever 1 shipped; Lever 2 deferred. Code review passed (no Critical/Important code issues). Review fixup: hoisted `chunkKey` to eliminate the second `getChunkKey()` call in the tail; added auto-decompression note to inline comment and case 4 to the Correctness section. 282/282 tests green.
 **Companions (this does NOT supersede them):**
 - `CCR-edge-lighting-redundant-recompute.md` (VOXEX-CCR-LIGHT-001) — the *other half* of the same backlog note. LIGHT-001 removes the redundant full-chunk `calculateChunkSunlight()` recompute inside `processEdgeLightingUpdates()` ("cache validity"). **This CCR is the "defer priming" half** and is fully orthogonal to it: LIGHT-001 fires during world *streaming* (chunk/neighbor arrival); this one fires on player *edits* (mining/placing). Different trigger, different function, no overlap.
 - `CCR-idle-streaming-remesh-reduction.md` (VOXEX-CCR-CHUNK-002) — already shipped the high-impact piece (the `genState & GEN_PASS.SUNLIGHT` flag that stopped false-positive lighting-invalidation driving idle chunks to ~3× remeshes). **What remains here is explicitly incremental** — a per-edit micro-cost, not the streaming-stall fix CHUNK-002 already landed.
