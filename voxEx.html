@@ -3926,11 +3926,12 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.7";
+            const VOXEX_BUILD = "2026-06-22.8";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
             const VOXEX_RECENT_CHANGES = [
+                "PARTICLE/FX PER-FRAME CLEANUP (VOXEX-CCR-FX-001, build 2026-06-22.8). Part A — Particle buffer uploads: replaced blanket full-array needsUpdate=true on all three buffers with bounded addUpdateRange uploads. (1) init(): setUsage(DynamicDrawUsage) on all three attributes. (2) spawn(): clearUpdateRanges()+addUpdateRange(0,(idx+1)*itemSize) for position+color (idx=pre-increment activeCount, so idx+1 covers the new top slot); sets _sizesDirty=true instead of flagging size unconditionally. (3) update(): snapshots startCount=activeCount before the loop; after the loop, touched=max(startCount,activeCount) is the high-water mark covering both live and just-hidden despawn slots; uploads position+color bounded to touched*itemSize; uploads size only when _sizesDirty, then clears it. Gate is 'touched>0' not 'activeCount>0', fixing the latent ghost-particle bug on the frame the last particle despawns (old code skipped the upload that frame, leaving stale GPU data). (4) despawn(): sets _sizesDirty=true (size buffer changed by swap-copy or slot hide). Part B — Placed-torch spawner: Phase 1: timing moved from position-keyed Maps (placedTorchLastSmoke/Flame, now replaced by tombstone comments) onto torch._lastSmokeTime/_lastFlameTime — zero per-frame string allocations, drops the two Maps and the buggy insertion-order eviction block. Phase 2: outer loop changed from for-of-chunkTorches (O(all torch-chunks)) to a 5×5 chunk window (cr=ceil(24/16)=2) via Map.get per cell — O(nearby), bounds the pathological many-torch case. 3D distSq gate unchanged. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
                 "SUNLIGHT COLUMN PRIMING COST (VOXEX-CCR-LIGHT-002 Lever 1, build 2026-06-22.7). Replaced the body of primeSunlightColumn() to hoist the loop-invariant chunk lookup out of the 320-iteration column walk. Previously each of 320 cells called getBlock()/getSkyLight()/setSkyLight(), which each rebuilt a template-string key and (for setSkyLight, which has no _lastChunk cache) re-did a chunkDataPool.get() Map lookup — totalling ≥640 string allocations + up to ~320 extra pool lookups per transparent edit (block break). Fix: resolve the chunk ONCE via chunkDataPool.get() before the loop, then read chunk.blocks[idx] and chunk.skyLight[idx] directly using idx = colBase + ((cy + yOffset) << 8) (loop-invariant colBase = (x&15)+((z&15)<<4)); write sky[idx] = target directly (target is already in [1,15], matching setSkyLight's clamp). Tail reuses the pre-computed cx/cz for getChunkKey(cx,cz) instead of Math.floor(x/chunkSize). Result-identical on the reachable edit path: same chunkDataPool.get() resolution, same idx formula, same [1,15] range, same enqueueAdd/enqueueRemove calls, same anyChange/tracker.mark/ensureQueued tail. Early return false for missing/legacy-format chunks (unreachable on the edit path per VoxelWorld.setBlock upgrade at 7426–7441). Lever 2 (scope walk to below edit height) deferred. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
                 "EDGE-LIGHTING STREAMING COST (VOXEX-CCR-LIGHT-001, build 2026-06-22.6). Two orthogonal fixes to the main-thread edge-lighting path (processEdgeLightingUpdates → propagateLightFromEdgesInward). Item 1: removed !hasValidEdgeLighting from the recompute gate — the EDGE_LIGHTING flag is cleared on every neighbor-arrival re-queue (~16951), causing a redundant 81,920-cell fill + full vertical scan + BFS on each of the ~8 neighbor-arrival passes per streamed chunk; now recomputes only when base sunlight is genuinely absent (!lightingLooksValid / GEN_PASS.SUNLIGHT clear). On the streaming path (skyLight ≥ base) skipping the reset can only equal-or-raise light; no dark seam. Two disclosed transients: Case B (over-bright border when a prior contributor unloaded) and Case C (momentary darkening during in-flight relight overlap — self-heals when SunlightTask refill completes). Item 2: replaced per-node `const neighbors = [...]` literal + for…of (7 arrays + 1 iterator per dequeued node — ~120K throwaway objects/call for a surface chunk) with iteration over the module-scope NEIGHBOR_OFFSETS table (same pattern as calculateChunkSunlight ~37907) and reuse of a module-scope scratch queue _edgeInwardQueue (reset at top of each call, safe because the function is synchronous and non-reentrant). Output byte-identical (monotone-max flood-fill converges to the same fixpoint regardless of neighbor visitation order). No DOM/settings/worker/cache-version changes. hasValidEdgeLighting still used unchanged by the else-if and re-queue guard.",
                 "BUILD QUEUE = WORKER COUNT (CCR-DEFAULTS-001, build 2026-06-22.5). buildQueueLimit default now auto-derives from the SAME formula as the worker pool — new shared autoWorkerCount() = min(cores-1, floor(0.75*cores)). 10c→7 workers→build queue 7; 4c→3→3. Rationale: workers run off-thread and the 75%/cores-1 cap already reserves the main thread, so build queue EQUALS worker count (not workers-1). The engine already used baseCap=max(buildQueueLimit, actual poolSize) at runtime (×2 when worker-meshing), so this mainly makes the default honest + self-scaling and matters most on low-core machines; manual worker overrides still respected via the runtime max(). buildQueueLimit stays a concrete number (NOT a 0=auto sentinel) because it's read raw in per-frame arithmetic. SETTINGS_VERSION 3→4 forces the new default onto devices. Profiles' buildQueueLimit (1/2/4) unchanged.",
@@ -14835,6 +14836,9 @@
                     this.geometry.setAttribute('position', new THREE.BufferAttribute(this.positions, 3));
                     this.geometry.setAttribute('color', new THREE.BufferAttribute(this.colors, 4));
                     this.geometry.setAttribute('size', new THREE.BufferAttribute(this.sizes, 1));
+                    this.geometry.attributes.position.setUsage(THREE.DynamicDrawUsage);
+                    this.geometry.attributes.color.setUsage(THREE.DynamicDrawUsage);
+                    this.geometry.attributes.size.setUsage(THREE.DynamicDrawUsage);
 
                     // Custom shader material for particles
                     this.material = new THREE.ShaderMaterial({
@@ -14933,10 +14937,13 @@
                     this.colors[idx * 4 + 3] = particle.a;
                     this.sizes[idx] = particle.size;
 
-                    // Mark buffers for update
-                    this.geometry.attributes.position.needsUpdate = true;
-                    this.geometry.attributes.color.needsUpdate = true;
-                    this.geometry.attributes.size.needsUpdate = true;
+                    // Bounded range: upload only through the new top slot for immediate same-frame visibility.
+                    // idx = this.activeCount (pre-increment), so (idx+1) covers [0, new top slot].
+                    const pos = this.geometry.attributes.position;
+                    const col = this.geometry.attributes.color;
+                    pos.clearUpdateRanges(); pos.addUpdateRange(0, (idx + 1) * 3); pos.needsUpdate = true;
+                    col.clearUpdateRanges(); col.addUpdateRange(0, (idx + 1) * 4); col.needsUpdate = true;
+                    this._sizesDirty = true;
 
                     this.particles.push(particle);
                     this.activeCount++;
@@ -14948,6 +14955,7 @@
                     if (!this.mesh || !playerPos) return;
 
                     const distSq = PARTICLE_CONFIG.updateDistance * PARTICLE_CONFIG.updateDistance;
+                    const startCount = this.activeCount;   // high-water mark: despawns shrink activeCount mid-loop
 
                     for (let i = this.particles.length - 1; i >= 0; i--) {
                         const p = this.particles[i];
@@ -14990,11 +14998,21 @@
                         this.sizes[idx] = p.size;
                     }
 
-                    // Mark buffers for update
-                    if (this.activeCount > 0) {
-                        this.geometry.attributes.position.needsUpdate = true;
-                        this.geometry.attributes.color.needsUpdate = true;
-                        this.geometry.attributes.size.needsUpdate = true;
+                    // Bounded buffer upload: only re-send the prefix touched this frame.
+                    // startCount is the high-water mark — covers active slots AND any just-hidden despawn
+                    // slots that must reach the GPU to clear, fixing the latent ghost on the frame the
+                    // last particle despawns (old code gated on activeCount > 0 and missed that frame).
+                    const touched = Math.max(startCount, this.activeCount);
+                    if (touched > 0) {
+                        const pos = this.geometry.attributes.position;
+                        const col = this.geometry.attributes.color;
+                        pos.clearUpdateRanges(); pos.addUpdateRange(0, touched * 3); pos.needsUpdate = true;
+                        col.clearUpdateRanges(); col.addUpdateRange(0, touched * 4); col.needsUpdate = true;
+                        if (this._sizesDirty) {
+                            const sz = this.geometry.attributes.size;
+                            sz.clearUpdateRanges(); sz.addUpdateRange(0, touched); sz.needsUpdate = true;
+                            this._sizesDirty = false;
+                        }
                     }
                 }
 
@@ -15039,6 +15057,7 @@
 
                     this.particles.pop();
                     this.activeCount--;
+                    this._sizesDirty = true;   // size buffer changed (swap-copy or slot hide)
                 }
 
                 // Spawn block break particles with configurable settings
@@ -43261,8 +43280,8 @@ self.onmessage = async (e) => {
             // Torch particle timers for separate smoke and flame spawning
             let lastTorchSmokeTime = 0;
             let lastTorchFlameTime = 0;
-            const placedTorchLastSmoke = new Map(); // Track smoke spawn times for placed torches
-            const placedTorchLastFlame = new Map(); // Track flame spawn times for placed torches
+            // placedTorchLastSmoke / placedTorchLastFlame removed by VOXEX-CCR-FX-001 Phase 1:
+            // timing now lives on torch._lastSmokeTime / torch._lastFlameTime (no per-frame alloc).
 
             /**
              * Calculate smoke particle spawn interval from spawn rate setting.
@@ -43397,49 +43416,45 @@ self.onmessage = async (e) => {
                     const playerPos = getPlayerWorldPosition();
                     const smokeInterval = getTorchSmokeInterval();
                     const flameInterval = getTorchFlameInterval();
-                    const PLACED_TORCH_PARTICLE_RADIUS = 24; // Only spawn particles for torches within this radius
+                    const PLACED_TORCH_PARTICLE_RADIUS = 24;
                     const radiusSq = PLACED_TORCH_PARTICLE_RADIUS * PLACED_TORCH_PARTICLE_RADIUS;
+                    // VOXEX-CCR-FX-001 Phase 1: timing on torch object → zero per-frame allocs,
+                    // drops position-keyed Maps and the buggy insertion-order eviction block.
+                    // VOXEX-CCR-FX-001 Phase 2: 5×5 chunk window (XZ) — O(nearby) not O(all).
+                    // 3D distSq gate unchanged; handles Y and the exact circular boundary.
+                    // Keys built inline (cx+','+cz) to match getChunkKey format.
+                    const chunkSize = WORLD_DIMS.chunkSize;
+                    const pcx = Math.floor(playerPos.x / chunkSize);
+                    const pcz = Math.floor(playerPos.z / chunkSize);
+                    const cr = Math.ceil(PLACED_TORCH_PARTICLE_RADIUS / chunkSize); // 2 → 5×5 window
+                    for (let dcz = -cr; dcz <= cr; dcz++) {
+                        for (let dcx = -cr; dcx <= cr; dcx++) {
+                            const torches = chunkTorches.get((pcx + dcx) + ',' + (pcz + dcz));
+                            if (!torches) continue;
+                            for (const torch of torches) {
+                                const torchPos = torch.position;
+                                const dx = torchPos.x - playerPos.x;
+                                const dy = torchPos.y - playerPos.y;
+                                const dz = torchPos.z - playerPos.z;
+                                if (dx * dx + dy * dy + dz * dz >= radiusSq) continue;
 
-                    // Iterate over nearby chunks and their torches
-                    for (const [chunkKey, torches] of chunkTorches) {
-                        for (const torch of torches) {
-                            const torchPos = torch.position;
-                            const dx = torchPos.x - playerPos.x;
-                            const dy = torchPos.y - playerPos.y;
-                            const dz = torchPos.z - playerPos.z;
-                            const distSq = dx * dx + dy * dy + dz * dz;
-
-                            if (distSq < radiusSq) {
-                                const torchKey = `${torchPos.x},${torchPos.y},${torchPos.z}`;
-                                const smokeY = torchPos.y + 0.5; // Top of torch where flame is
-                                const flameY = torchPos.y + 0.45; // Slightly lower for flame origin
+                                const smokeY = torchPos.y + 0.5;
+                                const flameY = torchPos.y + 0.45;
 
                                 // Smoke particles (slower spawn rate)
-                                const lastSmokeTime = placedTorchLastSmoke.get(torchKey) || 0;
-                                if (time - lastSmokeTime > smokeInterval) {
-                                    placedTorchLastSmoke.set(torchKey, time);
+                                if (time - (torch._lastSmokeTime || 0) > smokeInterval) {
+                                    torch._lastSmokeTime = time;
                                     particleSystem.spawnTorchEmber(torchPos.x, smokeY, torchPos.z);
                                 }
-
                                 // Flame particles (faster spawn rate)
-                                const lastFlameTime = placedTorchLastFlame.get(torchKey) || 0;
-                                if (time - lastFlameTime > flameInterval) {
-                                    placedTorchLastFlame.set(torchKey, time);
+                                if (time - (torch._lastFlameTime || 0) > flameInterval) {
+                                    torch._lastFlameTime = time;
                                     const flameCount = 2 + Math.floor(Math.random() * 2);
                                     for (let i = 0; i < flameCount; i++) {
                                         particleSystem.spawnTorchFlame(torchPos.x, flameY, torchPos.z);
                                     }
                                 }
                             }
-                        }
-                    }
-
-                    // Clean up old entries from torches that are no longer nearby
-                    if (placedTorchLastSmoke.size > 100) {
-                        const keys = Array.from(placedTorchLastSmoke.keys());
-                        for (let i = 0; i < keys.length - 50; i++) {
-                            placedTorchLastSmoke.delete(keys[i]);
-                            placedTorchLastFlame.delete(keys[i]);
                         }
                     }
                 }
