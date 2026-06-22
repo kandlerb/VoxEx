@@ -979,7 +979,17 @@ async function runAllTests() {
                 expect(mainT.fc).toBeGreaterThan(0);
                 cmp('terrain.positions', r.terrain.positions, mainT.pos, mainT.fc * 12, 1e-4);
                 cmp('terrain.uvs', r.terrain.uvs, mainT.uv, mainT.fc * 8, 1e-5);
-                cmp('terrain.colors', r.terrain.colors, mainT.col, mainT.fc * 12, 1e-4);
+                // VOXEX-CCR-VRAM-001 Phase 1: worker emits color as Uint8 RGBA (4/vert); oracle is
+                // Float32 RGB (3/vert). Unpack worker bytes to [0,1] RGB and compare within 8-bit
+                // quantization + the worker/main fp slack; assert the constant alpha lane is 255.
+                expect(r.terrain.colors.length).toBe(mainT.fc * 16);
+                for (let v = 0, nV = mainT.fc * 4; v < nV; v++) {
+                    for (let k = 0; k < 3; k++) {
+                        const wv = r.terrain.colors[v * 4 + k] / 255, mv = mainT.col[v * 3 + k];
+                        if (Math.abs(wv - mv) > (1 / 255 + 1e-4)) throw new Error('terrain.colors mismatch at vert ' + v + ' ch ' + k + ': worker=' + wv + ' main=' + mv);
+                    }
+                    if (r.terrain.colors[v * 4 + 3] !== 255) throw new Error('terrain.colors alpha != 255 at vert ' + v);
+                }
                 cmp('terrain.quadSize', r.terrain.quadSize, mainT.qs, mainT.fc * 8, 1e-4);
                 cmp('terrain.indices', r.terrain.indices, mainT.idx, mainT.fc * 6, 0);
 
@@ -1053,7 +1063,16 @@ async function runAllTests() {
                 expect(r.terrain.faceCount).toBe(mainT.faceCount);
                 cmp('terrain.positions', r.terrain.positions, mainT.positions, mainT.faceCount * 12, 1e-4);
                 cmp('terrain.uvs', r.terrain.uvs, mainT.uvs, mainT.faceCount * 8, 1e-5);
-                cmp('terrain.colors', r.terrain.colors, mainT.colors, mainT.faceCount * 12, 1e-4); // the seam-critical buffer
+                // VOXEX-CCR-VRAM-001 Phase 1: color is Uint8 RGBA (4/vert) — unpack + compare within
+                // 8-bit quantization + edge-light fp slack; alpha lane must be 255. (the seam-critical buffer)
+                expect(r.terrain.colors.length).toBe(mainT.faceCount * 16);
+                for (let v = 0, nV = mainT.faceCount * 4; v < nV; v++) {
+                    for (let k = 0; k < 3; k++) {
+                        const wv = r.terrain.colors[v * 4 + k] / 255, mv = mainT.colors[v * 3 + k];
+                        if (Math.abs(wv - mv) > (1 / 255 + 1e-4)) throw new Error('terrain.colors mismatch at vert ' + v + ' ch ' + k + ': worker=' + wv + ' main=' + mv);
+                    }
+                    if (r.terrain.colors[v * 4 + 3] !== 255) throw new Error('terrain.colors alpha != 255 at vert ' + v);
+                }
                 cmp('terrain.quadSize', r.terrain.quadSize, mainT.quadSize, mainT.faceCount * 8, 1e-4);
                 cmp('terrain.indices', r.terrain.indices, mainT.indices, mainT.faceCount * 6, 0);
                 expect(r.water.faceCount).toBe(main.water.faceCount);
@@ -1106,20 +1125,28 @@ async function runAllTests() {
                 // Mock geometry: zeroed color buffer + the recorded lightMap. refill rewrites colors
                 // in place. Set->refill->compare->delete runs synchronously, so no rAF frame (which
                 // could touch a non-Three mesh in chunkMeshes) can interleave.
-                const colorArr = new Float32Array(N);
+                // VOXEX-CCR-VRAM-001 Phase 1: the real color attribute is now Uint8 RGBA (4/vert), so
+                // the mock matches it — refill restrides to q*16+k*4 and packs to bytes (alpha 255).
+                const colorArr = new Uint8Array(lm.quadCount * 16);
                 const geo = { userData: { lightMap: lm }, attributes: { color: { array: colorArr, clearUpdateRanges() {}, addUpdateRange() {}, needsUpdate: false } } };
                 chunkMeshes.set(KEY, { geometry: geo });
                 const ok = refillChunkLightColors(KEY);
                 expect(ok).toBe(true);
 
+                // Refill float == mesh float (shared cellCornerLightDamped, <1e-6), so refill's packed
+                // byte must equal the oracle quantized to 8-bit: unpack and compare within 1/255.
                 let maxDiff = 0, firstBad = -1;
-                for (let i = 0; i < N; i++) {
-                    const d = Math.abs(colorArr[i] - meshedColors[i]);
-                    if (d > maxDiff) maxDiff = d;
-                    if (d > 1e-6 && firstBad < 0) firstBad = i;
+                for (let v = 0, nV = lm.quadCount * 4; v < nV; v++) {
+                    for (let k = 0; k < 3; k++) {
+                        const rv = colorArr[v * 4 + k] / 255, mv = meshedColors[v * 3 + k];
+                        const d = Math.abs(rv - mv);
+                        if (d > maxDiff) maxDiff = d;
+                        if (d > (1 / 255 + 1e-6) && firstBad < 0) firstBad = v * 3 + k;
+                    }
+                    if (colorArr[v * 4 + 3] !== 255 && firstBad < 0) firstBad = v * 4 + 3;
                 }
-                if (firstBad >= 0) throw new Error('refill!=mesh at color[' + firstBad + ']: refill=' + colorArr[firstBad] + ' mesh=' + meshedColors[firstBad] + ' (maxDiff=' + maxDiff + ')');
-                expect(maxDiff).toBeLessThan(1e-6);
+                if (firstBad >= 0) throw new Error('refill!=mesh near color[' + firstBad + '] (maxDiff=' + maxDiff + ', want <=1/255; alpha must be 255)');
+                expect(maxDiff).toBeLessThan(1 / 255 + 1e-6);
             } finally {
                 chunkMeshes.delete(KEY);
                 chunkDataPool.chunks.delete(KEY);
