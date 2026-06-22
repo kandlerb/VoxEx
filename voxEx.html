@@ -3926,11 +3926,12 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.5";
+            const VOXEX_BUILD = "2026-06-22.6";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
             const VOXEX_RECENT_CHANGES = [
+                "EDGE-LIGHTING STREAMING COST (VOXEX-CCR-LIGHT-001, build 2026-06-22.6). Two orthogonal fixes to the main-thread edge-lighting path (processEdgeLightingUpdates → propagateLightFromEdgesInward). Item 1: removed !hasValidEdgeLighting from the recompute gate — the EDGE_LIGHTING flag is cleared on every neighbor-arrival re-queue (~16951), causing a redundant 81,920-cell fill + full vertical scan + BFS on each of the ~8 neighbor-arrival passes per streamed chunk; now recomputes only when base sunlight is genuinely absent (!lightingLooksValid / GEN_PASS.SUNLIGHT clear). On the streaming path (skyLight ≥ base) skipping the reset can only equal-or-raise light; no dark seam. Two disclosed transients: Case B (over-bright border when a prior contributor unloaded) and Case C (momentary darkening during in-flight relight overlap — self-heals when SunlightTask refill completes). Item 2: replaced per-node `const neighbors = [...]` literal + for…of (7 arrays + 1 iterator per dequeued node — ~120K throwaway objects/call for a surface chunk) with iteration over the module-scope NEIGHBOR_OFFSETS table (same pattern as calculateChunkSunlight ~37907) and reuse of a module-scope scratch queue _edgeInwardQueue (reset at top of each call, safe because the function is synchronous and non-reentrant). Output byte-identical (monotone-max flood-fill converges to the same fixpoint regardless of neighbor visitation order). No DOM/settings/worker/cache-version changes. hasValidEdgeLighting still used unchanged by the else-if and re-queue guard.",
                 "BUILD QUEUE = WORKER COUNT (CCR-DEFAULTS-001, build 2026-06-22.5). buildQueueLimit default now auto-derives from the SAME formula as the worker pool — new shared autoWorkerCount() = min(cores-1, floor(0.75*cores)). 10c→7 workers→build queue 7; 4c→3→3. Rationale: workers run off-thread and the 75%/cores-1 cap already reserves the main thread, so build queue EQUALS worker count (not workers-1). The engine already used baseCap=max(buildQueueLimit, actual poolSize) at runtime (×2 when worker-meshing), so this mainly makes the default honest + self-scaling and matters most on low-core machines; manual worker overrides still respected via the runtime max(). buildQueueLimit stays a concrete number (NOT a 0=auto sentinel) because it's read raw in per-frame arithmetic. SETTINGS_VERSION 3→4 forces the new default onto devices. Profiles' buildQueueLimit (1/2/4) unchanged.",
                 "CHUNK GEOMETRY VRAM — ATTRIBUTE PACKING (VOXEX-CCR-VRAM-001 Phase 1, build 2026-06-22.4). Terrain chunk geometry shrunk 184 -> 136 B/face (-26%) by packing two over-precise attributes: vertex `color` Float32x3 (12 B) -> Uint8 RGBA normalized (4 B, 4-byte aligned, alpha lane const 255) and `quadSize` Float32x2 (8 B) -> Uint16 (4 B, integer block-spans up to 320; Uint8 would overflow). Lossless: baked light×AO is already ~15 discrete levels, far below 8-bit. Sites: _createTerrainGeometry retypes both attrs; the WORKER now emits terrain color as Uint8 RGBA (new packColorRGBA8-equivalent inline loop before transfer) so the streaming apply stays a native byte .set() AND the transferable shrinks 3x (no main-thread pack on the hot path); the main-thread mesher (flushBand, edited/banded chunks) and the light-only refill (refillChunkLightColors) pack inline — the refill restrides to 4/vert and addUpdateRange counts scale x4/3 (RGB->RGBA). NEW module helper packColorRGBA8 (round + high-clamp, alpha 255). GLSL: itemSize 4 makes three.js define USE_COLOR_ALPHA so vColor becomes vec4 — the two custom chunk-shader reads `dot(vColor, ...)` are now `dot(vColor.rgb, ...)` (safe for vec3 glass too). Water geometry UNCHANGED (still Float32 RGB — Phase 1.5). Memory-estimate constants GEO_TIER_*_BYTES updated 40->28 B/vert (also lowers the MemoryBudgetManager pressure estimate, deferring auto-downscale). Save format untouched (geometry never persisted). NEEDS IN-BROWSER TEST: stream fresh chunks (worker path), place/break blocks (main mesher), toggle torch / time-of-day (light refill) — confirm terrain lighting/AO/greedy-tiled textures look identical, no black/blown-out/transparent chunks; check window.memoryBudgetManager.getStatus() geometry bytes down ~26%.",
                 "COLLISION VERTICAL-GAP FIX (CCR-COLLIDE-001, build 2026-06-22.3). The player walked horizontally through solid blocks sitting in the MIDDLE of the body while airborne. Cause: collide() sampled only TWO Y planes (floor(feet+0.1) and floor(eye+0.1)). The player box is 0.6 wide but 1.8 TALL, so at fractional feet (the whole jump/fall arc) the body spans three cells and the middle one was never tested — a block there was walked through. FIX: replaced the two fixed samples with a for-loop over every integer cell yBottom..yTop (4 XZ corners each, <=12 isSolidBlock checks vs 8). yBottom/yTop are bit-identical to the old y0/y1 so integer-feet/standing/step behavior is unchanged; it only fills the interior cells. This matches zombieCollides()'s existing full-span scan. TDD: added 3 headless tests (collision: collide() scans the full vertical span) — the mid-body case was RED before the fix, all 281 green after. Exposed collide/checkGround/voxelWorld/playerEyeHeight on the ?test=1 seam (inert in prod). NEEDS IN-BROWSER TEST: float a block 2 cells above flat ground (head cell clear), jump up into it — should now stop; confirm you still pass UNDER it when walking, can walk under a 2-high gap, and crouch-fit a 2-high gap.",
@@ -9788,6 +9789,10 @@
                 [0, 0, 1],
                 [0, 0, -1],
             ];
+            // VOXEX-CCR-LIGHT-001 (Item 2): reused scratch BFS queue for propagateLightFromEdgesInward.
+            // All three call sites (processEdgeLightingUpdates ×2, recalculateEdgeLighting ×1) are
+            // synchronous and never nest an inward call, so one shared buffer is safe.
+            const _edgeInwardQueue = [];
             const FACE_DIRECTIONS = [ // --- OPTIMIZATION: Pre-computed face directions for rendering --- [dx, dy, dz, nx, ny, nz] - direction offset and normal
                 [0, 1, 0, 0, 1, 0], // Top
                 [0, -1, 0, 0, -1, 0], // Bottom
@@ -17342,8 +17347,10 @@
                 const blocks = chunk.blocks;
                 const cs = chunkSize;
 
-                // BFS queue: [lx, ly, lz, level]
-                const queue = [];
+                // VOXEX-CCR-LIGHT-001 (Item 2): reuse the module-scope scratch queue instead of
+                // allocating a fresh growable array each call. Non-reentrant → safe to reset in place.
+                const queue = _edgeInwardQueue;
+                queue.length = 0;
 
                 // Seed queue with all edge blocks that have light > 1
                 // West edge (lx = 0)
@@ -17394,14 +17401,13 @@
                     const propagated = level - 1;
                     if (propagated <= 1) continue;
 
-                    // Check 6 neighbors (but only within chunk)
-                    const neighbors = [
-                        [lx - 1, ly, lz], [lx + 1, ly, lz],
-                        [lx, ly - 1, lz], [lx, ly + 1, lz],
-                        [lx, ly, lz - 1], [lx, ly, lz + 1]
-                    ];
-
-                    for (const [nx, ny, nz] of neighbors) {
+                    // VOXEX-CCR-LIGHT-001 (Item 2): iterate the hoisted NEIGHBOR_OFFSETS table —
+                    // no per-node array allocation. Identical to the in-chunk sunlight BFS in
+                    // calculateChunkSunlight (~37907). Monotone-max flood-fill converges to the same
+                    // fixpoint regardless of neighbor visitation order → output is byte-identical.
+                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
+                        const o = NEIGHBOR_OFFSETS[n];
+                        const nx = lx + o[0]; const ny = ly + o[1]; const nz = lz + o[2];
                         if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue;
 
                         const nIdx = nx + nz * cs + ny * cs * cs;
@@ -17514,7 +17520,20 @@
                         logDebug(`[CCR002-verify] ${key} has skyLight but GEN_PASS.SUNLIGHT clear`);
                     }
                     const lightingLooksValid = (chunk.genState & GEN_PASS.SUNLIGHT) !== 0;
-                    if (!hasValidEdgeLighting || !lightingLooksValid) {
+                    // VOXEX-CCR-LIGHT-001 (Item 1): recompute base sunlight ONLY when it is actually
+                    // missing/invalid. The previous `!hasValidEdgeLighting ||` operand forced a full
+                    // 320-tall recompute on every pass where the EDGE_LIGHTING flag is clear — the
+                    // chunk's first pass AND every neighbor-arrival re-queue
+                    // (queueAdjacentChunksForUpdate clears the flag, ~16951). That recompute
+                    // re-derived the base skyLight calculateChunkSunlight() already produced at
+                    // creation (genState.SUNLIGHT, ~38773/38854). propagateLightFromNeighbors below
+                    // imports fresh edge values either way, and is monotone-max, so on the streaming
+                    // path (skyLight >= base) skipping the base reset can only EQUAL or RAISE light —
+                    // no dark seam introduced. See CCR for Case B (over-bright transient) and Case C
+                    // (in-flight-relight overlap — the one case that can transiently darken).
+                    // hasValidEdgeLighting is still used unchanged by the else-if (17546) and the
+                    // re-queue guard (17581) — only its use in this recompute gate is removed.
+                    if (!lightingLooksValid) {
                         calculateChunkSunlight(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
                     }
 
