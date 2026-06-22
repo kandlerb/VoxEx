@@ -3926,11 +3926,12 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.6";
+            const VOXEX_BUILD = "2026-06-22.7";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
             const VOXEX_RECENT_CHANGES = [
+                "SUNLIGHT COLUMN PRIMING COST (VOXEX-CCR-LIGHT-002 Lever 1, build 2026-06-22.7). Replaced the body of primeSunlightColumn() to hoist the loop-invariant chunk lookup out of the 320-iteration column walk. Previously each of 320 cells called getBlock()/getSkyLight()/setSkyLight(), which each rebuilt a template-string key and (for setSkyLight, which has no _lastChunk cache) re-did a chunkDataPool.get() Map lookup — totalling ≥640 string allocations + up to ~320 extra pool lookups per transparent edit (block break). Fix: resolve the chunk ONCE via chunkDataPool.get() before the loop, then read chunk.blocks[idx] and chunk.skyLight[idx] directly using idx = colBase + ((cy + yOffset) << 8) (loop-invariant colBase = (x&15)+((z&15)<<4)); write sky[idx] = target directly (target is already in [1,15], matching setSkyLight's clamp). Tail reuses the pre-computed cx/cz for getChunkKey(cx,cz) instead of Math.floor(x/chunkSize). Result-identical on the reachable edit path: same chunkDataPool.get() resolution, same idx formula, same [1,15] range, same enqueueAdd/enqueueRemove calls, same anyChange/tracker.mark/ensureQueued tail. Early return false for missing/legacy-format chunks (unreachable on the edit path per VoxelWorld.setBlock upgrade at 7426–7441). Lever 2 (scope walk to below edit height) deferred. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
                 "EDGE-LIGHTING STREAMING COST (VOXEX-CCR-LIGHT-001, build 2026-06-22.6). Two orthogonal fixes to the main-thread edge-lighting path (processEdgeLightingUpdates → propagateLightFromEdgesInward). Item 1: removed !hasValidEdgeLighting from the recompute gate — the EDGE_LIGHTING flag is cleared on every neighbor-arrival re-queue (~16951), causing a redundant 81,920-cell fill + full vertical scan + BFS on each of the ~8 neighbor-arrival passes per streamed chunk; now recomputes only when base sunlight is genuinely absent (!lightingLooksValid / GEN_PASS.SUNLIGHT clear). On the streaming path (skyLight ≥ base) skipping the reset can only equal-or-raise light; no dark seam. Two disclosed transients: Case B (over-bright border when a prior contributor unloaded) and Case C (momentary darkening during in-flight relight overlap — self-heals when SunlightTask refill completes). Item 2: replaced per-node `const neighbors = [...]` literal + for…of (7 arrays + 1 iterator per dequeued node — ~120K throwaway objects/call for a surface chunk) with iteration over the module-scope NEIGHBOR_OFFSETS table (same pattern as calculateChunkSunlight ~37907) and reuse of a module-scope scratch queue _edgeInwardQueue (reset at top of each call, safe because the function is synchronous and non-reentrant). Output byte-identical (monotone-max flood-fill converges to the same fixpoint regardless of neighbor visitation order). No DOM/settings/worker/cache-version changes. hasValidEdgeLighting still used unchanged by the else-if and re-queue guard.",
                 "BUILD QUEUE = WORKER COUNT (CCR-DEFAULTS-001, build 2026-06-22.5). buildQueueLimit default now auto-derives from the SAME formula as the worker pool — new shared autoWorkerCount() = min(cores-1, floor(0.75*cores)). 10c→7 workers→build queue 7; 4c→3→3. Rationale: workers run off-thread and the 75%/cores-1 cap already reserves the main thread, so build queue EQUALS worker count (not workers-1). The engine already used baseCap=max(buildQueueLimit, actual poolSize) at runtime (×2 when worker-meshing), so this mainly makes the default honest + self-scaling and matters most on low-core machines; manual worker overrides still respected via the runtime max(). buildQueueLimit stays a concrete number (NOT a 0=auto sentinel) because it's read raw in per-frame arithmetic. SETTINGS_VERSION 3→4 forces the new default onto devices. Profiles' buildQueueLimit (1/2/4) unchanged.",
                 "CHUNK GEOMETRY VRAM — ATTRIBUTE PACKING (VOXEX-CCR-VRAM-001 Phase 1, build 2026-06-22.4). Terrain chunk geometry shrunk 184 -> 136 B/face (-26%) by packing two over-precise attributes: vertex `color` Float32x3 (12 B) -> Uint8 RGBA normalized (4 B, 4-byte aligned, alpha lane const 255) and `quadSize` Float32x2 (8 B) -> Uint16 (4 B, integer block-spans up to 320; Uint8 would overflow). Lossless: baked light×AO is already ~15 discrete levels, far below 8-bit. Sites: _createTerrainGeometry retypes both attrs; the WORKER now emits terrain color as Uint8 RGBA (new packColorRGBA8-equivalent inline loop before transfer) so the streaming apply stays a native byte .set() AND the transferable shrinks 3x (no main-thread pack on the hot path); the main-thread mesher (flushBand, edited/banded chunks) and the light-only refill (refillChunkLightColors) pack inline — the refill restrides to 4/vert and addUpdateRange counts scale x4/3 (RGB->RGBA). NEW module helper packColorRGBA8 (round + high-clamp, alpha 255). GLSL: itemSize 4 makes three.js define USE_COLOR_ALPHA so vColor becomes vec4 — the two custom chunk-shader reads `dot(vColor, ...)` are now `dot(vColor.rgb, ...)` (safe for vec3 glass too). Water geometry UNCHANGED (still Float32 RGB — Phase 1.5). Memory-estimate constants GEO_TIER_*_BYTES updated 40->28 B/vert (also lowers the MemoryBudgetManager pressure estimate, deferring auto-downscale). Save format untouched (geometry never persisted). NEEDS IN-BROWSER TEST: stream fresh chunks (worker path), place/break blocks (main mesher), toggle torch / time-of-day (light refill) — confirm terrain lighting/AO/greedy-tiled textures look identical, no black/blown-out/transparent chunks; check window.memoryBudgetManager.getStatus() geometry bytes down ~26%.",
@@ -24655,28 +24656,42 @@
                 } else { sunTask.onComplete = () => finalizeLightTracker(tracker); }
             }
             function primeSunlightColumn(task, x, z, tracker) {
+                // VOXEX-CCR-LIGHT-002 (Lever 1): one fixed (x,z) => one fixed chunk for the whole column.
+                // Resolve it ONCE and index directly instead of calling getBlock/getSkyLight/setSkyLight
+                // 320× each (every one of which rebuilds a `${cx},${cz}` key; setSkyLight also re-does a
+                // pool lookup per write). Same chunkDataPool.get() resolution path the accessors use,
+                // same idx math, same [1,15] range, same enqueues — result-identical on the edit path.
+                const cx = x >> 4, cz = z >> 4;
+                const chunk = (typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(getChunkKey(cx, cz))
+                                                                    : voxelWorld.chunks.get(getChunkKey(cx, cz)));
+                // Edit path always reaches here with a loaded, object-format chunk (see Correctness).
+                // If blocks/skyLight are absent (legacy raw-array or partial chunk), the original walk
+                // could only no-op or write nothing useful, so an early return is the safe equivalent.
+                if (!chunk || !chunk.blocks || !chunk.skyLight) return false;
+                const blocks = chunk.blocks, sky = chunk.skyLight;
+                const colBase = (x & 15) + ((z & 15) << 4);   // loop-invariant XZ offset
                 const minY = -WORLD_DIMS.yOffset;
                 const maxY = WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset - 1;
                 let currentLight = 15;
                 let anyChange = false;
                 for (let cy = maxY; cy >= minY; cy--) {
-                    const blockId = getBlock(x, cy, z);
-                    if (blockId === undefined) continue; // Skip unloaded chunks
-                    const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;
+                    const idx = colBase + ((cy + WORLD_DIMS.yOffset) << 8);
+                    const blockId = blocks[idx];
+                    const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;   // ?? 0 now unreachable (Uint8 read) — kept for parity
                     const target = currentLight > 1 ? currentLight : 1;
-                    const prev = getSkyLight(x, cy, z);
+                    const prev = sky[idx];
                     if (target !== prev) {
-                        setSkyLight(x, cy, z, target);
+                        sky[idx] = target;                       // target ∈ [1,15] already → matches setSkyLight clamp
                         anyChange = true;
                         if (task) {
-                            if (target > prev) { task.enqueueAdd(x, cy, z, target);
-                            } else { task.enqueueRemove(x, cy, z, prev); }
+                            if (target > prev) { task.enqueueAdd(x, cy, z, target); }
+                            else { task.enqueueRemove(x, cy, z, prev); }
                         }
                     }
                     if (attenuation >= 15) { currentLight = 1; }
                     else if (attenuation > 0) { currentLight = currentLight > attenuation ? currentLight - attenuation : 1; }
                 }
-                if (anyChange) { const chunkKey = getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize)); tracker?.mark(chunkKey); task?.ensureQueued(); }
+                if (anyChange) { const chunkKey = getChunkKey(cx, cz); tracker?.mark(chunkKey); task?.ensureQueued(); }
                 return anyChange;
             }
             // SunlightTask class - Encapsulates sunlight update state and operations
