@@ -3926,7 +3926,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.12";
+            const VOXEX_BUILD = "2026-06-22.13";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
@@ -3935,6 +3935,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "SHORELINE DAMP SECTION FLAG (VOXEX-CCR-PERF-011 / #483, build 2026-06-22.13). Added hasWater flag to section metadata so cellCornerLightDamped() skips its ~40-read water-adjacency scan for sections with no water. On inland chunks (majority of the map) every top-facing land block called cellCornerLightDamped which scanned 6+ neighbors — all returning non-water — completely wasted. Fix: (1) createSectionData() initializes hasWater=false per section; (2) analyzeChunkSections() sets hasWater=true when WATER block found; (3) module-scope _greedySectionHasWater=true flag; (4) cellCornerLightDamped early-returns cornerLight when !_greedySectionHasWater; (5) main-thread greedy loop sets _greedySectionHasWater=section.hasWater??true before each greedyMeshSection call, resets to true after; (6) worker: _greedySectionHasWater emitted in template, per-section water scan (labeled break) sets flag before greedy calls. refillChunkLightColors unaffected (flag always true when it runs). Old cached sections missing hasWater default to true (conservative). 282/282 tests green.",
                 "WATER MESH DEPTH/SHORE HOIST (VOXEX-CCR-PERF-010 / #482, build 2026-06-22.12). Hoisted waterDepth and shoreDist computations above the per-face loop in all three water meshing sites: (1) greedy-path water-only loop (main thread), (2) non-greedy per-block loop (main thread), (3) worker static driver. Both values depend only on block position (x,y,z), not face direction, so computing them inside the face loop caused up to 6× redundant scans per water block. After hoist: computed once per water block, reused for all visible faces. Non-greedy path now guards the hoist with `if (isWater)` so non-water blocks pay zero cost. 282/282 tests green.",
                 "WATER SURFACE SCAN CACHE (VOXEX-CCR-PERF-009 / #491, build 2026-06-22.11). Eliminated redundant 50-block upward scans in applyPlayerVelocity() when the player holds jump while swimming. The scan (up to 50 getBlock Map lookups) ran every physics substep — with collisionSteps=3 that was 3× per frame while treading water. Fix: added two module-scope cache vars (_waterSurfaceScanPX/_waterSurfaceScanPZ, both NaN initially) that record the XZ column of the last scan; the scan only runs when the player enters a new XZ block column (Math.floor comparison). Cache is invalidated when the player dives (isCrouching branch sets _waterSurfaceScanPX=NaN). This is a cross-frame cache (simpler and broader than the frame-counter approach originally proposed in the CCR); it's safe because the water column above a given XZ cell doesn't change between frames under normal gameplay. 282/282 tests green.",
                 "PERF BATCH — ISSUES #490/#489/#485/#487/#479/#484/#473 (build 2026-06-22.10). #490: deleted dead updateFrustumPlanes() block (computed a Matrix4 but never stored it; frustumPlanes/PlanesValid/lastFrustumCameraMatrix never read — confirmed no callers). #489: replaced 3x new THREE.Vector2(clampX,clampY)+.copy() in updateVolumetricLighting with .set(clampX,clampY) directly on destination uniform (reusable volumetricTempVec2 already existed; saved ≤4 allocs/frame). #485: added _heldTorchPos module-scope scratch Vector3 near volumetricTempVec3; both held-torch getWorldPosition calls now reuse it (was 2x new THREE.Vector3() per frame while torch active). #487: added _springResult={value,velocity} module-scope scratch; springDamper() now writes into it and returns it instead of allocating a new object per call (~30-60 allocs/frame eliminated; all callers consume both fields before next call — sequential use verified at all 3 call sites). #479: removed Array.from() wrappers from ChunkCompressor.compress() — Uint16Arrays now stored directly in IndexedDB (structured clone handles typed arrays; decompress() already uses new Uint16Array(x) which accepts both formats, so old records still load). #484: deleted AO cache machinery (AO_CACHE_SIZE/aoCache/aoCacheValid/initAOCache/clearAOCache/getAOCacheKey) — removed from main thread, worker code emitter, and injection list; hit rate was ~0 (each face visited once per chunk render), worker bypassed it (aoCacheValid=false), and Float32 pack formula exceeded exact-integer range causing precision loss. calculateFaceAO now computes directly. #473: added TERRAIN_GEN_VERSION=1 constant; stamped in ChunkCompressor.compress() records; exposed in decompress() result; both loadChunkFromCache() and batchLoadChunksFromCache() reject records with mismatched version (0 for old records → regen). 282/282 tests green.",
@@ -6849,6 +6850,7 @@
                     sections[i] = {
                         isEmpty: true,       // Assume empty until analyzed
                         isFullySolid: false, // Assume not solid until analyzed
+                        hasWater: false,     // Whether section contains water (VOXEX-CCR-PERF-011)
                         hasMesh: false,      // No mesh initially
                         faceCount: 0,        // No faces initially
                         // Y bounds
@@ -7005,6 +7007,7 @@
                     // Reset section state
                     let isEmpty = true;
                     let isFullySolid = true;
+                    let hasWater = false;
                     let minBlockY = baseY + SECTION_HEIGHT; // Start beyond section
                     let maxBlockY = baseY - 1;              // Start before section
                     // Track X/Z bounds (start inverted, will be corrected as blocks found)
@@ -7028,6 +7031,7 @@
                                 if (blockId !== AIR) {
                                     // Found non-air block
                                     isEmpty = false;
+                                    if (blockId === WATER) hasWater = true; // VOXEX-CCR-PERF-011
 
                                     // Update Y bounds
                                     if (y < minBlockY) minBlockY = y;
@@ -7077,6 +7081,7 @@
                     section.maxBlockX = maxBlockX;
                     section.minBlockZ = minBlockZ;
                     section.maxBlockZ = maxBlockZ;
+                    section.hasWater = hasWater; // VOXEX-CCR-PERF-011
                     section.analyzed = true;
                 }
             }
@@ -18827,10 +18832,21 @@
                     const sEndY = sStartY + SECTION_HEIGHT;
 
                     // --- Terrain: greedy meshing per face direction (injected greedyMeshSection) ---
+                    // VOXEX-CCR-PERF-011: scan section for water to gate cellCornerLightDamped
+                    _greedySectionHasWater = false;
+                    wScan: for (let sy = sStartY; sy < sEndY; sy++) {
+                        const syOff = sy * 256;
+                        for (let sz = 0; sz < 16; sz++) {
+                            for (let sx = 0; sx < 16; sx++) {
+                                if (centerBlocks[sx + sz * 16 + syOff] === WATER) { _greedySectionHasWater = true; break wScan; }
+                            }
+                        }
+                    }
                     let terrainState = { vIdx: tVIdx, uvIdx: tUvIdx, cIdx: tCIdx, qsIdx: tQsIdx, iIdx: tIIdx, vertCount: tVertCount, faceCount: tFaceCount, inputFaceCount: 0 };
                     for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                         terrainState = greedyMeshSection(faceIdx, sStartY, sEndY, getLocal, getLocalLight, startX, startZ, terrainBuffers, terrainState);
                     }
+                    _greedySectionHasWater = true; // reset for safety
                     tVIdx = terrainState.vIdx; tUvIdx = terrainState.uvIdx; tCIdx = terrainState.cIdx;
                     tQsIdx = terrainState.qsIdx; tIIdx = terrainState.iIdx; tVertCount = terrainState.vertCount; tFaceCount = terrainState.faceCount;
 
@@ -19213,6 +19229,7 @@
                 meshCode += '    const _greedyAOScratch = [0,0,0,0];\n';
                 meshCode += '    const _greedyLightScratch = [0,0,0,0];\n';
                 meshCode += '    let _lastDampLevel = 0;\n';
+                meshCode += '    let _greedySectionHasWater = true;\n'; // VOXEX-CCR-PERF-011
                 meshCode += '    const mergedVertexCache = new Map();\n';
                 // _aoResult/_lightResult: shared hot-path return arrays for AO and light.
                 // AO_OCCLUDES: occluder table (leaves count as occluders; glass/water/torch don't).
@@ -39946,6 +39963,7 @@ self.onmessage = async (e) => {
             // darkening crisp/blocky (it interpolated smoothly once light left the key). damp = f(blocks),
             // not light, so geometry stays light-independent and the Phase 3B refill still works.
             let _lastDampLevel = 0;
+            let _greedySectionHasWater = true; // VOXEX-CCR-PERF-011: gate damp scan in waterless sections
             // PHASE 3: SINGLE SOURCE OF TRUTH for a cell's 4 corner lights INCLUDING the wet-shoreline
             // damp. Used by the mesher (at build time) AND by refillChunkLightColors (on a light-only
             // change), so the two paths can never drift. Returns calculateFaceCornerLight's array with
@@ -39954,6 +39972,8 @@ self.onmessage = async (e) => {
                 const cornerLight = calculateFaceCornerLight(nx, ny, nz, x, y, z, getLocal, getLocalLight);
                 _lastDampLevel = 0; // reset per cell; set below for damp top faces, fed into the merge key
                 // WET SHORELINE: top faces of land blocks near water render damp (two-step gradient).
+                // VOXEX-CCR-PERF-011: skip damp scan entirely when section has no water (inland sections).
+                if (ny === 1 && !_greedySectionHasWater) return cornerLight; // _lastDampLevel already 0
                 if (ny === 1) {
                     let dampFactor = 0;
                     // DARK damp: this block directly touches water on ANY of its 6 faces.
@@ -41335,6 +41355,8 @@ self.onmessage = async (e) => {
                                 inputFaceCount: 0 // Track faces before merging for stats
                             };
 
+                            // VOXEX-CCR-PERF-011: gate damp scan — skip if section has no water
+                            _greedySectionHasWater = section ? (section.hasWater ?? true) : true;
                             // Process each face direction with greedy meshing
                             for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                 terrainState = greedyMeshSection(
@@ -41349,6 +41371,7 @@ self.onmessage = async (e) => {
                                     terrainState
                                 );
                             }
+                            _greedySectionHasWater = true; // reset: refillChunkLightColors must see true
 
                             // Update counters from state
                             tVIdx = terrainState.vIdx;
