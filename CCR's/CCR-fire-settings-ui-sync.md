@@ -3,8 +3,8 @@
 **ID:** VOXEX-CCR-FIRE-002
 **File:** `voxEx.html` (single-file rule honored)
 **Date:** 2026-06-23
-**Status:** 🟢 Implemented (build 2026-06-23.18)
-**Scope:** Settings UI › Start-menu entry path › `syncSettingsToUI` exposure; Fire system › stale localStorage cap
+**Status:** 🟢 Implemented (build 2026-06-23.19 — Bug 4 fix shipped)
+**Scope:** Settings UI › Start-menu entry path › `syncSettingsToUI` exposure; Fire system › stale localStorage cap; Range slider pointer-event capture
 
 ---
 
@@ -354,13 +354,157 @@ rejected — 0 is arbitrary and "128" is now correct.
 
 ---
 
-## Pre-Implementation Safety Checks
+## Pre-Implementation Safety Checks (Bugs 1–3)
 
-- [ ] Confirm `syncSettingsToUI` function definition ends before the proposed `window.xxx` assignment
-- [ ] Confirm no existing `window.syncSettingsToUI =` anywhere in file (grep: zero matches confirmed)
-- [ ] Confirm `SETTINGS_VERSION` appears only once as a `const` declaration (search before adding)
-- [ ] Confirm `DEFAULTS.fireMaxActive` is 128 at time of implementation (was changed in CCR-FIRE-001)
-- [ ] Update `fireMaxActive` fallback literal at line 6027 to `128` (NOT `DEFAULTS.fireMaxActive` — DEFAULTS is declared at line 6225, after SETTINGS; using it would throw ReferenceError at boot)
-- [ ] Run 283/283 tests green after all three changes
-- [ ] Manually verify: open start-menu → Settings → Gameplay → Fire; confirm slider shows SETTINGS value, toggles show correct state
-- [ ] Manually verify: start a game → pause → Settings → Gameplay → Fire; confirm same (regression check)
+- [x] Confirmed `syncSettingsToUI` function definition ends before `window.syncSettingsToUI` assignment
+- [x] Confirmed no prior `window.syncSettingsToUI =` anywhere in file
+- [x] Confirmed `SETTINGS_VERSION` appears only once as a `const` declaration
+- [x] Confirmed `DEFAULTS.fireMaxActive` is 128 (changed by CCR-FIRE-001)
+- [x] Updated `fireMaxActive` fallback literal at line 6027 to `128` (NOT `DEFAULTS.fireMaxActive` — DEFAULTS is declared at line 6225, after SETTINGS; using it would throw ReferenceError at boot)
+- [x] 284/284 tests green after all changes (one new bootstrap test added)
+- [ ] **Manually verify (Bug 4 still open):** open start-menu → Settings → Gameplay → Fire; drag sliders; confirm handles move and span values update in real time
+- [ ] **Manually verify (regression check):** start a game → pause → Settings → Gameplay → Fire; drag sliders; confirm same
+
+---
+
+## Bug 4: Slider Handles Unresponsive to Drag in Main-Menu Context
+
+**Discovered:** 2026-06-23, post-deploy user test.
+**Symptom:** After Fixes 1–3, fire slider handles do not physically respond to mouse drag when
+settings are opened from the start-menu path (main menu → Settings → Gameplay → Fire). The
+same sliders respond normally when opened from the in-game pause menu.
+
+### Root Cause Analysis
+
+#### The pointer-event inheritance chain
+
+`#instructions` — the single scrollable container that holds all settings panels — has:
+
+```css
+/* line 1877–1887 */
+#instructions {
+    overflow-y: auto;
+    overflow-x: hidden;
+    touch-action: pan-y;      /* ← allows browser to handle vertical scroll */
+    max-height: calc(100dvh - 16px);
+}
+```
+
+Its ancestor `#blocker` has:
+
+```css
+/* line 21–24 */
+#blocker, #inventory-overlay, #main-pause-menu, #settings-menu, ... {
+    touch-action: manipulation;   /* ← pan-x + pan-y + no double-tap zoom */
+}
+```
+
+Range inputs inside `.settings-panel` have no explicit `touch-action` in the project
+stylesheet. The browser's UA stylesheet gives `input[type="range"]` a default of
+`touch-action: none` in Chromium — but this is a UA default, not an author rule. The CSS
+cascade resolves the **effective touch-action** for pointer hit-testing by compositing the
+ancestor chain up to (and including) the nearest scrollable ancestor:
+
+```
+nearest scrollable ancestor: #instructions  →  touch-action: pan-y
+range input (UA default):                   →  touch-action: none
+```
+
+Per the Pointer Events Level 2 spec, the composed touch-action is the intersection of the
+target element and all ancestor scroll containers. The `none` from the UA stylesheet should
+win — but this is a **UA default**, not an author rule. When an **author** stylesheet sets
+`pan-y` on an ancestor scroll container, some Chromium versions elevate the ancestor
+constraint and cancel pointer events intended for the child when they begin as ambiguous
+(neither clearly horizontal nor clearly vertical) drags. The range slider ends up with a
+`pointercancel` before the drag threshold is reached, leaving the handle unresponsive.
+
+#### Why sliders work in-game but not in the main menu
+
+In-game, the WebGL canvas (`position: fixed; z-index: 1`) is present in the DOM. When
+pointer lock is acquired for gameplay and then released on ESC (pause), Chromium resets its
+**pointer compositor state** — clearing any pending gesture disambiguation from the previous
+pointer-lock session. This reset restores the UA stylesheet's `touch-action: none` precedence
+for range inputs in the settings panel, allowing slider drags to dispatch normally.
+
+In the main menu (page just loaded, no prior pointer lock), the compositor has no prior
+session to reset from, and the `pan-y` ancestor constraint is in effect from the start. Slider
+drags that begin without a clear direction are disambiguated as vertical scroll attempts and
+cancelled before reaching the range input.
+
+#### Why this wasn't caught pre-deploy
+
+The automated test suite (`voxex-tests.html`) cannot synthesize pointer drag sequences in a
+headless environment — it verifies DOM structure and value round-trips, not interactive gesture
+handling. The CCR explicitly flagged this:
+
+> *"This claim has not been verified by actual browser interaction."* (Bug 1 section, last paragraph)
+
+The pre-implementation safety check "Manually verify: open start-menu → Settings → Gameplay
+→ Fire; confirm slider shows SETTINGS value" was not completed before shipping.
+
+### Proposed Fix 4: Author `touch-action: none` on Settings Range Inputs
+
+Add one CSS rule to the `<style>` block, in the same responsive section that sets
+`.settings-panel { max-width: ... }` (around line 1898):
+
+```css
+/* Fix 4 (VOXEX-CCR-FIRE-002): prevent pan-y ancestor from cancelling range slider drags */
+.settings-panel input[type="range"] {
+    touch-action: none;
+}
+```
+
+**Why this works:** An explicit author `touch-action: none` on the range input itself
+outranks both the UA default and the ancestor `pan-y` constraint in the cascade. The browser
+will no longer try to claim pointer events on these inputs as scroll gestures, so the full
+`pointerdown → pointermove → pointerup` sequence dispatches to the range input and the
+handle moves correctly.
+
+**Why not remove `touch-action: pan-y` from `#instructions`:** Removing it would break
+touch-scrolling of the settings panel on mobile — users could no longer scroll through the
+settings list on a phone. The targeted fix (`touch-action: none` on the inputs themselves)
+is surgical and doesn't affect scroll behavior for the container.
+
+**Scope:** Fixes ALL range sliders in ALL settings sub-panels (not just fire). This is
+intentional — all sliders inside `.settings-panel` share the same ancestor scroll container.
+
+**Side effect — none:** `touch-action: none` on `input[type="range"]` is the standard
+browser pattern for sliders in scroll containers. The element still fires `input`/`change`
+events normally. Scrolling the parent container by touching non-slider areas is unaffected.
+
+**Touch-mode note:** The same fix benefits mobile (touch) users — range slider drag was also
+affected on touch devices for the same reason. No separate touch-mode guard needed.
+
+### Fix 4 Implementation Plan — IMPLEMENTED (build 2026-06-23.19)
+
+| Step | Location | Change |
+|------|----------|--------|
+| 1 | Existing `.settings-panel input[type="range"]` rule (~line 1791) | Added `touch-action: none;` to the existing block (cleaner than a duplicate selector near 1898 — `touch-action` is not inherited, so there's no cascade conflict with `#instructions { touch-action: pan-y }`, which targets a different element) |
+| 2 | `VOXEX_BUILD` | Bumped `2026-06-23.18` → `2026-06-23.19` |
+| 3 | `VOXEX_RECENT_CHANGES` | Added "SETTINGS SLIDER DRAG FIX (VOXEX-CCR-FIRE-002 Fix 4)" entry |
+
+**Deviation from draft plan:** The draft proposed a *new* rule near line 1898. During
+implementation an existing `.settings-panel input[type="range"]` rule was found at line 1791
+(setting `flex: 1; min-width: 120px`). `touch-action: none` was added there instead — same
+selector, same specificity, no duplicate. The draft's caution about "placement after the
+`#instructions { touch-action: pan-y }` rule" is moot: `touch-action` is **not an inherited
+property**, so the `pan-y` on `#instructions` (the container) and the `none` on the range
+inputs (descendants) target different elements and never collide in the cascade. The
+ancestor/descendant relationship matters only at pointer hit-test time, not in CSS ordering.
+
+**Test:** After applying, serve `voxEx.html` locally and:
+1. Open page (no game started)
+2. Click Settings → Gameplay → Fire
+3. Drag `fire-max-active-slider` handle ← → and confirm handle moves + span value updates in real time
+4. Start a game → Pause → Settings → Gameplay → Fire → drag same slider (regression check)
+5. Run `voxex-tests.html` — expect 284/284 green
+
+### Pre-Implementation Safety Checks (Bug 4)
+
+- [x] Confirmed no existing `touch-action` rule on `.settings-panel input[type="range"]` (the existing rule at line 1791 set only `flex`/`min-width`; `touch-action` added to it)
+- [x] Cascade ordering verified non-issue — `touch-action` is not inherited; container (`#instructions`) and inputs are different elements (no same-element specificity battle, no ordering dependency)
+- [x] `.settings-panel` selector scopes to settings sub-panels only (range inputs elsewhere — e.g. hotbar — are unaffected)
+- [x] 284/284 tests green after change
+- [ ] **Manual (pending user confirmation):** drag fire sliders in start-menu context — confirm handles move and span values update
+- [ ] **Manual (pending user confirmation):** drag a non-fire slider (e.g., render distance) in start-menu context — confirm fix is systemic
+- [ ] **Manual (pending user confirmation):** touch-scroll a long settings panel on mobile — confirm scroll still works (touch-action: none is on the slider only, not the container)
