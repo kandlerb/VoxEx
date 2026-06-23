@@ -3926,7 +3926,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.10";
+            const VOXEX_BUILD = "2026-06-22.11";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
@@ -3935,6 +3935,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "WATER SURFACE SCAN CACHE (VOXEX-CCR-PERF-009 / #491, build 2026-06-22.11). Eliminated redundant 50-block upward scans in applyPlayerVelocity() when the player holds jump while swimming. The scan (up to 50 getBlock Map lookups) ran every physics substep — with collisionSteps=3 that was 3× per frame while treading water. Fix: added two module-scope cache vars (_waterSurfaceScanPX/_waterSurfaceScanPZ, both NaN initially) that record the XZ column of the last scan; the scan only runs when the player enters a new XZ block column (Math.floor comparison). Cache is invalidated when the player dives (isCrouching branch sets _waterSurfaceScanPX=NaN). This is a cross-frame cache (simpler and broader than the frame-counter approach originally proposed in the CCR); it's safe because the water column above a given XZ cell doesn't change between frames under normal gameplay. 282/282 tests green.",
                 "PERF BATCH — ISSUES #490/#489/#485/#487/#479/#484/#473 (build 2026-06-22.10). #490: deleted dead updateFrustumPlanes() block (computed a Matrix4 but never stored it; frustumPlanes/PlanesValid/lastFrustumCameraMatrix never read — confirmed no callers). #489: replaced 3x new THREE.Vector2(clampX,clampY)+.copy() in updateVolumetricLighting with .set(clampX,clampY) directly on destination uniform (reusable volumetricTempVec2 already existed; saved ≤4 allocs/frame). #485: added _heldTorchPos module-scope scratch Vector3 near volumetricTempVec3; both held-torch getWorldPosition calls now reuse it (was 2x new THREE.Vector3() per frame while torch active). #487: added _springResult={value,velocity} module-scope scratch; springDamper() now writes into it and returns it instead of allocating a new object per call (~30-60 allocs/frame eliminated; all callers consume both fields before next call — sequential use verified at all 3 call sites). #479: removed Array.from() wrappers from ChunkCompressor.compress() — Uint16Arrays now stored directly in IndexedDB (structured clone handles typed arrays; decompress() already uses new Uint16Array(x) which accepts both formats, so old records still load). #484: deleted AO cache machinery (AO_CACHE_SIZE/aoCache/aoCacheValid/initAOCache/clearAOCache/getAOCacheKey) — removed from main thread, worker code emitter, and injection list; hit rate was ~0 (each face visited once per chunk render), worker bypassed it (aoCacheValid=false), and Float32 pack formula exceeded exact-integer range causing precision loss. calculateFaceAO now computes directly. #473: added TERRAIN_GEN_VERSION=1 constant; stamped in ChunkCompressor.compress() records; exposed in decompress() result; both loadChunkFromCache() and batchLoadChunksFromCache() reject records with mismatched version (0 for old records → regen). 282/282 tests green.",
                 "PARTICLE SPAWN RANGE INVARIANT COMMENT (build 2026-06-22.9). Added clarifying comment in ParticleSystem.spawn() explaining why clearUpdateRanges() is correct in a multi-spawn batch: each successive spawn produces a prefix range starting at 0, so the last call's range [0,(idx+1)*N] is a superset of all prior ranges — one glBufferSubData call, correct coverage. Accumulating ranges without clearing would instead queue N redundant prefix uploads. No behavior change; addresses Important latent-fragility note from CCR-FX-001 review. 282/282 tests green.",
                 "PARTICLE/FX PER-FRAME CLEANUP (VOXEX-CCR-FX-001, build 2026-06-22.8). Part A — Particle buffer uploads: replaced blanket full-array needsUpdate=true on all three buffers with bounded addUpdateRange uploads. (1) init(): setUsage(DynamicDrawUsage) on all three attributes. (2) spawn(): clearUpdateRanges()+addUpdateRange(0,(idx+1)*itemSize) for position+color (idx=pre-increment activeCount, so idx+1 covers the new top slot); sets _sizesDirty=true instead of flagging size unconditionally. (3) update(): snapshots startCount=activeCount before the loop; after the loop, touched=max(startCount,activeCount) is the high-water mark covering both live and just-hidden despawn slots; uploads position+color bounded to touched*itemSize; uploads size only when _sizesDirty, then clears it. Gate is 'touched>0' not 'activeCount>0', fixing the latent ghost-particle bug on the frame the last particle despawns (old code skipped the upload that frame, leaving stale GPU data). (4) despawn(): sets _sizesDirty=true (size buffer changed by swap-copy or slot hide). Part B — Placed-torch spawner: Phase 1: timing moved from position-keyed Maps (placedTorchLastSmoke/Flame, now replaced by tombstone comments) onto torch._lastSmokeTime/_lastFlameTime — zero per-frame string allocations, drops the two Maps and the buggy insertion-order eviction block. Phase 2: outer loop changed from for-of-chunkTorches (O(all torch-chunks)) to a 5×5 chunk window (cr=ceil(24/16)=2) via Map.get per cell — O(nearby), bounds the pathological many-torch case. 3D distSq gate unchanged. No DOM/settings/worker/cache-version changes. 282/282 tests green.",
@@ -9780,6 +9781,8 @@
             let swimSpaceHoldTime = 0; // How long space has been held while underwater
             let isTreadingWater = false; // Whether player is floating at surface
             let waterSurfaceY = 0; // Y position of water surface for treading
+            let _waterSurfaceScanPX = NaN; // cached XZ for water-surface scan (VOXEX-CCR-PERF-009)
+            let _waterSurfaceScanPZ = NaN;
             // Water velocity effects state
             let waterEntryVelocityY = 0; // Capture vertical velocity at moment of water entry
             let wasFeetInWater = false; // Track feet water state for splash timing
@@ -43040,21 +43043,23 @@ self.onmessage = async (e) => {
                         velocity.y -= swimSpeed * dt * 1.5; // Sink faster
                         isTreadingWater = false;
                         swimSpaceHoldTime = 0;
+                        _waterSurfaceScanPX = NaN; // invalidate cache on dive (VOXEX-CCR-PERF-009)
                     } else if (spacePressed) {
                         // Track how long space has been held
                         swimSpaceHoldTime += dt;
 
-                        // Find water surface (search upward for air) - search from feet level
+                        // Find water surface (search upward for air) - search from feet level.
+                        // VOXEX-CCR-PERF-009: cache per XZ cell — skip re-scan if player hasn't
+                        // moved to a new column (constant across substeps in the same frame).
                         if (swimSpaceHoldTime > 0.1 && !isTreadingWater) {
                             const px = Math.floor(camPos.x);
                             const pz = Math.floor(camPos.z);
-                            // Search up from feet to find water surface
-                            const searchStart = Math.floor(camPos.y - 2);
-                            for (let y = searchStart; y < searchStart + 50; y++) {
-                                const blockAt = getBlock(px, y, pz);
-                                if (blockAt !== WATER) {
-                                    waterSurfaceY = y; // First air block above water
-                                    break;
+                            if (px !== _waterSurfaceScanPX || pz !== _waterSurfaceScanPZ) {
+                                _waterSurfaceScanPX = px;
+                                _waterSurfaceScanPZ = pz;
+                                const searchStart = Math.floor(camPos.y - 2);
+                                for (let y = searchStart; y < searchStart + 50; y++) {
+                                    if (getBlock(px, y, pz) !== WATER) { waterSurfaceY = y; break; }
                                 }
                             }
                         }
