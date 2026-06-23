@@ -312,17 +312,77 @@ Gate Edits 1a–1c on it inside `buildChunkWorkerCode` (when `false`, omit the `
 
 > Risk: medium — a worker-parity change, the category CLAUDE.md treats most carefully. Fully mitigated by the byte-parity test + the `hasWorkerLight` fallback + the `WORKER_LIGHTING_ENABLED` kill switch. Reward: removes the single biggest main-thread load cost (18.8 s, ~40% of gen). Visual check after enabling: fresh terrain lighting (caves, canopies, overhangs, shorelines) looks identical with no dark/bright seams at chunk borders.
 
-### Lever 2 (high win, low effort) — defer / debatch the spawn-time caching
+### Lever 2 — defer the spawn-time caching ⚠️ SHIPPED IN .23, REGRESSED, DISABLED IN .24
 
-During spawn pregen, every freshly generated chunk is compressed (8.7 s main) and written to IndexedDB (awaited, line 38990) + OPFS (20.9 s disk worker). None of that is needed to get the player *into* the world — it's a persistence optimization for *next* load. Defer it.
+> **Status (2026-06-23):** Lever 2 was implemented in build **.23** (commit `ee506f0`) using the "2a" approach below, **caused a world-entry freeze regression**, and was **disabled in build .24** by forcing `_pregenActive = false` (the deferral never activates → reverts to per-chunk saving during pregen). This section documents what went wrong and the corrected design. **Do not re-enable the .23 implementation as-is.**
 
-**Options (pick one):**
-- **2a (simplest):** in the `generateChunkData` worker branch, **drop the `await`** on `saveChunkToCache` (line 38990) so the IDB write no longer sits on the per-chunk critical path, and **move the compression+save off the hot path** — collect freshly generated chunk keys during pregen and flush them with a single `batchSaveChunksToCache(...)` (already exists) **after** the world is interactive / on idle, instead of per-chunk inside generation.
-- **2b:** gate spawn-time caching behind an idle callback (`requestIdleCallback` / a low-priority queue) so compression runs in the background after the player can move, throttled by frame budget.
+**Original intent (still valid):** during spawn pregen, every freshly generated chunk is compressed (8.7 s main, `ChunkCompressor.compress` → `_compressArray`) and written to IndexedDB + OPFS. That work isn't needed to get the player *into* the world, so the idea was to defer it.
 
-Either removes the **8.7 s** compression from the load-time main thread and takes the awaited IDB latency off the per-chunk path. The chunks still get persisted — just slightly later, when it doesn't block entry.
+#### What the .23 implementation did, and why it froze
 
-> Risk: low. No worker parity, no lighting math. Only caveat: if the user quits within the first second or two before the deferred flush, those spawn chunks regenerate next load instead of loading from cache (regeneration is deterministic, so correctness is unaffected — only that one re-load is slower). Worth a short flush-on-pagehide for safety.
+It added `_pregenActive` (set `true` for Phase 1C), routed per-chunk saves into a `_pregenPendingSaves` Set instead of writing them, and after Phase 1C flushed everything with a single `batchSaveChunksToCache(saveMap)` call (fire-and-forget via `.then()`), plus a `pagehide` safety flush.
+
+**The bug:** `batchSaveChunksToCache` (line **27094**) compresses **every** chunk in the map **synchronously**, in one tight `for` loop inside the Promise executor (`ChunkCompressor.compress(chunkData)` at line **27107**), *before* any yield. With per-chunk saving (the original), each ~29 ms compression was interleaved across Phase 1C **behind the loading screen**, with `setTimeout(0)` yields between generation batches — invisible to the user. Lever 2 collected **all** spawn chunks (hundreds) and handed them to that loop in **one call at the start of Phase 2 (world-entry)** → the entire **~8.7 s of compression ran as a single synchronous main-thread block right when the player expected to start playing.** Observed symptoms (test laptop, deployed .23): pressing ESC didn't pause until the block finished ("pauses after a long time"), and chunk meshing/rendering couldn't run during the block ("chunks not loading in at all"). The `.then()` "fire-and-forget" did **not** help — the compression is synchronous *inside* the function body, before the awaited IDB transaction.
+
+**Secondary fragility found:** `_pregenActive` is set `true` (line 27310) / `false` (line 27347) **without a `try/finally`**. If anything in Phase 1C throws, the flag stays `true` and **every** subsequent gameplay chunk save is silently deferred forever (chunks never persist). Not the cause of this regression, but a latent footgun that must be fixed in any re-enable.
+
+#### Why "defer to after-entry" is the wrong shape
+
+The 8.7 s of compression is **unavoidable main-thread CPU** (RLE over three 81,920-cell arrays per chunk, ~29 ms each — already longer than one frame). It has to run *somewhere* on the main thread. The original ran it **during the loading screen**, which is exactly when the user is already waiting and background work is expected. Deferring it to **after entry** moves that cost into live gameplay, where it either freezes (one batch, the .23 bug) or stutters (spread out — see Option C). So deferral, by itself, makes the experience **worse**, not better. The only way to actually *remove* the 8.7 s rather than relocate it is to take it **off the main thread**.
+
+#### Fixes (in recommended order)
+
+**Option A — abandon the deferral (DONE in .24, recommended).** Keep compression where it belongs: per-chunk during Phase 1C, behind the loading screen. This is the current state (`_pregenActive = false` at line 27310). Net effect: Lever 2 provides no real win and should stay disabled. If you want the dead code gone, also remove `_pregenActive` / `_pregenPendingSaves` (lines 13781–13782), the `if (_pregenActive)` branch in `generateChunkData` (line 39061), the post-Phase-1C flush block (lines 27347–27362), and the `pagehide` handler (line 24607 region). Lowest risk.
+
+**Option B — offload compression to a worker (the real win, follow-up).** Move `ChunkCompressor.compress` off the main thread so neither the load *nor* gameplay pays the 8.7 s. The OPFS disk-storage worker (`ChunkDiskStorage`, its own thread, already does `writeChunk`/`readChunk`) is the natural home — pass it the raw chunk arrays (zero-copy transfer) and have it compress + persist. This genuinely removes 8.7 s of main-thread CPU from the whole flow. Larger change (worker protocol + moving the compressor source into the worker), and `ChunkCompressor` must stay byte-compatible so existing cached records still decode — needs a round-trip test. This is the correct long-term lever if spawn caching cost matters.
+
+**Option C — if you insist on deferral, make the flush yield (and fix the flag).** Better than the .23 freeze but still competes with early gameplay (each chunk ~29 ms, so a thin trickle of occasional dropped frames over the first minute rather than one 8.7 s freeze). Three edits:
+
+1. **Wrap the flag in `try/finally`** so a Phase 1C throw can't strand it. Around the Phase 1C block (lines 27310–27347):
+   ```js
+   _pregenActive = true;
+   try {
+       if (chunksNeedingGeneration.length > 0) { /* … existing Phase 1C loop … */ }
+   } finally {
+       _pregenActive = false;
+   }
+   ```
+2. **Replace the single-call flush** (lines 27348–27362) with a fire-and-forget call to a new yielding helper, started after entry settles:
+   ```js
+   if (_pregenPendingSaves.size > 0) {
+       const keys = Array.from(_pregenPendingSaves);
+       _pregenPendingSaves.clear();
+       // Start after the first chunks have streamed/meshed so we don't fight world-entry.
+       setTimeout(() => { flushPregenCachesInBackground(keys); }, 1500);
+   }
+   ```
+3. **Add the helper** (module scope, near `batchSaveChunksToCache`) — small sub-batches with a yield between each so compression never blocks a frame for long. **Do not** change `batchSaveChunksToCache` itself (it's shared by the world-save / normal-save paths at lines 22564, 26790, 26868 and must stay atomic):
+   ```js
+   async function flushPregenCachesInBackground(keys) {
+       const SUB_BATCH = 2;        // chunks compressed per tick (each ~29 ms — keep small)
+       const TICK_MS = 60;         // generous yield so gameplay/meshing stays smooth
+       for (let i = 0; i < keys.length; i += SUB_BATCH) {
+           const saveMap = new Map();
+           for (let n = i; n < i + SUB_BATCH && n < keys.length; n++) {
+               const k = keys[n];
+               if (chunks.has(k)) saveMap.set(k, chunks.get(k));
+           }
+           if (saveMap.size > 0) {
+               try {
+                   await batchSaveChunksToCache(saveMap);
+                   if (chunkDataPool.diskStorageReady) {
+                       for (const [k, c] of saveMap) chunkDataPool.writeToDisk(k, c).catch(() => {});
+                   }
+               } catch (e) { logDebug(`[PreGen] Background flush sub-batch error: ${e.message}`); }
+           }
+           await new Promise(r => setTimeout(r, TICK_MS)); // yield to gameplay
+       }
+       logDebug(`[PreGen] Background cache flush complete (${keys.length} chunks)`);
+   }
+   ```
+   Re-enable by setting `_pregenActive = true` for Phase 1C again (revert the .24 line 27310 change). Keep the `pagehide` flush for the early-quit case.
+
+> Recommendation: **stay on Option A (.24)** for now — it's stable and the deferral never bought a real win. If reducing spawn-caching cost becomes a priority, do **Option B** (worker offload), not Option C. Option C is only worth it if a worker offload is off the table and you accept minor early-game stutter in exchange for a faster time-to-interactive.
 
 ### Lever 3 (cheapest win) — scale `preGenRenderDistance` down on low-end devices
 
@@ -362,4 +422,10 @@ This CCR is about *shrinking* the wait. The *perceived* wait (the ~10 s blank ga
 
 ## Recommendation
 
-Ship in three steps, smallest-risk first: **Lever 3** (lower the low-end pregen default — minutes of work, immediate proportional win), then **Lever 2** (defer spawn-time caching — removes the 8.7 s compression from the load path with low risk), then **Lever 1** (compute per-chunk sunlight in the worker and skip block light — removes ~19.5 s of main-thread lighting, gated behind a byte-parity test and the `WORKER_LIGHTING_ENABLED` kill switch; spelled out as six exact edits above). Together they target ~27 s of the ~41 s main-thread load time directly, and the trace gives a clean before/after baseline to measure against. All changes stay within `voxEx.html`.
+**As-built status (2026-06-23):**
+
+- **Lever 1 (worker sunlight)** — shipped in build **.22**, currently **enabled**. Works correctly (verified end-to-end) but produced little wall-clock improvement, because spawn load was never main-thread-*CPU*-bound — it's paced by the async caching/IDB/OPFS pipeline. Lever 1 mostly bought main-thread headroom (smoother, fewer freezes). Keep it on; it's not the regression.
+- **Lever 2 (defer caching)** — shipped in build **.23**, **regressed** (one ~8.7 s synchronous compression freeze at world-entry — ESC stalled, chunks didn't render), **disabled in build .24**. See the Lever 2 section: the deferral idea is the wrong shape (compression must run on the main thread, and after-entry is the worst place for it). **Do not re-enable as built.**
+- **Lever 3 (smaller pregen radius on low-end)** — **not yet implemented.** This is now the best remaining quick win.
+
+**Forward plan:** (1) keep Lever 1 on and Lever 2 off (current .24 state); (2) do **Lever 3** next — it linearly shrinks *all three* costs (lighting, compression, disk I/O) and can't introduce a freeze; (3) if spawn-caching cost still matters after that, pursue **Lever 2 Option B** (offload `ChunkCompressor.compress` to the OPFS worker) to actually remove the 8.7 s from the main thread, rather than relocating it. The real lesson from the .23 regression: relocating unavoidable main-thread CPU into live gameplay is worse than leaving it behind the loading screen — only moving it *off-thread* (worker) genuinely helps. All changes stay within `voxEx.html`.
