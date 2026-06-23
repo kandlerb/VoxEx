@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-23.20";
+            const VOXEX_BUILD = "2026-06-23.21";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "UI TIMING INSTRUMENTATION (VOXEX-CCR-TIMING-001, build 2026-06-23.21). Added UITiming module: capture-phase click listener timestamps every click before any handler runs; MutationObserver on allowlisted screen/overlay containers fires when display flips none→visible. Reports click→screen Δms in console ([Timing] CLICK / [Timing] SCREEN lines). Ring buffer (500 entries); dumpUITimings() prints console.table. No per-handler edits, no per-frame work, no new DOM IDs. Installed via single UITiming.install() call in DOMContentLoaded (covers start-menu and game paths). Disable at runtime: setUITiming(false) or window.VOXEX_TIMING=false.",
                 "FIRE SLIDER MAIN-MENU FIX — REAL ROOT CAUSE (VOXEX-CCR-FIRE-002 addendum, build 2026-06-23.20). Fire setting sliders/toggles did nothing when changed from the start-menu settings (handle moved, number frozen), but worked from the in-game pause menu. Root cause (the actual one — Fix 4's touch-action theory was a misdiagnosis; touch-action does not affect mouse input): the fire WRITE-listeners (bindFireToggle/bindFireSlider + 12 bind calls + the Reset Fire handler) lived inside init(), which runs ONLY via initGameEngine() on game start. On the start-menu path init() has never run, so no input/change listener was ever attached to any fire control. The 'works in-game' difference was simply that starting a game ran init(). Fix: relocated the entire fire binding block out of init() and into attachSettingsEventListeners() — the function called unconditionally at DOMContentLoaded, the same single-source location the CCR-D1 migration used for every other settings listener (render distance, AO, shadows, movement, camera, interaction). The fire block was the one never migrated. Scope correction: the moved Reset Fire handler called updateUIFromSettings() (init-scoped, unreachable from attachSettingsEventListeners) — swapped for syncSettingsToUI(), the module-scoped single-source it delegates to. Read path (initial slider values) was already handled by syncSettingsToUI via Fix 1. No double-binding (attachSettingsEventListeners has a one-time guard + single call site; removed from init()). New regression test dispatches a synthetic 'input' on #fire-max-active-slider in the pre-game test iframe and asserts SETTINGS.fireMaxActive + the span update — fails pre-fix, passes post-fix (added _doc test-seam getter for DOM access). 285/285 tests green.",
                 "SETTINGS SLIDER DRAG FIX (VOXEX-CCR-FIRE-002 Fix 4, build 2026-06-23.19). Settings range sliders were unresponsive to drag when opened from the start-menu (main menu → Settings → ...), but worked from the in-game pause menu. Root cause: #instructions (the scrollable settings container) sets touch-action: pan-y; range inputs had no explicit author touch-action, so Chromium could disambiguate an ambiguous slider drag as a vertical scroll and pointercancel it before the handle moved. In-game, the pointer-lock acquire/release cycle resets the pointer compositor and restores the UA-default touch-action: none precedence on the inputs, so sliders worked there. Fix: added touch-action: none to the existing .settings-panel input[type=range] rule (~line 1791) — an explicit author rule that outranks both the UA default and the pan-y ancestor constraint, keeping pointer events on the slider. Systemic fix: applies to all settings sliders, all sub-panels, desktop and touch. Container scroll (pan-y) unaffected — touch-action is not inherited, so #instructions still scrolls via non-slider areas. CSS-only change; no DOM/settings/worker/cache-version changes. 284/284 tests green.",
                 "FIRE SETTINGS UI SYNC FIX (VOXEX-CCR-FIRE-002, build 2026-06-23.18). Three fixes. (1) window.syncSettingsToUI = syncSettingsToUI: exposes the module-scoped sync function so the non-module showPanel() guard (typeof syncSettingsToUI === 'function') becomes true; every settings sub-panel navigated from the start-screen now syncs sliders/toggles from SETTINGS before rendering. The pause-menu path (btn-settings, initGameEngine) already called syncSettingsToUI directly and was unaffected. (2) SETTINGS_VERSION 4→5: CCR-FIRE-001 changed DEFAULTS.fireMaxActive 48→128 but missed the version bump — users who previously set the slider to minimum (8) retained fireMaxActive:8 in localStorage, silently capping fire spread and model count at 8. Version bump clears all stale settings. (3) fireMaxActive init fallback 48→128 (line ~6027): after the version bump, savedSettings is empty and the inline literal is the fallback; it was still 48 (old default). DEFAULTS.fireMaxActive is 128 but is declared at line 6224, after the SETTINGS object — using DEFAULTS.fireMaxActive at 6027 would throw ReferenceError at boot; the literal 128 is correct. No DOM/worker/cache-version changes. 283/283 tests green.",
@@ -11903,6 +11904,125 @@
             }
             function logDebug(message, ...args) { if (isDebug) { console.log(`[VoxEx Debug]:`, message, ...args); }}
             function logWarn(message, ...args) { if (isDebug) { console.warn(`[VoxEx Warning]:`, message, ...args); }}
+            // =====================================================
+            // UI TIMING INSTRUMENTATION (VOXEX-CCR-TIMING-001)
+            // Two central hooks — NO per-handler edits:
+            //   (1) capture-phase click listener → timestamps every click
+            //   (2) MutationObserver on screen containers → timestamps the
+            //       moment a menu/overlay's display flips none → visible.
+            // Reports the gap so we can see where "click → next screen" time
+            // goes and where loading animations are worth adding.
+            // =====================================================
+            const UITiming = (() => {
+                let enabled = (typeof window !== 'undefined' && window.VOXEX_TIMING !== false); // on unless explicitly disabled
+                let installed = false;
+                const log = [];                 // ring buffer of {click, clickAt, screen, screenAt, deltaMs}
+                const LOG_MAX = 500;
+                let lastClick = null;           // { label, perf, clock }
+                const shown = new Set();        // screen elements currently considered visible (dedupe)
+
+                // Screen/overlay containers to time. Curated core — widen freely.
+                const SCREEN_IDS = new Set([
+                    'seed-menu', 'create-world-panel', 'world-gen-progress',
+                    'blocker', 'instructions', 'settings-menu', 'controls-menu',
+                    'main-pause-menu', 'inventory-overlay', 'debug-overlay', 'perf-overlay'
+                ]);
+
+                /** Wall-clock as hh:mm:ss.ss (centiseconds). @param {number} ms @returns {string} */
+                function fmtClock(ms) {
+                    const d = new Date(ms);
+                    const p2 = (n) => String(n).padStart(2, '0');
+                    const cs = Math.floor((ms % 1000) / 10);
+                    return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}.${p2(cs)}`;
+                }
+
+                /** Best-effort human label for a clicked element. @param {EventTarget} t @returns {string} */
+                function labelFor(t) {
+                    if (!(t instanceof Element)) return '(non-element)';
+                    const withId = t.closest('[id]');
+                    if (withId && withId.id) return '#' + withId.id;
+                    const txt = (t.textContent || '').trim().replace(/\s+/g, ' ');
+                    if (txt) return '"' + txt.slice(0, 40) + '"';
+                    return t.tagName.toLowerCase();
+                }
+
+                function recordClick(target) {
+                    const now = performance.now();
+                    const clock = Date.now();
+                    lastClick = { label: labelFor(target), perf: now, clock };
+                    if (enabled) console.log(`[Timing] CLICK ${lastClick.label} @ ${fmtClock(clock)}`);
+                }
+
+                function recordScreen(id, srcClock) {
+                    const clock = (srcClock != null) ? srcClock : Date.now();
+                    const now = performance.now();
+                    // Only pair with a click that happened within the last 10s.
+                    const paired = lastClick && (now - lastClick.perf) < 10000 ? lastClick : null;
+                    const deltaMs = paired ? Math.round(now - paired.perf) : null;
+                    const entry = {
+                        click: paired ? paired.label : '(no recent click)',
+                        clickAt: paired ? fmtClock(paired.clock) : '—',
+                        screen: '#' + id,
+                        screenAt: fmtClock(clock),
+                        deltaMs
+                    };
+                    log.push(entry);
+                    if (log.length > LOG_MAX) log.shift();
+                    if (enabled) {
+                        console.log(
+                            `[Timing] SCREEN #${id} @ ${entry.screenAt}` +
+                            (deltaMs != null ? `  (Δ ${deltaMs} ms after ${entry.click} @ ${entry.clickAt})`
+                                             : `  (no preceding click)`)
+                        );
+                    }
+                }
+
+                /** Manual mark for exact instrumentation at a known show-site (optional). */
+                function mark(id) { recordScreen(id); }
+
+                function isVisible(el) {
+                    if (!el || el.nodeType !== 1) return false;
+                    if (el.hidden) return false;
+                    const cs = getComputedStyle(el);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+                    return el.getClientRects().length > 0;
+                }
+
+                function install() {
+                    if (installed) return;
+                    installed = true;
+
+                    // Hook 1 — capture phase: runs before any per-button handler.
+                    document.addEventListener('click', (e) => {
+                        if (!enabled) return;
+                        recordClick(e.target);
+                    }, { capture: true, passive: true });
+
+                    // Hook 2 — screen appearance via attribute mutations.
+                    const obs = new MutationObserver((muts) => {
+                        if (!enabled) return;
+                        for (let i = 0; i < muts.length; i++) {
+                            const el = muts[i].target;
+                            if (!(el instanceof Element) || !el.id || !SCREEN_IDS.has(el.id)) continue;
+                            const vis = isVisible(el);
+                            const was = shown.has(el);
+                            if (vis && !was) { shown.add(el); recordScreen(el.id); }
+                            else if (!vis && was) { shown.delete(el); }
+                        }
+                    });
+                    obs.observe(document.body, {
+                        subtree: true, attributes: true,
+                        attributeFilter: ['style', 'class', 'hidden']
+                    });
+                }
+
+                if (typeof window !== 'undefined') {
+                    window.__uiTimings = log;
+                    window.dumpUITimings = () => { console.table(log); return log; };
+                    window.setUITiming = (on) => { enabled = !!on; };
+                }
+                return { install, mark, fmtClock, get enabled() { return enabled; } };
+            })();
             /**
              * PerformanceMonitor - Comprehensive performance profiling system.
              * Tracks frame timing, section timing, memory usage, and provides historical data.
@@ -24441,6 +24561,7 @@
 
             // Initialize on page load
             document.addEventListener('DOMContentLoaded', () => {
+                UITiming.install();   // VOXEX-CCR-TIMING-001: start click/screen timing (start-menu path included)
                 initWorldPreview();
                 populateWorldCards();
                 if (activeProfileName) { document.querySelectorAll('.profile-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.profile === activeProfileName)); }
