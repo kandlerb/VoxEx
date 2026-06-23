@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-23.21";
+            const VOXEX_BUILD = "2026-06-23.22";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "WORKER SUNLIGHT (VOXEX-CCR-PERF-013, build 2026-06-23.22). Moves per-chunk sunlight calculation (calculateChunkSunlight) off the main thread by running it inside the terrain worker immediately after tree generation. The worker now returns all three buffers {blocks, skyLight, blockLight} via zero-copy Transferable transfer; generateChunkData consumes them and skips Pass 4 (sunlight) and Pass 5 (block light) on the main thread. Block light stays all-zero in the worker because freshly generated terrain never contains TORCH/FIRE — invariant guarded by the new parity test. Six edits: WORKER_LIGHTING_ENABLED flag + typeof guard in worker handler + SUNLIGHT_ATTENUATION/NEIGHBOR_OFFSETS injection + calculateChunkSunlight added to meshFuncs + generateTerrainViaWorker returns full result + generateChunkData hasWorkerLight fallback path. Kill switch: set WORKER_LIGHTING_ENABLED=false to revert to pre-CCR-013 main-thread lighting. New parity test in voxex-tests.html asserts worker skyLight byte-identical to main and blockLight all-zero. Target: removes ~18.8 s main-thread lighting from the 41 s spawn pre-gen wall time.",
                 "UI TIMING INSTRUMENTATION (VOXEX-CCR-TIMING-001, build 2026-06-23.21). Added UITiming module: capture-phase click listener timestamps every click before any handler runs; MutationObserver on allowlisted screen/overlay containers fires when display flips none→visible. Reports click→screen Δms in console ([Timing] CLICK / [Timing] SCREEN lines). Ring buffer (500 entries); dumpUITimings() prints console.table. No per-handler edits, no per-frame work, no new DOM IDs. Installed via single UITiming.install() call in DOMContentLoaded (covers start-menu and game paths). Disable at runtime: setUITiming(false) or window.VOXEX_TIMING=false.",
                 "FIRE SLIDER MAIN-MENU FIX — REAL ROOT CAUSE (VOXEX-CCR-FIRE-002 addendum, build 2026-06-23.20). Fire setting sliders/toggles did nothing when changed from the start-menu settings (handle moved, number frozen), but worked from the in-game pause menu. Root cause (the actual one — Fix 4's touch-action theory was a misdiagnosis; touch-action does not affect mouse input): the fire WRITE-listeners (bindFireToggle/bindFireSlider + 12 bind calls + the Reset Fire handler) lived inside init(), which runs ONLY via initGameEngine() on game start. On the start-menu path init() has never run, so no input/change listener was ever attached to any fire control. The 'works in-game' difference was simply that starting a game ran init(). Fix: relocated the entire fire binding block out of init() and into attachSettingsEventListeners() — the function called unconditionally at DOMContentLoaded, the same single-source location the CCR-D1 migration used for every other settings listener (render distance, AO, shadows, movement, camera, interaction). The fire block was the one never migrated. Scope correction: the moved Reset Fire handler called updateUIFromSettings() (init-scoped, unreachable from attachSettingsEventListeners) — swapped for syncSettingsToUI(), the module-scoped single-source it delegates to. Read path (initial slider values) was already handled by syncSettingsToUI via Fix 1. No double-binding (attachSettingsEventListeners has a one-time guard + single call site; removed from init()). New regression test dispatches a synthetic 'input' on #fire-max-active-slider in the pre-game test iframe and asserts SETTINGS.fireMaxActive + the span update — fails pre-fix, passes post-fix (added _doc test-seam getter for DOM access). 285/285 tests green.",
                 "SETTINGS SLIDER DRAG FIX (VOXEX-CCR-FIRE-002 Fix 4, build 2026-06-23.19). Settings range sliders were unresponsive to drag when opened from the start-menu (main menu → Settings → ...), but worked from the in-game pause menu. Root cause: #instructions (the scrollable settings container) sets touch-action: pan-y; range inputs had no explicit author touch-action, so Chromium could disambiguate an ambiguous slider drag as a vertical scroll and pointercancel it before the handle moved. In-game, the pointer-lock acquire/release cycle resets the pointer compositor and restores the UA-default touch-action: none precedence on the inputs, so sliders worked there. Fix: added touch-action: none to the existing .settings-panel input[type=range] rule (~line 1791) — an explicit author rule that outranks both the UA default and the pan-y ancestor constraint, keeping pointer events on the slider. Systemic fix: applies to all settings sliders, all sub-panels, desktop and touch. Container scroll (pan-y) unaffected — touch-action is not inherited, so #instructions still scrolls via non-slider areas. CSS-only change; no DOM/settings/worker/cache-version changes. 284/284 tests green.",
@@ -13775,6 +13776,7 @@
             // banded/edited → renderChunk); saved-torch/fire chunks fall back to renderChunk. Revert =
             // set this back to false.
             const WORKER_MESH_PIPELINE_ENABLED = true;
+            const WORKER_LIGHTING_ENABLED = true; // VOXEX-CCR-PERF-013: compute per-chunk sunlight in the worker
             const inFlightMeshKeys = new Set();   // chunk keys with a worker mesh job in flight
             const readyMeshResults = [];          // [{cKey, cx, cz, distSq, meshData}] completed, awaiting apply
             const syncFallbackQueue = [];         // [{cKey, cx, cz, distSq}] worker unavailable/timeout — main-thread mesh, 1/frame
@@ -18789,14 +18791,35 @@
                 treeMaskCache.clear();
                 generateTreesForChunk(cx, cz, blocks, chunkSize, chunkHeight, startX, startZ, workerNumericSeed, get, set, caches);
 
-                // Transfer the buffer (zero-copy)
-                self.postMessage({
-                    type: 'terrain',
-                    jobId: jobId,
-                    cx: cx,
-                    cz: cz,
-                    blocks: blocks
-                }, [blocks.buffer]);
+                // --- Phase 4 (VOXEX-CCR-PERF-013): per-chunk sunlight on the worker ---
+                // calculateChunkSunlight is injected by buildChunkWorkerCode when WORKER_LIGHTING_ENABLED=true.
+                // blockLight stays all-zero: generated terrain has no TORCH/FIRE, so the main-thread
+                // calculateBlockLight would produce zeros anyway (invariant guarded by the parity test).
+                if (typeof calculateChunkSunlight === 'function') {
+                    const size = chunkSize * chunkSize * chunkHeight;
+                    const lightChunk = { blocks: blocks, skyLight: new Uint8Array(size), blockLight: new Uint8Array(size) };
+                    calculateChunkSunlight(lightChunk, chunkSize, chunkHeight);
+                    const skyLight = lightChunk.skyLight;
+                    const blockLight = lightChunk.blockLight;
+                    self.postMessage({
+                        type: 'terrain',
+                        jobId: jobId,
+                        cx: cx,
+                        cz: cz,
+                        blocks: blocks,
+                        skyLight: skyLight,
+                        blockLight: blockLight
+                    }, [blocks.buffer, skyLight.buffer, blockLight.buffer]);
+                } else {
+                    // Transfer the buffer (zero-copy) - fallback when WORKER_LIGHTING_ENABLED=false
+                    self.postMessage({
+                        type: 'terrain',
+                        jobId: jobId,
+                        cx: cx,
+                        cz: cz,
+                        blocks: blocks
+                    }, [blocks.buffer]);
+                }
             }
 
             if (type === 'mesh') {
@@ -19298,6 +19321,11 @@
                 meshCode += '    const AO_QUANT_LOOKUP = new Uint8Array(' + JSON.stringify(Array.from(AO_QUANT_LOOKUP)) + ');\n';
                 meshCode += '    const LIGHT_QUANT_LOOKUP = new Uint8Array(' + JSON.stringify(Array.from(LIGHT_QUANT_LOOKUP)) + ');\n';
                 meshCode += '    const IS_TRANSPARENT = new Uint8Array(' + JSON.stringify(Array.from(IS_TRANSPARENT)) + ');\n';
+                if (WORKER_LIGHTING_ENABLED) {
+                    // VOXEX-CCR-PERF-013: tables needed by the injected calculateChunkSunlight
+                    meshCode += '    const SUNLIGHT_ATTENUATION = new Uint8Array(' + JSON.stringify(Array.from(SUNLIGHT_ATTENUATION)) + ');\n';
+                    meshCode += '    const NEIGHBOR_OFFSETS = ' + JSON.stringify(NEIGHBOR_OFFSETS) + ';\n';
+                }
                 meshCode += '    const CULLS_SAME_ID = new Uint8Array(' + JSON.stringify(Array.from(CULLS_SAME_ID)) + ');\n';
                 meshCode += '    const CORNER_AB_TOP = ' + JSON.stringify(CORNER_AB_TOP) + ';\n';
                 meshCode += '    const CORNER_AB_BOTTOM = ' + JSON.stringify(CORNER_AB_BOTTOM) + ';\n';
@@ -19340,7 +19368,8 @@
                     getMergeKey, isWaterAdjacent, isFoamLand, waterHash,
                     writeFaceVerticesIndexed, writeFaceColorsIndexed, writeFaceColorsWaterIndexed, writeFaceUVsIndexed, writeFaceIndices,
                     addFaceWaterIndexed, addMergedFaceIndexed,
-                    cellCornerLightDamped, extractLightFromChunk, clearGreedyBuffers, greedyMeshSection
+                    cellCornerLightDamped, extractLightFromChunk, clearGreedyBuffers, greedyMeshSection,
+                    ...(WORKER_LIGHTING_ENABLED ? [calculateChunkSunlight] : []) // VOXEX-CCR-PERF-013
                 ];
                 for (const fn of meshFuncs) {
                     const indentedSource = fn.toString().split('\n').map(line => '    ' + line).join('\n');
@@ -19686,7 +19715,8 @@
 
                 try {
                     const result = await chunkWorkerPool.generateTerrain(cx, cz, finalSeedDisplay);
-                    return result.blocks;
+                    // VOXEX-CCR-PERF-013: pass worker-computed light through to generateChunkData
+                    return result; // { blocks, skyLight, blockLight, cx, cz, ... }
                 } catch (e) {
                     logDebug(`[Worker] Terrain gen failed for ${cx},${cz}: ${e.message}`);
                     return null; // Signal to use main thread fallback
@@ -38939,25 +38969,25 @@ self.onmessage = async (e) => {
                     // 4. Try worker-based terrain generation (if enabled)
                     // ============================================================
                     const seed = worldConfig.seed;
-                    let workerBlocks = null;
+                    let workerResult = null;
                     if (SETTINGS.useWorkers && chunkWorkerPool) {
                         try {
-                            workerBlocks = await generateTerrainViaWorker(cx, cz);
-                            if (workerBlocks) {
-                                // Worker generation succeeded — no logging needed
-                            }
+                            workerResult = await generateTerrainViaWorker(cx, cz); // { blocks, skyLight, blockLight }
                         } catch (e) {
                             logDebug(`[Worker] Failed, falling back to main thread: ${e.message}`);
                         }
                     }
 
-                    if (workerBlocks) {
-                        // Worker generated terrain + water + trees (Phase 3) - only need lighting on main thread
+                    if (workerResult && workerResult.blocks) {
                         const size = chunkSize * chunkSize * chunkHeight;
+                        // VOXEX-CCR-PERF-013: prefer worker-computed light. If absent (workers off,
+                        // older worker, or WORKER_LIGHTING_ENABLED=false → injection omitted), fall
+                        // back to computing it here — the pre-CCR-013 behavior.
+                        const hasWorkerLight = !!(workerResult.skyLight && workerResult.blockLight);
                         const chunk = {
-                            blocks: workerBlocks,
-                            skyLight: new Uint8Array(size),
-                            blockLight: new Uint8Array(size),
+                            blocks: workerResult.blocks,
+                            skyLight: hasWorkerLight ? workerResult.skyLight : new Uint8Array(size),
+                            blockLight: hasWorkerLight ? workerResult.blockLight : new Uint8Array(size),
                             cx,
                             cz,
                             startX,
@@ -38968,13 +38998,17 @@ self.onmessage = async (e) => {
 
                         // Trees already generated in worker - skip decorations pass
 
-                        // --- PASS 4: Calculate sunlight ---
-                        calculateChunkSunlight(chunk, chunkSize, chunkHeight);
-                        chunk.genState |= GEN_PASS.SUNLIGHT;
-
-                        // --- PASS 5: Calculate block light ---
-                        calculateBlockLight(chunk, chunkSize, chunkHeight);
-                        chunk.genState |= GEN_PASS.BLOCKLIGHT;
+                        if (hasWorkerLight) {
+                            // Worker already did Pass 4 (sunlight) + Pass 5 (blockLight = zeros).
+                            chunk.genState |= GEN_PASS.SUNLIGHT | GEN_PASS.BLOCKLIGHT;
+                        } else {
+                            // --- PASS 4: Calculate sunlight (fallback) ---
+                            calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                            chunk.genState |= GEN_PASS.SUNLIGHT;
+                            // --- PASS 5: Calculate block light (fallback) ---
+                            calculateBlockLight(chunk, chunkSize, chunkHeight);
+                            chunk.genState |= GEN_PASS.BLOCKLIGHT;
+                        }
 
                         // --- PASS 6: Analyze sections for visibility optimization ---
                         analyzeChunkSections(chunk);

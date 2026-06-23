@@ -957,6 +957,83 @@ async function runAllTests() {
         });
     });
 
+    describe("Tier 4: worker sunlight byte-parity (VOXEX-CCR-PERF-013)", () => {
+        // Asserts:
+        // (1) Worker-returned skyLight is byte-identical to main-thread calculateChunkSunlight on the
+        //     same blocks (including tree canopy/overhang shading, not just flat terrain).
+        // (2) Worker-returned blockLight is all-zero AND equals main calculateBlockLight output —
+        //     guards the "generated terrain has no emissive blocks" invariant.
+        it("worker skyLight/blockLight match main-thread calculateChunkSunlight/calculateBlockLight", async () => {
+            const SEED = "sunlight_parity";
+            const CX = 32100, CZ = 32100;
+            const SIZE = CHUNK_SIZE * CHUNK_SIZE * CHUNK_HEIGHT;
+            const { calculateChunkSunlight, calculateBlockLight } = VoxEx;
+
+            // 1. Get worker-generated terrain + light
+            let code = VoxEx.buildChunkWorkerCode();
+            const url = URL.createObjectURL(new Blob([code], { type: 'application/javascript' }));
+            const worker = new Worker(url);
+            let workerResult;
+            try {
+                await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker init timeout')), 10000);
+                    worker.onmessage = (e) => { if (e.data && e.data.type === 'ready') { clearTimeout(to); resolve(); } };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'init', jobId: 1, seedStr: SEED });
+                });
+                workerResult = await new Promise((resolve, reject) => {
+                    const to = setTimeout(() => reject(new Error('worker generate timeout')), 15000);
+                    worker.onmessage = (e) => {
+                        if (e.data && e.data.type === 'terrain') { clearTimeout(to); resolve(e.data); }
+                        else if (e.data && e.data.type === 'error') { clearTimeout(to); reject(new Error('worker error: ' + e.data.error)); }
+                    };
+                    worker.onerror = (e) => { clearTimeout(to); reject(new Error('worker error: ' + (e.message || 'unknown'))); };
+                    worker.postMessage({ type: 'generate', jobId: 2, cx: CX, cz: CZ, seedStr: SEED, worldGenSettings: {} });
+                });
+            } finally {
+                worker.terminate();
+                URL.revokeObjectURL(url);
+            }
+
+            // Worker must return all 3 buffers when WORKER_LIGHTING_ENABLED=true
+            expect(workerResult.blocks).toBeTruthy();
+            expect(workerResult.skyLight).toBeTruthy();
+            expect(workerResult.blockLight).toBeTruthy();
+            expect(workerResult.skyLight.length).toBe(SIZE);
+            expect(workerResult.blockLight.length).toBe(SIZE);
+
+            // 2. Compute main-thread light on the same blocks
+            const mainChunk = {
+                blocks: workerResult.blocks,
+                skyLight: new Uint8Array(SIZE),
+                blockLight: new Uint8Array(SIZE),
+            };
+            calculateChunkSunlight(mainChunk, CHUNK_SIZE, CHUNK_HEIGHT);
+            calculateBlockLight(mainChunk, CHUNK_SIZE, CHUNK_HEIGHT);
+
+            // (1) skyLight byte-identical
+            let skyMismatches = 0;
+            for (let i = 0; i < SIZE; i++) {
+                if (workerResult.skyLight[i] !== mainChunk.skyLight[i]) skyMismatches++;
+            }
+            expect(skyMismatches).toBe(0);
+
+            // (2) blockLight all-zero — invariant: generated terrain has no TORCH/FIRE
+            let blockLightNonZero = 0;
+            for (let i = 0; i < SIZE; i++) {
+                if (workerResult.blockLight[i] !== 0) blockLightNonZero++;
+            }
+            expect(blockLightNonZero).toBe(0);
+
+            // (2b) worker blockLight equals main calculateBlockLight output (both all-zero)
+            let blMismatches = 0;
+            for (let i = 0; i < SIZE; i++) {
+                if (workerResult.blockLight[i] !== mainChunk.blockLight[i]) blMismatches++;
+            }
+            expect(blMismatches).toBe(0);
+        });
+    });
+
     describe("Tier 4: worker MESH byte-parity (Phase 4a — gate, flag stays off until green)", () => {
         // Proves the worker mesher (single-sourced via buildChunkWorkerCode injection) produces
         // byte-identical buffers to main's renderChunk for the SAME unbanded chunk + SETTINGS. Uses a
