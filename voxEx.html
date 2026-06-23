@@ -3926,7 +3926,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.11";
+            const VOXEX_BUILD = "2026-06-22.12";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
@@ -3935,6 +3935,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "WATER MESH DEPTH/SHORE HOIST (VOXEX-CCR-PERF-010 / #482, build 2026-06-22.12). Hoisted waterDepth and shoreDist computations above the per-face loop in all three water meshing sites: (1) greedy-path water-only loop (main thread), (2) non-greedy per-block loop (main thread), (3) worker static driver. Both values depend only on block position (x,y,z), not face direction, so computing them inside the face loop caused up to 6× redundant scans per water block. After hoist: computed once per water block, reused for all visible faces. Non-greedy path now guards the hoist with `if (isWater)` so non-water blocks pay zero cost. 282/282 tests green.",
                 "WATER SURFACE SCAN CACHE (VOXEX-CCR-PERF-009 / #491, build 2026-06-22.11). Eliminated redundant 50-block upward scans in applyPlayerVelocity() when the player holds jump while swimming. The scan (up to 50 getBlock Map lookups) ran every physics substep — with collisionSteps=3 that was 3× per frame while treading water. Fix: added two module-scope cache vars (_waterSurfaceScanPX/_waterSurfaceScanPZ, both NaN initially) that record the XZ column of the last scan; the scan only runs when the player enters a new XZ block column (Math.floor comparison). Cache is invalidated when the player dives (isCrouching branch sets _waterSurfaceScanPX=NaN). This is a cross-frame cache (simpler and broader than the frame-counter approach originally proposed in the CCR); it's safe because the water column above a given XZ cell doesn't change between frames under normal gameplay. 282/282 tests green.",
                 "PERF BATCH — ISSUES #490/#489/#485/#487/#479/#484/#473 (build 2026-06-22.10). #490: deleted dead updateFrustumPlanes() block (computed a Matrix4 but never stored it; frustumPlanes/PlanesValid/lastFrustumCameraMatrix never read — confirmed no callers). #489: replaced 3x new THREE.Vector2(clampX,clampY)+.copy() in updateVolumetricLighting with .set(clampX,clampY) directly on destination uniform (reusable volumetricTempVec2 already existed; saved ≤4 allocs/frame). #485: added _heldTorchPos module-scope scratch Vector3 near volumetricTempVec3; both held-torch getWorldPosition calls now reuse it (was 2x new THREE.Vector3() per frame while torch active). #487: added _springResult={value,velocity} module-scope scratch; springDamper() now writes into it and returns it instead of allocating a new object per call (~30-60 allocs/frame eliminated; all callers consume both fields before next call — sequential use verified at all 3 call sites). #479: removed Array.from() wrappers from ChunkCompressor.compress() — Uint16Arrays now stored directly in IndexedDB (structured clone handles typed arrays; decompress() already uses new Uint16Array(x) which accepts both formats, so old records still load). #484: deleted AO cache machinery (AO_CACHE_SIZE/aoCache/aoCacheValid/initAOCache/clearAOCache/getAOCacheKey) — removed from main thread, worker code emitter, and injection list; hit rate was ~0 (each face visited once per chunk render), worker bypassed it (aoCacheValid=false), and Float32 pack formula exceeded exact-integer range causing precision loss. calculateFaceAO now computes directly. #473: added TERRAIN_GEN_VERSION=1 constant; stamped in ChunkCompressor.compress() records; exposed in decompress() result; both loadChunkFromCache() and batchLoadChunksFromCache() reject records with mismatched version (0 for old records → regen). 282/282 tests green.",
                 "PARTICLE SPAWN RANGE INVARIANT COMMENT (build 2026-06-22.9). Added clarifying comment in ParticleSystem.spawn() explaining why clearUpdateRanges() is correct in a multi-spawn batch: each successive spawn produces a prefix range starting at 0, so the last call's range [0,(idx+1)*N] is a superset of all prior ranges — one glBufferSubData call, correct coverage. Accumulating ranges without clearing would instead queue N redundant prefix uploads. No behavior change; addresses Important latent-fragility note from CCR-FX-001 review. 282/282 tests green.",
@@ -18846,6 +18847,25 @@
                                 const wz = startZ + z;
                                 const uv = getBlockUV(id);
                                 const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                // VOXEX-CCR-PERF-010: hoist waterDepth/shoreDist above face loop
+                                let waterDepth = 0;
+                                for (let dy = y - 1; dy >= 0; dy--) {
+                                    if (getLocal(x, dy, z) !== WATER) break;
+                                    waterDepth++;
+                                }
+                                const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                let shoreDist = 4;
+                                if (hasAirAbove) {
+                                    const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                    for (const [dx, dz] of directions) {
+                                        for (let d = 1; d <= 4; d++) {
+                                            const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                            if (checkId === UNLOADED_BLOCK) break;
+                                            if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) { shoreDist = Math.min(shoreDist, d); break; }
+                                            if (checkId === AIR) { shoreDist = Math.min(shoreDist, d); break; }
+                                        }
+                                    }
+                                }
                                 for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                     const face = FACE_DIRECTIONS[faceIdx];
                                     const lx = x + face[0];
@@ -18855,24 +18875,7 @@
                                     const uvCoord = faceIdx === 0 ? uvTop : faceIdx === 1 ? uvBottom : uvSide;
                                     const nid = getLocal(lx, ly, lz);
                                     if (nid === AIR || isLeafBlock(nid)) {
-                                        let waterDepth = 0;
-                                        for (let dy = y - 1; dy >= 0; dy--) {
-                                            if (getLocal(x, dy, z) !== WATER) break;
-                                            waterDepth++;
-                                        }
-                                        const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                        let shoreDist = 4;
-                                        if (hasAirAbove) {
-                                            const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-                                            for (const [dx, dz] of directions) {
-                                                for (let d = 1; d <= 4; d++) {
-                                                    const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                    if (checkId === UNLOADED_BLOCK) break;
-                                                    if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) { shoreDist = Math.min(shoreDist, d); break; }
-                                                    if (checkId === AIR) { shoreDist = Math.min(shoreDist, d); break; }
-                                                }
-                                            }
-                                        }
+                                        // waterDepth/shoreDist hoisted above face loop (VOXEX-CCR-PERF-010)
                                         addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, null, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
                                         wVIdx += 12; wUvIdx += 8; wCIdx += 12; wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
                                     }
@@ -41373,6 +41376,30 @@ self.onmessage = async (e) => {
                                         const uv = getBlockUV(id);
                                         const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
 
+                                        // VOXEX-CCR-PERF-010: hoist waterDepth/shoreDist above face loop —
+                                        // both depend only on (x,y,z), not face direction; computing inside
+                                        // the face loop caused up to 6x redundant scans per water block.
+                                        let waterDepth = 0;
+                                        for (let dy = y - 1; dy >= 0; dy--) {
+                                            if (getLocal(x, dy, z) !== WATER) break;
+                                            waterDepth++;
+                                        }
+                                        const hasAirAbove = getLocal(x, y + 1, z) === AIR;
+                                        let shoreDist = 4;
+                                        if (hasAirAbove) {
+                                            const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                            for (const [dx, dz] of directions) {
+                                                for (let d = 1; d <= 4; d++) {
+                                                    const checkId = getLocal(x + dx * d, y, z + dz * d);
+                                                    // UNLOADED neighbor chunk: stop without flagging shore —
+                                                    // neighbor-refresh remesh fills in the true value later.
+                                                    if (checkId === UNLOADED_BLOCK) break;
+                                                    if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) { shoreDist = Math.min(shoreDist, d); break; }
+                                                    if (checkId === AIR) { shoreDist = Math.min(shoreDist, d); break; }
+                                                }
+                                            }
+                                        }
+
                                         for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                             const face = FACE_DIRECTIONS[faceIdx];
                                             const lx = x + face[0];
@@ -41386,38 +41413,7 @@ self.onmessage = async (e) => {
 
                                             // Water only draws faces at boundaries (against air or leaves)
                                             if (nid === AIR || isLeafBlock(nid)) {
-                                                // Calculate water depth (search DOWN to find bottom)
-                                                let waterDepth = 0;
-                                                for (let dy = y - 1; dy >= 0; dy--) {
-                                                    const belowId = getLocal(x, dy, z);
-                                                    if (belowId !== WATER) break;
-                                                    waterDepth++;
-                                                }
-                                                // Calculate shore distance
-                                                const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                                let shoreDist = 4;
-                                                if (hasAirAbove) {
-                                                    const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-                                                    for (const [dx, dz] of directions) {
-                                                        for (let d = 1; d <= 4; d++) {
-                                                            const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                            // UNLOADED neighbor chunk: stop scanning this direction
-                                                            // WITHOUT flagging shore — treating 255 as land painted a
-                                                            // dark calm/low-reflection band along chunk borders (the
-                                                            // neighbor-refresh remesh fills in the true value later)
-                                                            if (checkId === UNLOADED_BLOCK) break;
-                                                            if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
-                                                                shoreDist = Math.min(shoreDist, d);
-                                                                break;
-                                                            }
-                                                            if (checkId === AIR) {
-                                                                shoreDist = Math.min(shoreDist, d);
-                                                                break;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                // Indexed water face rendering
+                                                // waterDepth/shoreDist hoisted above face loop (VOXEX-CCR-PERF-010)
                                                 addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, waterPos, waterNorm, waterUvs, waterCols, waterIndices, getLocal, x, y, z, id, wVIdx, wUvIdx, wCIdx, wIIdx, wVertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
                                                 wVIdx += 12; wUvIdx += 8; wCIdx += 12;
                                                 wIIdx += 6; wVertCount += 4; wSIdx += 4; wTIdx += 4; wFaceCount++;
@@ -41453,6 +41449,26 @@ self.onmessage = async (e) => {
                                         // OPTIMIZATION: Pre-compute UV lookup once per block instead of per-face
                                         // UV lookup: index 0=top, 1=bottom, 2-5=side
                                         const uvTop = uv.top, uvBottom = uv.bottom, uvSide = uv.side;
+                                        // VOXEX-CCR-PERF-010: hoist waterDepth/shoreDist above face loop
+                                        let waterDepth = 0, shoreDist = 4;
+                                        if (isWater) {
+                                            for (let dy = y - 1; dy >= 0; dy--) {
+                                                if (getLocal(x, dy, z) !== WATER) break;
+                                                waterDepth++;
+                                            }
+                                            const hasAirAboveW = getLocal(x, y + 1, z) === AIR;
+                                            if (hasAirAboveW) {
+                                                const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+                                                for (const [dx, dz] of dirs) {
+                                                    for (let d = 1; d <= 4; d++) {
+                                                        const cid = getLocal(x + dx * d, y, z + dz * d);
+                                                        if (cid === UNLOADED_BLOCK) break;
+                                                        if (cid !== WATER && cid !== AIR && !isLeafBlock(cid)) { shoreDist = Math.min(shoreDist, d); break; }
+                                                        if (cid === AIR) { shoreDist = Math.min(shoreDist, d); break; }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
                                             const face = FACE_DIRECTIONS[faceIdx];
                                             const lx = x + face[0];
@@ -41481,35 +41497,7 @@ self.onmessage = async (e) => {
                                                 if (useDeferredLight) {
                                                     addFaceSimplifiedIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, ly, terrainQuadSize, tQsIdx);
                                                 } else if (isWater) {
-                                                    // Calculate water depth (search DOWN to find bottom)
-                                                    let waterDepth = 0;
-                                                    for (let dy = y - 1; dy >= 0; dy--) {
-                                                        const belowId = getLocal(x, dy, z);
-                                                        if (belowId !== WATER) break;
-                                                        waterDepth++;
-                                                    }
-                                                    // Calculate shore distance - check horizontal neighbors for solid blocks
-                                                    const hasAirAbove = getLocal(x, y + 1, z) === AIR;
-                                                    let shoreDist = 4;
-                                                    if (hasAirAbove) {
-                                                        const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-                                                        for (const [dx, dz] of directions) {
-                                                            for (let d = 1; d <= 4; d++) {
-                                                                const checkId = getLocal(x + dx * d, y, z + dz * d);
-                                                                // UNLOADED neighbor: stop without flagging shore (see
-                                                                // identical guard in the water-only loop above)
-                                                                if (checkId === UNLOADED_BLOCK) break;
-                                                                if (checkId !== WATER && checkId !== AIR && !isLeafBlock(checkId)) {
-                                                                    shoreDist = Math.min(shoreDist, d);
-                                                                    break;
-                                                                }
-                                                                if (checkId === AIR) {
-                                                                    shoreDist = Math.min(shoreDist, d);
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                    }
+                                                    // waterDepth/shoreDist hoisted above face loop (VOXEX-CCR-PERF-010)
                                                     // Indexed water face rendering (no quadSize - water doesn't use greedy meshing)
                                                     addFaceWaterIndexed(wx, wy, wz, nx, ny, nz, uvCoord, pos, norm, uvs, cols, indices, getLocal, x, y, z, id, vIdx, uvIdx, cIdx, iIdx, vertCount, getLocalLight, lx, ly, lz, faceIdx, waterDepth, waterShore, wSIdx, shoreDist, waterThickness, wTIdx, waterFoam);
                                                 } else {
