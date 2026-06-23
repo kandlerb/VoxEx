@@ -3,7 +3,7 @@
 **ID:** VOXEX-CCR-FIRE-002
 **File:** `voxEx.html` (single-file rule honored)
 **Date:** 2026-06-23
-**Status:** 🔴 Proposed
+**Status:** 🟢 Implemented (build 2026-06-23.18)
 **Scope:** Settings UI › Start-menu entry path › `syncSettingsToUI` exposure; Fire system › stale localStorage cap
 
 ---
