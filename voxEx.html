@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-23.22";
+            const VOXEX_BUILD = "2026-06-23.23";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "DEFERRED PREGEN CACHING (VOXEX-CCR-PERF-013 Lever 2, build 2026-06-23.23). During spawn pre-generation (Phase 1C), per-chunk saveChunkToCache (sync compression + awaited IDB write, 8.7 s total) and OPFS writeToDisk are now deferred instead of running per-chunk. A module-level _pregenActive flag suppresses saves inside generateChunkData; collected keys are flushed via a single batchSaveChunksToCache call immediately after Phase 1C ends, running fire-and-forget concurrently with Phase 2 (rendering). Normal gameplay chunk caching is unaffected. pagehide safety flush covers the early-quit edge case. Risk: none to correctness (generation is deterministic); only consequence of an early quit before flush completes is re-generation on next load.",
                 "WORKER SUNLIGHT (VOXEX-CCR-PERF-013, build 2026-06-23.22). Moves per-chunk sunlight calculation (calculateChunkSunlight) off the main thread by running it inside the terrain worker immediately after tree generation. The worker now returns all three buffers {blocks, skyLight, blockLight} via zero-copy Transferable transfer; generateChunkData consumes them and skips Pass 4 (sunlight) and Pass 5 (block light) on the main thread. Block light stays all-zero in the worker because freshly generated terrain never contains TORCH/FIRE — invariant guarded by the new parity test. Six edits: WORKER_LIGHTING_ENABLED flag + typeof guard in worker handler + SUNLIGHT_ATTENUATION/NEIGHBOR_OFFSETS injection + calculateChunkSunlight added to meshFuncs + generateTerrainViaWorker returns full result + generateChunkData hasWorkerLight fallback path. Kill switch: set WORKER_LIGHTING_ENABLED=false to revert to pre-CCR-013 main-thread lighting. New parity test in voxex-tests.html asserts worker skyLight byte-identical to main and blockLight all-zero. Target: removes ~18.8 s main-thread lighting from the 41 s spawn pre-gen wall time.",
                 "UI TIMING INSTRUMENTATION (VOXEX-CCR-TIMING-001, build 2026-06-23.21). Added UITiming module: capture-phase click listener timestamps every click before any handler runs; MutationObserver on allowlisted screen/overlay containers fires when display flips none→visible. Reports click→screen Δms in console ([Timing] CLICK / [Timing] SCREEN lines). Ring buffer (500 entries); dumpUITimings() prints console.table. No per-handler edits, no per-frame work, no new DOM IDs. Installed via single UITiming.install() call in DOMContentLoaded (covers start-menu and game paths). Disable at runtime: setUITiming(false) or window.VOXEX_TIMING=false.",
                 "FIRE SLIDER MAIN-MENU FIX — REAL ROOT CAUSE (VOXEX-CCR-FIRE-002 addendum, build 2026-06-23.20). Fire setting sliders/toggles did nothing when changed from the start-menu settings (handle moved, number frozen), but worked from the in-game pause menu. Root cause (the actual one — Fix 4's touch-action theory was a misdiagnosis; touch-action does not affect mouse input): the fire WRITE-listeners (bindFireToggle/bindFireSlider + 12 bind calls + the Reset Fire handler) lived inside init(), which runs ONLY via initGameEngine() on game start. On the start-menu path init() has never run, so no input/change listener was ever attached to any fire control. The 'works in-game' difference was simply that starting a game ran init(). Fix: relocated the entire fire binding block out of init() and into attachSettingsEventListeners() — the function called unconditionally at DOMContentLoaded, the same single-source location the CCR-D1 migration used for every other settings listener (render distance, AO, shadows, movement, camera, interaction). The fire block was the one never migrated. Scope correction: the moved Reset Fire handler called updateUIFromSettings() (init-scoped, unreachable from attachSettingsEventListeners) — swapped for syncSettingsToUI(), the module-scoped single-source it delegates to. Read path (initial slider values) was already handled by syncSettingsToUI via Fix 1. No double-binding (attachSettingsEventListeners has a one-time guard + single call site; removed from init()). New regression test dispatches a synthetic 'input' on #fire-max-active-slider in the pre-game test iframe and asserts SETTINGS.fireMaxActive + the span update — fails pre-fix, passes post-fix (added _doc test-seam getter for DOM access). 285/285 tests green.",
@@ -13777,6 +13778,8 @@
             // set this back to false.
             const WORKER_MESH_PIPELINE_ENABLED = true;
             const WORKER_LIGHTING_ENABLED = true; // VOXEX-CCR-PERF-013: compute per-chunk sunlight in the worker
+            let _pregenActive = false;              // VOXEX-CCR-PERF-013 Lever 2: true while Phase 1C runs
+            const _pregenPendingSaves = new Set();  // chunk keys awaiting deferred batch cache flush
             const inFlightMeshKeys = new Set();   // chunk keys with a worker mesh job in flight
             const readyMeshResults = [];          // [{cKey, cx, cz, distSq, meshData}] completed, awaiting apply
             const syncFallbackQueue = [];         // [{cKey, cx, cz, distSq}] worker unavailable/timeout — main-thread mesh, 1/frame
@@ -24597,6 +24600,18 @@
                 if (activeProfileName) { document.querySelectorAll('.profile-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.profile === activeProfileName)); }
                 // Attach settings event listeners early so settings work from main menu
                 attachSettingsEventListeners();
+                // VOXEX-CCR-PERF-013 Lever 2: best-effort flush of any un-persisted pregen chunks
+                // before the page unloads (e.g. user quits within seconds of entering a new world).
+                // Regeneration is deterministic so missing this only costs a slower next load.
+                window.addEventListener('pagehide', () => {
+                    if (_pregenPendingSaves.size === 0) return;
+                    const saveMap = new Map();
+                    for (const k of _pregenPendingSaves) {
+                        if (chunks.has(k)) saveMap.set(k, chunks.get(k));
+                    }
+                    _pregenPendingSaves.clear();
+                    if (saveMap.size > 0) batchSaveChunksToCache(saveMap).catch(() => {});
+                });
             });
 
             // Update create world button handler to also init preview
@@ -27292,6 +27307,7 @@ self.onmessage = async (e) => {
                 // Batch size for parallel generation - allows multiple workers to be utilized
                 const GEN_BATCH_SIZE = 18;
                 let generatedCount = 0;
+                _pregenActive = true; // VOXEX-CCR-PERF-013 Lever 2: defer per-chunk cache writes
                 if (chunksNeedingGeneration.length > 0) {
                     if (progressText) progressText.textContent = `Generating ${chunksNeedingGeneration.length} new chunks...`;
                     logDebug(`[PreGen] Phase 1C: Generating ${chunksNeedingGeneration.length} new chunks (parallel workers)...`);
@@ -27325,6 +27341,24 @@ self.onmessage = async (e) => {
                     }
                     const genTime = performance.now() - genStartTime;
                     logDebug(`[PreGen] New chunks generated in ${genTime.toFixed(2)}ms`);
+                }
+                // VOXEX-CCR-PERF-013 Lever 2: clear flag, then fire deferred batch save.
+                // Does not block Phase 2 rendering — runs concurrently as a fire-and-forget promise.
+                _pregenActive = false;
+                if (_pregenPendingSaves.size > 0) {
+                    const pendingCount = _pregenPendingSaves.size;
+                    logDebug(`[PreGen] Deferred cache flush: ${pendingCount} chunks (fire-and-forget)`);
+                    const saveMap = new Map();
+                    for (const k of _pregenPendingSaves) {
+                        if (chunks.has(k)) saveMap.set(k, chunks.get(k));
+                    }
+                    _pregenPendingSaves.clear();
+                    batchSaveChunksToCache(saveMap).then(() => {
+                        if (chunkDataPool.diskStorageReady) {
+                            for (const [k, c] of saveMap) chunkDataPool.writeToDisk(k, c).catch(() => {});
+                        }
+                        logDebug(`[PreGen] Batch cache flush complete (${pendingCount} chunks)`);
+                    }).catch(e => logDebug(`[PreGen] Batch cache flush error: ${e.message}`));
                 }
 
                 // === PHASE 2: Render chunks within render distance only ===
@@ -39020,12 +39054,17 @@ self.onmessage = async (e) => {
                         // Queue adjacent chunks for update
                         queueAdjacentChunksForUpdate(cx, cz, key);
 
-                        // Save to IndexedDB
-                        await saveChunkToCache(key, chunk);
-
-                        // Also write to OPFS disk cache
-                        if (chunkDataPool.diskStorageReady) {
-                            chunkDataPool.writeToDisk(key, chunk).catch(() => {});
+                        // VOXEX-CCR-PERF-013 Lever 2: during spawn pregen, skip per-chunk IDB compression
+                        // (8.7 s) and OPFS write — neither is needed to enter the world. The batch flush
+                        // fires fire-and-forget after Phase 1C ends, running concurrently with Phase 2.
+                        // Outside pregen the saves proceed immediately (normal gameplay caching).
+                        if (_pregenActive) {
+                            _pregenPendingSaves.add(key);
+                        } else {
+                            await saveChunkToCache(key, chunk);
+                            if (chunkDataPool.diskStorageReady) {
+                                chunkDataPool.writeToDisk(key, chunk).catch(() => {});
+                            }
                         }
 
                         return chunk;
