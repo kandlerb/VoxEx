@@ -3926,7 +3926,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.15";
+            const VOXEX_BUILD = "2026-06-22.16";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
@@ -3935,6 +3935,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "NOISE SINGLE-SOURCE INJECTION (VOXEX-CCR-ARCH-001 / #474, build 2026-06-22.16). noise2D, noise3D, fbm2D, fbmWithDomainWarp are now single-sourced on the main thread and injected into the chunk worker via Function.toString() between the __TERRAIN_FUNCS_START__/__END__ markers. Worker-local hand-maintained copies at ~line 18415-18463 deleted. Main-thread noise2D converted from arrow function to function declaration so Function.toString() produces a named declaration (arrow Function.toString() yields an anonymous expression that can't inject as a binding). Injection order: noise functions first (before continentalHeight etc. which call them). Static parity test added: asserts each of the four functions appears exactly once in generated worker code (no duplicate declarations). Existing blendedHeight parity test (Tier 4) provides dynamic correctness guard. 283/283 tests green.",
                 "UPDATE-CHUNKS SORT OPTIMIZATION (VOXEX-CCR-PERF-012 / #481, build 2026-06-22.15). Two fixes to updateChunks() reducing per-call allocation and sort cost. Sub-fix A (6B cleanup): replaced Array.from(chunkMeshes.keys()) allocation + forEach with a direct for-of over chunkMeshes.keys() into a pre-screened toDelete6B array, then a second loop to call releaseMeshForKey(); avoids iterator-while-mutating hazard and the Array.from() copy. Sub-fix B1 (6A proactive eviction): replaced sort-all-~200-meshes with a pre-filter-then-sort pattern — only out-of-range chunks are pushed into farCandidates[] (filtered by !chunksInRange.has(baseKey) before the sort), so the sort operates on typically 0-10 entries instead of ~200; the inner removal loop drops the redundant has() re-check since all entries are pre-confirmed out-of-range. 282/282 tests green.",
                 "EDGE-LIGHTING COLUMN EARLY-OUT (VOXEX-CCR-LIGHT-003 / #486, build 2026-06-22.14). Added top-of-column guard in propagateLightFromEdgesInward() seed scan. Before descending each 320-cell edge column, checks skyLight[top] <= 1; if the top is dark (skyLight never reached from above), the column holds no seeds and is skipped immediately. One extra read per column replaces up to 320 reads + IS_TRANSPARENT checks per dark column. Computed topYOff = (chunkHeight-1)*cs*cs once before all four edge loops. Does not affect the neighbor re-queue scan (already has its own hasLight guard) or the interior BFS. 282/282 tests green.",
                 "SHORELINE DAMP SECTION FLAG (VOXEX-CCR-PERF-011 / #483, build 2026-06-22.13). Added hasWater flag to section metadata so cellCornerLightDamped() skips its ~40-read water-adjacency scan for sections with no water. On inland chunks (majority of the map) every top-facing land block called cellCornerLightDamped which scanned 6+ neighbors — all returning non-water — completely wasted. Fix: (1) createSectionData() initializes hasWater=false per section; (2) analyzeChunkSections() sets hasWater=true when WATER block found; (3) module-scope _greedySectionHasWater=true flag; (4) cellCornerLightDamped early-returns cornerLight when !_greedySectionHasWater; (5) main-thread greedy loop sets _greedySectionHasWater=section.hasWater??true before each greedyMeshSection call, resets to true after; (6) worker: _greedySectionHasWater emitted in template, per-section water scan (labeled break) sets flag before greedy calls. refillChunkLightColors unaffected (flag always true when it runs). Old cached sections missing hasWater default to true (conservative). 282/282 tests green.",
@@ -18412,56 +18413,6 @@
         return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
     };
 
-    function noise2D(x, y) {
-        const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
-        x -= Math.floor(x);
-        y -= Math.floor(y);
-        const u = fadeFast(x), v = fadeFast(y);
-        const A = perm[X] + Y, B = perm[X + 1] + Y;
-        return lerp(v,
-            lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)),
-            lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1))
-        );
-    }
-
-    function noise3D(x, y, z) {
-        const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
-        x -= Math.floor(x);
-        y -= Math.floor(y);
-        z -= Math.floor(z);
-        const u = fadeFast(x), v = fadeFast(y), w = fadeFast(z);
-        const A = perm[X] + Y, AA = perm[A] + Z, AB = perm[A + 1] + Z;
-        const B = perm[X + 1] + Y, BA = perm[B] + Z, BB = perm[B + 1] + Z;
-        return lerp(w,
-            lerp(v,
-                lerp(u, grad3D(perm[AA], x, y, z), grad3D(perm[BA], x - 1, y, z)),
-                lerp(u, grad3D(perm[AB], x, y - 1, z), grad3D(perm[BB], x - 1, y - 1, z))
-            ),
-            lerp(v,
-                lerp(u, grad3D(perm[AA + 1], x, y, z - 1), grad3D(perm[BA + 1], x - 1, y, z - 1)),
-                lerp(u, grad3D(perm[AB + 1], x, y - 1, z - 1), grad3D(perm[BB + 1], x - 1, y - 1, z - 1))
-            )
-        );
-    }
-
-    function fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
-        let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
-        for (let i = 0; i < octaves; i++) {
-            total += noise2D(x * frequency, z * frequency) * amplitude;
-            maxValue += amplitude;
-            amplitude *= persistence;
-            frequency *= lacunarity;
-        }
-        return total / maxValue;
-    }
-
-    function fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
-        const warpScale = 0.03;
-        const offsetX = fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
-        const offsetZ = fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
-        return fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
-    }
-
     // ============================================================
     // BIOME SYSTEM
     // ============================================================
@@ -19017,6 +18968,7 @@
             function buildChunkWorkerCode() {
                 // Get terrain function sources from main thread (defined later in file, but hoisted)
                 const terrainFuncs = [
+                    noise2D, noise3D, fbm2D, fbmWithDomainWarp, // VOXEX-CCR-ARCH-001: single-source upstream noise
                     continentalHeight,
                     defaultHeightFunc,
                     hillsHeightFunc,
@@ -20677,14 +20629,14 @@
                 return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
             };
             // OPTIMIZED: Use lookup table for fade function (fadeFast) instead of polynomial calculation
-            const noise2D = (x, y) => {
+            function noise2D(x, y) {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
                 x -= Math.floor(x);
                 y -= Math.floor(y);
                 const u = fadeFast(x), v = fadeFast(y); // OPTIMIZATION: Use LUT instead of polynomial
                 const A = perm[X] + Y, B = perm[X + 1] + Y;
                 return lerp(v, lerp(u, grad(perm[A], x, y), grad(perm[B], x - 1, y)), lerp(u, grad(perm[A + 1], x, y - 1), grad(perm[B + 1], x - 1, y - 1)));
-            };
+            }
             // OPTIMIZED: Use lookup table for fade function
             function noise3D(x, y, z) {
                 const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
