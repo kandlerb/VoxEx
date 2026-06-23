@@ -3926,7 +3926,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-22.14";
+            const VOXEX_BUILD = "2026-06-22.15";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 4;
@@ -3935,6 +3935,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "UPDATE-CHUNKS SORT OPTIMIZATION (VOXEX-CCR-PERF-012 / #481, build 2026-06-22.15). Two fixes to updateChunks() reducing per-call allocation and sort cost. Sub-fix A (6B cleanup): replaced Array.from(chunkMeshes.keys()) allocation + forEach with a direct for-of over chunkMeshes.keys() into a pre-screened toDelete6B array, then a second loop to call releaseMeshForKey(); avoids iterator-while-mutating hazard and the Array.from() copy. Sub-fix B1 (6A proactive eviction): replaced sort-all-~200-meshes with a pre-filter-then-sort pattern — only out-of-range chunks are pushed into farCandidates[] (filtered by !chunksInRange.has(baseKey) before the sort), so the sort operates on typically 0-10 entries instead of ~200; the inner removal loop drops the redundant has() re-check since all entries are pre-confirmed out-of-range. 282/282 tests green.",
                 "EDGE-LIGHTING COLUMN EARLY-OUT (VOXEX-CCR-LIGHT-003 / #486, build 2026-06-22.14). Added top-of-column guard in propagateLightFromEdgesInward() seed scan. Before descending each 320-cell edge column, checks skyLight[top] <= 1; if the top is dark (skyLight never reached from above), the column holds no seeds and is skipped immediately. One extra read per column replaces up to 320 reads + IS_TRANSPARENT checks per dark column. Computed topYOff = (chunkHeight-1)*cs*cs once before all four edge loops. Does not affect the neighbor re-queue scan (already has its own hasLight guard) or the interior BFS. 282/282 tests green.",
                 "SHORELINE DAMP SECTION FLAG (VOXEX-CCR-PERF-011 / #483, build 2026-06-22.13). Added hasWater flag to section metadata so cellCornerLightDamped() skips its ~40-read water-adjacency scan for sections with no water. On inland chunks (majority of the map) every top-facing land block called cellCornerLightDamped which scanned 6+ neighbors — all returning non-water — completely wasted. Fix: (1) createSectionData() initializes hasWater=false per section; (2) analyzeChunkSections() sets hasWater=true when WATER block found; (3) module-scope _greedySectionHasWater=true flag; (4) cellCornerLightDamped early-returns cornerLight when !_greedySectionHasWater; (5) main-thread greedy loop sets _greedySectionHasWater=section.hasWater??true before each greedyMeshSection call, resets to true after; (6) worker: _greedySectionHasWater emitted in template, per-section water scan (labeled break) sets flag before greedy calls. refillChunkLightColors unaffected (flag always true when it runs). Old cached sections missing hasWater default to true (conservative). 282/282 tests green.",
                 "WATER MESH DEPTH/SHORE HOIST (VOXEX-CCR-PERF-010 / #482, build 2026-06-22.12). Hoisted waterDepth and shoreDist computations above the per-face loop in all three water meshing sites: (1) greedy-path water-only loop (main thread), (2) non-greedy per-block loop (main thread), (3) worker static driver. Both values depend only on block position (x,y,z), not face direction, so computing them inside the face loop caused up to 6× redundant scans per water block. After hoist: computed once per water block, reused for all visible faces. Non-greedy path now guards the hoist with `if (isWater)` so non-water blocks pay zero cost. 282/282 tests green.",
@@ -42240,40 +42241,43 @@ self.onmessage = async (e) => {
                 const maxAllowedMeshes = Math.max(SETTINGS.maxCachedChunks, currentRenderRadius * currentRenderRadius * 2);
                 let meshPrunedDuringUpdate = false;
                 if (terrainMeshCount > maxAllowedMeshes) {
-                    const chunkDistances = [];
+                    // VOXEX-CCR-PERF-012 Sub-fix B1: pre-filter to out-of-range only before sorting.
+                    // Avoids sorting all ~200 meshes — only the few outside render distance need sorting.
                     const processedKeys = new Set();
+                    const farCandidates = [];
                     for (const key of chunkMeshes.keys()) {
                         const baseKey = chunkBaseOfMeshKey(key); // dedupe band keys to the chunk
                         if (!processedKeys.has(baseKey)) {
                             processedKeys.add(baseKey);
-                            const [c, z] = parseChunkKey(baseKey);
-                            const dist = (c - chunkX) ** 2 + (z - chunkZ) ** 2;
-                            chunkDistances.push({ key: baseKey, dist });
+                            if (!chunksInRange.has(baseKey)) { // pre-filter: only out-of-range chunks
+                                const [c, z] = parseChunkKey(baseKey);
+                                const dist = (c - chunkX) ** 2 + (z - chunkZ) ** 2;
+                                farCandidates.push({ key: baseKey, dist });
+                            }
                         }
                     }
-                    chunkDistances.sort((a, b) => b.dist - a.dist);
+                    farCandidates.sort((a, b) => b.dist - a.dist);
                     const excess = terrainMeshCount - maxAllowedMeshes;
                     const toRemove = Math.ceil(excess * 0.3);
-                    for (let i = 0; i < toRemove && i < chunkDistances.length; i++) {
-                        const targetKey = chunkDistances[i].key;
-                        if (!chunksInRange.has(targetKey)) {
-                            // Remove terrain + water meshes (and all bands when banded)
-                            releaseMeshForKey(targetKey);
-                            releaseMeshForKey(targetKey + "_WATER");
-                            releaseMeshForKey(targetKey + "_GLASS");
-                            if (chunkUsesBands(targetKey)) { for (const k of chunkBandMeshKeys(targetKey)) releaseMeshForKey(k); }
-                            bandedChunkKeys.delete(targetKey); // PHASE 3.5: re-streamed chunk starts unbanded
-                            chunkRenderedFaces.delete(targetKey);
-                            meshPrunedDuringUpdate = true;
-                        }
+                    for (let i = 0; i < toRemove && i < farCandidates.length; i++) {
+                        const targetKey = farCandidates[i].key;
+                        // targetKey always out-of-range (pre-filtered above) — no extra has() check needed
+                        releaseMeshForKey(targetKey);
+                        releaseMeshForKey(targetKey + "_WATER");
+                        releaseMeshForKey(targetKey + "_GLASS");
+                        if (chunkUsesBands(targetKey)) { for (const k of chunkBandMeshKeys(targetKey)) releaseMeshForKey(k); }
+                        bandedChunkKeys.delete(targetKey); // PHASE 3.5: re-streamed chunk starts unbanded
+                        chunkRenderedFaces.delete(targetKey);
+                        meshPrunedDuringUpdate = true;
                     }
                 }
                 // --- 6B. Cleanup Old Chunks ---
-                // Iterate over KEYS to avoid iterator invalidation issues during delete
-                // Strip _WATER suffix to check if the base chunk is needed
-                // If it's not in our "Needed" list, KILL IT IMMEDIATELY
-                const meshKeys = Array.from(chunkMeshes.keys());
-                for (const key of meshKeys) { const baseKey = chunkBaseOfMeshKey(key); if (!chunksInRange.has(baseKey)) { releaseMeshForKey(key); bandedChunkKeys.delete(baseKey); meshPrunedDuringUpdate = true; }}
+                // VOXEX-CCR-PERF-012 Sub-fix A: collect toDelete first, then delete — avoids
+                // Array.from(chunkMeshes.keys()) allocation while still safe against iterator
+                // invalidation (releaseMeshForKey mutates chunkMeshes during iteration otherwise).
+                const toDelete6B = [];
+                for (const key of chunkMeshes.keys()) { const baseKey = chunkBaseOfMeshKey(key); if (!chunksInRange.has(baseKey)) toDelete6B.push(key); }
+                for (const key of toDelete6B) { releaseMeshForKey(key); bandedChunkKeys.delete(chunkBaseOfMeshKey(key)); meshPrunedDuringUpdate = true; }
                 if (meshPrunedDuringUpdate) { invalidateFrustumCache(); }
                 // --- 7. Smart Queueing ---
                 // Sort by distance (closest first)
