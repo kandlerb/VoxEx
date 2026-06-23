@@ -3,8 +3,8 @@
 **ID:** VOXEX-CCR-FIRE-002
 **File:** `voxEx.html` (single-file rule honored)
 **Date:** 2026-06-23
-**Status:** 🟢 Implemented (build 2026-06-23.19 — Bug 4 fix shipped)
-**Scope:** Settings UI › Start-menu entry path › `syncSettingsToUI` exposure; Fire system › stale localStorage cap; Range slider pointer-event capture
+**Status:** 🟢 RESOLVED (build 2026-06-23.20 — real root cause fixed; see ADDENDUM + IMPLEMENTATION NOTE at end). Builds .18/.19 (Fixes 1–4) did NOT fix the reported symptom.
+**Scope:** Settings UI › Start-menu entry path › `syncSettingsToUI` exposure; Fire system › stale localStorage cap; **fire write-listeners never attached pre-game (the actual bug)**
 
 ---
 
@@ -508,3 +508,280 @@ ancestor/descendant relationship matters only at pointer hit-test time, not in C
 - [ ] **Manual (pending user confirmation):** drag fire sliders in start-menu context — confirm handles move and span values update
 - [ ] **Manual (pending user confirmation):** drag a non-fire slider (e.g., render distance) in start-menu context — confirm fix is systemic
 - [ ] **Manual (pending user confirmation):** touch-scroll a long settings panel on mobile — confirm scroll still works (touch-action: none is on the slider only, not the container)
+
+---
+---
+
+# ADDENDUM — 2026-06-23 Review: The Real Root Cause (Bugs 1–4 Did Not Fix It)
+
+**Author:** Review/report pass (no code changed — investigation only)
+**Build reviewed:** `VOXEX_BUILD = 2026-06-23.19` (all of Fixes 1–4 already shipped)
+**Status of the reported bug:** 🔴 **STILL BROKEN.** User confirms: from the start
+screen → Settings → Gameplay → Fire, the sliders "do not connect to anything and moving
+the sliders doesn't change the number."
+
+> **Do not delete the sections above.** They are preserved intentionally. This addendum
+> explains what each prior fix got wrong, why the bug survived four fixes, and the one
+> change that actually resolves it.
+
+---
+
+## TL;DR — The actual root cause
+
+**The fire settings event listeners are never attached on the start-menu path because they
+live inside `init()`, and `init()` only runs when a game starts.**
+
+- The fire toggle/slider bindings (`bindFireToggle` / `bindFireSlider` and their 12 call
+  sites) are at **lines 29063–29099**, inside the block opened at line 29062.
+- That block is inside the function **`init()`** (begins line 27195, ends line 29341 — the
+  next function, `initBlockOptimization()`, starts at 29342; there is no other function
+  definition between 27195 and 29342, so the fire block is unambiguously inside `init()`).
+- **`init()` is called from exactly one place: line 24424, inside `initGameEngine()`**
+  (`await init();`). `initGameEngine` only runs when the user creates or loads a world.
+- Therefore, on the start screen — before any game has started — `init()` has never run,
+  and **no `input`/`change` listener is ever attached to any fire control.**
+
+A native `<input type="range">` handle is draggable on its own (the browser moves the thumb
+without any JS), but the **number span and `SETTINGS[...]` only update inside the missing
+`input` listener.** Result, exactly as reported: the handle slides, the number is frozen,
+and nothing connects. The toggles behave the same way (no `change` listener → clicking does
+nothing).
+
+### Proof that this is the cause (not touch-action, not sync)
+
+| Fact | Evidence (verified in build .19) |
+|---|---|
+| Fire listeners are inside `init()` | `bindFireSlider`/`bindFireToggle` defined and called at 29063–29099; enclosing fn `init()` spans 27195–29341 |
+| `init()` runs only on game start | Sole call site is `await init();` at line 24424 inside `initGameEngine()` (24411) |
+| `attachSettingsEventListeners()` (the main-menu path) has **no** fire code | Scan of lines 22992–24389 for `fire`/`Fire`: **zero matches** |
+| Other settings *do* work from the main menu because their listeners *were* moved | Tombstones at 28290, 28295, 28311–28312: "CCR D1: …-listener removed — single-source in attachSettingsEventListeners()". The fire block was simply **never migrated**. |
+
+### Why it "works in-game but not the main menu" — the boring truth
+
+Open Settings → Fire from the **pause menu** (after starting a game) and the sliders work.
+The prior CCR (Bug 4) attributed this to a Chromium "pointer compositor reset on
+pointer-lock release." That is fiction. The real reason is trivial: **starting the game
+ran `init()`, which attached the fire listeners.** Same DOM elements, same CSS — the only
+difference is whether `init()` has executed yet.
+
+---
+
+## What each prior fix got wrong, and why
+
+### Fix 1 — `window.syncSettingsToUI = syncSettingsToUI` — *correct, but addresses the wrong half of the problem*
+
+`syncSettingsToUI()` is the **read** path: SETTINGS → UI. It sets `s.value` and the span text
+(fire portion: lines 22546–22555). Exposing it on `window` (line 22974) and calling it from
+`showPanel` (line 3819) is a legitimate, real fix — it makes each slider *start* at the
+correct value when the panel is opened from the start menu.
+
+But it does **nothing** about the **write** path (UI → SETTINGS), which is the `input`/`change`
+listener. The user's symptom is entirely on the write path. So Fix 1 makes the slider show
+the right starting number and then sit there inert.
+
+> The CCR's Bug 1 section asserted: *"The problem is not broken input listeners."* **That
+> conclusion was wrong.** The problem is *precisely* that the input listeners are never
+> attached on this code path. The same section flagged its own risk honestly
+> (*"This claim has not been verified by actual browser interaction… If that still fails,
+> there is a third bug not captured in this CCR."*) — and that unverified caveat is exactly
+> what shipped broken.
+
+### Fix 2 — bump `SETTINGS_VERSION` 4→5 + init literal `48→128` — *a correct fix for a different bug*
+
+This addresses the **stale `fireMaxActive` cap** (a user with `fireMaxActive: 8` in
+localStorage silently capping fires). That is a real, separate issue, and the fix is sound:
+`SETTINGS_VERSION = 5` (line 3939) and the init fallback literal is now `128` (line 6036),
+matching `DEFAULTS.fireMaxActive = 128` (line 6296). The caps it feeds are real
+(`m.size >= SETTINGS.fireMaxActive` at 40388; `this.cells.size < SETTINGS.fireMaxActive` at
+40610; `MAX_FIRES_PER_CHUNK = SETTINGS.fireMaxActive` at 41843).
+
+**But it has nothing to do with "the slider doesn't move the number."** Two unrelated fire
+problems were investigated in one CCR and the cap fix was allowed to stand in for a UI fix it
+never touched. Keep Fix 2 — just don't count it toward the reported symptom.
+
+### Fix 3 — static span `128` — *cosmetic, fine, irrelevant to the symptom.* No issue.
+
+### Fix 4 — `touch-action: none` on `.settings-panel input[type="range"]` — *incorrect diagnosis; a no-op for the actual bug*
+
+This is the one to retract. The root-cause analysis is not physically correct:
+
+1. **`touch-action` does not affect mouse input — at all.** Per the CSS / Pointer Events
+   spec, `touch-action` governs whether the browser may consume **touch and pen** gestures
+   for scrolling/zoom. A desktop user dragging a slider with a **mouse** is completely
+   unaffected by any `touch-action` value on the element or its ancestors. The reported bug
+   is on desktop with a mouse, so this CSS rule cannot change the behavior.
+2. **The "Chromium resets its pointer compositor state on pointer-lock release, restoring UA
+   `touch-action` precedence" mechanism does not exist.** There is no such documented
+   behavior, and even if there were, it would be irrelevant to mouse input (see #1).
+3. **The premise that `input[type=range]` has a UA-stylesheet default of
+   `touch-action: none` that an ancestor `pan-y` "elevates and cancels"** is not a correct
+   description of the cascade. `touch-action` is not inherited; ancestor scroll-container
+   `touch-action` and element `touch-action` combine only at touch hit-test time, and again
+   only for touch/pen.
+4. **It directly contradicts Fix 1's section**, which claimed the drag interaction worked.
+   Both can't be right; in fact neither identified the real cause (no listener attached).
+
+**Net effect of Fix 4:** harmless CSS that does not fix the desktop bug. (It may marginally
+help genuine *touch-device* slider-vs-scroll conflicts, so it isn't worth reverting urgently —
+but it must not be recorded as the fix for this issue. The bug persisting after .19 shipped is
+the empirical proof it didn't work.)
+
+---
+
+## The correct fix (single source of truth: move the bindings to the main-menu path)
+
+The whole "CCR D1" migration already established the right pattern: **every settings listener
+belongs in `attachSettingsEventListeners()`** (lines 22992–24389), because that function — and
+only that function — is called unconditionally at `DOMContentLoaded` (line 24400), so it runs
+on the start screen before any game exists. The fire block is the one that was missed.
+
+**Fix: relocate the fire binding block (lines 29062–29100) out of `init()` and into
+`attachSettingsEventListeners()`.** Concretely:
+
+1. Cut the entire `// ===== GAMEPLAY - FIRE … =====` block (29061–29100), including the
+   `bindFireToggle`/`bindFireSlider` helpers, the 12 bind calls, and the `btn-reset-gameplay-fire`
+   handler.
+2. Paste it inside `attachSettingsEventListeners()` — e.g. right after the
+   "GAMEPLAY - INTERACTION" wiring that currently ends at line 24386, before the closing
+   `logDebug('[Settings] Event listeners attached');` at 24388.
+3. Delete the now-empty fire block from `init()` and leave a tombstone comment there matching
+   the existing CCR-D1 style, e.g.:
+   `// CCR-FIRE-002 addendum: fire setting listeners moved to attachSettingsEventListeners() so they bind on the start-menu path (init() only runs on game start).`
+
+Why this is the right shape rather than "also call something from `btn-settings-main`":
+
+- It is the **identical pattern** already applied to render distance, AO, shadows, texture
+  resolution, movement, camera, interaction, etc. (the CCR-D1 tombstones). Fire is simply
+  brought into line with the rest. No new mechanism, no new global, no new event.
+- `attachSettingsEventListeners()` runs exactly once at `DOMContentLoaded`, so there is **no
+  double-binding risk** — unlike `init()`, which would re-bind on every game start if a user
+  could re-enter it without a reload. (Today the Quit button does `location.reload()` at line
+  28308, so re-entry is via fresh page load; moving to the DOMContentLoaded path keeps it
+  single-bind regardless.)
+- The fire elements (`fire-spread-toggle`, `fire-max-active-slider`, etc.) exist in the static
+  HTML at lines 3612–3641 from first paint, so `getElementById` resolves them fine at
+  `DOMContentLoaded`. No timing dependency on a game being started.
+
+**After the move, Fix 1 still pulls its weight:** `syncSettingsToUI()` (via `showPanel`) sets
+the slider's starting value, and the now-attached `input` listener handles the drag. Read path
+and write path are both present on the start-menu path for the first time.
+
+### What this fix does *not* require
+
+- No `SETTINGS_VERSION` change (Fix 2's bump stands on its own merits for the cap issue).
+- No CSS / `touch-action` change (Fix 4 is unrelated; it can stay or go).
+- No change to `bindFireSlider`/`bindFireToggle` internals — they are correct as written.
+
+---
+
+## Secondary finding — minor fire-settings optimization (not the bug)
+
+`bindFireSlider`'s `input` listener calls `saveSettings()` on **every** `input` event
+(line 29074), and `saveSettings()` does a full `JSON.stringify(SETTINGS)` +
+`localStorage.setItem` each time (lines 22509–22511). Dragging a slider fires `input`
+continuously (dozens of events/second), so each drag serializes the entire SETTINGS object
+dozens of times. This is a systemic pattern across many sliders, not fire-specific, and it is
+not the cause of this bug — but while the fire block is being relocated it is a cheap win to
+either (a) persist on the `change` event (fires once at drag-end) instead of `input`, or
+(b) debounce `saveSettings()` (e.g. trailing 150–250 ms). Live gameplay reads
+`SETTINGS.fire*` directly each tick, so deferring the *persistence* does not delay the
+*effect* of a slider change. Out of scope for the bug fix; worth a follow-up CCR if desired.
+
+---
+
+## Corrected status table
+
+| Prior fix | Verdict | Keep? | Fixes the reported symptom? |
+|---|---|---|---|
+| Fix 1 — expose `syncSettingsToUI` | Correct, but read-path only | ✅ Keep | ❌ No (necessary, not sufficient) |
+| Fix 2 — `SETTINGS_VERSION` 4→5 + init literal 128 | Correct fix for the *stale cap*, a different bug | ✅ Keep | ❌ No |
+| Fix 3 — static span `128` | Cosmetic | ✅ Keep | ❌ No |
+| Fix 4 — `touch-action: none` | **Misdiagnosed; no-op for desktop/mouse** | ⚠️ Harmless; do not credit as the fix | ❌ No |
+| **NEW — move fire bindings into `attachSettingsEventListeners()`** | **The actual fix** | — | ✅ **Yes** |
+
+## Verification that would actually have caught this (and should gate the real fix)
+
+The automated suite verifies DOM structure and value round-trips but cannot prove a listener
+is *attached on a given code path*. Two cheap checks close that gap:
+
+1. **Path-specific listener assertion (automatable):** at `DOMContentLoaded`, before any game
+   starts, assert that a fire control has a bound handler — e.g. dispatch a synthetic
+   `new Event('input')` on `#fire-max-active-slider` after programmatically nudging
+   `.value`, then assert `SETTINGS.fireMaxActive` changed and `#fire-max-active-val` updated.
+   This fails today and passes after the move. (Native handle drag can't be synthesized
+   headlessly, but the `input` event dispatch exercises the exact listener that's missing.)
+2. **Manual, on the reported path (do this before closing):** load the page, **do not start a
+   game**, go Settings → Gameplay → Fire, drag each slider, confirm the number tracks and
+   `SETTINGS.fire*` updates in the console. Then start a game → pause → Fire and confirm the
+   same (regression). This is the step the prior CCR listed as "pending" and shipped without.
+
+---
+---
+
+# IMPLEMENTATION NOTE — 2026-06-23, build 2026-06-23.20 (the real fix, shipped)
+
+The addendum's prescribed fix was implemented exactly as described, with one verified
+scope correction the addendum itself anticipated.
+
+## What changed in `voxEx.html`
+
+1. **Relocated the fire binding block from `init()` into `attachSettingsEventListeners()`.**
+   The entire `// ===== GAMEPLAY - FIRE =====` block (the `bindFireToggle`/`bindFireSlider`
+   helpers, all 12 bind calls, and the `btn-reset-gameplay-fire` handler) was cut from inside
+   `init()` and pasted into `attachSettingsEventListeners()` just before its closing
+   `logDebug('[Settings] Event listeners attached')`. `attachSettingsEventListeners()` is
+   called unconditionally at `DOMContentLoaded`, so the fire listeners now bind on the
+   start-menu path before any game exists.
+
+2. **Scope correction (`updateUIFromSettings` → `syncSettingsToUI`).** The Reset Fire handler
+   called `updateUIFromSettings()`, which is a **function declaration scoped inside `init()`**
+   (verified: sole definition is inside the `init()` body; it is not reachable from
+   `attachSettingsEventListeners()`). Left as-is, "Reset Fire" from the main menu would throw
+   `ReferenceError: updateUIFromSettings is not defined`. It was swapped for
+   `syncSettingsToUI()` — the **module-scoped** single-source function that
+   `updateUIFromSettings()` merely delegates to (its entire body is
+   `if (typeof syncSettingsToUI === "function") { syncSettingsToUI(); return; }`). Behavior is
+   identical; the call is now in scope. This bonus makes "Reset Fire" work from the main menu
+   too (the other reset buttons remain in-game-only, unchanged).
+
+3. **Tombstone left in `init()`** at the old location, matching the CCR-D1 comment style:
+   "fire setting listeners moved to attachSettingsEventListeners() so they bind on the
+   start-menu path (init() only runs on game start)."
+
+4. **No double-binding.** `attachSettingsEventListeners()` has a one-time
+   `settingsListenersAttached` guard and exactly one call site (DOMContentLoaded). Removing the
+   block from `init()` means it never re-binds on game start.
+
+## What was NOT changed (per the addendum)
+
+- `SETTINGS_VERSION` / init-literal (Fix 2) — kept; it correctly addresses the *separate*
+  stale-cap bug.
+- `touch-action: none` on `.settings-panel input[type="range"]` (Fix 4) — left in place. It is
+  a no-op for the mouse bug but harmless and marginally helps genuine touch slider-vs-scroll
+  conflicts. **Not credited as the fix.**
+- `bindFireSlider`/`bindFireToggle` internals — unchanged; they were always correct.
+- The `saveSettings()`-on-every-`input` micro-optimization (secondary finding) — deferred to a
+  follow-up CCR as the addendum recommended; out of scope here.
+
+## Verification
+
+- **Automated regression test added** (`tools/voxex-tests.html`, bootstrap describe block):
+  dispatches a synthetic `new Event('input')` on `#fire-max-active-slider` in the pre-game
+  `?test=1` iframe (which never starts a game, so `init()` never runs) and asserts both
+  `SETTINGS.fireMaxActive` and the `#fire-max-active-val` span update. This **fails before the
+  move** (no listener attached on the DOMContentLoaded path) and **passes after**. A test-only
+  `_doc` getter was added to the `window.VoxEx` seam to give tests DOM access. **285/285 green.**
+- **Manual check still recommended** before final close: load the page, do **not** start a
+  game, Settings → Gameplay → Fire, drag each slider, confirm the number tracks; then start a
+  game → pause → Fire and confirm the same (regression). The automated `input`-dispatch test
+  exercises the exact listener that was missing, but cannot synthesize a native handle drag.
+
+## Corrected status table (final)
+
+| Fix | Verdict | Fixes the reported symptom? |
+|---|---|---|
+| Fix 1 — expose `syncSettingsToUI` | Correct; read-path only (necessary, not sufficient) | ❌ |
+| Fix 2 — `SETTINGS_VERSION` 4→5 + init literal 128 | Correct fix for the *stale cap* (different bug) | ❌ |
+| Fix 3 — static span `128` | Cosmetic | ❌ |
+| Fix 4 — `touch-action: none` | Misdiagnosed; no-op for desktop/mouse; harmless, kept | ❌ |
+| **Move fire bindings into `attachSettingsEventListeners()` (build .20)** | **The actual fix** | ✅ **Yes** |
