@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-23.28";
+            const VOXEX_BUILD = "2026-06-23.29";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "CAMERA FAR PLANE SCALES WITH RENDER DISTANCE (CCR-chunk-memory-cap-render-distance Symptom B-1, build 2026-06-23.29). Fixed: flying high made the visible terrain disc shrink (looked like chunks weren't being held/saved). Root cause: camera was constructed with a fixed far-clip plane of 800; render distance 32 is a 512-block fog disc, and from altitude H the farthest the camera sees straight down is sqrt(800²−H²), which drops below the ~480-block fog radius above ~640 blocks up and reaches 0 at ~800 (cylindrical fog adds no haze to soften the cut). Chunks were meshed and resident the whole time — purely a frustum-clip issue, not eviction or save. Fix: new computeCameraFar(renderRadius)=renderRadius·chunkSize·2+256 (≈1280 at RD 32); camera built with near 0.05 (was 0.01) and far=computeCameraFar(currentRenderRadius); an ungated block in updateChunks updates camera.far + updateProjectionMatrix whenever fogDistance (=currentRenderRadius·chunkSize) changes, tracked via lastCameraFarDistance. uCamFar needs no manual sync — the water render block already sets it from camera.far each frame. Net depth precision improves (near 5× larger, far only 1.6×). No chunk-data, meshing, worker, cache, or DOM changes.",
                 "INIT DWELL FIX + LOADING NARRATION (VOXEX-CCR-LOADUX-002, build 2026-06-23.28). Part 1 (dwell fix): initDiskStorage() awaited this.diskStorage.getStats() — an OPFS directory scan — solely to print one debug line, blocking init for a duration that grew with the number of cached files. diskStorageReady was already set before the scan, so it had no functional purpose on the load path. Changed to fire-and-forget (.then().catch()); the log still prints, just asynchronously. Part 2 (narration): renamed 'Initializing renderer...' to 'Preparing engine...' (the WebGL renderer is created later at the // 8. Renderer block, not here); added 'Opening disk cache...' label inside the OPFS if-block before chunkDataPool.initDiskStorage(); added 'Setting up rendering...' before new THREE.WebGLRenderer + EffectComposer + post-processing passes. Full sequence: Initializing engine → Preparing storage → Preparing engine → Opening disk cache → Creating effects → Building textures → Indexing blocks → Setting up rendering → Setting up controls → Starting workers → Loading/Generating/Rendering chunks.",
                 "LOADING SCREEN NARRATION (VOXEX-CCR-LOADUX-001, build 2026-06-23.27). Promotes _setGenPhase from a local const inside initGameEngine to a module-scoped async function so both initGameEngine() and init() can call it. Adds four granular sub-step labels inside init(): 'Creating effects...' (before starField/clouds/particles), 'Building textures...' (before initTextures — the heaviest step), 'Indexing blocks...' (before initDebugGrid → initBlockOptimization), 'Setting up controls...' (before PointerLockControls). Renames the pre-init() umbrella label from 'Building world & textures...' to 'Initializing renderer...' to avoid duplicate wording. Full sequence: Initializing engine → Preparing storage → Initializing renderer → Creating effects → Building textures → Indexing blocks → Setting up controls → Starting workers → Loading/Generating/Rendering chunks. UI-only change; no behavior, worker, cache, or DOM changes.",
                 "DEFERRED PREGEN CACHING (VOXEX-CCR-PERF-013 Lever 2, build 2026-06-23.23). During spawn pre-generation (Phase 1C), per-chunk saveChunkToCache (sync compression + awaited IDB write, 8.7 s total) and OPFS writeToDisk are now deferred instead of running per-chunk. A module-level _pregenActive flag suppresses saves inside generateChunkData; collected keys are flushed via a single batchSaveChunksToCache call immediately after Phase 1C ends, running fire-and-forget concurrently with Phase 2 (rendering). Normal gameplay chunk caching is unaffected. pagehide safety flush covers the early-quit edge case. Risk: none to correctness (generation is deterministic); only consequence of an early quit before flush completes is re-generation on next load.",
@@ -9783,6 +9784,19 @@
             let currentRenderRadius = SETTINGS.renderDistance;
             let fogFar = SETTINGS.renderDistance * WORLD_DIMS.chunkSize;
             let lastFogFar = -1;
+            let lastCameraFarDistance = -1; // tracks render-radius changes for the camera far-plane sync
+            /**
+             * Compute the camera far-clip distance for a given render radius.
+             * The far plane must clear the cylindrical fog disc (radius ≈ renderRadius·chunkSize)
+             * even when looking straight down from altitude. A fixed far plane clips the visible
+             * disc when flying high (the higher you go, the smaller the circle) — scaling it with
+             * render distance keeps the full fog disc visible from any reachable altitude.
+             * @param {number} renderRadius - Render distance in chunks.
+             * @returns {number} Far-clip distance in world units (blocks).
+             */
+            function computeCameraFar(renderRadius) {
+                return renderRadius * WORLD_DIMS.chunkSize * 2 + 256;
+            }
             const velocity = new THREE.Vector3();
             const direction = new THREE.Vector3();
             const cameraDirTmp = new THREE.Vector3(); // Reusable vectors to avoid per-frame allocations
@@ -27620,7 +27634,10 @@ self.onmessage = async (e) => {
                 console.log('[Particles] ParticleSystem initialized, maxCount:', particleSystem.maxCount);
 
                 // 4. Camera & Lighting
-                camera = new THREE.PerspectiveCamera(SETTINGS.normalFOV, window.innerWidth / window.innerHeight, 0.01, 800); // Fix: Small near plane to render blocks close to camera and prevent clipping
+                // near: small (0.05) so close blocks don't clip; far: scaled to render distance via
+                // computeCameraFar so the full fog disc stays visible from altitude (a fixed far plane
+                // clipped the disc when flying high — see CCR-chunk-memory-cap-render-distance, Symptom B-1).
+                camera = new THREE.PerspectiveCamera(SETTINGS.normalFOV, window.innerWidth / window.innerHeight, 0.05, computeCameraFar(currentRenderRadius));
                 camera.layers.enable(0); // World layer
                 camera.layers.enable(1); // View model layer (torch, etc.)
                 ambLight = new THREE.AmbientLight(0xffffff, SETTINGS.ambientIntensity); // Very dark for underground atmosphere
@@ -42322,6 +42339,15 @@ self.onmessage = async (e) => {
                 // Don't create 'new Fog' every frame. Update properties instead.
                 // Skip fog distance updates when underwater (underwater fog handles its own distances)
                 const fogDistance = currentRenderRadius * WORLD_DIMS.chunkSize;
+                // Keep the camera far plane scaled to render distance so the full fog disc stays
+                // visible from altitude. Ungated by isUnderwater (the fog block below is not) so the
+                // far plane always tracks render-radius changes. uCamFar is synced from camera.far
+                // each frame in the water render block, so no manual uniform update is needed here.
+                if (fogDistance !== lastCameraFarDistance && typeof camera !== 'undefined') {
+                    lastCameraFarDistance = fogDistance;
+                    camera.far = computeCameraFar(currentRenderRadius);
+                    camera.updateProjectionMatrix();
+                }
                 if (fogDistance !== lastFogFar && !isUnderwater) {
                     lastFogFar = fogDistance;
                     fogFar = fogDistance;
