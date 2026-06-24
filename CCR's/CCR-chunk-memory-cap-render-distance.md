@@ -2,7 +2,7 @@
 
 **File:** `voxEx.html` (single-file rule honored — all changes stay in this file)
 **Date:** 2026-06-23
-**Status:** Symptom B-1 (camera far plane) **implemented** in build `2026-06-23.29`. Symptom A (cache cap) and Symptom B-2 (emergency-unload hardening) remain proposal-only.
+**Status:** Symptom B-1 (camera far plane, render-distance **and altitude** aware) **implemented** in build `2026-06-23.30`. Symptom A (cache cap) and Symptom B-2 (emergency-unload hardening) remain proposal-only.
 **Scope:** Make the chunk-hold limit cover the full set of chunks a render distance puts in view, and stop in-view chunks from being evicted when the whole disc is meshed at once (looking down from altitude). Two related symptoms:
 
 - **Symptom A (settings mismatch):** at render distance 32 the view contains ~3,200 chunks but the **Max Cached Chunks** control tops out at **1,000** (default 500), so the user-facing memory cap is well below what the render distance demands.
@@ -23,7 +23,7 @@
   2. Re-scope the **Max Cached Chunks** control as an **optional manual override** (0 = Auto, tracks render distance) and raise its ceiling to ~5,000 so a manual value can actually represent a high-RD view. Re-label to "Max Cached Chunk Meshes (0 = Auto)".
   3. Clamp the effective data-keep radius to `Math.max(dataKeepDistance, currentRenderRadius + 2)` so in-view chunk data is never an eviction candidate.
 - **Recommended fix — Symptom B (primary):**
-  4. **Scale the camera far plane with render distance** so the full fog disc is visible from any reachable altitude. Set `camera.far` from `currentRenderRadius` (e.g. `far = renderRadius × chunkSize × 2 + 256`, ≈ **1,280** at RD 32) and update it whenever render distance changes — the same places that already update `scene.fog.far` (lines **23197–23200**, **42331–42334**). Keep the water shader's `uCamFar` in sync (line **31091**) and nudge `near` from 0.01 → ~0.05 to offset the depth-precision cost of the larger far plane.
+  4. **Scale the camera far plane with render distance AND altitude.** A render-distance-only far plane still clips once you climb past it, because looking straight down the distance to the ground ≈ camera altitude. Recompute `camera.far` **every frame** in `renderFrame()` as `max(renderRadius×chunkSize×2 + 256, cameraWorldY + renderRadius×chunkSize + 256)`, using the camera's **world** position (`camera.position` is local under the rig). Gate the `updateProjectionMatrix()` call on a >16-block change to avoid churn. (Doing it in `updateChunks` fails — that function early-exits during pure vertical flight.) `uCamFar` self-syncs from `camera.far` in the water render path; nudge `near` 0.01 → 0.05 to offset the larger depth range.
 - **Recommended fix — Symptom B (secondary hardening, for when scaling is on):**
   5. Make the emergency unload **view-aware**: only release chunks genuinely outside the live `currentRenderRadius` (not `0.75 × SETTINGS.renderDistance`), using the same Euclidean disc the loader uses — so it can never shrink the visible disc.
   6. Use the geometry pool's real tiered byte total (`geometryPool.getMemoryUsageMB().total`) for the GPU-geometry term instead of `count × flat-avg`, so a fully-meshed disc doesn't trip a false `CRITICAL`.
@@ -191,24 +191,33 @@ Both `_handleWarningMemory` and `_handleCriticalMemory` start with `if (!SETTING
 
 ### Proposed fix — Symptom B
 
-**4. (Primary) Scale the camera far plane with render distance — line 27623 + the render-distance update sites.**
+**4. (Primary) Scale the camera far plane with render distance AND altitude — construction + per-frame in `renderFrame()`. (Implemented build 2026-06-23.30.)**
 
 ```js
-// Helper: far must clear the cylindrical fog disc (radius ≈ RD×chunkSize) from any reachable altitude.
-// RD×chunkSize×2 + 256 gives generous headroom (≈1,280 at RD 32 — covers look-down from ~1,170 blocks up).
+// Helper (module scope): horizontal reach to the fog disc edge with headroom.
 function computeCameraFar(renderRadius) {
     return renderRadius * WORLD_DIMS.chunkSize * 2 + 256;
 }
-// At construction (line 27623): use a slightly larger near to offset the bigger depth range.
+const _camFarWorldPos = new THREE.Vector3(); // scratch
+
+// At construction (was `..., 0.01, 800`): larger near offsets the bigger depth range.
 camera = new THREE.PerspectiveCamera(SETTINGS.normalFOV, window.innerWidth / window.innerHeight, 0.05, computeCameraFar(currentRenderRadius));
-// Wherever render distance changes (the same spots that already set scene.fog.far —
-// lines 23197–23200 and 42331–42334, plus the dynamic-RD path at 42249–42266):
-camera.far = computeCameraFar(currentRenderRadius);
-camera.updateProjectionMatrix();
-if (waterMaterialRefraction?.uniforms?.uCamFar) waterMaterialRefraction.uniforms.uCamFar.value = camera.far; // keep depth linearization correct (line 31091)
+
+// Per frame, at the top of renderFrame() — far must cover vertical drop (≈ camera world-Y, since
+// looking down the ground is ~that far) PLUS horizontal reach to the disc edge. camera.position is
+// LOCAL under the rig, so read the WORLD position. Gate on >16-block change to avoid projection churn.
+if (camera) {
+    camera.getWorldPosition(_camFarWorldPos);
+    const horizReach = currentRenderRadius * WORLD_DIMS.chunkSize;
+    const desiredFar = Math.max(computeCameraFar(currentRenderRadius), _camFarWorldPos.y + horizReach + 256);
+    if (Math.abs(desiredFar - camera.far) > 16) {
+        camera.far = desiredFar;
+        camera.updateProjectionMatrix();
+    }
+}
 ```
 
-This makes the full fog disc visible from any sane altitude. Note the depth-precision trade: a larger `far` with the old `near = 0.01` worsens z-fighting, so raise `near` to ~0.05 (still well inside the 0.01 block-close margin the comment at line 27623 was protecting).
+Why per-frame in `renderFrame()` and not at the render-distance update sites: a render-distance-only far plane (build .29) still clipped when flying high, because the straight-down view distance grows with altitude. `updateChunks` (where `scene.fog.far` updates) **early-exits during pure vertical flight** (it only runs on chunk/frustum/memory change), so the far plane there never refreshes while ascending. `renderFrame()` runs every frame. `uCamFar` needs no manual sync — the water render path already sets it from `camera.far`. Depth-precision trade: larger `far` with old `near = 0.01` worsens z-fighting, so `near` is raised to 0.05.
 
 **5. (Secondary) View-aware emergency unload — `_emergencyChunkUnload`, lines 20659–20674.**
 
@@ -268,7 +277,7 @@ Most chunks are small-tier, so `count × 1.09 MB` over-counts and manufactures f
 4. **Movement sweep:** walk a long straight line at RD=32; confirm out-of-range chunks still evict (6A/6B unchanged for out-of-range) and no in-view pop-out.
 5. **Manual-cap path:** set the slider to e.g. 1,500 on a weak device; confirm the manual floor is honored as a *lower* bound and "Auto" (0) renders correctly in the label and survives a reload.
 6. **Data-keep clamp:** set `dataKeepDistance` below render distance (via saved settings) and confirm in-view chunk data is no longer evicted.
-7. **Symptom B-1 (far plane) repro/fix:** RD=32, dynamic off, Auto Memory Scaling off. Fly to ~700 blocks altitude and look straight down. *Before:* the disc is clipped to ~390-block radius and shrinks further as you climb (gone above ~800 blocks). *After (change #4):* the full ~480-block fog disc stays visible from any reachable altitude; check for new z-fighting at close range (raised `near` should prevent it).
+7. **Symptom B-1 (far plane) repro/fix:** RD=32, dynamic off, Auto Memory Scaling off. Fly straight up to several hundred — then several thousand — blocks and look straight down. *Before:* terrain "derenders" from the outer edge inward as you climb (build .29 only pushed the threshold to ~1,250 blocks; pre-fix it was ~640). *After (change #4, altitude-aware):* the full fog disc stays visible at any altitude because `camera.far` tracks `cameraWorldY + horizontal reach`. Check for new z-fighting at close range (raised `near` should prevent it) and confirm no per-frame stutter (projection matrix only updates on >16-block altitude change).
 8. **Symptom B-2 (emergency unload) repro/fix:** same spot but **Auto Memory Scaling ON**. *Before:* overlay logs `[MemoryBudget] Emergency unloaded N …` and the disc thrashes. *After (changes #5/#6):* unloads, if any, only target chunks beyond `currentRenderRadius`, and the GPU-memory line (overlay `O`) reads materially lower (tiered total vs count×avg).
 
 ---
@@ -287,9 +296,9 @@ Most chunks are small-tier, so `count × 1.09 MB` over-counts and manufactures f
 | Reset handler | line **29010** |
 | Data-keep clamp | `getEvictionCandidates`, line **8193** |
 | (Read-only) debug overlay expectedMax | near line **11704** |
-| **Camera far plane (Symptom B-1, primary)** | `camera = new THREE.PerspectiveCamera(...)`, line **27623** |
-| Render-distance update sites (set `camera.far`) | lines **23197–23200**, **42331–42334**, dynamic path **42249–42266** |
-| Water shader `uCamFar` sync | line **31091** |
+| **Camera far plane construction (Symptom B-1)** | `camera = new THREE.PerspectiveCamera(...)`, line **27623** (now `0.05`, `computeCameraFar(currentRenderRadius)`) |
+| **Per-frame altitude-aware far update** | top of `renderFrame()` (~line **44138**); helper `computeCameraFar` + `_camFarWorldPos` scratch near line **9787** |
+| Water shader `uCamFar` (self-syncs from `camera.far`) | water render path in `renderFrame()` |
 | Frustum bypass when looking down | `isChunkInFrustum`, line **42341** |
 | View-aware emergency unload (Symptom B-2) | `_emergencyChunkUnload`, lines **20659–20674** |
 | GPU-memory estimate (count×avg → tiered total) | `_getGPUMemory` / `update`, lines **20517–20531**, **20554–20561** |
