@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-23.30";
+            const VOXEX_BUILD = "2026-06-24.31";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "TORCH OCCLUSION + ROUGHNESS TILING FIX (CCR-torch-occlusion-and-roughness-tiling, build 2026-06-24.31). Two independent fixes. (T1) Removed camera line-of-sight gate from torchLightPool.updateOcclusion: the gate multiplied PointLight intensity by getPointLightVisibility (a 5-ray torch→camera cone), killing all dynamic sheen when the torch sprite went behind a block (Issue 2) and producing adjacency-vs-LOS inconsistency (Issue 1). Physical 'no light through walls' is already handled correctly by (A) the baked voxel block-light BFS and (B1) the chunk shader's bakedLightGate (~line 31814) which suppresses dynamic sheen on surfaces the BFS marks as dark. The function now only keeps pooled light intensity synced with SETTINGS.torchIntensity. getPointLightVisibility and the volumetric pass (updateVolumetricLighting) are untouched — they still legitimately gate the in-air haze by camera LOS. (R1) Fixed roughness/gloss texels stretching across greedy-merged faces: replaced the stock #include <roughnessmap_fragment> with a per-block tiled sample that mirrors the albedo <map_fragment> path — fract(localUV * vQuadSize) repeats one atlas tile per block. Uses vMapUv (same channel-0 UV as albedo), plain texture2D, half-texel inset clamp (0.0078125). uShininessStrength matte lerp preserved. Covers both chunkMaterial and glassMaterial (single applyCylindricalFog onBeforeCompile path).",
                 "CAMERA FAR PLANE SCALES WITH RENDER DISTANCE + ALTITUDE (CCR-chunk-memory-cap-render-distance Symptom B-1, build 2026-06-23.30). Fixed: flying high made the visible terrain disc shrink / chunks 'derender' (looked like chunks weren't being held). Root cause: camera was built with a FIXED far-clip plane of 800 that never tracked render distance OR altitude. Looking straight down, the distance to the ground is ≈ camera altitude, so a render-distance-only far plane still clips the disc once you climb past it. Chunks are meshed and resident the whole time — purely a frustum far-clip issue, not eviction or save (Auto Memory Scaling confirmed off). Fix (two parts): (1) computeCameraFar(renderRadius)=renderRadius·chunkSize·2+256 for the horizontal reach, used at camera construction with near 0.05 (was 0.01). (2) renderFrame() now recomputes camera.far EVERY frame as max(computeCameraFar(RD), cameraWorldY + RD·chunkSize + 256) so the far plane always covers vertical drop + horizontal reach from any altitude; uses camera.getWorldPosition (camera.position is LOCAL under the rig) into the _camFarWorldPos scratch, and only calls updateProjectionMatrix when far changes >16 blocks (no per-frame churn). The earlier updateChunks-based update (build .29) was removed: updateChunks early-exits during pure vertical flight, so it never ran while ascending. uCamFar self-syncs from camera.far in the water render path. No chunk-data, meshing, worker, cache, or DOM changes.",
                 "INIT DWELL FIX + LOADING NARRATION (VOXEX-CCR-LOADUX-002, build 2026-06-23.28). Part 1 (dwell fix): initDiskStorage() awaited this.diskStorage.getStats() — an OPFS directory scan — solely to print one debug line, blocking init for a duration that grew with the number of cached files. diskStorageReady was already set before the scan, so it had no functional purpose on the load path. Changed to fire-and-forget (.then().catch()); the log still prints, just asynchronously. Part 2 (narration): renamed 'Initializing renderer...' to 'Preparing engine...' (the WebGL renderer is created later at the // 8. Renderer block, not here); added 'Opening disk cache...' label inside the OPFS if-block before chunkDataPool.initDiskStorage(); added 'Setting up rendering...' before new THREE.WebGLRenderer + EffectComposer + post-processing passes. Full sequence: Initializing engine → Preparing storage → Preparing engine → Opening disk cache → Creating effects → Building textures → Indexing blocks → Setting up rendering → Setting up controls → Starting workers → Loading/Generating/Rendering chunks.",
                 "LOADING SCREEN NARRATION (VOXEX-CCR-LOADUX-001, build 2026-06-23.27). Promotes _setGenPhase from a local const inside initGameEngine to a module-scoped async function so both initGameEngine() and init() can call it. Adds four granular sub-step labels inside init(): 'Creating effects...' (before starField/clouds/particles), 'Building textures...' (before initTextures — the heaviest step), 'Indexing blocks...' (before initDebugGrid → initBlockOptimization), 'Setting up controls...' (before PointerLockControls). Renames the pre-init() umbrella label from 'Building world & textures...' to 'Initializing renderer...' to avoid duplicate wording. Full sequence: Initializing engine → Preparing storage → Initializing renderer → Creating effects → Building textures → Indexing blocks → Setting up controls → Starting workers → Loading/Generating/Rendering chunks. UI-only change; no behavior, worker, cache, or DOM changes.",
@@ -13691,12 +13692,6 @@
                         if (i < closest.length) {
                             const pos = closest[i].pos;
                             const light = this.lights[i];
-                            if (!light.visible || light.position.x !== pos.x ||
-                                light.position.y !== pos.y + 0.33 || light.position.z !== pos.z) {
-                                // Reassigned to a different torch — reset occlusion smoothing
-                                // so the new torch doesn't inherit the old one's dim factor.
-                                light.userData.visFactor = undefined;
-                            }
                             light.position.set(pos.x, pos.y + 0.33, pos.z);
                             light.visible = true;
                         } else {
@@ -13711,29 +13706,26 @@
                 _lastVisUpdate: 0,
 
                 /**
-                 * Dim each pooled torch PointLight by its voxel line-of-sight to the
-                 * player (5-ray cone, same sampling the volumetric pass uses). The
-                 * dynamic PointLight is only the "gloss" on top of baked voxel block
-                 * light, so an obscured torch must not splash dynamic light onto
-                 * surfaces in front of its occluder (torch-behind-a-log ground flare).
-                 * Baked block light still illuminates the torch's own area correctly.
-                 * Smoothed toward the target factor to avoid popping. Throttled to
-                 * every 150ms; ~5 rays x <=8 lights of cheap voxel lookups.
+                 * Keep each pooled torch PointLight's intensity in sync with
+                 * SETTINGS.torchIntensity. Physical occlusion ("no light through walls")
+                 * is handled by (A) the baked voxel block-light BFS and (B1) the chunk
+                 * shader's bakedLightGate (~line 31814) which suppresses dynamic sheen on
+                 * surfaces the BFS says are dark. The former camera-LOS gate (B2) was
+                 * removed — it keyed off whether the camera could see the torch sprite,
+                 * not whether a surface could receive the torch's light, causing two bugs:
+                 * (1) adjacency vs LOS inconsistency, (2) illumination killed when the
+                 * torch sprite went behind a block. See CCR-torch-occlusion-and-roughness-tiling.
+                 * Throttled to every 150ms (unchanged).
                  * @param {number} now - performance.now() timestamp.
                  * @returns {void}
                  */
                 updateOcclusion(now) {
                     if (now - this._lastVisUpdate < 150) return;
                     this._lastVisUpdate = now;
-                    if (typeof getPointLightVisibility !== 'function') return;
                     const baseIntensity = (typeof SETTINGS !== 'undefined' ? SETTINGS.torchIntensity : 2.0) * 1; // PLACED_TORCH_MULT (see applyTorchSettingsToLights)
                     for (const light of this.lights) {
                         if (!light.visible) continue;
-                        const target = getPointLightVisibility(light.position);
-                        const cur = light.userData.visFactor ?? target; // first sample: jump straight there
-                        const next = cur + (target - cur) * 0.35; // ~0.5s settle at 150ms cadence
-                        light.userData.visFactor = next;
-                        light.intensity = baseIntensity * next;
+                        light.intensity = baseIntensity;
                     }
                 },
 
@@ -31531,14 +31523,26 @@ self.onmessage = async (e) => {
                             void main() {`
                         );
 
-                        // VOXEX-CCR-MATRESP-001 Phase 1: scale per-pixel roughness toward matte.
-                        // roughnessFactor is set by the stock <roughnessmap_fragment> chunk
-                        // (= roughness * roughnessMap.g). Lerp toward 1.0 (matte) by strength so the
-                        // baked shiny texels only glint when strength > 0. No-ops safely if the
-                        // material ever drops its roughnessMap (the include string vanishes).
+                        // roughnessFactor: per-block tiled roughness sample, mirroring the albedo
+                        // <map_fragment> tiling path (~line 31752). Without tiling, greedy-merged
+                        // quads stretch one roughness atlas texel across the whole face.
+                        // vMapUv == vRoughnessMapUv (map and roughnessMap share channel-0 identity
+                        // UVs; vMapUv is always declared because both chunkMaterial and glassMaterial
+                        // carry map). Uses plain texture2D (not textureGrad) — roughness drives a
+                        // scalar so seam-mip banding is usually invisible; escalate if needed.
+                        // uShininessStrength lerp kept from original: 0 → matte, 1 → full gloss.
                         shader.fragmentShader = shader.fragmentShader.replace(
                             '#include <roughnessmap_fragment>',
-                            `#include <roughnessmap_fragment>
+                            `float roughnessFactor = roughness;
+                            #ifdef USE_ROUGHNESSMAP
+                                float _rLocalU = mod(vMapUv.x, tileWidth) / tileWidth;
+                                float _rLocalV = fract(vMapUv.y);
+                                float _rU = clamp(fract(_rLocalU * vQuadSize.x), 0.0078125, 0.9921875);
+                                float _rV = clamp(fract(_rLocalV * vQuadSize.y), 0.0078125, 0.9921875);
+                                float _rTileBase = floor(vMapUv.x / tileWidth) * tileWidth;
+                                vec2 _rTiledUv = vec2(_rTileBase + _rU * tileWidth, _rV);
+                                roughnessFactor *= texture2D(roughnessMap, _rTiledUv).g;
+                            #endif
                             roughnessFactor = mix(1.0, roughnessFactor, uShininessStrength);`
                         );
 
