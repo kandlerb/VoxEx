@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-24.31";
+            const VOXEX_BUILD = "2026-06-25.32";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "PER-TILE ATLAS MIPMAPS + TRILINEAR (CCR-LOD-MIPS-001, build 2026-06-25.32). Distant leaves went brown and grass browned at grazing angles/distance, with a hard LOD band. Root cause: the block atlas is a 33-tile horizontal STRIP with no gutters, and GPU auto-mipmapping box-filtered the whole strip — so each tile bled into its neighbours at coarse mips (LEAF[6] between LOG_SIDE[5] bark and BEDROCK[7] dark → brown; GRASS_TOP[0] into the dirt half of GRASS_SIDE[1]). Existing dilation (within-tile holes) and the textureGrad+half-texel-inset shader path (seam derivatives) didn't touch cross-tile bleed. Fix (texture-init only; shader UNCHANGED): (A) registerPixelTexture minFilter NearestMipMapNearest→NearestMipMapLinear (smooth fade between levels, crisp Nearest within a level). (B) new buildAtlasMipChain() builds the chain by hand, clamping every averaging box to the ONE source tile it maps to (a tile only ever averages with itself; every level derived from pristine level-0; full chain to 1×1) → zero cross-tile bleed at all levels. (C) atlas tex: generateMipmaps=false + tex.mipmaps=buildAtlasMipChain(cvs, NUM_TILES). (D) setGlassBodyAlpha rebuilds the chain after live atlas edits so distant glass tracks the Opacity slider. Init-time only; no per-frame cost; no worker/cache/save/DOM changes. NEEDS IN-BROWSER TEST: fly to render edge, check leaf tops/bottoms + grass stay green with a smooth fade, no black chunks, glass slider still works.",
                 "TORCH OCCLUSION + ROUGHNESS TILING FIX (CCR-torch-occlusion-and-roughness-tiling, build 2026-06-24.31). Two independent fixes. (T1) Removed camera line-of-sight gate from torchLightPool.updateOcclusion: the gate multiplied PointLight intensity by getPointLightVisibility (a 5-ray torch→camera cone), killing all dynamic sheen when the torch sprite went behind a block (Issue 2) and producing adjacency-vs-LOS inconsistency (Issue 1). Physical 'no light through walls' is already handled correctly by (A) the baked voxel block-light BFS and (B1) the chunk shader's bakedLightGate (~line 31814) which suppresses dynamic sheen on surfaces the BFS marks as dark. The function now only keeps pooled light intensity synced with SETTINGS.torchIntensity. getPointLightVisibility and the volumetric pass (updateVolumetricLighting) are untouched — they still legitimately gate the in-air haze by camera LOS. (R1) Fixed roughness/gloss texels stretching across greedy-merged faces: replaced the stock #include <roughnessmap_fragment> with a per-block tiled sample that mirrors the albedo <map_fragment> path — fract(localUV * vQuadSize) repeats one atlas tile per block. Uses vMapUv (same channel-0 UV as albedo), plain texture2D, half-texel inset clamp (0.0078125). uShininessStrength matte lerp preserved. Covers both chunkMaterial and glassMaterial (single applyCylindricalFog onBeforeCompile path).",
                 "CAMERA FAR PLANE SCALES WITH RENDER DISTANCE + ALTITUDE (CCR-chunk-memory-cap-render-distance Symptom B-1, build 2026-06-23.30). Fixed: flying high made the visible terrain disc shrink / chunks 'derender' (looked like chunks weren't being held). Root cause: camera was built with a FIXED far-clip plane of 800 that never tracked render distance OR altitude. Looking straight down, the distance to the ground is ≈ camera altitude, so a render-distance-only far plane still clips the disc once you climb past it. Chunks are meshed and resident the whole time — purely a frustum far-clip issue, not eviction or save (Auto Memory Scaling confirmed off). Fix (two parts): (1) computeCameraFar(renderRadius)=renderRadius·chunkSize·2+256 for the horizontal reach, used at camera construction with near 0.05 (was 0.01). (2) renderFrame() now recomputes camera.far EVERY frame as max(computeCameraFar(RD), cameraWorldY + RD·chunkSize + 256) so the far plane always covers vertical drop + horizontal reach from any altitude; uses camera.getWorldPosition (camera.position is LOCAL under the rig) into the _camFarWorldPos scratch, and only calls updateProjectionMatrix when far changes >16 blocks (no per-frame churn). The earlier updateChunks-based update (build .29) was removed: updateChunks early-exits during pure vertical flight, so it never ran while ascending. uCamFar self-syncs from camera.far in the water render path. No chunk-data, meshing, worker, cache, or DOM changes.",
                 "INIT DWELL FIX + LOADING NARRATION (VOXEX-CCR-LOADUX-002, build 2026-06-23.28). Part 1 (dwell fix): initDiskStorage() awaited this.diskStorage.getStats() — an OPFS directory scan — solely to print one debug line, blocking init for a duration that grew with the number of cached files. diskStorageReady was already set before the scan, so it had no functional purpose on the load path. Changed to fire-and-forget (.then().catch()); the log still prints, just asynchronously. Part 2 (narration): renamed 'Initializing renderer...' to 'Preparing engine...' (the WebGL renderer is created later at the // 8. Renderer block, not here); added 'Opening disk cache...' label inside the OPFS if-block before chunkDataPool.initDiskStorage(); added 'Setting up rendering...' before new THREE.WebGLRenderer + EffectComposer + post-processing passes. Full sequence: Initializing engine → Preparing storage → Preparing engine → Opening disk cache → Creating effects → Building textures → Indexing blocks → Setting up rendering → Setting up controls → Starting workers → Loading/Generating/Rendering chunks.",
@@ -9870,7 +9871,7 @@
             let MAX_TEXTURE_ANISOTROPY = 1;
             function registerPixelTexture(tex) {
                 tex.magFilter = THREE.NearestFilter;
-                tex.minFilter = THREE.NearestMipMapNearestFilter;
+                tex.minFilter = THREE.NearestMipMapLinearFilter; // CCR-LOD-MIPS-001: linear BETWEEN mip levels = smooth LOD fade (no hard band); nearest WITHIN a level keeps texels crisp up close
                 tex.generateMipmaps = true;
                 tex.needsUpdate = true;
                 tex.anisotropy = Math.max(1, MAX_TEXTURE_ANISOTROPY);
@@ -9886,6 +9887,68 @@
                 // Ensure chunk and water materials pick up new texture settings
                 queueMaterialUpdate("chunk");
                 queueMaterialUpdate("water");
+            }
+            // ===== CCR-LOD-MIPS-001: per-tile mip chain for the chunk atlas =====
+            // The block atlas is a single horizontal STRIP (numTiles tiles side-by-side,
+            // no gutters). GPU auto-mipmapping box-filters the whole strip, so each tile
+            // bleeds into its neighbours at distance (leaf[6] sits between bark[5] and
+            // bedrock[7] -> distant leaves go brown; grass blends with the dirt half of
+            // grass-side). Fix: build the mip chain OURSELVES, clamping every averaging
+            // box to the source tile it belongs to, so a tile can only ever average with
+            // itself. Each level is derived from the PRISTINE level-0 (not the previous
+            // level) so error never accumulates. Returns <canvas> levels for tex.mipmaps
+            // (caller must set generateMipmaps = false). Resolution-agnostic: tile width
+            // is derived from the canvas, so it tracks the Texture Resolution setting.
+            /**
+             * Build a per-tile (bleed-free) mipmap chain for a horizontal strip atlas.
+             * @param {HTMLCanvasElement} srcCanvas - Full-res atlas canvas (level 0).
+             * @param {number} numTiles - Number of equal-width tiles in the strip.
+             * @returns {HTMLCanvasElement[]} Mip levels 0..N (down to 1x1), each a canvas.
+             */
+            function buildAtlasMipChain(srcCanvas, numTiles) {
+                const w0 = srcCanvas.width, h0 = srcCanvas.height;
+                const tileW0 = w0 / numTiles;            // level-0 tile width (px)
+                const src = srcCanvas.getContext("2d").getImageData(0, 0, w0, h0).data;
+                const levels = [];
+                let L = 0;
+                for (;;) {
+                    const lw = Math.max(1, w0 >> L), lh = Math.max(1, h0 >> L);
+                    const c = document.createElement("canvas");
+                    c.width = lw; c.height = lh;
+                    const lctx = c.getContext("2d");
+                    if (L === 0) {
+                        lctx.drawImage(srcCanvas, 0, 0); // level 0 = exact copy
+                    } else {
+                        const out = lctx.createImageData(lw, lh);
+                        const od = out.data;
+                        const scale = 1 << L;            // source px per output px
+                        for (let oy = 0; oy < lh; oy++) {
+                            const sy0 = oy * scale, sy1 = Math.min(h0, sy0 + scale);
+                            for (let ox = 0; ox < lw; ox++) {
+                                const sx0 = ox * scale;
+                                const tile = (sx0 / tileW0) | 0;            // tile this texel maps to
+                                const tx0 = tile * tileW0, tx1 = tx0 + tileW0;
+                                const bx0 = Math.max(sx0, tx0);             // clamp box to ONE tile
+                                const bx1 = Math.min(sx0 + scale, tx1, w0);
+                                let r = 0, g = 0, b = 0, a = 0, n = 0;
+                                for (let sy = sy0; sy < sy1; sy++) {
+                                    let si = (sy * w0 + bx0) * 4;
+                                    for (let sx = bx0; sx < bx1; sx++) {
+                                        r += src[si]; g += src[si + 1]; b += src[si + 2]; a += src[si + 3];
+                                        si += 4; n++;
+                                    }
+                                }
+                                const oi = (oy * lw + ox) * 4;
+                                od[oi] = r / n; od[oi + 1] = g / n; od[oi + 2] = b / n; od[oi + 3] = a / n;
+                            }
+                        }
+                        lctx.putImageData(out, 0, 0);
+                    }
+                    levels.push(c);
+                    if (lw === 1 && lh === 1) break;     // full chain to 1x1 (WebGL requires completeness)
+                    L++;
+                }
+                return levels;
             }
             // --- OPTIMIZATION: Pre-computed AO power curve lookup table ---
             // Math.pow((3 - occlusionCount) / 3, 0.6) for occlusion counts 0-3
@@ -13832,6 +13895,8 @@
                 const d = _glassAtlas.imageData.data;
                 for (let k = 0; k < _glassBodyTexels.length; k++) d[_glassBodyTexels[k] + 3] = a;
                 _glassAtlas.ctx.putImageData(_glassAtlas.imageData, 0, 0);
+                // CCR-LOD-MIPS-001: the live atlas edit invalidates the hand-built mip chain — rebuild it so distant glass tracks the slider
+                if (_glassAtlas.tex.mipmaps && _glassAtlas.tex.mipmaps.length) _glassAtlas.tex.mipmaps = buildAtlasMipChain(_glassAtlas.ctx.canvas, NUM_TILES);
                 _glassAtlas.tex.needsUpdate = true; // re-uploads the atlas (small; debounce if it ever hitches on drag)
             }
             const mobs = [];
@@ -30896,6 +30961,15 @@ self.onmessage = async (e) => {
 
                 const tex = new THREE.CanvasTexture(cvs);
                 registerPixelTexture(tex);
+                // CCR-LOD-MIPS-001: replace the GPU's strip-wide auto-mips (which bleed
+                // neighbouring tiles together -> brown leaves/grass at distance) with a
+                // hand-built per-tile chain. minFilter stays a *MipMapLinear* (set in
+                // registerPixelTexture) so the distance fade is smooth; magFilter stays
+                // Nearest (crisp texels up close); anisotropy from registerPixelTexture
+                // is preserved. Must set generateMipmaps=false so the manual chain sticks.
+                tex.generateMipmaps = false;
+                tex.mipmaps = buildAtlasMipChain(cvs, NUM_TILES);
+                tex.needsUpdate = true;
                 // CCR 2a.1: capture atlas refs so setGlassBodyAlpha() can re-bake the glass body opacity live.
                 _glassAtlas = { ctx, tex, imageData: atlasImageData };
 
