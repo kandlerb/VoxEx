@@ -3933,7 +3933,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-25.32";
+            const VOXEX_BUILD = "2026-06-25.33";
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3942,6 +3942,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "ATLAS MIPMAPPING FINISHED — ROUGHNESS MIPS + OPAQUE-ONLY COLOUR (CCR-LOD-MIPS-002, build 2026-06-25.33). Follow-up to CCR-LOD-MIPS-001. (1) Roughness map (same 33-tile strip) now gets the same per-tile mip chain via buildAtlasMipChain(roughnessCanvas, NUM_TILES) + generateMipmaps=false, so gloss/roughness no longer bleeds across tiles at distance (e.g. glass base:20 into matte neighbours). Build-once; no live re-bake so no rebuild hook. (2) buildAtlasMipChain now averages COLOUR from opaque texels only (skip alpha==0) so cutout-tile mips (leaves, fire) carry the real leaf/flame colour instead of the hidden under-hole colour; ALPHA still averages all texels so distant canopies fill in solid + stable (no shimmer). Fully-opaque tiles and the roughness map are byte-identical to before (no===n). All-transparent boxes fall back to the tile's precomputed mean opaque colour (deterministic; matters faintly under trilinear). The CCR-001 dilateTileHiddenColor pass is now redundant but left in place (harmless). Init-time only; shader/worker/cache/save/DOM unchanged. NEEDS IN-BROWSER TEST: distant leaves stay true-green & solid (not washed/olive), gloss on stone/glass/snow looks right at distance, no black chunks.",
                 "PER-TILE ATLAS MIPMAPS + TRILINEAR (CCR-LOD-MIPS-001, build 2026-06-25.32). Distant leaves went brown and grass browned at grazing angles/distance, with a hard LOD band. Root cause: the block atlas is a 33-tile horizontal STRIP with no gutters, and GPU auto-mipmapping box-filtered the whole strip — so each tile bled into its neighbours at coarse mips (LEAF[6] between LOG_SIDE[5] bark and BEDROCK[7] dark → brown; GRASS_TOP[0] into the dirt half of GRASS_SIDE[1]). Existing dilation (within-tile holes) and the textureGrad+half-texel-inset shader path (seam derivatives) didn't touch cross-tile bleed. Fix (texture-init only; shader UNCHANGED): (A) registerPixelTexture minFilter NearestMipMapNearest→NearestMipMapLinear (smooth fade between levels, crisp Nearest within a level). (B) new buildAtlasMipChain() builds the chain by hand, clamping every averaging box to the ONE source tile it maps to (a tile only ever averages with itself; every level derived from pristine level-0; full chain to 1×1) → zero cross-tile bleed at all levels. (C) atlas tex: generateMipmaps=false + tex.mipmaps=buildAtlasMipChain(cvs, NUM_TILES). (D) setGlassBodyAlpha rebuilds the chain after live atlas edits so distant glass tracks the Opacity slider. Init-time only; no per-frame cost; no worker/cache/save/DOM changes. NEEDS IN-BROWSER TEST: fly to render edge, check leaf tops/bottoms + grass stay green with a smooth fade, no black chunks, glass slider still works.",
                 "TORCH OCCLUSION + ROUGHNESS TILING FIX (CCR-torch-occlusion-and-roughness-tiling, build 2026-06-24.31). Two independent fixes. (T1) Removed camera line-of-sight gate from torchLightPool.updateOcclusion: the gate multiplied PointLight intensity by getPointLightVisibility (a 5-ray torch→camera cone), killing all dynamic sheen when the torch sprite went behind a block (Issue 2) and producing adjacency-vs-LOS inconsistency (Issue 1). Physical 'no light through walls' is already handled correctly by (A) the baked voxel block-light BFS and (B1) the chunk shader's bakedLightGate (~line 31814) which suppresses dynamic sheen on surfaces the BFS marks as dark. The function now only keeps pooled light intensity synced with SETTINGS.torchIntensity. getPointLightVisibility and the volumetric pass (updateVolumetricLighting) are untouched — they still legitimately gate the in-air haze by camera LOS. (R1) Fixed roughness/gloss texels stretching across greedy-merged faces: replaced the stock #include <roughnessmap_fragment> with a per-block tiled sample that mirrors the albedo <map_fragment> path — fract(localUV * vQuadSize) repeats one atlas tile per block. Uses vMapUv (same channel-0 UV as albedo), plain texture2D, half-texel inset clamp (0.0078125). uShininessStrength matte lerp preserved. Covers both chunkMaterial and glassMaterial (single applyCylindricalFog onBeforeCompile path).",
                 "CAMERA FAR PLANE SCALES WITH RENDER DISTANCE + ALTITUDE (CCR-chunk-memory-cap-render-distance Symptom B-1, build 2026-06-23.30). Fixed: flying high made the visible terrain disc shrink / chunks 'derender' (looked like chunks weren't being held). Root cause: camera was built with a FIXED far-clip plane of 800 that never tracked render distance OR altitude. Looking straight down, the distance to the ground is ≈ camera altitude, so a render-distance-only far plane still clips the disc once you climb past it. Chunks are meshed and resident the whole time — purely a frustum far-clip issue, not eviction or save (Auto Memory Scaling confirmed off). Fix (two parts): (1) computeCameraFar(renderRadius)=renderRadius·chunkSize·2+256 for the horizontal reach, used at camera construction with near 0.05 (was 0.01). (2) renderFrame() now recomputes camera.far EVERY frame as max(computeCameraFar(RD), cameraWorldY + RD·chunkSize + 256) so the far plane always covers vertical drop + horizontal reach from any altitude; uses camera.getWorldPosition (camera.position is LOCAL under the rig) into the _camFarWorldPos scratch, and only calls updateProjectionMatrix when far changes >16 blocks (no per-frame churn). The earlier updateChunks-based update (build .29) was removed: updateChunks early-exits during pure vertical flight, so it never ran while ascending. uCamFar self-syncs from camera.far in the water render path. No chunk-data, meshing, worker, cache, or DOM changes.",
@@ -9910,6 +9911,25 @@
                 const tileW0 = w0 / numTiles;            // level-0 tile width (px)
                 const src = srcCanvas.getContext("2d").getImageData(0, 0, w0, h0).data;
                 const levels = [];
+                // CCR-LOD-MIPS-002: per-tile mean OPAQUE colour (RGB). Used as the colour for any
+                // downsample box that contains only transparent texels, so a cutout tile's mip
+                // colour is always a real leaf/flame colour — never the hidden under-hole colour.
+                // Fully-opaque tiles get their plain mean (and never hit the fallback). One pass.
+                const tileMeanR = new Float64Array(numTiles);
+                const tileMeanG = new Float64Array(numTiles);
+                const tileMeanB = new Float64Array(numTiles);
+                for (let t = 0; t < numTiles; t++) {
+                    const tStart = t * tileW0;
+                    let mr = 0, mg = 0, mb = 0, cnt = 0;
+                    for (let yy = 0; yy < h0; yy++) {
+                        let si = (yy * w0 + tStart) * 4;
+                        for (let xx = 0; xx < tileW0; xx++) {
+                            if (src[si + 3] > 0) { mr += src[si]; mg += src[si + 1]; mb += src[si + 2]; cnt++; }
+                            si += 4;
+                        }
+                    }
+                    if (cnt > 0) { tileMeanR[t] = mr / cnt; tileMeanG[t] = mg / cnt; tileMeanB[t] = mb / cnt; }
+                }
                 let L = 0;
                 for (;;) {
                     const lw = Math.max(1, w0 >> L), lh = Math.max(1, h0 >> L);
@@ -9930,16 +9950,23 @@
                                 const tx0 = tile * tileW0, tx1 = tx0 + tileW0;
                                 const bx0 = Math.max(sx0, tx0);             // clamp box to ONE tile
                                 const bx1 = Math.min(sx0 + scale, tx1, w0);
-                                let r = 0, g = 0, b = 0, a = 0, n = 0;
+                                // CCR-LOD-MIPS-002: average COLOUR from opaque texels only (skip alpha==0)
+                                // so a cutout tile's mip colour is the real leaf/flame colour, not the
+                                // hidden under-hole colour. Alpha still averages ALL texels (fills toward
+                                // solid at distance). Fully-opaque tiles are unaffected (no === n).
+                                let r = 0, g = 0, b = 0, a = 0, n = 0, no = 0;
                                 for (let sy = sy0; sy < sy1; sy++) {
                                     let si = (sy * w0 + bx0) * 4;
                                     for (let sx = bx0; sx < bx1; sx++) {
-                                        r += src[si]; g += src[si + 1]; b += src[si + 2]; a += src[si + 3];
-                                        si += 4; n++;
+                                        const sa = src[si + 3];
+                                        if (sa > 0) { r += src[si]; g += src[si + 1]; b += src[si + 2]; no++; }
+                                        a += sa; n++; si += 4;
                                     }
                                 }
                                 const oi = (oy * lw + ox) * 4;
-                                od[oi] = r / n; od[oi + 1] = g / n; od[oi + 2] = b / n; od[oi + 3] = a / n;
+                                if (no > 0) { od[oi] = r / no; od[oi + 1] = g / no; od[oi + 2] = b / no; }
+                                else { od[oi] = tileMeanR[tile]; od[oi + 1] = tileMeanG[tile]; od[oi + 2] = tileMeanB[tile]; }
+                                od[oi + 3] = a / n;
                             }
                         }
                         lctx.putImageData(out, 0, 0);
@@ -31033,6 +31060,12 @@ self.onmessage = async (e) => {
                 const roughnessMap = new THREE.CanvasTexture(roughnessCanvas);
                 registerPixelTexture(roughnessMap);
                 console.log(`[Textures] Created per-texture roughness map: ${roughnessCanvas.width}x${roughnessCanvas.height}`);
+                // CCR-LOD-MIPS-002: same per-tile bleed-free mip chain for the roughness strip
+                // (gloss bled across tiles at distance, exactly like the albedo did). Build-once;
+                // the roughness map is never re-baked live, so no rebuild hook (cf. Edit D) is needed.
+                roughnessMap.generateMipmaps = false;
+                roughnessMap.mipmaps = buildAtlasMipChain(roughnessCanvas, NUM_TILES);
+                roughnessMap.needsUpdate = true;
 
                 chunkMaterial = new THREE.MeshStandardMaterial({
                     map: tex,
