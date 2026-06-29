@@ -3961,7 +3961,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-29.47"; // CCR REFACTOR-001 #524: deduplicate water vertex-color math into computeWaterFaceColor
+            const VOXEX_BUILD = "2026-06-29.48"; // VRAM-003 #573: glass geometry routed through GeometryBufferPool at all 4 dispose sites
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3970,6 +3970,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "GLASS GEOMETRY POOLING (VRAM-003 #573, build 2026-06-29.48). Glass mesh now acquires geometry from GeometryBufferPool (geometryPool.acquireTerrain) instead of allocating a fresh THREE.BufferGeometry per remesh. Four release sites converted from geometry.dispose() to geometryPool.releaseTerrain(): (1) remesh-reuse path in renderChunk (old gMesh.geometry.dispose), (2) stale-drop when gFaceCount drops to 0 (else-if oldGlassMesh inside gFaceCount>0), (3) stale-drop when chunk loses glass entirely (outer else-if oldGlassMesh), (4) releaseMeshForKey _GLASS branch. Color packed via packColorRGBA8(gColAttr.array, gCols, gCIdx/3) into the pool's Uint8-RGBA lane (raw .set of Float32 [0,1] into Uint8 would truncate to 0 = black). gGeo.setDrawRange(0, gIIdx) added (acquireTerrain resets drawRange to Infinity). Scratch-array pools (posPool/uvPool/colPool/indexPool/quadSizePool) unchanged. Glass material, mesh flags (DoubleSide, alphaTest 0.5, depthWrite false, renderOrder 1, glassDepthMaterial, castShadow) untouched.",
                 "PARTICLE OUT-OF-RANGE SKIP (VOXEX-CCR-FX-003 #570, build 2026-06-29.45). Particles outside the 64-unit updateDistance were despawned instantly, causing visible pop-out at the radius boundary. Changed the distance-check branch in ParticleSystem.update from this.despawn(i); continue to bare continue — particles skip physics integration when far but remain alive and resume on return. Lifetime decrement (above the branch) still runs every frame, so particles age out naturally. maxParticles cap in spawn() unchanged. No buffer, worker, cache, save format, or DOM changes. Behavioral: particles fade out instead of snapping off.",
                 "PREGEN PHASE-1C PROGRESS FIX (VOXEX-CCR-PREGEN-001 #554/#550, build 2026-06-29.43). Fixed Phase-1C progress formula that double-counted cached chunks: prior formula was (totalProcessed/length)*50 + 50*(processedCached/length), adding processedCached twice. Simplified to (totalProcessed/length)*50 so each chunk counts once across the 0-50% band. Also removed redundant _pregenActive = false at Lever-2 (already cleared at Phase-1C start; nothing re-sets it true between those two sites). No behavior change on the happy path; progress bar now advances monotonically without jumps.",
                 "TREE TOGGLE DENSITY ROUND-TRIP (VOXEX-CCR-WORLDUI-001 #521, build 2026-06-29.42). World creation UI toggle-trees handler was destructively zeroing customWorldSettings.treeDensityMultiplier on uncheck, preventing the slider value from surviving an off→on toggle. The numeric multiplier is already gated by enableTrees in applyTerrainSettings() (treeMult = enableTrees ? multiplier : 0), making the boolean the sole control. Removed the destructive zeroing; now toggling trees off→on preserves the density slider value. Unchecking and starting a world still produces zero trees (gate holds). No change to terrain, preview, worker, or save format.",
@@ -41343,11 +41344,12 @@ self.onmessage = async (e) => {
             //   - No allocations - only deletions and counter updates
             //   - No-op: Already optimal
             function releaseMeshForKey(key) {
-                // GLASS (CCR-MATRESP-001 Phase 2a): not pooled — a plain BufferGeometry mesh. Dispose
-                // directly and bail before the terrain/water pool path (which would corrupt the pools).
+                // GLASS (#573 VRAM-003): pooled terrain geometry — return via geometryPool.releaseTerrain,
+                // NOT geometry.dispose() (which would destroy a buffer the pool still owns). Bail before
+                // the terrain/water pool path (the branching there is for banded meshes, not needed for glass).
                 if (key.includes("_GLASS")) {
                     const gm = chunkMeshes.get(key);
-                    if (gm) { if (gm.parent) gm.parent.remove(gm); else scene.remove(gm); if (gm.geometry) gm.geometry.dispose(); chunkMeshes.delete(key); }
+                    if (gm) { if (gm.parent) gm.parent.remove(gm); else scene.remove(gm); if (gm.geometry) geometryPool.releaseTerrain(gm.geometry); chunkMeshes.delete(key); } // #573: return pooled geo
                     return;
                 }
                 const isWater = key.includes("_WATER");
@@ -42411,16 +42413,31 @@ self.onmessage = async (e) => {
                                 }
                             }
                             if (gFaceCount > 0) {
-                                const gGeo = new THREE.BufferGeometry();
-                                gGeo.setAttribute('position', new THREE.BufferAttribute(gPos.slice(0, gVIdx), 3));
-                                gGeo.setAttribute('uv', new THREE.BufferAttribute(gUvs.slice(0, gUvIdx), 2));
-                                gGeo.setAttribute('color', new THREE.BufferAttribute(gCols.slice(0, gCIdx), 3));
-                                gGeo.setAttribute('quadSize', new THREE.BufferAttribute(gQuad.slice(0, gQsIdx), 2));
-                                gGeo.setIndex(new THREE.BufferAttribute(gIndices.slice(0, gIIdx), 1));
+                                // #573: build into a POOLED terrain geometry (reuse buffers) instead of a
+                                // fresh BufferGeometry. Pool schema: color Uint8 RGBA (pack via packColorRGBA8),
+                                // quadSize Uint16, index Uint32 — fill in place + set update/draw ranges, exactly
+                                // like the terrain mesher. Material/flags below are untouched.
+                                const gGeo = geometryPool.acquireTerrain(gFaceCount);
+                                const gPosAttr = gGeo.attributes.position;
+                                const gUvAttr = gGeo.attributes.uv;
+                                const gColAttr = gGeo.attributes.color;
+                                const gQsAttr = gGeo.attributes.quadSize;
+                                const gIdxAttr = gGeo.index;
+                                gPosAttr.array.set(gPos.subarray(0, gVIdx));
+                                gUvAttr.array.set(gUvs.subarray(0, gUvIdx));
+                                packColorRGBA8(gColAttr.array, gCols, gCIdx / 3); // Float32 RGB scratch -> Uint8 RGBA
+                                gQsAttr.array.set(gQuad.subarray(0, gQsIdx));
+                                gIdxAttr.array.set(gIndices.subarray(0, gIIdx));
+                                gPosAttr.clearUpdateRanges(); gPosAttr.addUpdateRange(0, gVIdx); gPosAttr.needsUpdate = true;
+                                gUvAttr.clearUpdateRanges(); gUvAttr.addUpdateRange(0, gUvIdx); gUvAttr.needsUpdate = true;
+                                gColAttr.clearUpdateRanges(); gColAttr.addUpdateRange(0, (gCIdx / 3) * 4); gColAttr.needsUpdate = true;
+                                gQsAttr.clearUpdateRanges(); gQsAttr.addUpdateRange(0, gQsIdx); gQsAttr.needsUpdate = true;
+                                gIdxAttr.clearUpdateRanges(); gIdxAttr.addUpdateRange(0, gIIdx); gIdxAttr.needsUpdate = true;
+                                gGeo.setDrawRange(0, gIIdx);
                                 gGeo.computeBoundingSphere();
                                 let gMesh = oldGlassMesh;
                                 if (gMesh) {
-                                    if (gMesh.geometry) gMesh.geometry.dispose();
+                                    if (gMesh.geometry) geometryPool.releaseTerrain(gMesh.geometry); // #573: pool, don't dispose
                                     gMesh.geometry = gGeo;
                                 } else {
                                     gMesh = new THREE.Mesh(gGeo, glassMaterial);
@@ -42446,14 +42463,14 @@ self.onmessage = async (e) => {
                                 chunkMeshes.set(glassKey, gMesh);
                             } else if (oldGlassMesh) {
                                 if (oldGlassMesh.parent) oldGlassMesh.parent.remove(oldGlassMesh); else scene.remove(oldGlassMesh);
-                                if (oldGlassMesh.geometry) oldGlassMesh.geometry.dispose();
+                                if (oldGlassMesh.geometry) geometryPool.releaseTerrain(oldGlassMesh.geometry); // #573: pooled glass dropped (gFaceCount became 0)
                                 chunkMeshes.delete(glassKey);
                             }
                             posPool.release(gPos); uvPool.release(gUvs); colPool.release(gCols); indexPool.release(gIndices); quadSizePool.release(gQuad);
                         } else if (oldGlassMesh) {
                             // chunk no longer contains glass — drop the stale glass mesh
                             if (oldGlassMesh.parent) oldGlassMesh.parent.remove(oldGlassMesh); else scene.remove(oldGlassMesh);
-                            if (oldGlassMesh.geometry) oldGlassMesh.geometry.dispose();
+                            if (oldGlassMesh.geometry) geometryPool.releaseTerrain(oldGlassMesh.geometry); // #573: pooled glass dropped (chunk lost glass)
                             chunkMeshes.delete(glassKey);
                         }
                     }
