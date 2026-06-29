@@ -17,6 +17,18 @@
 
 ---
 
+## Audit outcome (2026-06-29, against build `2026-06-29.43`)
+
+Re-verified every anchor and factual claim against the live `voxEx.html` / `index.html`:
+
+- **All target elements exist** — every ID/class cited (menus, sub-panels, inputs, buttons, modals) is present in the current build. No fabricated anchors.
+- **Line numbers re-synced.** `voxEx.html` drifted ~35 lines *shorter* during authoring, so all `voxEx.html` numbers were corrected (e.g. `#seed-menu` 1929→1894, `#create-world-panel` 2009→1974, `#main-pause-menu` 2428→2393, `#inventory-overlay` 3812→3777). `index.html` numbers were already exact. Treat all numbers as approximate — **grep the anchor**, as the format requires.
+- **Corrected one stale premise:** the `#blocker` / menu `backdrop-filter: blur` was **already removed** by `CCR-menu-overlay-lag.md` (shipped 2026-06-22 — see the `/* backdrop-filter … removed */` comments ~250/~280). UI-004's cross-ref and the perf safety-check were updated accordingly. The only overlay still carrying a blur is `#inventory-overlay` (~1391), now noted under UI-007.
+- **Confirmed collision-free:** `ui-twocol` / `ui-col` / `ui-collapse` / `ui-chev` → 0 existing hits (UI-000 may claim these names).
+- **Confirmed live hooks:** `function toggleSettingsGroup` (~3814), `recomputeTouchMode` (~45144) + `body.touch-mode`, and `const SETTINGS_PROFILES` (~6564) all exist as referenced.
+
+---
+
 ## Design principles (the three notes that drive this CCR)
 
 1. **Landscape, not portrait, on mobile.** Mobile menus must be compact *multi-column* layouts, NOT portrait single-column stacks. Target viewport ≈ 880×404. Reuse the existing `body.touch-mode` hook for the compact variant; do not add a portrait breakpoint.
@@ -52,7 +64,7 @@
 
 ## UI-000 — Shared pattern library (do this FIRST; everything else depends on it)
 
-**Location:** `voxEx.html` `<style>` block (grep anchor: `.category-btn {` ~1630 for a nearby insertion point) and one new delegated click handler near the existing `function toggleSettingsGroup` (grep: `function toggleSettingsGroup`).
+**Location:** `voxEx.html` `<style>` block (grep anchor: `.category-btn {` ~1630 for a nearby insertion point) and one new delegated click handler near the existing `function toggleSettingsGroup` (grep: `function toggleSettingsGroup` ~3814).
 **Why:** Notes 2 and 3 require a single reusable collapsible-in-independent-columns idiom. Defining it once keeps every screen consistent and lets the per-screen items below be pure markup re-wraps.
 **Change:** Add these utility classes (verbatim from `ui-mockups.html`) once, then use them everywhere a collapsible stack appears:
 
@@ -111,7 +123,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-002 — World Select / main menu
 
-**Location:** `voxEx.html` `#seed-menu` (~1929), `#btn-create-world` (~1933), `#saved-worlds-container` (~1937), `#storage-overview` (~1940), `#btn-load-start` (~1946), `#btn-settings-main` (~1949).
+**Location:** `voxEx.html` `#seed-menu` (~1894), `#btn-create-world` (~1898), `#saved-worlds-container` (~1902), `#storage-overview` (~1905), `#btn-load-start` (~1911), `#btn-settings-main` (~1914).
 **Why:** Saved worlds are a single narrow capped-height list; lots of dead horizontal space.
 **Change:** Split `#seed-menu` into a fixed left action rail (wordmark + tagline + Create New World + storage usage + Settings) and a right pane whose `#saved-worlds-container` becomes a responsive card **grid** (thumbnail, name, seed, size, Play/Manage). Preserve the IDs the world-list JS writes into. Landscape: rail + grid stay side-by-side (grid just fits fewer cards/row).
 **Reference:** `ui-mockups.html` → **World Select**.
@@ -121,7 +133,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-003 — Create World
 
-**Location:** `voxEx.html` `#create-world-panel` (~2009), `.panel-header` (~2010), `.panel-content` (~2014), `#world-preview-container` (~2016), `#preset-selector` (~2023), `#biome-selector` (~2047), the structure/terrain groups (~2051-2095), `.advanced-section`/`#advanced-toggle` (~2098).
+**Location:** `voxEx.html` `#create-world-panel` (~1974), `.panel-header` (~1975), `.panel-content` (~1979), `#world-preview-container` (~1981), `#preset-selector` (~1988), `#biome-selector` (~2012), the structure/terrain groups (~2016-2060), `.advanced-section`/`#advanced-toggle` (~2063-2064).
 **Why:** The whole form is crammed into one ~380px column.
 **Change:** Make `.panel-content` a two-pane layout — **left** (sticky): preview canvas + preset grid + World Info (name/seed); **right**: the option groups (Biomes, Structures, Terrain, Advanced) wrapped as `.grp` inside a `.ui-twocol` so they flow into two independent columns. Keep `#world-preview-canvas`, every input ID, and `applyTerrainSettings` bindings intact. Convert the Advanced collapsible to a `.ui-collapse` for consistency. Landscape: keep both panes; right pane may drop to one column (`body.touch-mode .colcards { flex-direction: column }`).
 **Reference:** `ui-mockups.html` → **Create World** (`.cw .cols`, `.colcards`/`.ccol`).
@@ -138,7 +150,7 @@ document.addEventListener('click', (e) => {
 2. Pin `#settings-search` and the `#settings-profiles` chips (`.profile-btn`) at the top of the content pane.
 3. Convert each `.settings-group` (Sun, Moon, Torch, Volumetric, Bloom, GI, …) to the shared `.ui-collapse` card and lay the groups out in a `.ui-twocol` (independent columns). Migrate the `onclick="toggleSettingsGroup(this, 'x')"` headers to the UI-000 delegated handler (keep the data-group hooks the save/restore code relies on).
 4. Landscape/touch: sidebar stays (narrower); groups stay 2 columns.
-**Cross-ref:** `CCR-menu-overlay-lag.md` / memory `voxex-menu-overlay-perf` — the current lag is `#blocker` `backdrop-filter: blur` + always-on `renderFrame` behind tall scrollable panels. The sidebar layout reduces panel height and count, but **keep an eye on the blur**: if scroll/expand still janks, gate the backdrop blur while a settings panel is open (out of scope here, but note it).
+**Cross-ref (audit-corrected):** `CCR-menu-overlay-lag.md` already **shipped** (2026-06-22) and **removed** the `backdrop-filter: blur` from `#blocker` and the menu panels (see the `/* backdrop-filter … removed */` comments ~250/~280) — so the blur is **not** a current Settings concern. The remaining menu-overlay cost is the always-on `renderFrame` running behind open panels; the sidebar layout doesn't change that, and no blur action is needed here. (The lone surviving blur is on `#inventory-overlay` — see UI-007.)
 **Reference:** `ui-mockups.html` → **Settings** (`.set .nav`, `.subtabs`, `.gcols`/`.gcol`, `.gcard` collapse).
 **Verify:** every setting still round-trips via save/load; profile chips (Perf/Balanced/Quality/Custom) still apply; search still filters; touch settings still survive profile switches; expanding a group doesn't shift any other group between columns.
 
@@ -146,7 +158,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-005 — Pause menu (landscape fix)
 
-**Location:** `voxEx.html` `#main-pause-menu` (~2428), `#pause-seed-display` (~2430), the save/load block (~2436-2452), `#btn-controls`/`#btn-settings` (~2453-2454), `#touch-pause-actions` (~2456), `#btn-quit` (~2462).
+**Location:** `voxEx.html` `#main-pause-menu` (~2393), `#pause-seed-display` (~2395), the save/load block (~2401-2417), `#btn-controls`/`#btn-settings` (~2418-2419), `#touch-pause-actions` (~2421), `#btn-quit` (~2427).
 **Why:** In landscape the tall single-column card is clipped top and bottom.
 **Change:** Wrap the card's children into two column groups so on mobile/landscape it renders as a **two-column** card (left: PAUSED + seed + Resume + save/load; right: Controls/Settings + the `#touch-pause-actions` quick grid + Quit) that fits the short height. Desktop stays the current vertical stack (use `display:contents` on the wrappers at desktop width so layout/order is unchanged). Make the pause backdrop scrollable as a safety net. Keep all button IDs and the touch-only quick-actions block.
 **Reference:** `ui-mockups.html` → **Pause Menu** (`.pcard` with two `.pcol`, `.pcol{display:contents}` desktop → flex columns under `body.touch-mode`).
@@ -156,7 +168,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-006 — Controls reference
 
-**Location:** `voxEx.html` `#controls-menu` (~2464), the `.control-row` list (~2466-2481), `#btn-back-from-controls` (~2482).
+**Location:** `voxEx.html` `#controls-menu` (~2429), the `.control-row` list (~2431-2446), `#btn-back-from-controls` (~2447).
 **Why:** A tall single list wastes width.
 **Change:** Lay the `.control-row` items into a 3-column reference grouped **Movement / Actions / Interface**. Landscape: 3 columns still fit; allow wrap to 2 if needed. Pure markup/CSS regroup — keys/labels unchanged (this remains a static display; rebinding UI is still out of scope).
 **Reference:** `ui-mockups.html` → **Controls** (`.kcols`, `.kgroup`).
@@ -166,7 +178,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-007 — Inventory
 
-**Location:** `voxEx.html` `#inventory-overlay` (~3812 region), `#inventory-container`, the inventory grid + hotbar markup, the touch close button.
+**Location:** `voxEx.html` `#inventory-overlay` (~3777), `#inventory-container` (~3778), the inventory grid + hotbar markup, the touch close button. Note: `#inventory-overlay` still carries `backdrop-filter: blur(2px)` (~1391) — the only menu overlay that kept the blur after the menu-overlay-lag CCR; if the wider landscape grid feels heavy, that blur is the cheapest thing to drop.
 **Why:** A cramped 6-column box with lots of empty overlay around it.
 **Change:** Widen `#inventory-container`; render the block grid at 8 columns with optional category tabs (All / Natural / Building / Light) and a clearer hotbar row. Landscape: widen the grid (≈10 columns) to show more blocks without scrolling. Preserve drag-drop hooks, slot IDs, and the hotbar binding logic.
 **Reference:** `ui-mockups.html` → **Inventory** (`.invpanel`, `.invgrid`, `.hbar`).
@@ -176,7 +188,7 @@ document.addEventListener('click', (e) => {
 
 ## UI-008 — Manage World modal
 
-**Location:** `voxEx.html` `#world-manage-modal` (~1953), `.world-modal-content` (~1954), `.world-modal-section` blocks (Rename ~1960, Duplicate ~1968, Storage ~1976, Export/Import ~1993, Danger Zone ~2002).
+**Location:** `voxEx.html` `#world-manage-modal` (~1918), `.world-modal-content` (~1919), `.world-modal-section` blocks (Rename ~1925, Duplicate ~1933, Storage ~1941, Export/Import ~1958, Danger Zone ~1968).
 **Why:** Sections stack in a single narrow column.
 **Change:** Lay the sections in a two-column grid (Rename | Duplicate side-by-side; full-width Storage and Export/Import), with the Danger Zone visually isolated below. Landscape: the 680px modal fits as-is. Keep all input/button IDs and the storage-bar update hooks.
 **Reference:** `ui-mockups.html` → **Manage World** (`.mmgrid`, `.mmsec`, `.danger`).
@@ -203,7 +215,7 @@ Each screen is a self-contained markup/CSS re-wrap; bump the build banner and co
 - [ ] **Landscape:** verify each screen at ~880×404 with `body.touch-mode` active — no clipping (esp. Pause UI-005), no portrait single-column fallback, no horizontal overflow.
 - [ ] **Independent columns:** on Launcher, Settings, and Create-World, expanding one collapsible pushes only cards below it in the same column; the other column doesn't move and the row-mate doesn't stretch.
 - [ ] **Dev Tools + Docs:** Launcher still exposes Voxel/Terrain/KeyFrame/Sound editors + README/Roadmap with correct `href`s.
-- [ ] **Menu perf:** watch the `#blocker` `backdrop-filter: blur` + always-on `renderFrame` cost behind open panels (see `CCR-menu-overlay-lag.md`); if scroll/expand janks, gate the blur while a panel is open (follow-up CCR).
+- [ ] **Menu perf:** the `#blocker`/menu blur is already gone (menu-overlay-lag CCR, 2026-06-22) — do NOT reintroduce a `backdrop-filter` on menu panels. The remaining cost is the always-on `renderFrame` behind open panels; if a tall panel still janks, that's the lever (follow-up CCR), not the blur. The one surviving blur is `#inventory-overlay` (~1391) — drop it if UI-007's wider grid feels heavy.
 - [ ] **No shadowing** of globals (`scene`, `camera`, `chunks`, `SETTINGS`, `WORLD_CONFIG`); the one new delegated listener doesn't double-fire with existing handlers.
 - [ ] **Tests:** `tools/voxex-tests.html` (~204 tests) stays green (UI-only change should not affect them; confirms no accidental logic edits). Eyeball each screen on desktop + landscape.
 - [ ] **Build banner:** bump `VOXEX_BUILD` + add a `VOXEX_RECENT_CHANGES` entry per screen shipped (cite `VOXEX-CCR-UI-001` + the UI-00x item).
