@@ -3,7 +3,7 @@
 **ID:** VOXEX-CCR-UI-001
 **Files:** `voxEx.html` (single-file rule honored for the game) **and** `index.html` (the launcher is a separate file — same as the shipped `CCR-launcher-system-exam-and-report`).
 **Date:** 2026-06-29
-**Status:** 🔴 Proposed
+**Status:** 🟢 Implemented & corrected — shipped across builds `2026-06-29.52`–`.59`; see **As-built reconciliation** below.
 **GitHub:** (none yet — design-driven; supersedes the layout intent in `SETTINGS_MENU_CCR.md` and complements `CCR-menu-overlay-lag.md`)
 **Reference build:** `2026-06-29.43`
 **Visual source of truth:** `D:\Projects\voxex\ui-mockups.html` — an interactive, single-file mockup of all 8 screens with a Desktop / Mobile(landscape) toggle. It already contains the **exact target CSS idioms and markup patterns** in the live VoxEx palette. Open it side-by-side while implementing; each item below names the mockup screen to port.
@@ -26,6 +26,17 @@ Re-verified every anchor and factual claim against the live `voxEx.html` / `inde
 - **Corrected one stale premise:** the `#blocker` / menu `backdrop-filter: blur` was **already removed** by `CCR-menu-overlay-lag.md` (shipped 2026-06-22 — see the `/* backdrop-filter … removed */` comments ~250/~280). UI-004's cross-ref and the perf safety-check were updated accordingly. The only overlay still carrying a blur is `#inventory-overlay` (~1391), now noted under UI-007.
 - **Confirmed collision-free:** `ui-twocol` / `ui-col` / `ui-collapse` / `ui-chev` → 0 existing hits (UI-000 may claim these names).
 - **Confirmed live hooks:** `function toggleSettingsGroup` (~3814), `recomputeTouchMode` (~45144) + `body.touch-mode`, and `const SETTINGS_PROFILES` (~6564) all exist as referenced.
+
+---
+
+## As-built reconciliation (2026-06-29, builds .52–.59)
+
+UI-000 through UI-008 were implemented one-per-build (`2026-06-29.52`–`.58`). A follow-up fix (`UI-FIX`, build `.59`) corrected two places where the first pass diverged from the mockup/intent:
+
+- **Settings never got its columns.** The sidebar, sub-tabs and `.ui-collapse` cards shipped, but the group cards were left in a SINGLE column — `.ui-twocol` was defined in CSS yet **used in markup zero times**, so every settings panel rendered one-up (the original complaint). Fixed by wrapping all **15** settings leaf panels in explicit `.ui-twocol`/`.ui-col`.
+- **Three divergent column systems.** The launcher used `.accgrid`/`.acccol`, create-world used `.colcards`/`.ccol`, and the shared `.ui-twocol` sat unused — violating principle #2. Fixed by converging all three onto `.ui-twocol`/`.ui-col` (dup CSS removed).
+
+**Root cause (why this CCR was then tightened):** the per-screen items described the columns in PROSE ("lay out in a `.ui-twocol`") and pointed at the mockup as source of truth, but never embedded the explicit wrapper **markup** — so the implementer added the cards and silently dropped the column wrapper on the hardest screen, and copied the mockup's per-screen class names instead of converging. UI-000 and the per-screen items below now carry the **exact** wrapper markup and mandate one column class. **Do not regress to per-screen column class names or CSS-only columns.**
 
 ---
 
@@ -102,8 +113,19 @@ document.addEventListener('click', (e) => {
 });
 ```
 
-**Reference:** `ui-mockups.html` — search `.accgrid`, `.gcols`, `.colcards` (all three use exactly this `flex / align-items:flex-start` independent-column idiom) and `.acc` / `.gcard` (the collapse card).
-**Verify:** add a throwaway pair of `.ui-collapse` cards in a `.ui-twocol`, confirm expanding the top-left card pushes only the bottom-left card down and leaves the right column untouched. Remove the throwaway.
+**MANDATE — one column system, explicit markup (this is exactly what the first implementation got wrong):**
+- Use **only** `.ui-twocol` / `.ui-col` for every collapsible-column screen (Launcher, Settings, Create-World). Do **NOT** invent per-screen column classes — the mockup happens to use three different names (`.accgrid`/`.acccol`, `.gcols`/`.gcol`, `.colcards`/`.ccol`) for the **same** idiom; collapse them all to `.ui-twocol`/`.ui-col` in the real files.
+- The CSS alone does **nothing visible** — each screen MUST contain the explicit wrapper **in its markup**. The canonical shape (used verbatim by UI-001 / UI-003 / UI-004) is:
+  ```html
+  <div class="ui-twocol">
+    <div class="ui-col"><!-- first half of the cards/items --></div>
+    <div class="ui-col"><!-- second half --></div>
+  </div>
+  ```
+  Split the cards at a balanced midpoint, **between** top-level blocks (never inside a `.ui-collapse`). Any full-width trailing controls (reset/back buttons) stay **outside/below** the `.ui-twocol`.
+
+**Reference:** `ui-mockups.html` — the `.accgrid`/`.gcols`/`.colcards` blocks all show this exact `flex / align-items:flex-start` idiom; copy the structure but **rename the wrappers to `.ui-twocol`/`.ui-col`**. `.acc` / `.gcard` = the `.ui-collapse` card.
+**Verify:** after wrapping a screen, `grep 'class="ui-twocol"'` for that screen returns ≥1 (with two `class="ui-col"` per wrapper); expanding the top-left card pushes only the bottom-left card down and leaves the right column untouched.
 **Safety:** grep `ui-twocol`, `ui-col`, `ui-collapse`, `ui-chev` first — confirm 0 existing hits (no collision). Do NOT delete `toggleSettingsGroup` yet — UI-004 migrates its call sites, then it can be removed in a follow-up.
 
 ---
@@ -114,9 +136,16 @@ document.addEventListener('click', (e) => {
 **Why:** Today it's one long skinny scroll; sections are always-expanded and stack vertically. It must use width and scale as tests are added.
 **Change:**
 1. Widen `.container` from `max-width:650px` to a responsive wide shell (≈ `min(1180px, 100%)`), and lay out a **hero row** (left: VoxEx wordmark + protocol badge + Play button + "all required checks passed" pill; right: the GPU tier card built from the existing benchmark result) above the tests.
-2. Convert `#tests-critical`, `#tests-storage`, `#tests-optional`, plus Benchmark detail, System Details (`#sysinfo-panel`) and Share Diagnostics (`#diag-section`) into `.ui-collapse` cards, **collapsed by default**, each header showing a status summary (e.g. `8 / 8 ✓`, `2 / 3 !`, `Score 2106`). Place them in a `.ui-twocol`. Keep the existing JS that fills `#detail-*`/`#icon-*` — only the wrapping markup changes.
+2. Convert `#tests-critical`, `#tests-storage`, `#tests-optional`, plus Benchmark detail, System Details (`#sysinfo-panel`) and Share Diagnostics (`#diag-section`) into `.ui-collapse` cards, **collapsed by default**, each header showing a status summary (e.g. `8 / 8 ✓`, `2 / 3 !`, `Score 2106`). Place them in an **explicit** two-column wrapper (the CSS alone won't lay them out — the markup must contain it; ≈3 cards per column):
+```html
+<div class="ui-twocol">
+  <div class="ui-col"><!-- Required Features, Optional, System Details --></div>
+  <div class="ui-col"><!-- Storage & Persistence, Benchmark, Share Diagnostics --></div>
+</div>
+```
+Keep the existing JS that fills `#detail-*`/`#icon-*` — only the wrapping markup changes.
 3. **Keep Developer Tools + Documentation.** Preserve the `.hamburger-menu`/`#menu-dropdown` items (Voxel/Terrain/KeyFrame/Sound editors; README, Roadmap). Either keep the hamburger, or (preferred, per mockup) render them as two top-right dropdown buttons in the launcher header. The links/`href`s are unchanged.
-**Reference:** `ui-mockups.html` → **Launcher** screen (header dropdowns, hero, `.acc` collapsed sections in `.acccol` columns).
+**Reference:** `ui-mockups.html` → **Launcher** screen (header dropdowns, hero, `.acc` collapsed sections inside the shared `.ui-twocol`/`.ui-col` wrapper — the mockup names them `.accgrid`/`.acccol`, but use `.ui-twocol`/`.ui-col` here).
 **Verify:** run the launcher; all probes still populate and gate `#play-btn`; Dev-Tools and Docs links still open the right tools; expanding "Required Features" doesn't move the "Storage & Persistence" card. Check landscape width.
 
 ---
@@ -135,8 +164,15 @@ document.addEventListener('click', (e) => {
 
 **Location:** `voxEx.html` `#create-world-panel` (~1974), `.panel-header` (~1975), `.panel-content` (~1979), `#world-preview-container` (~1981), `#preset-selector` (~1988), `#biome-selector` (~2012), the structure/terrain groups (~2016-2060), `.advanced-section`/`#advanced-toggle` (~2063-2064).
 **Why:** The whole form is crammed into one ~380px column.
-**Change:** Make `.panel-content` a two-pane layout — **left** (sticky): preview canvas + preset grid + World Info (name/seed); **right**: the option groups (Biomes, Structures, Terrain, Advanced) wrapped as `.grp` inside a `.ui-twocol` so they flow into two independent columns. Keep `#world-preview-canvas`, every input ID, and `applyTerrainSettings` bindings intact. Convert the Advanced collapsible to a `.ui-collapse` for consistency. Landscape: keep both panes; right pane may drop to one column (`body.touch-mode .colcards { flex-direction: column }`).
-**Reference:** `ui-mockups.html` → **Create World** (`.cw .cols`, `.colcards`/`.ccol`).
+**Change:** Make `.panel-content` a two-pane layout — **left** (sticky): preview canvas + preset grid + World Info (name/seed); **right**: the option groups in the explicit shared wrapper (use `.ui-twocol`/`.ui-col` — do NOT create a `.colcards` class):
+```html
+<div class="ui-twocol">
+  <div class="ui-col"><!-- Biome Selection, Structures --></div>
+  <div class="ui-col"><!-- Terrain Settings, Advanced --></div>
+</div>
+```
+Keep `#world-preview-canvas`, every input ID, and `applyTerrainSettings` bindings intact. Convert the Advanced collapsible to a `.ui-collapse` for consistency. Landscape: keep both panes — the shared `.ui-twocol` stays two columns; do not add a `body.touch-mode` single-column override.
+**Reference:** `ui-mockups.html` → **Create World** (`.cw .cols`; the right-pane columns are the shared `.ui-twocol`/`.ui-col` — the mockup names them `.colcards`/`.ccol`).
 **Verify:** preview still updates live from inputs; preset buttons + biome toggles + sliders still drive world creation; Start/Back still work; nothing overflows in landscape.
 
 ---
@@ -148,10 +184,24 @@ document.addEventListener('click', (e) => {
 **Change:**
 1. Replace the **drill-down** (each category a `category-btn` that swaps a `.settings-panel` to `display:block`) with a persistent **left category sidebar** + **sub-tabs** + a content pane. The category/sub-tab buttons already exist (`#btn-settings-graphics`, `#btn-graphics-lighting`, …) — re-style them as sidebar/tab items and keep their existing show/hide handlers (they can still toggle which `.settings-panel` is visible; the panels just render inside the content pane instead of replacing the whole menu).
 2. Pin `#settings-search` and the `#settings-profiles` chips (`.profile-btn`) at the top of the content pane.
-3. Convert each `.settings-group` (Sun, Moon, Torch, Volumetric, Bloom, GI, …) to the shared `.ui-collapse` card and lay the groups out in a `.ui-twocol` (independent columns). Migrate the `onclick="toggleSettingsGroup(this, 'x')"` headers to the UI-000 delegated handler (keep the data-group hooks the save/restore code relies on).
-4. Landscape/touch: sidebar stays (narrower); groups stay 2 columns.
+3. Convert each `.settings-group` (Sun, Moon, Torch, Volumetric, Bloom, GI, …) to the shared `.ui-collapse` card. Keep the `onclick="toggleSettingsGroup(this, 'x')"` headers and their `data-group` hooks (the save/restore code relies on them); the UI-000 delegated handler can coexist.
+4. **REQUIRED — wrap EACH leaf panel's content in an explicit `.ui-twocol`/`.ui-col` (this is the step the first pass dropped — `.ui-twocol` was defined in CSS but never used, so every panel rendered one column).** The CSS is not enough; the wrapper must be in the markup of every leaf panel. Insert right after the panel `<h1>`, split the setting-items/groups at a balanced midpoint, and close **before** the trailing reset/back buttons:
+```html
+<div id="settings-graphics-lighting" class="settings-panel" ...>
+  <h1>Graphics › Lighting</h1>
+  <div class="ui-twocol"><div class="ui-col">
+    <!-- ~half the .setting-item rows / .ui-collapse groups -->
+  </div><div class="ui-col">
+    <!-- the other half -->
+  </div></div>
+  <button class="menu-btn reset-btn" ...>Reset…</button>   <!-- OUTSIDE the columns -->
+  <button class="menu-btn" ...>Back</button>
+</div>
+```
+The **15** leaf panels that EACH need this wrapper: `settings-performance-rendering` / `-streaming` / `-workers`; `settings-graphics-visual` / `-lighting` / `-materials` / `-water` / `-effects` / `-sky`; `settings-gameplay-movement` / `-camera` / `-interaction` / `-fire`; `settings-world-time`; `settings-touch`. Do NOT wrap `#settings-menu` (the sidebar shell) or any nav-only hub.
+5. Landscape/touch: sidebar stays (narrower); groups stay 2 columns.
 **Cross-ref (audit-corrected):** `CCR-menu-overlay-lag.md` already **shipped** (2026-06-22) and **removed** the `backdrop-filter: blur` from `#blocker` and the menu panels (see the `/* backdrop-filter … removed */` comments ~250/~280) — so the blur is **not** a current Settings concern. The remaining menu-overlay cost is the always-on `renderFrame` running behind open panels; the sidebar layout doesn't change that, and no blur action is needed here. (The lone surviving blur is on `#inventory-overlay` — see UI-007.)
-**Reference:** `ui-mockups.html` → **Settings** (`.set .nav`, `.subtabs`, `.gcols`/`.gcol`, `.gcard` collapse).
+**Reference:** `ui-mockups.html` → **Settings** (`.set .nav`, `.subtabs`, `.gcard` collapse; the mockup's `.gcols`/`.gcol` = the shared `.ui-twocol`/`.ui-col` — use those names here).
 **Verify:** every setting still round-trips via save/load; profile chips (Perf/Balanced/Quality/Custom) still apply; search still filters; touch settings still survive profile switches; expanding a group doesn't shift any other group between columns.
 
 ---
@@ -214,6 +264,8 @@ Each screen is a self-contained markup/CSS re-wrap; bump the build banner and co
 - [ ] **Settings round-trip:** all settings still save/load; profiles apply; search filters; touch prefs survive profile switches (they're deliberately excluded from `SETTINGS_PROFILES`).
 - [ ] **Landscape:** verify each screen at ~880×404 with `body.touch-mode` active — no clipping (esp. Pause UI-005), no portrait single-column fallback, no horizontal overflow.
 - [ ] **Independent columns:** on Launcher, Settings, and Create-World, expanding one collapsible pushes only cards below it in the same column; the other column doesn't move and the row-mate doesn't stretch.
+- [ ] **Explicit two-column markup (the regression guard):** every collapsible-column screen contains a `.ui-twocol` with two `.ui-col` IN THE MARKUP — `grep -c 'class="ui-twocol"'` ≥ 1 in the launcher, ≥ 1 in create-world, and **= 15** across the settings leaf panels (one per panel). A defined-but-unused `.ui-twocol` (CSS only) is exactly the bug this CCR was tightened to prevent.
+- [ ] **One column system:** no `accgrid` / `acccol` / `colcards` / `ccol` / `gcols` / `gcol` tokens remain in `voxEx.html` or `index.html` markup or CSS (all converged to `.ui-twocol`/`.ui-col`; a lone historical mention inside a `VOXEX_RECENT_CHANGES` string is fine).
 - [ ] **Dev Tools + Docs:** Launcher still exposes Voxel/Terrain/KeyFrame/Sound editors + README/Roadmap with correct `href`s.
 - [ ] **Menu perf:** the `#blocker`/menu blur is already gone (menu-overlay-lag CCR, 2026-06-22) — do NOT reintroduce a `backdrop-filter` on menu panels. The remaining cost is the always-on `renderFrame` behind open panels; if a tall panel still janks, that's the lever (follow-up CCR), not the blur. The one surviving blur is `#inventory-overlay` (~1391) — drop it if UI-007's wider grid feels heavy.
 - [ ] **No shadowing** of globals (`scene`, `camera`, `chunks`, `SETTINGS`, `WORLD_CONFIG`); the one new delegated listener doesn't double-fire with existing handlers.
