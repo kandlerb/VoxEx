@@ -35,7 +35,7 @@ VoxEx/
 │   ├── voxelEditor.html          # Voxel model editor
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
 │   ├── voxex-tests.html          # Test suite — REAL voxEx.html functions via ?test=1 seam (window.VoxEx); ~204 tests incl. live worker round-trip. Serve over localhost.
-│   └── voxex-texture-tests.html  # Visual texture atlas tests (all 18 tiles + automated checks)
+│   └── voxex-texture-tests.html  # Visual texture atlas tests (all 33 tiles + automated checks)
 └── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
 ```
 
@@ -66,7 +66,7 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 - **Memory & Performance**: MemoryBudgetManager (auto-scale render distance: −1 at 80% warning, −2 + emergency unload 20% at 95% critical); GeometryBufferPool (4K/8K/16K face tiers, auto-upgrade); object pools (Float32/Uint8/Uint32Array, Vector3, ChunkData, GeometryBuffer); PerformanceMonitor (FPS ring buffer, 8ms budget); geometry leak detection (5s, warn at 500+ excess); spatial hash grid (O(1) proximity); SeededRandom PRNG.
 - **Data Persistence**: IndexedDB chunk cache (stores: saves/chunks/settings); ChunkDiskStorage OPFS backend (lazy init); RLE compression (v2: blocks + skyLight + blockLight); batch ops; JSON world save (seed, player state, modified chunks, thumbnail); LocalStorage settings/profiles/quick save.
 
-## Block Types (Current: 16 blocks)
+## Block Types (Current: 19 blocks)
 
 | ID | Constant | Description |
 |----|----------|-------------|
@@ -86,9 +86,12 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 | 13 | `LONGWOOD_LOG` | Longwood biome log (2x2/3x3 trunks) |
 | 14 | `LONGWOOD_LEAVES` | Longwood biome leaves |
 | 15 | `GLASS` | Transparent + collidable (tags: transparent/cutout/collidable), zero light attenuation |
+| 16 | `FIRE` | Transparent, walk-through, emissive separate-render block; clings to adjacent faces; 12-frame anim |
+| 17 | `BURNT_LOG` | Charred log (fire burn result) |
+| 18 | `BURNT_PLANKS` | Charred planks (fire burn result) |
 | 255 | `UNLOADED_BLOCK` | Placeholder for unloaded chunks |
 
-- **Texture Atlas**: `NUM_TILES = 18` tiles in a horizontal strip.
+- **Texture Atlas**: `NUM_TILES = 33` tiles in a horizontal strip (12 fire frames + 3 burnt + base blocks).
 - **Water light**: attenuates sunlight 1/block, blocklight 2/block (chunk cache v3 — bump `CURRENT_CACHE_VERSION` + `_cacheVersion` writes when changing attenuation).
 - **Lookup Tables**: `BLOCK_IS_SOLID[256]`, `BLOCK_IS_OPAQUE[256]`, `IS_TRANSPARENT[256]`, `SUNLIGHT_ATTENUATION[256]`, `BLOCKLIGHT_ATTENUATION[256]` — Uint8Array fast lookups.
 
@@ -137,7 +140,7 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`. **Volumetric Sampling**: 7-ray cone (sun/moon), 5-ray cone (point lights) for partial visibility through foliage.
 
 ### Rendering System
-- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 18 tiles).
+- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 33 tiles).
 - **Terrain Material**: MeshStandardMaterial, vertex colors, roughness, alpha test 0.1.
 - **Water**: three modes — Standard (PBR), Fast (Lambert), Refraction (custom GLSL, Beer-Lambert absorption).
 - **Fog**: custom cylindrical shader (XZ-only distance, not vertical) via `onBeforeCompile`. **Biome Fog Tinting**: per-biome fog color lerp (plains=neutral, forests=green, mountains=blue, swamp=murky).
@@ -237,7 +240,7 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 | `SECTION_HEIGHT` | 16 | Blocks per vertical section |
 | `SECTIONS_PER_CHUNK` | 20 | Sections per chunk (320/16) |
 | `CHUNK_DATA_SIZE` | 81920 | Bytes per chunk (16x16x320) |
-| `NUM_TILES` | 17 | Texture atlas tile count |
+| `NUM_TILES` | 33 | Texture atlas tile count |
 | `MAX_FACES_PER_CHUNK` | 16384 | Hard cap on faces per chunk mesh |
 | `GEO_TIER_SMALL` / `_MEDIUM` / `_LARGE` | 4096 / 8192 / 16384 | Geometry tier max faces |
 | `MAX_POINT_LIGHTS` | 8 | Max simultaneous torch lights |
@@ -300,7 +303,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 ### When Modifying `voxEx.html`
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, JS.
-2. **Texture Atlas**: adding blocks → update `NUM_TILES` (~line 3552) + add texture gen in `initTextures`. Current count: **18**.
+2. **Texture Atlas**: adding blocks → update `NUM_TILES` (~line 4334) + add texture gen in `initTextures`. Current count: **33**.
 3. **Block Config**: add to `BLOCK_CONFIG` (~line 3580; auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()` (~line 11831).
 4. **Biome Config**: add to `BIOME_CONFIG` (~line 3987; inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`.
 5. **Settings**: default in `DEFAULTS` (~line 5284) → wire into `SETTINGS` (~line 5067) → DOM binding in settings UI (event wiring ~line 28800+) → `saveSettings()`.
@@ -393,7 +396,7 @@ Before committing, verify:
 - [ ] Logs use `logDebug()` with `[Tag]` prefix, not `console.log()`
 - [ ] No work added to the per-frame render loop without batching
 - [ ] Touch handlers start with `if (!touchModeActive) return;`; no allocations/closures/logging in `pointermove`; gameplay gates use `isGameplayActive()` not raw `controls.isLocked`
-- [ ] Chunk size is 16x16x320 (not 128); atlas has 18 tiles (update `NUM_TILES` if adding blocks); block lookup tables updated if adding blocks (`initBlockLookupTables()`)
+- [ ] Chunk size is 16x16x320 (not 128); atlas has 33 tiles (update `NUM_TILES` if adding blocks); block lookup tables updated if adding blocks (`initBlockLookupTables()`)
 - [ ] Worker parity: edit ONLY main-thread terrain functions (~line 36269-36693); worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — keep markers intact
 - [ ] Terrain changes: update `terrain-visualizer.html` to match (biome config, height funcs)
 - [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
@@ -405,4 +408,4 @@ Before committing, verify:
 
 - **`tools/voxex-tests.html`** — automated suite (~204 tests). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
 - **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Uses extracted copies of terrain functions — **must be kept in sync** with voxEx.html biome config and height functions.
-- **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 18 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
+- **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 33 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
