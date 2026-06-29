@@ -3961,7 +3961,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-29.48"; // VRAM-003 #573: glass geometry routed through GeometryBufferPool at all 4 dispose sites
+            const VOXEX_BUILD = "2026-06-29.49"; // TERRAIN-001 #517/#513: extract sampleBiomeBilinearHeight + hoist _FH_NEIGHBORS
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3970,6 +3970,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "TERRAIN SINGLE-SOURCE (TERRAIN-001 #517/#513, build 2026-06-29.49). Extracted sampleBiomeBilinearHeight(gx,gz,seed) from the identical 14-line continentalness+domain-warp+bilinear block shared by blendedHeight and getPreRiverHeight; both functions now delegate to the helper. Added sampleBiomeBilinearHeight to the terrainFuncs injection list so the chunk worker receives it. Hoisted _FH_NEIGHBORS (8-cell Moore neighbourhood offsets) from per-cache-miss allocation inside getBiomeCellDirect to module scope; emitted into the worker injection block alongside _BIOME_CDF_TABLE so getBiomeCellDirect finds it in worker scope. Pure refactor — no terrain values change.",
                 "GLASS GEOMETRY POOLING (VRAM-003 #573, build 2026-06-29.48). Glass mesh now acquires geometry from GeometryBufferPool (geometryPool.acquireTerrain) instead of allocating a fresh THREE.BufferGeometry per remesh. Four release sites converted from geometry.dispose() to geometryPool.releaseTerrain(): (1) remesh-reuse path in renderChunk (old gMesh.geometry.dispose), (2) stale-drop when gFaceCount drops to 0 (else-if oldGlassMesh inside gFaceCount>0), (3) stale-drop when chunk loses glass entirely (outer else-if oldGlassMesh), (4) releaseMeshForKey _GLASS branch. Color packed via packColorRGBA8(gColAttr.array, gCols, gCIdx/3) into the pool's Uint8-RGBA lane (raw .set of Float32 [0,1] into Uint8 would truncate to 0 = black). gGeo.setDrawRange(0, gIIdx) added (acquireTerrain resets drawRange to Infinity). Scratch-array pools (posPool/uvPool/colPool/indexPool/quadSizePool) unchanged. Glass material, mesh flags (DoubleSide, alphaTest 0.5, depthWrite false, renderOrder 1, glassDepthMaterial, castShadow) untouched.",
                 "PARTICLE OUT-OF-RANGE SKIP (VOXEX-CCR-FX-003 #570, build 2026-06-29.45). Particles outside the 64-unit updateDistance were despawned instantly, causing visible pop-out at the radius boundary. Changed the distance-check branch in ParticleSystem.update from this.despawn(i); continue to bare continue — particles skip physics integration when far but remain alive and resume on return. Lifetime decrement (above the branch) still runs every frame, so particles age out naturally. maxParticles cap in spawn() unchanged. No buffer, worker, cache, save format, or DOM changes. Behavioral: particles fade out instead of snapping off.",
                 "PREGEN PHASE-1C PROGRESS FIX (VOXEX-CCR-PREGEN-001 #554/#550, build 2026-06-29.43). Fixed Phase-1C progress formula that double-counted cached chunks: prior formula was (totalProcessed/length)*50 + 50*(processedCached/length), adding processedCached twice. Simplified to (totalProcessed/length)*50 so each chunk counts once across the 0-50% band. Also removed redundant _pregenActive = false at Lever-2 (already cleared at Phase-1C start; nothing re-sets it true between those two sites). No behavior change on the happy path; progress bar now advances monotonically without jumps.",
@@ -19255,6 +19256,7 @@
                     getBiomeCellDirect,
                     getBiomeParams,
                     getBiomeHeightAtCell,
+                    sampleBiomeBilinearHeight,
                     blendedHeight,
                     getPreRiverHeight,
                     getLocalSlope,
@@ -19278,6 +19280,7 @@
                 // Inject biome CDF table + uniform roll (used by getRawBiomeParams).
                 // Done here so main is the single source of truth for the empirical CDF.
                 injectedCode += '    const _BIOME_CDF_TABLE = ' + JSON.stringify(_BIOME_CDF_TABLE) + ';\n';
+                injectedCode += '    const _FH_NEIGHBORS = ' + JSON.stringify(_FH_NEIGHBORS) + ';\n';
                 injectedCode += '    ' + uniformBiomeRoll.toString() + '\n\n';
 
                 // Inject biome data structures so the injected biome-cell functions (getRawBiomeParams,
@@ -37634,11 +37637,6 @@ self.onmessage = async (e) => {
                 // Single foothill ring — direct 8-neighbour check.
                 const MAX_FOOTHILL_RINGS = 1;
                 let nearestMountainRing = Infinity;
-                const _FH_NEIGHBORS = [
-                    [-1,-1], [0,-1], [1,-1],
-                    [-1, 0],         [1, 0],
-                    [-1, 1], [0, 1], [1, 1]
-                ];
                 for (let i = 0; i < 8; i++) {
                     const dx = _FH_NEIGHBORS[i][0], dz = _FH_NEIGHBORS[i][1];
                     if (getRawBiomeCellDirect(cellX + dx, cellZ + dz).name === 'mountains') {
@@ -37700,6 +37698,14 @@ self.onmessage = async (e) => {
             // Empirical CDF inverse: maps the biome-selection noise to a uniform distribution in [0, 1]
             // so weighted biome selection respects configured weights. Sampled at cell centers over
             // 8 seeds × 200×200 cells using the corrected isotropic noise (5 non-mountain biomes).
+            // Foothill 8-neighbour offsets (Moore neighbourhood, no centre).
+            // Module-scope so it is allocated once; emitted into the chunk worker
+            // by buildChunkWorkerCode() — getBiomeCellDirect references it after injection.
+            const _FH_NEIGHBORS = [
+                [-1,-1], [0,-1], [1,-1],
+                [-1, 0],         [1, 0],
+                [-1, 1], [0, 1], [1, 1]
+            ];
             const _BIOME_CDF_TABLE = [
                 [0.1954, 0.000], [0.2263, 0.010], [0.2757, 0.050], [0.3319, 0.100],
                 [0.3642, 0.150], [0.3846, 0.200], [0.4004, 0.250], [0.4275, 0.300],
@@ -37751,7 +37757,10 @@ self.onmessage = async (e) => {
                 }
                 return selectedBiome;
             }
-            function blendedHeight(gx, gz, seed) {
+            // Continentalness + domain-warped 4-corner biome bilinear height sample.
+            // Shared by blendedHeight() and getPreRiverHeight(); pre-jagged, pre-ocean.
+            // Injected into the chunk worker (terrainFuncs list) — no external closure capture.
+            function sampleBiomeBilinearHeight(gx, gz, seed) {
                 // 1. Get continentalness (-1 to 1)
                 const c = continentalHeight(gx, gz, seed);
                 // 2. Biome grid interpolation with boundary warping
@@ -37779,7 +37788,10 @@ self.onmessage = async (e) => {
                 const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
                 const h0 = lerpValue(h00, h10, sx);
                 const h1 = lerpValue(h01, h11, sx);
-                let finalHeight = lerpValue(h0, h1, sz);
+                return lerpValue(h0, h1, sz);
+            }
+            function blendedHeight(gx, gz, seed) {
+                let finalHeight = sampleBiomeBilinearHeight(gx, gz, seed);
 
                 // Peak preservation removed: Math.max(h00..h11) stepped when the warp
                 // slid the bilinear cell window across an integer in (u,v), causing
@@ -38110,30 +38122,7 @@ self.onmessage = async (e) => {
              * @returns {number} Pre-river terrain height
              */
             function getPreRiverHeight(gx, gz, seed) {
-                const c = continentalHeight(gx, gz, seed);
-                const gridScale = BIOME_CELL_SIZE;
-                const warpX = noise2D(gx * 0.003 + seed * 0.13, gz * 0.003 - seed * 0.07)
-                            + noise2D(gx * 0.012 + seed * 0.31, gz * 0.012 - seed * 0.17) * 0.5;
-                const warpZ = noise2D(gx * 0.003 - seed * 0.19, gz * 0.003 + seed * 0.11)
-                            + noise2D(gx * 0.012 - seed * 0.43, gz * 0.012 + seed * 0.29) * 0.5;
-                const u = gx / gridScale - 0.5 + warpX;
-                const v = gz / gridScale - 0.5 + warpZ;
-                const x0 = Math.floor(u);
-                const z0 = Math.floor(v);
-                const x1 = x0 + 1;
-                const z1 = z0 + 1;
-                const wx = u - x0;
-                const wz = v - z0;
-                const sx = wx * wx * (3 - 2 * wx);
-                const sz = wz * wz * (3 - 2 * wz);
-
-                const h00 = getBiomeHeightAtCell(x0, z0, gx, gz, seed, c);
-                const h10 = getBiomeHeightAtCell(x1, z0, gx, gz, seed, c);
-                const h01 = getBiomeHeightAtCell(x0, z1, gx, gz, seed, c);
-                const h11 = getBiomeHeightAtCell(x1, z1, gx, gz, seed, c);
-                const h0 = lerpValue(h00, h10, sx);
-                const h1 = lerpValue(h01, h11, sx);
-                let finalHeight = lerpValue(h0, h1, sz);
+                let finalHeight = sampleBiomeBilinearHeight(gx, gz, seed);
 
                 const oceanFactor = getOceanFactor(gx, gz, seed);
                 if (oceanFactor < 1.0) {
