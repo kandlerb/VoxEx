@@ -3961,7 +3961,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-29.46"; // CCR PERF-014 #572/#574/#575/#549/#546/#544/#525/#577/#542: render-loop hygiene
+            const VOXEX_BUILD = "2026-06-29.47"; // CCR REFACTOR-001 #524: deduplicate water vertex-color math into computeWaterFaceColor
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -4104,6 +4104,7 @@
                 "Water: wave crest highlights + trough shading on open water",
                 "Water/glass: glass block added, glass-glass face culling, water attenuates sunlight (cache v4)",
                 "Perf: render-loop hygiene (CCR PERF-014) — hoist per-frame/per-chunk allocs to module scratch; gate debug scene traverse",
+                "Refactor: dedup water vertex-color math into computeWaterFaceColor (REFACTOR-001 #524)",
             ];
             console.info(`%c[VoxEx] Build ${VOXEX_BUILD}`, "color:#4caf50;font-weight:bold;font-size:13px");
             console.info(`[VoxEx] Recent changes:\n  - ${VOXEX_RECENT_CHANGES.join("\n  - ")}`);
@@ -19475,6 +19476,7 @@
                 // AO cache removed (VOXEX-CCR-PERF-007) — hit rate was ~0 (each face visited once per render).
                 meshCode += '    const _aoResult = [1, 1, 1, 1];\n';
                 meshCode += '    const _lightResult = [1, 1, 1, 1];\n';
+                meshCode += '    const _waterColorScratch = new Float32Array(7);\n';
                 meshCode += '    const AO_OCCLUDES = new Uint8Array(' + JSON.stringify(Array.from(AO_OCCLUDES)) + ');\n';
                 // getBlockUV: worker reads the per-job UV map (set in the mesh handler) — matches main getBlockUV output.
                 meshCode += '    let _workerUvMap = null;\n';
@@ -19485,7 +19487,7 @@
                     getAOConfig, calculateVertexAO, calculateFaceAO,
                     calculateVertexCornerLight, calculateFaceCornerLight,
                     getMergeKey, isWaterAdjacent, isFoamLand, waterHash,
-                    writeFaceVerticesIndexed, writeFaceColorsIndexed, writeFaceColorsWaterIndexed, writeFaceUVsIndexed, writeFaceIndices,
+                    writeFaceVerticesIndexed, writeFaceColorsIndexed, writeFaceColorsWaterIndexed, computeWaterFaceColor, writeFaceUVsIndexed, writeFaceIndices,
                     addFaceWaterIndexed, addMergedFaceIndexed,
                     cellCornerLightDamped, extractLightFromChunk, clearGreedyBuffers, greedyMeshSection,
                     ...(WORKER_LIGHTING_ENABLED ? [calculateChunkSunlight] : []) // VOXEX-CCR-PERF-013
@@ -39826,9 +39828,13 @@ self.onmessage = async (e) => {
                 return ((h ^ (h >> 16)) & 0x7FFFFFFF) / 0x7FFFFFFF; // 0-1 range
             }
 
-            // Write vertex colors for water with depth-based fog effect and visual variation
-            // Creates a foggy, more substantial look for water with caustics and foam
-            function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
+            // Reused scratch for water vertex colors: [rMult, gMult, bMult, c1, c2, c3, c4].
+            // Module-scope + emitted into the worker (see buildChunkWorkerCode meshCode).
+            const _waterColorScratch = new Float32Array(7);
+
+            // Compute the per-face water color terms once; fills _waterColorScratch.
+            // No allocation, no external closure capture (uses SETTINGS, waterHash, Math only).
+            function computeWaterFaceColor(ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
                 // Water fog: makes water look more like a substance, less like clear glass
                 // fogDensity controls how quickly water becomes opaque (0 = clear, 1 = very foggy)
                 const fogDensity = SETTINGS.waterFogDensity;
@@ -39916,8 +39922,21 @@ self.onmessage = async (e) => {
                 const c2 = ao[1] * lightLevel * v2Var;
                 const c3 = ao[2] * lightLevel * v3Var;
                 const c4 = ao[3] * lightLevel * v4Var;
+                _waterColorScratch[0] = rMult;
+                _waterColorScratch[1] = gMult;
+                _waterColorScratch[2] = bMult;
+                _waterColorScratch[3] = c1;
+                _waterColorScratch[4] = c2;
+                _waterColorScratch[5] = c3;
+                _waterColorScratch[6] = c4;
+            }
 
-                // Apply depth-based color tinting to each vertex
+            // Write vertex colors for water with depth-based fog effect and visual variation
+            // Creates a foggy, more substantial look for water with caustics and foam
+            function writeFaceColorsWater(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
+                computeWaterFaceColor(ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
+                const rMult = _waterColorScratch[0], gMult = _waterColorScratch[1], bMult = _waterColorScratch[2];
+                const c1 = _waterColorScratch[3], c2 = _waterColorScratch[4], c3 = _waterColorScratch[5], c4 = _waterColorScratch[6];
                 col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
                 col[cIdx + 3] = c2 * rMult; col[cIdx + 4] = c2 * gMult; col[cIdx + 5] = c2 * bMult;
                 col[cIdx + 6] = c4 * rMult; col[cIdx + 7] = c4 * gMult; col[cIdx + 8] = c4 * bMult;
@@ -40063,61 +40082,9 @@ self.onmessage = async (e) => {
              * @param {number} nz - Normal Z
              */
             function writeFaceColorsWaterIndexed(col, cIdx, ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz) {
-                // Same water coloring logic as non-indexed version, but for 4 vertices
-                const fogDensity = SETTINGS.waterFogDensity;
-                const maxVisualDepth = 6 + (1 - fogDensity) * 10;
-                const depthFactor = Math.min(waterDepth / maxVisualDepth, 1.0);
-                const fogEffect = depthFactor * (0.5 + fogDensity * 0.5);
-                const fogR = 0.1 + (1 - fogDensity) * 0.15;
-                const fogG = 0.25 + (1 - fogDensity) * 0.15;
-                const fogB = 0.4 + (1 - fogDensity) * 0.1;
-                let rMult = 1.0 - fogEffect * (1.0 - fogR);
-                let gMult = 1.0 - fogEffect * (1.0 - fogG);
-                let bMult = 1.0 - fogEffect * (1.0 - fogB);
-                // Caustics
-                const shallowFactor = 1.0 - depthFactor;
-                const causticStrength = shallowFactor * 0.15;
-                const caustic1 = waterHash(wx * 2, wy * 3, wz * 2);
-                const caustic2 = waterHash(wx * 5 + 17, wy * 7 + 31, wz * 5 + 23);
-                const causticPattern = caustic1 * 0.6 + caustic2 * 0.4;
-                const causticBoost = 1.0 + (causticPattern - 0.5) * 2 * causticStrength;
-                // Foam
-                const isTopFace = ny > 0.5;
-                let foamBoost = 1.0;
-                if (isTopFace && waterDepth <= 2) {
-                    const foamNoise = waterHash(wx * 3 + 7, wy, wz * 3 + 11);
-                    if (foamNoise > 0.6) {
-                        foamBoost = 1.0 + (foamNoise - 0.6) * 0.5;
-                        rMult = Math.min(1.0, rMult * 1.1);
-                        gMult = Math.min(1.0, gMult * 1.05);
-                    }
-                }
-                // Depth variation
-                const depthVariation = waterHash(wx + 101, wy * 2 + 53, wz + 79);
-                const depthMod = 1.0 + (depthVariation - 0.5) * 0.1 * depthFactor;
-                rMult *= causticBoost * foamBoost * depthMod;
-                gMult *= causticBoost * foamBoost * depthMod;
-                bMult *= causticBoost * foamBoost;
-                rMult = Math.min(1.2, Math.max(0.0, rMult));
-                gMult = Math.min(1.2, Math.max(0.0, gMult));
-                bMult = Math.min(1.2, Math.max(0.0, bMult));
-                // Base water color from settings
-                const baseR = ((SETTINGS.waterColor >> 16) & 0xff) / 255;
-                const baseG = ((SETTINGS.waterColor >> 8) & 0xff) / 255;
-                const baseB = (SETTINGS.waterColor & 0xff) / 255;
-                rMult *= baseR;
-                gMult *= baseG;
-                bMult *= baseB;
-                // Per-vertex variation
-                const v1Var = 1.0 + (waterHash(wx, wy, wz) - 0.5) * 0.05;
-                const v2Var = 1.0 + (waterHash(wx + 1, wy, wz) - 0.5) * 0.05;
-                const v3Var = 1.0 + (waterHash(wx + 1, wy, wz + 1) - 0.5) * 0.05;
-                const v4Var = 1.0 + (waterHash(wx, wy, wz + 1) - 0.5) * 0.05;
-                const c1 = ao[0] * lightLevel * v1Var;
-                const c2 = ao[1] * lightLevel * v2Var;
-                const c3 = ao[2] * lightLevel * v3Var;
-                const c4 = ao[3] * lightLevel * v4Var;
-                // Write 4 vertices (indexed order: v1, v2, v3, v4)
+                computeWaterFaceColor(ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz);
+                const rMult = _waterColorScratch[0], gMult = _waterColorScratch[1], bMult = _waterColorScratch[2];
+                const c1 = _waterColorScratch[3], c2 = _waterColorScratch[4], c3 = _waterColorScratch[5], c4 = _waterColorScratch[6];
                 col[cIdx + 0] = c1 * rMult; col[cIdx + 1] = c1 * gMult; col[cIdx + 2] = c1 * bMult;
                 col[cIdx + 3] = c2 * rMult; col[cIdx + 4] = c2 * gMult; col[cIdx + 5] = c2 * bMult;
                 col[cIdx + 6] = c3 * rMult; col[cIdx + 7] = c3 * gMult; col[cIdx + 8] = c3 * bMult;
