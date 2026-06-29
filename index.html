@@ -230,6 +230,63 @@
         }
         .btn-secondary:hover { background: #333; }
 
+        /* VOXEX-CCR-LAUNCHER-001: System Details panel + Share Diagnostics */
+        .sysinfo {
+            margin-top: 12px;
+            background: #222;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 10px 12px;
+            font-size: 12px;
+        }
+        .sysinfo summary {
+            cursor: pointer;
+            color: #888;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-size: 11px;
+        }
+        .sysinfo-body {
+            margin-top: 10px;
+            color: #aaa;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 11px;
+        }
+        .sysinfo-body .si-label { color: #4caf50; }
+
+        .diag-section { margin-top: 16px; }
+        .diag-help {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 10px;
+            line-height: 1.4;
+        }
+        .diag-input {
+            width: 100%;
+            background: #2a2a2a;
+            border: 1px solid #3a3a3a;
+            border-radius: 5px;
+            color: #eee;
+            padding: 8px 10px;
+            font-size: 13px;
+            font-family: inherit;
+            margin-bottom: 8px;
+            resize: vertical;
+        }
+        .diag-input:focus { outline: none; border-color: #4caf50; }
+        .btn-row { display: flex; gap: 8px; }
+        .btn-row .btn { margin-top: 0; }
+        .diag-status {
+            text-align: center;
+            font-size: 12px;
+            margin-top: 8px;
+            min-height: 1.2em;
+        }
+
         .hidden { display: none !important; }
 
         #benchmark-canvas {
@@ -422,6 +479,25 @@
 
         <div id="error-container"></div>
 
+        <!-- VOXEX-CCR-LAUNCHER-001: collected system details (populated after tests) -->
+        <details class="sysinfo hidden" id="sysinfo-panel">
+            <summary>System Details</summary>
+            <div class="sysinfo-body" id="sysinfo-body"></div>
+        </details>
+
+        <!-- VOXEX-CCR-LAUNCHER-001: shareable diagnostic report (works even if checks fail) -->
+        <div class="diag-section hidden" id="diag-section">
+            <div class="section-title">Share Diagnostics</div>
+            <p class="diag-help">Having trouble? Copy or download this report and send it over so the issue can be investigated.</p>
+            <input type="text" class="diag-input" id="diag-name" placeholder="Your name (optional)" maxlength="80">
+            <textarea class="diag-input" id="diag-notes" placeholder="What went wrong? (optional)" rows="2" maxlength="500"></textarea>
+            <div class="btn-row">
+                <button class="btn btn-secondary" id="copy-report-btn">📋 Copy Report</button>
+                <button class="btn btn-secondary" id="download-report-btn">⬇️ Download .json</button>
+            </div>
+            <p class="diag-status" id="diag-status"></p>
+        </div>
+
         <button class="btn btn-primary" id="play-btn" disabled>Checking...</button>
         <button class="btn btn-secondary hidden" id="skip-btn">Continue Anyway (Limited Features)</button>
     </div>
@@ -433,6 +509,9 @@
         const protocol = location.protocol;
         const isFileProtocol = protocol === 'file:';
         const isSecure = protocol === 'https:';
+
+        // VOXEX-CCR-LAUNCHER-001: bump when the report shape changes (for your data collection).
+        const REPORT_SCHEMA = 1;
 
         // ==== Test Definitions ====
         const CRITICAL_TESTS = [
@@ -488,6 +567,10 @@
         // ==== State ====
         let results = {};
         let gpuInfo = { renderer: null, vendor: null };
+        // VOXEX-CCR-LAUNCHER-001: state for the diagnostic report
+        let systemInfo = {};        // populated by collectSystemInfo()
+        let benchmarkData = null;   // { perf, raw } captured after runBenchmark()
+        const testRecords = [];     // ordered { id, name, category, status, detail, reason }
 
         // ==== DOM Elements ====
         const protocolBadge = document.getElementById('protocol-badge');
@@ -1192,14 +1275,317 @@
             errorContainer.appendChild(div);
         }
 
+        // ==== Expanded System Examination (VOXEX-CCR-LAUNCHER-001) ====
+        // Pure data-gathering for the diagnostic report. Every probe is guarded so a
+        // single unsupported API can't abort the whole collection. Returns a plain object.
+        async function collectSystemInfo() {
+            const info = {};
+            const nav = navigator;
+
+            // --- OS / Browser / Device ---
+            info.os_browser = {
+                userAgent: nav.userAgent || '',
+                language: nav.language || '',
+                languages: Array.isArray(nav.languages) ? nav.languages.slice(0, 5) : [],
+                timezone: (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { return ''; } })(),
+                hardwareConcurrency: nav.hardwareConcurrency ?? null,
+                deviceMemoryGB: nav.deviceMemory ?? null,
+                maxTouchPoints: nav.maxTouchPoints ?? 0,
+                cookiesEnabled: nav.cookieEnabled ?? null
+            };
+            // High-entropy UA Client Hints (Chromium) — async, optional, best source of OS/device.
+            if (nav.userAgentData && typeof nav.userAgentData.getHighEntropyValues === 'function') {
+                try {
+                    const ch = await nav.userAgentData.getHighEntropyValues([
+                        'platform', 'platformVersion', 'architecture', 'bitness',
+                        'model', 'uaFullVersion', 'fullVersionList'
+                    ]);
+                    info.os_browser.platform = ch.platform || '';
+                    info.os_browser.platformVersion = ch.platformVersion || '';
+                    info.os_browser.architecture = ch.architecture || '';
+                    info.os_browser.bitness = ch.bitness || '';
+                    info.os_browser.model = ch.model || '';
+                    info.os_browser.brands = (ch.fullVersionList || nav.userAgentData.brands || [])
+                        .map(b => `${b.brand} ${b.version}`);
+                    info.os_browser.mobile = !!nav.userAgentData.mobile;
+                } catch (e) { info.os_browser.uaClientHintsError = e.name || 'failed'; }
+            } else {
+                info.os_browser.platform = nav.platform || '';
+            }
+
+            // --- Display & Input ---
+            info.display = {
+                screen: `${screen.width}x${screen.height}`,
+                available: `${screen.availWidth}x${screen.availHeight}`,
+                window: `${window.innerWidth}x${window.innerHeight}`,
+                devicePixelRatio: window.devicePixelRatio || 1,
+                colorDepth: screen.colorDepth || null,
+                orientation: (screen.orientation && screen.orientation.type) || '',
+                pointerCoarse: matchMedia('(pointer: coarse)').matches,
+                hover: matchMedia('(hover: hover)').matches,
+                prefersReducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches
+            };
+
+            // --- WebGL capabilities ---
+            info.webgl = collectWebGLCaps();
+
+            // --- Storage quota & persistence ---
+            info.storage = {};
+            try {
+                if (nav.storage && nav.storage.estimate) {
+                    const est = await nav.storage.estimate();
+                    info.storage.quotaMB = est.quota ? Math.round(est.quota / 1048576) : null;
+                    info.storage.usageMB = est.usage ? Math.round(est.usage / 1048576) : null;
+                }
+                if (nav.storage && nav.storage.persisted) {
+                    info.storage.persisted = await nav.storage.persisted();
+                }
+            } catch (e) { info.storage.error = e.name || 'failed'; }
+
+            // --- Network ---
+            const conn = nav.connection || nav.mozConnection || nav.webkitConnection;
+            info.network = {
+                onLine: nav.onLine,
+                effectiveType: conn?.effectiveType || '',
+                downlinkMbps: conn?.downlink ?? null,
+                rttMs: conn?.rtt ?? null,
+                saveData: conn?.saveData ?? null
+            };
+
+            return info;
+        }
+
+        // Detailed WebGL limits/extensions from a throwaway context (VOXEX-CCR-LAUNCHER-001).
+        function collectWebGLCaps() {
+            const caps = {};
+            try {
+                const canvas = document.createElement('canvas');
+                const gl2 = canvas.getContext('webgl2');
+                const gl = gl2 || canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                if (!gl) return { available: false };
+                caps.available = true;
+                caps.webgl2 = !!gl2;
+                caps.version = gl.getParameter(gl.VERSION);
+                caps.glsl = gl.getParameter(gl.SHADING_LANGUAGE_VERSION);
+                const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                if (dbg) {
+                    caps.unmaskedVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+                    caps.unmaskedRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+                }
+                caps.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+                caps.maxCubeMapSize = gl.getParameter(gl.MAX_CUBE_MAP_TEXTURE_SIZE);
+                caps.maxRenderBufferSize = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+                caps.maxTextureImageUnits = gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS);
+                caps.maxVertexAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS);
+                caps.maxVaryingVectors = gl.getParameter(gl.MAX_VARYING_VECTORS);
+                caps.maxFragmentUniformVectors = gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS);
+                caps.maxVertexUniformVectors = gl.getParameter(gl.MAX_VERTEX_UNIFORM_VECTORS);
+                const vp = gl.getParameter(gl.MAX_VIEWPORT_DIMS);
+                if (vp) caps.maxViewportDims = `${vp[0]}x${vp[1]}`;
+                // Fragment high-float precision affects lighting/fog shader quality.
+                const fp = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT);
+                if (fp) caps.fragHighFloat = { precision: fp.precision, rangeMin: fp.rangeMin, rangeMax: fp.rangeMax };
+                caps.contextLossExt = !!gl.getExtension('WEBGL_lose_context');
+                const exts = gl.getSupportedExtensions() || [];
+                caps.extensionCount = exts.length;
+                caps.extensions = exts;
+                // Extensions VoxEx specifically relies on (mirrors testWebGL's requiredExts).
+                caps.hasElementIndexUint = exts.includes('OES_element_index_uint');
+                caps.hasStandardDerivatives = caps.webgl2 || exts.includes('OES_standard_derivatives');
+            } catch (e) {
+                caps.error = e.name || 'failed';
+            }
+            return caps;
+        }
+
+        // ==== Diagnostic Report (VOXEX-CCR-LAUNCHER-001) ====
+        // Assemble the structured report object (the pure-JSON payload for Download).
+        function buildReportData() {
+            const nameInput = document.getElementById('diag-name');
+            const notesInput = document.getElementById('diag-notes');
+            const tester = {
+                name: (nameInput?.value || '').trim(),
+                notes: (notesInput?.value || '').trim()
+            };
+            return {
+                report: { schema: REPORT_SCHEMA, app: 'VoxEx System Check', generatedAt: new Date().toISOString() },
+                page: { url: location.href, protocol: location.protocol },
+                tester,
+                system: systemInfo,
+                tests: testRecords,
+                benchmark: benchmarkData ? {
+                    tier: benchmarkData.perf.tier,
+                    capped: benchmarkData.perf.capped,
+                    gpu: benchmarkData.perf.gpuClass,
+                    scores: benchmarkData.perf.scores,
+                    isMobile: benchmarkData.perf.isMobile
+                } : null
+            };
+        }
+
+        // Human-readable report (summary up top, full JSON block below) for the clipboard.
+        function buildReportText(data) {
+            const L = [];
+            const ob = data.system.os_browser || {};
+            const d = data.system.display || {};
+            const w = data.system.webgl || {};
+            const s = data.system.storage || {};
+            const n = data.system.network || {};
+
+            L.push('===== VoxEx System Check Report =====');
+            L.push(`Generated: ${data.report.generatedAt}`);
+            L.push(`Page: ${data.page.url} (${data.page.protocol})`);
+            if (data.tester.name) L.push(`Tester: ${data.tester.name}`);
+            if (data.tester.notes) L.push(`Notes: ${data.tester.notes}`);
+            L.push('');
+
+            L.push('--- System ---');
+            L.push(`OS/Platform: ${(ob.platform || '') + ' ' + (ob.platformVersion || '')}`.trim());
+            if (ob.architecture) L.push(`Architecture: ${ob.architecture} ${ob.bitness || ''}`.trim());
+            if (ob.model) L.push(`Device model: ${ob.model}`);
+            if (ob.brands && ob.brands.length) L.push(`Browser: ${ob.brands.join(', ')}`);
+            L.push(`CPU threads: ${ob.hardwareConcurrency ?? 'n/a'} | Device memory: ${ob.deviceMemoryGB ?? 'n/a'} GB`);
+            L.push(`Language: ${ob.language || ''} | Timezone: ${ob.timezone || ''}`);
+            L.push(`User agent: ${ob.userAgent || ''}`);
+            L.push('');
+
+            L.push('--- Display & Input ---');
+            L.push(`Screen: ${d.screen} | Window: ${d.window} | DPR: ${d.devicePixelRatio} | Color depth: ${d.colorDepth}`);
+            L.push(`Pointer coarse: ${d.pointerCoarse} | Hover: ${d.hover} | Reduced motion: ${d.prefersReducedMotion}`);
+            L.push('');
+
+            L.push('--- WebGL ---');
+            if (!w.available) {
+                L.push('WebGL: NOT AVAILABLE');
+            } else {
+                L.push(`Renderer: ${w.unmaskedRenderer || '(masked)'} | Vendor: ${w.unmaskedVendor || '(masked)'}`);
+                L.push(`Version: ${w.version} | WebGL2: ${w.webgl2}`);
+                L.push(`Max texture: ${w.maxTextureSize} | Max viewport: ${w.maxViewportDims} | Max renderbuffer: ${w.maxRenderBufferSize}`);
+                L.push(`Varyings: ${w.maxVaryingVectors} | Vertex attribs: ${w.maxVertexAttribs} | Tex units: ${w.maxTextureImageUnits}`);
+                L.push(`Extensions: ${w.extensionCount} | element_index_uint: ${w.hasElementIndexUint} | std_derivatives: ${w.hasStandardDerivatives}`);
+            }
+            L.push('');
+
+            L.push('--- Storage & Network ---');
+            L.push(`Storage quota: ${s.quotaMB ?? 'n/a'} MB | used: ${s.usageMB ?? 'n/a'} MB | persisted: ${s.persisted ?? 'n/a'}`);
+            L.push(`Online: ${n.onLine} | Connection: ${n.effectiveType || 'n/a'} | Downlink: ${n.downlinkMbps ?? 'n/a'} Mbps | RTT: ${n.rttMs ?? 'n/a'} ms`);
+            L.push('');
+
+            L.push('--- Test Results ---');
+            for (const t of data.tests) {
+                const mark = t.status === 'pass' ? 'PASS' : t.status === 'warn' ? 'WARN' : 'FAIL';
+                L.push(`[${mark}] (${t.category}) ${t.name}: ${t.reason || t.detail || ''}`);
+            }
+
+            if (data.benchmark) {
+                L.push('');
+                L.push('--- Benchmark ---');
+                L.push(`Tier: ${data.benchmark.tier}${data.benchmark.capped ? ' (capped by GPU)' : ''}`);
+                L.push(`GPU class: ${data.benchmark.gpu.brand} (${data.benchmark.gpu.type}, ${data.benchmark.gpu.tier})`);
+                const sc = data.benchmark.scores || {};
+                L.push(`Scores - combined: ${sc.combined}, upload: ${sc.upload}, draw: ${sc.draw}, fill: ${sc.fill}`);
+            }
+
+            L.push('');
+            L.push('===== Machine-readable JSON =====');
+            L.push(JSON.stringify(data, null, 2));
+            return L.join('\n');
+        }
+
+        async function copyReport() {
+            const text = buildReportText(buildReportData());
+            try {
+                if (navigator.clipboard && window.isSecureContext) {
+                    await navigator.clipboard.writeText(text);
+                } else {
+                    // Insecure-context fallback (e.g. file://): hidden textarea + execCommand.
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.position = 'fixed';
+                    ta.style.top = '-9999px';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(ta);
+                }
+                flashDiagStatus('Report copied to clipboard ✓');
+            } catch (e) {
+                flashDiagStatus('Copy failed — use Download instead', true);
+            }
+        }
+
+        function downloadReport() {
+            const json = JSON.stringify(buildReportData(), null, 2);
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `voxex-syscheck-${stamp}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            flashDiagStatus('Report downloaded ✓');
+        }
+
+        let _diagStatusTimer = null;
+        function flashDiagStatus(msg, isError) {
+            const el = document.getElementById('diag-status');
+            if (!el) return;
+            el.textContent = msg;
+            el.style.color = isError ? '#f44336' : '#4caf50';
+            if (_diagStatusTimer) clearTimeout(_diagStatusTimer);
+            _diagStatusTimer = setTimeout(() => { el.textContent = ''; }, 4000);
+        }
+
+        // Render a compact, human-readable system summary into the on-screen panel.
+        function renderSystemDetails(info) {
+            const body = document.getElementById('sysinfo-body');
+            const panel = document.getElementById('sysinfo-panel');
+            if (!body || !panel) return;
+            const ob = info.os_browser || {};
+            const d = info.display || {};
+            const w = info.webgl || {};
+            const s = info.storage || {};
+            const n = info.network || {};
+            const row = (label, val) => `<div><span class="si-label">${label}:</span> ${val ?? 'n/a'}</div>`;
+            const html = [
+                row('OS', `${(ob.platform || '') + ' ' + (ob.platformVersion || '')}`.trim() || 'n/a'),
+                ob.model ? row('Device', ob.model) : '',
+                ob.brands && ob.brands.length ? row('Browser', ob.brands.join(', ')) : '',
+                row('CPU threads', ob.hardwareConcurrency ?? 'n/a'),
+                row('Device memory', ob.deviceMemoryGB != null ? ob.deviceMemoryGB + ' GB' : 'n/a'),
+                row('Screen', `${d.screen} @ ${d.devicePixelRatio}x`),
+                row('GPU', w.available ? (w.unmaskedRenderer || '(masked)') : 'WebGL unavailable'),
+                row('WebGL2', w.available ? w.webgl2 : false),
+                row('Max texture', w.maxTextureSize ?? 'n/a'),
+                row('Storage quota', s.quotaMB != null ? s.quotaMB + ' MB' : 'n/a'),
+                row('Connection', n.effectiveType || 'n/a')
+            ].filter(Boolean).join('');
+            body.innerHTML = html;
+            panel.classList.remove('hidden');
+        }
+
+        // Reveal + wire the report controls (idempotent — safe to call once).
+        function enableDiagnostics() {
+            const section = document.getElementById('diag-section');
+            const copyBtn = document.getElementById('copy-report-btn');
+            const dlBtn = document.getElementById('download-report-btn');
+            if (section) section.classList.remove('hidden');
+            if (copyBtn && !copyBtn._wired) { copyBtn.addEventListener('click', copyReport); copyBtn._wired = true; }
+            if (dlBtn && !dlBtn._wired) { dlBtn.addEventListener('click', downloadReport); dlBtn._wired = true; }
+        }
+
         // ==== Main Test Runner ====
         async function runTests() {
             initUI();
 
             const allTests = [
-                ...CRITICAL_TESTS.map(t => ({ ...t, critical: true })),
-                ...STORAGE_TESTS.map(t => ({ ...t, critical: false })),
-                ...OPTIONAL_TESTS.map(t => ({ ...t, critical: false })),
+                ...CRITICAL_TESTS.map(t => ({ ...t, critical: true, category: 'Required' })),
+                ...STORAGE_TESTS.map(t => ({ ...t, critical: false, category: 'Storage' })),
+                ...OPTIONAL_TESTS.map(t => ({ ...t, critical: false, category: 'Optional' })),
             ];
 
             const testFunctions = {
@@ -1233,6 +1619,17 @@
 
                 updateTest(test.id, result);
 
+                // VOXEX-CCR-LAUNCHER-001: normalized status + reason for the shareable report.
+                const status = result.pass ? 'pass' : (result.warn ? 'warn' : 'fail');
+                let reason = result.detail || '';
+                if (status === 'fail' && ERRORS[test.id]) {
+                    reason = (reason ? reason + ' — ' : '') + ERRORS[test.id].message;
+                }
+                testRecords.push({
+                    id: test.id, name: test.name, category: test.category,
+                    status, detail: result.detail || '', reason
+                });
+
                 if (!result.pass && test.critical && !result.skipError) {
                     criticalFailed.push(test.id);
                 }
@@ -1248,6 +1645,7 @@
 
                 if (benchResult) {
                     const perf = getPerformanceTier(benchResult);
+                    benchmarkData = { perf, raw: benchResult }; // VOXEX-CCR-LAUNCHER-001
                     benchmarkResultEl.textContent = perf.tier;
                     benchmarkResultEl.style.color = perf.color;
 
@@ -1289,6 +1687,12 @@
                 playBtn.textContent = 'Play VoxEx';
                 playBtn.disabled = false;
             }
+
+            // VOXEX-CCR-LAUNCHER-001: gather full system info, render the details panel, and
+            // enable the copy/download report controls (runs even if critical tests failed).
+            systemInfo = await collectSystemInfo();
+            renderSystemDetails(systemInfo);
+            enableDiagnostics();
         }
 
         // ==== Event Handlers ====
