@@ -3961,7 +3961,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-29.49"; // TERRAIN-001 #517/#513: extract sampleBiomeBilinearHeight + hoist _FH_NEIGHBORS
+            const VOXEX_BUILD = "2026-06-29.50"; // TERRAIN-001 #514: true preview biome parity via seedMainThreadNoise + blendedHeight delegation
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -3970,6 +3970,7 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 1;
             const VOXEX_RECENT_CHANGES = [
+                "PREVIEW BIOME PARITY (TERRAIN-001 #514, build 2026-06-29.50). WorldPreviewRenderer now delegates to the game's own noise2D/perm table and blendedHeight() for true biome/terrain parity. WorldPreviewNoise class removed (tombstoned); WorldPreviewRenderer.init() accepts a seed string and calls seedMainThreadNoise(new SeededRandom(seedStr)) to sync the global perm table and worldConfig.seed before render. render() calls blendedHeight(gx,gz,worldConfig.seed) directly — ocean, river, delta-finger, and jagged-peak effects now match actual generation exactly. Dead preview-private methods removed: continentalHeight, getBiomeForCell, getHeight, getBiomeHeight, getOceanFactor, getRiverFactor. updateWorldPreview() passes seedStr directly to init() instead of pre-hashing via hashStringForPreview (which is now tombstoned). ampMult/biomeSizeMult/showRivers locals removed from render() — applyTerrainSettings() already mutates BIOME_CONFIG.amplitude and WORLD_DIMS.seaLevel so blendedHeight reads them automatically; enableRivers is never checked by the actual terrain generator so removing showRivers gate is an accuracy improvement. terrain-visualizer.html: added MOUNTAIN_REGION_FREQ/MOUNTAIN_REGION_THRESHOLD constants and isMountainRegion(gx,gz) function; getRawBiomeCellValue now returns mountains early when isMountainRegion fires (cell-centre approximation cx*64+32,cz*64+32) and skips mountains in the CDF loop to match game biome selection.",
                 "TERRAIN SINGLE-SOURCE (TERRAIN-001 #517/#513, build 2026-06-29.49). Extracted sampleBiomeBilinearHeight(gx,gz,seed) from the identical 14-line continentalness+domain-warp+bilinear block shared by blendedHeight and getPreRiverHeight; both functions now delegate to the helper. Added sampleBiomeBilinearHeight to the terrainFuncs injection list so the chunk worker receives it. Hoisted _FH_NEIGHBORS (8-cell Moore neighbourhood offsets) from per-cache-miss allocation inside getBiomeCellDirect to module scope; emitted into the worker injection block alongside _BIOME_CDF_TABLE so getBiomeCellDirect finds it in worker scope. Pure refactor — no terrain values change.",
                 "GLASS GEOMETRY POOLING (VRAM-003 #573, build 2026-06-29.48). Glass mesh now acquires geometry from GeometryBufferPool (geometryPool.acquireTerrain) instead of allocating a fresh THREE.BufferGeometry per remesh. Four release sites converted from geometry.dispose() to geometryPool.releaseTerrain(): (1) remesh-reuse path in renderChunk (old gMesh.geometry.dispose), (2) stale-drop when gFaceCount drops to 0 (else-if oldGlassMesh inside gFaceCount>0), (3) stale-drop when chunk loses glass entirely (outer else-if oldGlassMesh), (4) releaseMeshForKey _GLASS branch. Color packed via packColorRGBA8(gColAttr.array, gCols, gCIdx/3) into the pool's Uint8-RGBA lane (raw .set of Float32 [0,1] into Uint8 would truncate to 0 = black). gGeo.setDrawRange(0, gIIdx) added (acquireTerrain resets drawRange to Infinity). Scratch-array pools (posPool/uvPool/colPool/indexPool/quadSizePool) unchanged. Glass material, mesh flags (DoubleSide, alphaTest 0.5, depthWrite false, renderOrder 1, glassDepthMaterial, castShadow) untouched.",
                 "ZOMBIE PROXIMITY UNIFORM (VOXEX-CCR-FX-002 #520, build 2026-06-29.44). Fixed renderFrame re-computing nearestZombieDistSq from scratch each frame, causing flicker with multiple equidistant zombies. Added module-scope let nearestZombieDistSq = Infinity; the updateZombies loop now tracks the true nearest zombie per frame; renderFrame reads the pre-computed value directly instead of rescanning.",
@@ -21258,97 +21259,8 @@
              * Seeded Perlin noise generator for world preview.
              * Matches the noise implementation from terrain-parameter-editor.html
              */
-            class WorldPreviewNoise {
-                /**
-                 * @param {number} seed - Numeric seed for deterministic noise.
-                 */
-                constructor(seed) {
-                    this.permutation = this.generatePermutation(seed);
-                }
-                /**
-                 * Generate seeded permutation table.
-                 * @param {number} seed - Numeric seed.
-                 * @returns {number[]} Permutation table.
-                 */
-                generatePermutation(seed) {
-                    const p = [];
-                    for (let i = 0; i < 256; i++) p[i] = i;
-                    // Seeded shuffle using LCG
-                    let s = seed;
-                    for (let i = 255; i > 0; i--) {
-                        s = (s * 1103515245 + 12345) & 0x7fffffff;
-                        const j = s % (i + 1);
-                        [p[i], p[j]] = [p[j], p[i]];
-                    }
-                    return [...p, ...p];
-                }
-                /** @param {number} t */
-                fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
-                /** @param {number} t @param {number} a @param {number} b */
-                lerp(t, a, b) { return a + t * (b - a); }
-                /** @param {number} hash @param {number} x @param {number} y */
-                grad2D(hash, x, y) {
-                    const h = hash & 15;
-                    const u = h < 8 ? x : y;
-                    const v = h < 4 ? y : (h === 12 || h === 14 ? x : 0);
-                    return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
-                }
-                /**
-                 * 2D Perlin noise.
-                 * @param {number} x - X coordinate.
-                 * @param {number} y - Y coordinate.
-                 * @returns {number} Noise value (-1 to 1).
-                 */
-                noise2D(x, y) {
-                    const X = Math.floor(x) & 255;
-                    const Y = Math.floor(y) & 255;
-                    x -= Math.floor(x);
-                    y -= Math.floor(y);
-                    const u = this.fade(x);
-                    const v = this.fade(y);
-                    const p = this.permutation;
-                    const A = p[X] + Y;
-                    const B = p[X + 1] + Y;
-                    return this.lerp(v,
-                        this.lerp(u, this.grad2D(p[A], x, y), this.grad2D(p[B], x - 1, y)),
-                        this.lerp(u, this.grad2D(p[A + 1], x, y - 1), this.grad2D(p[B + 1], x - 1, y - 1))
-                    );
-                }
-                /**
-                 * Fractal Brownian Motion 2D.
-                 * @param {number} x - X coordinate.
-                 * @param {number} z - Z coordinate.
-                 * @param {number} octaves - Number of octaves.
-                 * @param {number} persistence - Amplitude multiplier.
-                 * @param {number} lacunarity - Frequency multiplier.
-                 * @returns {number} Noise value.
-                 */
-                fbm2D(x, z, octaves = 4, persistence = 0.5, lacunarity = 2.0) {
-                    let total = 0, frequency = 1, amplitude = 1, maxValue = 0;
-                    for (let i = 0; i < octaves; i++) {
-                        total += this.noise2D(x * frequency, z * frequency) * amplitude;
-                        maxValue += amplitude;
-                        amplitude *= persistence;
-                        frequency *= lacunarity;
-                    }
-                    return total / maxValue;
-                }
-                /**
-                 * FBM with domain warping - matches voxEx.html terrain generation.
-                 * @param {number} x - X coordinate.
-                 * @param {number} z - Z coordinate.
-                 * @param {number} octaves - Number of octaves.
-                 * @param {number} persistence - Amplitude multiplier.
-                 * @param {number} lacunarity - Frequency multiplier.
-                 * @returns {number} Noise value.
-                 */
-                fbmWithDomainWarp(x, z, octaves, persistence, lacunarity) {
-                    const warpScale = 0.03;
-                    const offsetX = this.fbm2D(x * warpScale, z * warpScale, 3, 0.5, 2.0) * 20;
-                    const offsetZ = this.fbm2D((x + 100) * warpScale, (z + 100) * warpScale, 3, 0.5, 2.0) * 20;
-                    return this.fbm2D(x + offsetX, z + offsetZ, octaves, persistence, lacunarity);
-                }
-            }
+            // TERRAIN-001 #514: WorldPreviewNoise removed — WorldPreviewRenderer now delegates
+            // to the game's own noise2D/perm (seeded via seedMainThreadNoise) and blendedHeight().
 
             /**
              * World preview renderer using actual terrain algorithms.
@@ -21361,17 +21273,17 @@
                 constructor(canvas) {
                     this.canvas = canvas;
                     this.ctx = canvas.getContext('2d');
-                    this.noise = null;
-                    this.seed = 0;
+                    this._seeded = false;
                     this.renderTimeout = null;
                 }
                 /**
-                 * Initialize with a seed value.
-                 * @param {number} seed - Numeric seed.
+                 * Initialize with a seed string — syncs global perm table and worldConfig.seed
+                 * via seedMainThreadNoise so blendedHeight() produces true game-parity output.
+                 * @param {string} seedStr - Seed string (same as world creation input).
                  */
-                init(seed) {
-                    this.seed = seed;
-                    this.noise = new WorldPreviewNoise(seed);
+                init(seedStr) {
+                    seedMainThreadNoise(new SeededRandom(seedStr));
+                    this._seeded = true;
                 }
                 /**
                  * Schedule a render with debouncing.
@@ -21380,181 +21292,8 @@
                     if (this.renderTimeout) clearTimeout(this.renderTimeout);
                     this.renderTimeout = setTimeout(() => this.render(), 100);
                 }
-                /**
-                 * Get continental height for a position (matches blendedHeight).
-                 * @param {number} gx - Global X.
-                 * @param {number} gz - Global Z.
-                 * @returns {number} Continental factor (-1 to 1).
-                 */
-                continentalHeight(gx, gz) {
-                    const base = this.noise.fbmWithDomainWarp(gx * 0.002, gz * 0.002, 4, 0.5, 2.0);
-                    const erosion = this.noise.fbm2D(gx * 0.004 + this.seed * 3.17, gz * 0.004 - this.seed * 5.41, 3, 0.6, 1.8);
-                    let c = base * 0.7 + erosion * 0.3 + 0.3;
-                    return Math.max(-1, Math.min(1, c));
-                }
-                /**
-                 * Get biome for a cell coordinate using weighted selection.
-                 * @param {number} cellX - Cell X.
-                 * @param {number} cellZ - Cell Z.
-                 * @param {number} biomeSizeMult - Biome size multiplier.
-                 * @returns {Object} Biome object with name and color.
-                 */
-                getBiomeForCell(cellX, cellZ, biomeSizeMult = 1.0) {
-                    // Weighted biome selection for all biomes including mountains
-                    const freq = 0.1 / biomeSizeMult;
-                    const noiseVal = this.noise.noise2D(cellX * freq + 1000, cellZ * freq + 1000);
-                    const t = (noiseVal + 1) * 0.5;
-                    // Biome weights: plains(2), hills(2), forests(2), mountains(1), swamp(1), longwoods(2) = 10 total
-                    const biomes = [
-                        { name: 'plains', weight: 2, color: { r: 124, g: 186, b: 61 }, baseHeight: 62, amplitude: 8, roughness: 0.006 },
-                        { name: 'hills', weight: 2, color: { r: 90, g: 156, b: 46 }, baseHeight: 65, amplitude: 40, roughness: 0.010 },
-                        { name: 'forests', weight: 2, color: { r: 45, g: 107, b: 34 }, baseHeight: 64, amplitude: 12, roughness: 0.015 },
-                        { name: 'mountains', weight: 1, color: { r: 140, g: 140, b: 140 }, baseHeight: 64, amplitude: 180, roughness: 0.003 },
-                        { name: 'swamp', weight: 1, color: { r: 74, g: 93, b: 35 }, baseHeight: 58, amplitude: 5, roughness: 0.025 },
-                        { name: 'longwoods', weight: 2, color: { r: 61, g: 122, b: 45 }, baseHeight: 68, amplitude: 25, roughness: 0.008 }
-                    ];
-                    const totalWeight = 10;  // Includes mountains
-                    const target = t * totalWeight;
-                    let accumulated = 0;
-                    for (const biome of biomes) {
-                        accumulated += biome.weight;
-                        if (target <= accumulated) return biome;
-                    }
-                    return biomes[0];
-                }
-                /**
-                 * Get blended height at a position (simplified version of main blendedHeight).
-                 * @param {number} gx - Global X.
-                 * @param {number} gz - Global Z.
-                 * @param {number} ampMult - Amplitude multiplier.
-                 * @param {number} biomeSizeMult - Biome size multiplier.
-                 * @returns {number} Height value.
-                 */
-                getHeight(gx, gz, ampMult = 1.0, biomeSizeMult = 1.0) {
-                    const c = this.continentalHeight(gx, gz);
-                    const gridScale = 64 * biomeSizeMult;
-                    // Domain warping for organic biome boundaries
-                    const warpX = this.noise.noise2D(gx * 0.003 + this.seed * 0.13, gz * 0.003 - this.seed * 0.07)
-                                + this.noise.noise2D(gx * 0.012 + this.seed * 0.31, gz * 0.012 - this.seed * 0.17) * 0.5;
-                    const warpZ = this.noise.noise2D(gx * 0.003 - this.seed * 0.19, gz * 0.003 + this.seed * 0.11)
-                                + this.noise.noise2D(gx * 0.012 - this.seed * 0.43, gz * 0.012 + this.seed * 0.29) * 0.5;
-                    const u = gx / gridScale - 0.5 + warpX;
-                    const v = gz / gridScale - 0.5 + warpZ;
-                    const x0 = Math.floor(u), z0 = Math.floor(v);
-                    const x1 = x0 + 1, z1 = z0 + 1;
-                    const wx = u - x0, wz = v - z0;
-                    const sx = wx * wx * (3 - 2 * wx);
-                    const sz = wz * wz * (3 - 2 * wz);
-                    // Sample 4 biome corners
-                    const h00 = this.getBiomeHeight(x0, z0, gx, gz, c, ampMult, biomeSizeMult);
-                    const h10 = this.getBiomeHeight(x1, z0, gx, gz, c, ampMult, biomeSizeMult);
-                    const h01 = this.getBiomeHeight(x0, z1, gx, gz, c, ampMult, biomeSizeMult);
-                    const h11 = this.getBiomeHeight(x1, z1, gx, gz, c, ampMult, biomeSizeMult);
-                    const h0 = h00 + (h10 - h00) * sx;
-                    const h1 = h01 + (h11 - h01) * sx;
-                    let finalHeight = h0 + (h1 - h0) * sz;
-
-                    // Mountain peak preservation - reduce smoothing for tall terrain
-                    // Must match blendedHeight() to ensure preview matches actual terrain
-                    const maxCornerHeight = Math.max(h00, h10, h01, h11);
-                    if (maxCornerHeight > 140 && maxCornerHeight > finalHeight + 15) {
-                        const preservation = (maxCornerHeight - finalHeight) * 0.4;
-                        finalHeight += preservation;
-                    }
-
-                    // Post-blend jagged detail - applied AFTER biome interpolation
-                    // Must match blendedHeight() to ensure preview matches actual terrain
-                    const avgCornerHeight = (h00 + h10 + h01 + h11) * 0.25;
-                    if (avgCornerHeight > 90) {
-                        const mountainWeight = Math.min(1.0, (avgCornerHeight - 90) / 60);
-                        const postJaggedFreq = 0.1;
-                        const pj1 = 1.0 - Math.abs(this.noise.noise2D(gx * postJaggedFreq + this.seed * 50, gz * postJaggedFreq - this.seed * 50));
-                        const pj2 = 1.0 - Math.abs(this.noise.noise2D(gx * postJaggedFreq * 2.1 - this.seed * 35, gz * postJaggedFreq * 2.1 + this.seed * 25));
-                        const postJagged = (Math.pow(pj1, 1.5) * 8 + Math.pow(pj2, 1.8) * 5) * mountainWeight;
-                        finalHeight += postJagged;
-                    }
-
-                    return finalHeight;
-                }
-                /**
-                 * Get biome-specific height at a cell.
-                 * @param {number} cx - Cell X.
-                 * @param {number} cz - Cell Z.
-                 * @param {number} gx - Global X.
-                 * @param {number} gz - Global Z.
-                 * @param {number} continentFactor - Continental factor.
-                 * @param {number} ampMult - Amplitude multiplier.
-                 * @param {number} biomeSizeMult - Biome size multiplier.
-                 * @returns {number} Height value.
-                 */
-                getBiomeHeight(cx, cz, gx, gz, continentFactor, ampMult, biomeSizeMult) {
-                    const biome = this.getBiomeForCell(cx, cz, biomeSizeMult);
-                    const n = this.noise.fbm2D(gx * biome.roughness, gz * biome.roughness, 4, 0.5, 2.0);
-                    let h = biome.baseHeight + n * biome.amplitude * ampMult;
-                    // Apply continental scaling
-                    const t = (continentFactor + 1) * 0.5;
-                    const factor = 0.3 + t * 0.7;
-                    h = biome.baseHeight + (h - biome.baseHeight) * factor;
-                    h += Math.max(0, continentFactor - 0.15) * 10;
-                    return h;
-                }
-                /**
-                 * Ocean factor — mirrors getOceanFactor (recalibrated thresholds +
-                 * two-octave domain warp + regional variation). Uses the shared
-                 * OCEAN_* tuning constants so the preview matches generation.
-                 * @param {number} gx - Global X.
-                 * @param {number} gz - Global Z.
-                 * @returns {number} 0 = open ocean, 1 = land.
-                 */
-                getOceanFactor(gx, gz) {
-                    const seed = this.seed;
-                    const owVar = this.noise.noise2D(gx * OCEAN_WARP_VAR_FREQ + seed * 7.3, gz * OCEAN_WARP_VAR_FREQ - seed * 4.1);
-                    const owAmp = OCEAN_WARP_AMP * (1.0 + owVar * OCEAN_WARP_VAR_STRENGTH);
-                    const owF2 = OCEAN_WARP_FREQ * 3.7, owA2 = owAmp * 0.35;
-                    const owx = gx + this.noise.noise2D(gx * OCEAN_WARP_FREQ + seed * 11.7, gz * OCEAN_WARP_FREQ - seed * 3.3) * owAmp
-                                  + this.noise.noise2D(gx * owF2 + seed * 5.1, gz * owF2 - seed * 1.9) * owA2;
-                    const owz = gz + this.noise.noise2D(gx * OCEAN_WARP_FREQ - seed * 5.9, gz * OCEAN_WARP_FREQ + seed * 8.2) * owAmp
-                                  + this.noise.noise2D(gx * owF2 - seed * 2.3, gz * owF2 + seed * 6.7) * owA2;
-                    const oceanNoise = this.noise.noise2D(owx * 0.0008 + seed * 1.5, owz * 0.0008 - seed * 0.8);
-                    const coastNoise = this.noise.noise2D(gx * 0.004 + seed * 2.1, gz * 0.004 + seed * 1.3);
-                    const detailNoise = this.noise.noise2D(gx * 0.02 - seed * 0.5, gz * 0.02 + seed * 0.9) * 0.1;
-                    const combined = oceanNoise + coastNoise * 0.3 + detailNoise;
-                    if (combined < OCEAN_THRESHOLD_DEEP) return 0.0;
-                    if (combined < OCEAN_THRESHOLD_SHALLOW) {
-                        const t = (combined - OCEAN_THRESHOLD_DEEP) / (OCEAN_THRESHOLD_SHALLOW - OCEAN_THRESHOLD_DEEP);
-                        return t * t * (3 - 2 * t);
-                    }
-                    return 1.0;
-                }
-                /**
-                 * River factor — simplified mirror of getRiverFactor (recalibrated
-                 * width + macro-meander warp). The preview omits the elevation-driven
-                 * sinusoidal meander for speed, but matches width + large-scale wander.
-                 * @param {number} gx - Global X.
-                 * @param {number} gz - Global Z.
-                 * @returns {number} River factor (0 = center, 1 = not river).
-                 */
-                getRiverFactor(gx, gz) {
-                    const seed = this.seed;
-                    const warpScale = 0.004;
-                    const warpStrength = 20.0;
-                    const wx = gx + this.noise.noise2D(gx * warpScale, gz * warpScale) * warpStrength;
-                    const wz = gz + this.noise.noise2D(gx * warpScale + 100, gz * warpScale + 100) * warpStrength;
-                    // Macro-meander (mirrors getRiverFactor)
-                    const rwVar = this.noise.noise2D(gx * RIVER_WARP_VAR_FREQ + seed * 3.7, gz * RIVER_WARP_VAR_FREQ - seed * 6.1);
-                    const rwAmp = RIVER_WARP_AMP * (1.0 + rwVar * RIVER_WARP_VAR_STRENGTH);
-                    const mwx = this.noise.noise2D(gx * RIVER_WARP_FREQ + seed * 9.1, gz * RIVER_WARP_FREQ - seed * 2.7) * rwAmp;
-                    const mwz = this.noise.noise2D(gx * RIVER_WARP_FREQ - seed * 4.3, gz * RIVER_WARP_FREQ + seed * 5.5) * rwAmp;
-                    const scale = 0.001;
-                    const n = Math.abs(this.noise.noise2D((wx + mwx) * scale + seed * 0.1, (wz + mwz) * scale - seed * 0.1));
-                    const coastNoise = this.noise.noise2D(gx * 0.008 + seed * 0.7, gz * 0.008 - seed * 0.3);
-                    const width = RIVER_BASE_WIDTH + coastNoise * 0.02;
-                    if (n < width) {
-                        const t = n / width;
-                        return t * t * (3 - 2 * t);
-                    }
-                    return 1.0;
-                }
+                // TERRAIN-001 #514: continentalHeight, getBiomeForCell, getHeight, getBiomeHeight,
+                // getOceanFactor, getRiverFactor removed — render() now delegates to blendedHeight().
                 /**
                  * Get height color using terrain-style gradient.
                  * @param {number} h - Height value.
@@ -21636,15 +21375,12 @@
                  * Main render function.
                  */
                 render() {
-                    if (!this.noise) return;
+                    if (!this._seeded) return;
                     const width = this.canvas.width;
                     const height = this.canvas.height;
                     const imageData = this.ctx.createImageData(width, height);
                     const data = imageData.data;
                     const seaLevel = customWorldSettings.seaLevel ?? 60;
-                    const ampMult = customWorldSettings.terrainAmplitudeMultiplier ?? 1.0;
-                    const biomeSizeMult = customWorldSettings.biomeSizeMultiplier ?? 1.0;
-                    const showRivers = customWorldSettings.enableRivers !== false;
                     const spawnX = customWorldSettings.spawnX ?? 0;
                     const spawnZ = customWorldSettings.spawnZ ?? 0;
                     // Scale: each pixel = 2 world units
@@ -21656,25 +21392,9 @@
                         for (let px = 0; px < width; px++) {
                             const gx = spawnX + (px - width / 2) * scale;
                             const gz = spawnZ + (py - height / 2) * scale;
-                            let h = this.getHeight(gx, gz, ampMult, biomeSizeMult);
-                            // Apply ocean carving first (mirrors blendedHeight): carve
-                            // toward an ocean floor where getOceanFactor < 1 so the preview
-                            // shows the same warped, organic coastlines as generation.
-                            const of = this.getOceanFactor(gx, gz);
-                            if (of < 1.0) {
-                                const oceanFloor = seaLevel - 12;
-                                const bank = of * of * (3 - 2 * of);
-                                h = oceanFloor + (h - oceanFloor) * bank;
-                            }
-                            // Apply river carving (land only)
-                            if (showRivers && h >= seaLevel) {
-                                const r = this.getRiverFactor(gx, gz);
-                                if (r < 1.0) {
-                                    const riverBed = seaLevel - 6;
-                                    const bank = r * r * (3 - 2 * r);
-                                    h = riverBed + (h - riverBed) * bank;
-                                }
-                            }
+                            // Delegate directly to the game's blendedHeight — includes ocean,
+                            // river, delta-finger, and jagged-peak with correct noise/perm.
+                            const h = blendedHeight(gx, gz, worldConfig.seed);
                             heights[py * width + px] = h;
                             if (h < minH) minH = h;
                             if (h > maxH) maxH = h;
@@ -21768,27 +21488,14 @@
                 previewUpdateTimeout = setTimeout(() => {
                     const seedInput = document.getElementById('new-seed-input');
                     const seedStr = seedInput?.value.trim() || '12345';
-                    const seedNum = hashStringForPreview(seedStr);
-                    worldPreviewRenderer.init(seedNum);
+                    worldPreviewRenderer.init(seedStr);
                     worldPreviewRenderer.render();
                 }, 100);
             }
 
-            /**
-             * Hash a string to a numeric seed for preview.
-             * Uses the same algorithm as SeededRandom for consistency with actual game.
-             * @param {string} str - String to hash.
-             * @returns {number} Numeric hash.
-             */
-            function hashStringForPreview(str) {
-                // Match SeededRandom's string hashing algorithm exactly
-                let h = 0xdeadbeef;
-                for (let i = 0; i < str.length; i++) {
-                    h = Math.imul(h ^ str.charCodeAt(i), 2654435761);
-                    h = (h ^ (h >>> 16)) >>> 0;
-                }
-                return h;
-            }
+            // TERRAIN-001 #514: hashStringForPreview removed — updateWorldPreview() passes
+            // the seed string directly to WorldPreviewRenderer.init(), which delegates to
+            // seedMainThreadNoise(new SeededRandom(seedStr)). SeededRandom does the hash internally.
 
             // ===========================================
             // WORLD TYPE PRESETS
