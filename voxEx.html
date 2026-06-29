@@ -3961,7 +3961,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-06-29.45"; // CCR FX-003 #570: particle out-of-range skip instead of despawn (no pop)
+            const VOXEX_BUILD = "2026-06-29.46"; // CCR PERF-014 #572/#574/#575/#549/#546/#544/#525/#577/#542: render-loop hygiene
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -4103,6 +4103,7 @@
                 "Foam: all corner/edge motion now fully world-position-driven (corners flow in sync)",
                 "Water: wave crest highlights + trough shading on open water",
                 "Water/glass: glass block added, glass-glass face culling, water attenuates sunlight (cache v4)",
+                "Perf: render-loop hygiene (CCR PERF-014) — hoist per-frame/per-chunk allocs to module scratch; gate debug scene traverse",
             ];
             console.info(`%c[VoxEx] Build ${VOXEX_BUILD}`, "color:#4caf50;font-weight:bold;font-size:13px");
             console.info(`[VoxEx] Recent changes:\n  - ${VOXEX_RECENT_CHANGES.join("\n  - ")}`);
@@ -16791,6 +16792,7 @@
             // button resets progress (see animate() + onMouseUp).
             const BREAK_TIME = 0.3; // seconds
             const chunkNeighborUpdateQueue = new Set();
+            const _neighborDrainBuf = []; // VOXEX-CCR-PERF-014 #574: reused drain buffer for processChunkQueue
             const NEIGHBOR_RECONCILE_INTERVAL_MS = 750; // OPTIMIZATION: Increased from 500ms to reduce CPU usage
             const NEIGHBOR_RECONCILE_BUDGET = 4; // OPTIMIZATION: Reduced from 6 to limit per-frame work
             let lastNeighborReconcile = 0;
@@ -39126,6 +39128,7 @@ self.onmessage = async (e) => {
             //   - Has skip button for user control
             //   - No-op: Already optimal for initialization
 
+            const _lightingSampleIndices = [0, 1000, 5000, 10000, 50000, 0]; // VOXEX-CCR-PERF-014 #546 (idx 5 set per call)
             /**
              * Check if chunk lighting data is valid and can be trusted.
              * @param {Object} chunk - Chunk data with skyLight/blockLight arrays
@@ -39144,7 +39147,9 @@ self.onmessage = async (e) => {
                 // 1. Variation (not all same value)
                 // 2. Valid range (0-15 for light values)
                 // 3. Reasonable distribution (not all max or all min)
-                const sampleIndices = [0, 1000, 5000, 10000, 50000, expectedSize - 1];
+                // VOXEX-CCR-PERF-014 #546: reuse module array; last index is per-call.
+                _lightingSampleIndices[5] = expectedSize - 1;
+                const sampleIndices = _lightingSampleIndices;
                 let hasVariation = false;
                 let hasShadows = false;  // At least some values < 15
                 let prevSky = chunk.skyLight[0];
@@ -39592,7 +39597,9 @@ self.onmessage = async (e) => {
              */
             function calculateFaceAO(nx, ny, nz, lx, ly, lz, blockId, getter, faceIdx) {
                 if (!SETTINGS.AO || blockId === WATER) {
-                    return [1, 1, 1, 1];
+                    // VOXEX-CCR-PERF-014 #525: reuse the shared scratch (was a fresh literal per face).
+                    _aoResult[0] = _aoResult[1] = _aoResult[2] = _aoResult[3] = 1;
+                    return _aoResult;
                 }
 
                 const config = getAOConfig(nx, ny, nz);
@@ -40510,6 +40517,7 @@ self.onmessage = async (e) => {
             function greedyMeshSection(faceIdx, sectionBaseY, sectionEndY, getLocal, getLocalLight, startX, startZ, buffers, state) {
                 // Initialize inputFaceCount if not present
                 if (state.inputFaceCount === undefined) state.inputFaceCount = 0;
+                const maxSize = SETTINGS.maxGreedyQuadSize || 16; // VOXEX-CCR-PERF-014 #544: hoisted (loop-invariant)
                 const face = FACE_DIRECTIONS[faceIdx];
                 const dx = face[0], dy = face[1], dz = face[2];
                 const nx = face[3], ny = face[4], nz = face[5];
@@ -40610,7 +40618,6 @@ self.onmessage = async (e) => {
                             if (greedyProcessed[idx] || greedyMergeKeys[idx] === 0) continue;
 
                             const mergeKey = greedyMergeKeys[idx];
-                            const maxSize = SETTINGS.maxGreedyQuadSize || 16;
 
                             // Expand right (u direction). Merge on blockId+AO only (Phase 3); light is
                             // sampled per-vertex from corner cells at emit time, so light gradients no
@@ -41593,6 +41600,9 @@ self.onmessage = async (e) => {
                     _meshProfile.buildBuckets[_b]++;
                 }
             }
+            // VOXEX-CCR-PERF-014 #572: reusable greedy-mesh scratch (was per-section literals)
+            const _greedyTerrainBuffers = { pos: null, norm: null, uvs: null, cols: null, quadSize: null, indices: null };
+            const _greedyTerrainState = { vIdx: 0, uvIdx: 0, cIdx: 0, qsIdx: 0, iIdx: 0, vertCount: 0, faceCount: 0, inputFaceCount: 0 };
             function _renderChunkImpl(cx, cz, distSq = 0) {
                 try {
                     const cKey = getChunkKey(cx, cz);
@@ -41843,33 +41853,33 @@ self.onmessage = async (e) => {
 
                         if (useGreedyMeshing) {
                             // --- GREEDY MESHING PATH: Process terrain with merged quads ---
-                            // Create buffer references for greedy meshing
-                            const terrainBuffers = {
-                                pos: terrainPos,
-                                norm: terrainNorm,
-                                uvs: terrainUvs,
-                                cols: terrainCols,
-                                quadSize: terrainQuadSize,
-                                indices: terrainIndices
-                            };
+                            // VOXEX-CCR-PERF-014 #572: reuse module-scope scratch objects (was a
+                            // fresh literal per section, 20×/chunk). Buffer refs are loop-invariant
+                            // (acquired once above the section loop); state fields are re-seeded each
+                            // section from the running counters.
+                            _greedyTerrainBuffers.pos = terrainPos;
+                            _greedyTerrainBuffers.norm = terrainNorm;
+                            _greedyTerrainBuffers.uvs = terrainUvs;
+                            _greedyTerrainBuffers.cols = terrainCols;
+                            _greedyTerrainBuffers.quadSize = terrainQuadSize;
+                            _greedyTerrainBuffers.indices = terrainIndices;
+                            const terrainBuffers = _greedyTerrainBuffers;
 
-                            // Track state across all 6 face directions
-                            let terrainState = {
-                                vIdx: tVIdx,
-                                uvIdx: tUvIdx,
-                                cIdx: tCIdx,
-                                qsIdx: tQsIdx,
-                                iIdx: tIIdx,
-                                vertCount: tVertCount,
-                                faceCount: tFaceCount,
-                                inputFaceCount: 0 // Track faces before merging for stats
-                            };
+                            const terrainState = _greedyTerrainState;
+                            terrainState.vIdx = tVIdx;
+                            terrainState.uvIdx = tUvIdx;
+                            terrainState.cIdx = tCIdx;
+                            terrainState.qsIdx = tQsIdx;
+                            terrainState.iIdx = tIIdx;
+                            terrainState.vertCount = tVertCount;
+                            terrainState.faceCount = tFaceCount;
+                            terrainState.inputFaceCount = 0; // Track faces before merging for stats
 
                             // VOXEX-CCR-PERF-011: gate damp scan — skip if section has no water
                             _greedySectionHasWater = section ? (section.hasWater ?? true) : true;
                             // Process each face direction with greedy meshing
                             for (let faceIdx = 0; faceIdx < 6; faceIdx++) {
-                                terrainState = greedyMeshSection(
+                                greedyMeshSection(
                                     faceIdx,
                                     startY,
                                     endY,
@@ -43018,8 +43028,14 @@ self.onmessage = async (e) => {
                 const remainingBudget = CHUNK_BUILD_BUDGET_MS - (performance.now() - chunkBuildStartMs);
                 if (chunkNeighborUpdateQueue.size > 0 && builds < SETTINGS.buildQueueLimit && remainingBudget > 2) {
                     const updateLimit = Math.min(2, SETTINGS.buildQueueLimit - builds);
-                    const toUpdate = Array.from(chunkNeighborUpdateQueue).slice(0, updateLimit);
-                    for (const key of toUpdate) {
+                    // VOXEX-CCR-PERF-014 #574: drain ≤updateLimit keys into a reused buffer
+                    // (was Array.from(set).slice — two allocs per pass over the whole set).
+                    _neighborDrainBuf.length = 0;
+                    for (const key of chunkNeighborUpdateQueue) {
+                        if (_neighborDrainBuf.length >= updateLimit) break;
+                        _neighborDrainBuf.push(key);
+                    }
+                    for (const key of _neighborDrainBuf) {
                         chunkNeighborUpdateQueue.delete(key);
                         // COALESCE (Phase 0): already scheduled by the primary path? That rebuild covers
                         // the neighbor change — a second build here is a duplicate full-column rebuild.
@@ -43097,6 +43113,13 @@ self.onmessage = async (e) => {
                 if (lx === 15 && lz === 0) scheduleChunkUpdate(cx + 1, cz - 1, false, "edit-ne-corner", { bands: bandMask });
                 if (lx === 15 && lz === 15) scheduleChunkUpdate(cx + 1, cz + 1, false, "edit-se-corner", { bands: bandMask });
             }
+            // VOXEX-CCR-PERF-014 #575: hoisted, frozen DDA face normals (consumers only read face[0..2]).
+            const _PICK_FACE_NX = Object.freeze([-1, 0, 0]);
+            const _PICK_FACE_PX = Object.freeze([1, 0, 0]);
+            const _PICK_FACE_NY = Object.freeze([0, -1, 0]);
+            const _PICK_FACE_PY = Object.freeze([0, 1, 0]);
+            const _PICK_FACE_NZ = Object.freeze([0, 0, -1]);
+            const _PICK_FACE_PZ = Object.freeze([0, 0, 1]);
             function pickVoxel(origin, dir, range) {
                 let x = Math.floor(origin.x), y = Math.floor(origin.y), z = Math.floor(origin.z);
                 // Cache chunk data to avoid repeated lookups
@@ -43125,8 +43148,8 @@ self.onmessage = async (e) => {
                     const id = cachedChunk.blocks ? cachedChunk.blocks[idx] : cachedChunk[idx];
                     if (id !== AIR && id !== WATER) return { x, y, z, face };
                     // DDA algorithm - step to next voxel
-                    if (tMaxX < tMaxY) { if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX; face = stepX > 0 ? [-1, 0, 0] : [1, 0, 0]; dist = tMaxX; } else { z += stepZ; tMaxZ += tDeltaZ; face = stepZ > 0 ? [0, 0, -1] : [0, 0, 1]; dist = tMaxZ; }
-                    } else { if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY; face = stepY > 0 ? [0, -1, 0] : [0, 1, 0]; dist = tMaxY; } else { z += stepZ; tMaxZ += tDeltaZ; face = stepZ > 0 ? [0, 0, -1] : [0, 0, 1]; dist = tMaxZ; }}
+                    if (tMaxX < tMaxY) { if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX; face = stepX > 0 ? _PICK_FACE_NX : _PICK_FACE_PX; dist = tMaxX; } else { z += stepZ; tMaxZ += tDeltaZ; face = stepZ > 0 ? _PICK_FACE_NZ : _PICK_FACE_PZ; dist = tMaxZ; }
+                    } else { if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY; face = stepY > 0 ? _PICK_FACE_NY : _PICK_FACE_PY; dist = tMaxY; } else { z += stepZ; tMaxZ += tDeltaZ; face = stepZ > 0 ? _PICK_FACE_NZ : _PICK_FACE_PZ; dist = tMaxZ; }}
                 }
                 return null;
             }
@@ -43632,6 +43655,7 @@ self.onmessage = async (e) => {
                 }
                 // OPTIMIZATION: Track stationary state for physics optimization
                 updateStationaryState(velocity);
+                return inputSpeed; // VOXEX-CCR-PERF-014 #577: reused by updatePhysicsAndMovement (collisionSteps)
             }
             // Apply a single collision step (axis-sweep collision resolution)
             function applyCollisionStep(obj, stepDt) {
@@ -43707,15 +43731,10 @@ self.onmessage = async (e) => {
                     physicsSteps++;
                     const dt = FIXED_TIME_STEP;
                     // Apply velocity from player input
-                    applyPlayerVelocity(dt);
+                    // VOXEX-CCR-PERF-014 #577: reuse the inputSpeed it already computed (same
+                    // inputs, same instant) instead of recomputing for collisionSteps.
+                    const inputSpeed = applyPlayerVelocity(dt);
                     // Calculate collision substeps for fast movement
-                    const flySpeedMultCollision = isFlying ?
-                        (isSprinting ? SETTINGS.flySpeedMultiplier * 2 : SETTINGS.flySpeedMultiplier) : 1.0;
-                    const inputSpeed = SETTINGS.playerSpeed * (
-                        isFlying ? flySpeedMultCollision :
-                        isCrouching ? SETTINGS.crouchMultiplier :
-                        isSprinting ? SETTINGS.sprintMultiplier : 1.0
-                    );
                     const collisionSteps = Math.ceil((Math.max(inputSpeed, Math.abs(velocity.y)) * dt) / 0.3) || 1;
                     const stepDt = dt / collisionSteps;
                     // Use cameraRig for player position if available (modern PointerLockControls fix)
@@ -44350,6 +44369,7 @@ self.onmessage = async (e) => {
             // Scratch objects for the refraction staleness check (hot path — no per-frame allocs)
             const _refractCamWorldPos = new THREE.Vector3();
             const _refractCamWorldQuat = new THREE.Quaternion();
+            const _hiddenWaterMeshes = []; // VOXEX-CCR-PERF-014 #549: reused water-mesh hide list (refraction)
             // Scratch color for save/restore of the renderer clear color when clearing glow buffers to BLACK.
             const _ppPrevClear = new THREE.Color();
             // Composited frame: capture scene → sceneRT, render the downsampled glow (god rays above
@@ -44461,7 +44481,10 @@ self.onmessage = async (e) => {
                         window.lastRefractionCamQuat.copy(_refractCamWorldQuat);
 
                         // Temporarily hide all water meshes
-                        const hiddenWaterMeshes = [];
+                        // VOXEX-CCR-PERF-014 #549: reuse a persistent array (consumed fully within
+                        // this block — pushed here, drained in the restore loop below).
+                        const hiddenWaterMeshes = _hiddenWaterMeshes;
+                        hiddenWaterMeshes.length = 0;
                         if (chunkMeshes) {
                             for (const [key, mesh] of chunkMeshes.entries()) {
                                 if (key.endsWith("_WATER") && mesh && mesh.visible) { // glass stays visible so water refracts it (2a.2 refraction retired)
@@ -44580,10 +44603,13 @@ self.onmessage = async (e) => {
                 perfMetrics.composerUsed = true;
 
                 // DIAGNOSTIC: Render mesh analysis (logs every ~5 seconds)
-                // Tracks how many scene meshes have geometry and valid drawRange
+                // Tracks how many scene meshes have geometry and valid drawRange.
+                // VOXEX-CCR-PERF-014 #542: gated behind isDebug (~ toggle) so the full
+                // scene.traverse + warn don't run in production. NOTE: this is the
+                // [RenderDiag] walk, NOT checkGeometryLeaks() — leak detection is unaffected.
                 if (!window._lastRenderDiagTime) window._lastRenderDiagTime = 0;
                 const diagNow = performance.now();
-                if (diagNow - window._lastRenderDiagTime > 5000) {
+                if (isDebug && diagNow - window._lastRenderDiagTime > 5000) {
                     window._lastRenderDiagTime = diagNow;
                     let meshesWithGeometry = 0, meshesWithDrawRange = 0, totalDrawCount = 0;
                     let meshesWithZeroDrawRange = 0;
