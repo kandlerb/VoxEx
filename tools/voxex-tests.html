@@ -188,7 +188,11 @@ async function runAllTests() {
             calculateChunkSunlight,
             calculateBlockLight, pickVoxel, VoxelWorld,
             FIRE, BURNT_LOG, BURNT_PLANKS, BURNABLE_BLOCK_IDS, BURN_RESULT, BURN_TIME, isBurnable,
-            dist2DSq } = VoxEx;
+            dist2DSq,
+            // --- new terrain (VOXEX-CCR-TERRAIN-004, flag-gated) ---
+            continentalness, erosionParam, weirdness, peaksValleys, temperature, humidity,
+            terrainBaseHeight, computeSurfaceHeight, resolveBiome, spline, normField,
+            WORLD_CONFIG, BIOME_PARAMS, getBiomeParams } = VoxEx;
     const seedNoise = VoxEx.seedNoise;
     const biomeCellCache = VoxEx.biomeCellCache;
     const CHUNK_SIZE = WORLD_DIMS.chunkSize, CHUNK_HEIGHT = WORLD_DIMS.chunkHeight;
@@ -669,6 +673,216 @@ async function runAllTests() {
         it("getRiverDepth positive", () => {
             biomeCellCache.clear(); seedNoise("river"); const sd = VoxEx.worldSeed;
             for (let i = 0; i < 100; i++) { const d = getRiverDepth(0.0, i*61, i*-43, sd); expect(d).toBeGreaterThan(0); }
+        });
+    });
+
+    // ============================================================
+    // NEW TERRAIN (VOXEX-CCR-TERRAIN-004): climate/spline system, flag-gated by
+    // worldConfig.useNewTerrain (default true). See terrain-architecture-plan.md §9.2 for the
+    // spec these tests implement: field ranges, determinism, invariants, and continuity.
+    // NOTE: worker<->main byte-parity for the new path is already covered for free by the
+    // existing generic "Tier 4: chunk worker round-trip + blendedHeight parity" and
+    // "Tier 4: worker biome-resolver parity" suites below — they compare blendedHeight/
+    // getBiomeParams output between threads with no assumption about which algorithm is
+    // active, so they exercise whichever path useNewTerrain currently selects. Not duplicated here.
+    // ============================================================
+    describe("new terrain: spline() helper", () => {
+        const pts = [[-1, 0], [0, 10], [1, 0]];
+        it("clamps to first control point below domain", () => { expect(spline(pts, -5)).toBe(0); });
+        it("clamps to last control point above domain", () => { expect(spline(pts, 5)).toBe(0); });
+        it("hits control points exactly", () => { expect(spline(pts, -1)).toBe(0); expect(spline(pts, 0)).toBe(10); expect(spline(pts, 1)).toBe(0); });
+        it("interpolates monotonically between points (smoothstep, no overshoot)", () => {
+            let prev = spline(pts, -1);
+            for (let x = -1; x <= 0; x += 0.1) { const y = spline(pts, x); expect(y).toBeGreaterThanOrEqual(prev - 1e-9); prev = y; }
+        });
+        it("single-point table returns that constant everywhere", () => { const one = [[0, 42]]; expect(spline(one, -10)).toBe(42); expect(spline(one, 10)).toBe(42); });
+    });
+
+    describe("new terrain: normField() helper", () => {
+        it("zero maps to zero", () => { expect(normField(0)).toBe(0); });
+        it("clamps to [-1, 1] for large inputs", () => { expect(normField(100)).toBe(1); expect(normField(-100)).toBe(-1); });
+        it("preserves sign for small inputs", () => { expect(normField(0.1)).toBeGreaterThan(0); expect(normField(-0.1)).toBeLessThan(0); });
+    });
+
+    describe("new terrain: climate field ranges", () => {
+        it("erosionParam in [-1,1]", () => {
+            biomeCellCache.clear(); seedNoise("climate1");
+            for (let i = 0; i < 200; i++) { const v = erosionParam(i * 131 - 13000, i * -97 + 5000); expect(v).toBeGreaterThanOrEqual(-1); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("weirdness in [-1,1]", () => {
+            biomeCellCache.clear(); seedNoise("climate2");
+            for (let i = 0; i < 200; i++) { const v = weirdness(i * 151 - 13000, i * -83 + 5000); expect(v).toBeGreaterThanOrEqual(-1); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("peaksValleys in [-1,1]", () => {
+            biomeCellCache.clear(); seedNoise("climate3");
+            for (let i = 0; i < 200; i++) { const v = peaksValleys(i * 163 - 13000, i * -101 + 5000); expect(v).toBeGreaterThanOrEqual(-1); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("temperature in [0,1]", () => {
+            biomeCellCache.clear(); seedNoise("climate4");
+            for (let i = 0; i < 200; i++) { const v = temperature(i * 173 - 13000, i * -109 + 5000); expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("humidity in [0,1]", () => {
+            biomeCellCache.clear(); seedNoise("climate5");
+            for (let i = 0; i < 200; i++) { const v = humidity(i * 181 - 13000, i * -113 + 5000); expect(v).toBeGreaterThanOrEqual(0); expect(v).toBeLessThanOrEqual(1); }
+        });
+        it("continentalness finite (skewed 0..~0.7 range, not normField'd — see terrain-architecture-plan.md §8.6)", () => {
+            biomeCellCache.clear(); seedNoise("climate6");
+            for (let i = 0; i < 200; i++) { expect(isFinite(continentalness(i * 191 - 13000, i * -127 + 5000))).toBeTruthy(); }
+        });
+        it("peaksValleys actually reaches both a peak and a valley over a wide sweep (fold isn't pinned one-sided)", () => {
+            biomeCellCache.clear(); seedNoise("climate7");
+            let min = Infinity, max = -Infinity;
+            for (let i = 0; i < 500; i++) { const v = peaksValleys(i * 211 - 50000, i * -149 + 20000); min = Math.min(min, v); max = Math.max(max, v); }
+            expect(max).toBeGreaterThan(0.3);
+            expect(min).toBeLessThan(-0.3);
+        });
+    });
+
+    describe("new terrain: climate field determinism", () => {
+        const fns = { continentalness, erosionParam, weirdness, peaksValleys, temperature, humidity };
+        it("same (seed,coord) -> same value for every field", () => {
+            for (const s of ["alpha", "det_seed", "42"]) {
+                for (const name in fns) {
+                    biomeCellCache.clear(); seedNoise(s);
+                    const a = fns[name](321, -654);
+                    biomeCellCache.clear(); seedNoise(s);
+                    const b = fns[name](321, -654);
+                    expect(a).toBe(b);
+                }
+            }
+        });
+    });
+
+    describe("new terrain: computeSurfaceHeight invariants", () => {
+        it("finite over a wide coordinate sweep", () => {
+            biomeCellCache.clear(); seedNoise("surf_sweep");
+            for (let i = 0; i < 400; i++) { const gx = (i * 977) % 100000 - 50000, gz = (i * 1597) % 100000 - 50000; expect(isFinite(computeSurfaceHeight(gx, gz))).toBeTruthy(); }
+        });
+        it("returns an integer (floored)", () => {
+            biomeCellCache.clear(); seedNoise("surf_int");
+            for (let i = 0; i < 50; i++) { const h = computeSurfaceHeight(i * 53, i * -71); expect(h).toBe(Math.floor(h)); }
+        });
+        it("stays within [1, MAX_SURFACE_Y] safety clamp", () => {
+            biomeCellCache.clear(); seedNoise("surf_bounds");
+            for (let i = 0; i < 300; i++) { const h = computeSurfaceHeight(i * 311 - 40000, i * -219 + 40000); expect(h).toBeGreaterThanOrEqual(1); expect(h).toBeLessThanOrEqual(285); }
+        });
+        it("deterministic per (seed,coord)", () => {
+            biomeCellCache.clear(); seedNoise("surf_det");
+            const a = computeSurfaceHeight(4242, -1313);
+            biomeCellCache.clear(); seedNoise("surf_det");
+            const b = computeSurfaceHeight(4242, -1313);
+            expect(a).toBe(b);
+        });
+        it("different seeds usually differ", () => {
+            biomeCellCache.clear(); seedNoise("surf_a"); const ha = computeSurfaceHeight(777, 777);
+            biomeCellCache.clear(); seedNoise("surf_b"); const hb = computeSurfaceHeight(777, 777);
+            expect(ha === hb).toBeFalsy();
+        });
+    });
+
+    describe("new terrain: continuity (no border seams — terrain-architecture-plan.md §3.4/§9.2d)", () => {
+        it("adjacent-column height delta stays bounded on X", () => {
+            biomeCellCache.clear(); seedNoise("continuity_x");
+            let maxDelta = 0;
+            for (let x = -200; x < 200; x++) { const a = computeSurfaceHeight(x, 500), b = computeSurfaceHeight(x + 1, 500); maxDelta = Math.max(maxDelta, Math.abs(a - b)); }
+            expect(maxDelta).toBeLessThan(30); // generous — catches gross discontinuities/seams, not fine mountain jaggedness
+        });
+        it("adjacent-column height delta stays bounded on Z", () => {
+            biomeCellCache.clear(); seedNoise("continuity_z");
+            let maxDelta = 0;
+            for (let z = -200; z < 200; z++) { const a = computeSurfaceHeight(500, z), b = computeSurfaceHeight(500, z + 1); maxDelta = Math.max(maxDelta, Math.abs(a - b)); }
+            expect(maxDelta).toBeLessThan(30);
+        });
+        it("no 64-block-grid-aligned jumps (old bilinear cell boundaries are gone)", () => {
+            // Sample straddling several old BIOME_CELL_SIZE=64 boundaries; a leftover grid artifact
+            // would show as a spike concentrated exactly at multiples of 64.
+            biomeCellCache.clear(); seedNoise("continuity_grid");
+            for (const boundary of [64, 128, 192, 256]) {
+                const before = computeSurfaceHeight(boundary - 1, 1000), at = computeSurfaceHeight(boundary, 1000), after = computeSurfaceHeight(boundary + 1, 1000);
+                expect(Math.abs(at - before)).toBeLessThan(30);
+                expect(Math.abs(after - at)).toBeLessThan(30);
+            }
+        });
+    });
+
+    describe("new terrain: resolveBiome", () => {
+        it("returns a biome object with a name that is a BIOME_PARAMS key", () => {
+            biomeCellCache.clear(); seedNoise("resolve1");
+            const names = Object.keys(BIOME_PARAMS);
+            for (let i = 0; i < 100; i++) {
+                const b = resolveBiome(i * 233 - 20000, i * -179 + 20000);
+                expect(b).toBeTruthy();
+                expect(names.includes(b.name)).toBeTruthy();
+            }
+        });
+        it("deterministic per (seed,coord)", () => {
+            biomeCellCache.clear(); seedNoise("resolve2");
+            const a = resolveBiome(999, -999).name;
+            biomeCellCache.clear(); seedNoise("resolve2");
+            const b = resolveBiome(999, -999).name;
+            expect(a).toBe(b);
+        });
+        it("most declared biomes are reachable over a wide param-space sweep", () => {
+            // Probabilistic smoke test (nearest-target scan over real noise fields, not a synthetic
+            // param grid) — asserts the selector isn't collapsed onto one or two biomes, not that
+            // every biome appears in this particular sample.
+            biomeCellCache.clear(); seedNoise("resolve3");
+            const seen = new Set();
+            for (let i = 0; i < 4000; i++) { seen.add(resolveBiome(i * 337 - 600000, i * -401 + 600000).name); }
+            const total = Object.keys(BIOME_PARAMS).length;
+            expect(seen.size).toBeGreaterThanOrEqual(Math.ceil(total / 2));
+        });
+        it("honors worldConfig.forceSingleBiome (selectedBiome short-circuit)", () => {
+            const prev = VoxEx.selectedBiome;
+            try {
+                VoxEx.selectedBiome = 'mountains';
+                biomeCellCache.clear(); seedNoise("force1");
+                for (let i = 0; i < 20; i++) { expect(resolveBiome(i * 500, i * -700).name).toBe('mountains'); }
+            } finally { VoxEx.selectedBiome = prev; }
+        });
+        it("getBiomeParams(gx,gz) delegates to resolveBiome when useNewTerrain is on (public entry point per plan §4.3)", () => {
+            expect(WORLD_CONFIG.useNewTerrain).toBeTruthy(); // default; document the precondition this test relies on
+            biomeCellCache.clear(); seedNoise("delegate1");
+            const a = getBiomeParams(1234, -4321).name;
+            biomeCellCache.clear(); seedNoise("delegate1");
+            const b = resolveBiome(1234, -4321).name;
+            expect(a).toBe(b);
+        });
+    });
+
+    describe("new terrain: useNewTerrain flag switches blendedHeight's algorithm", () => {
+        it("toggling the flag changes output at typical (non-degenerate) coordinates", () => {
+            const prevFlag = WORLD_CONFIG.useNewTerrain;
+            try {
+                biomeCellCache.clear(); seedNoise("flagtest"); const sd = VoxEx.worldSeed;
+                WORLD_CONFIG.useNewTerrain = true;
+                const newH = blendedHeight(3000, -1500, sd);
+                biomeCellCache.clear();
+                WORLD_CONFIG.useNewTerrain = false;
+                const oldH = blendedHeight(3000, -1500, sd);
+                expect(isFinite(newH)).toBeTruthy();
+                expect(isFinite(oldH)).toBeTruthy();
+                // The two algorithms are unrelated (spline/climate vs. bilinear per-biome blend) —
+                // equal-by-coincidence at one probe point is astronomically unlikely across a real sweep.
+                let sameCount = 0;
+                for (let i = 0; i < 20; i++) {
+                    const gx = i * 401 - 4000, gz = i * -337 + 4000;
+                    WORLD_CONFIG.useNewTerrain = true; biomeCellCache.clear(); const a = blendedHeight(gx, gz, sd);
+                    WORLD_CONFIG.useNewTerrain = false; biomeCellCache.clear(); const b = blendedHeight(gx, gz, sd);
+                    if (a === b) sameCount++;
+                }
+                expect(sameCount).toBeLessThan(20);
+            } finally { WORLD_CONFIG.useNewTerrain = prevFlag; biomeCellCache.clear(); }
+        });
+        it("old path unaffected: getBiomeParams still returns a valid BIOME_CONFIG biome when the flag is off", () => {
+            const prevFlag = WORLD_CONFIG.useNewTerrain;
+            try {
+                WORLD_CONFIG.useNewTerrain = false;
+                biomeCellCache.clear(); seedNoise("oldpath");
+                const b = getBiomeParams(500, 500);
+                expect(b).toBeTruthy();
+                expect(BIOME_NAMES.includes(b.name)).toBeTruthy();
+            } finally { WORLD_CONFIG.useNewTerrain = prevFlag; biomeCellCache.clear(); }
         });
     });
 
