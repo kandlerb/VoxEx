@@ -5526,15 +5526,8 @@
                 };
             }
 
-            /**
-             * Check if a ground block is valid for tree spawning
-             * @param {BlockId} blockId - The block ID to check
-             * @param {Set<BlockId>} allowedGroundBlocks - Set of valid ground block IDs
-             * @returns {boolean} True if the block is valid for tree spawning
-             */
-            function isValidTreeGround(blockId, allowedGroundBlocks) {
-                return allowedGroundBlocks.has(blockId);
-            }
+            // [TOMBSTONE PAR-7] Removed dead isValidTreeGround() — the tree go/no-go is now
+            // fully deterministic (pure function of gx, gz, seed); no chunk-data ground check.
 
             /**
              * Seeded deterministic hash RNG for tree generation.
@@ -5837,8 +5830,6 @@
                             allTrees.push({
                                 ...tree,
                                 isOwnChunk: (dx === 0 && dz === 0),
-                                sourceCx: ncx,
-                                sourceCz: ncz,
                             });
                         }
                     }
@@ -5848,7 +5839,7 @@
                 for (const tree of allTrees) {
                     const { gx, gz, lx, lz, trunkHeight, trunkW, trunkD, profile, isOwnChunk,
                             halfW, halfD, minTx, maxTx, minTz, maxTz, groundY } = tree;
-                    const { canopy, blocks, allowedGroundBlocks } = profile;
+                    const { blocks } = profile;
 
                     // Calculate local coordinates in THIS chunk for the tree center
                     const localX = gx - startX;
@@ -5864,39 +5855,18 @@
                     const trunkBaseY = finalGroundY + 1;
                     const trunkTopY = trunkBaseY + trunkHeight;
 
-                    // Validate and place trunk only for trees in THIS chunk
-                    // Note: River/spacing/slope/overhang checks are done deterministically
-                    // in getChunkTreePositions; the checks below need actual chunk data.
+                    // DETERMINISTIC GO/NO-GO (PAR-7): every accept/reject input is a pure
+                    // function of (gx, gz, seed) and already ran in getChunkTreePositions
+                    // (biome, tree mask, density, river, spacing, slope/footprint via
+                    // isTreeSiteViable, world-top room). The old chunk-data reads here
+                    // (surface-block whitelist, cave-roof probe, trunk-space scan) were
+                    // REMOVED: neighbor chunks and the worker (whose `chunks` map is
+                    // permanently empty) could never reproduce them, so canopies were
+                    // placed for trunks the owning chunk then rejected — floating leaves
+                    // at seams, and worker-vs-main-fallback chunks with different blocks.
+                    // Accepted trade-off: trees may stand on stone/gravel surface patches,
+                    // lake-bed gravel, or bridge a cave roof carved below the surface.
                     if (isOwnChunk) {
-                        // Ground + support check for EVERY trunk footprint column —
-                        // multi-trunk longwoods must not stand on invalid ground, and a
-                        // cave/tunnel directly under the surface disqualifies the site.
-                        let groundOk = true;
-                        for (let tx = minTx; tx <= maxTx && groundOk; tx++) {
-                            for (let tz = minTz; tz <= maxTz && groundOk; tz++) {
-                                const groundId = get(lx + tx, finalGroundY, lz + tz);
-                                if (!isValidTreeGround(groundId, allowedGroundBlocks)) groundOk = false;
-                                const belowId = get(lx + tx, finalGroundY - 1, lz + tz);
-                                if (belowId === AIR || belowId === WATER) groundOk = false; // cave roof / overhang
-                            }
-                        }
-                        if (!groundOk) continue;
-
-                        // Check space for the FULL trunk footprint
-                        let hasSpace = true;
-                        for (let y = trunkBaseY; y <= trunkTopY && hasSpace; y++) {
-                            for (let tx = minTx; tx <= maxTx && hasSpace; tx++) {
-                                for (let tz = minTz; tz <= maxTz && hasSpace; tz++) {
-                                    const block = get(lx + tx, y, lz + tz);
-                                    if (block !== AIR && !isLeafBlock(block)) hasSpace = false;
-                                }
-                            }
-                        }
-                        if (!hasSpace) continue;
-
-                        // Height limit check
-                        if (trunkTopY + canopy.topExtension >= chunkHeight) continue;
-
                         // Place trunk
                         for (let y = trunkBaseY; y <= trunkTopY; y++) {
                             for (let tx = minTx; tx <= maxTx; tx++) {
@@ -5909,35 +5879,10 @@
                                 }
                             }
                         }
-                    } else {
-                        // NEIGHBOR TREE VALIDATION
-                        // For trees from neighbor chunks, we trust the deterministic generator.
-                        // If the source chunk exists, verify the trunk was actually placed.
-                        // If the source chunk doesn't exist yet, assume the tree will be placed.
-                        const sourceKey = getChunkKey(tree.sourceCx, tree.sourceCz);
-                        const sourceChunk = chunks.get(sourceKey);
-
-                        if (sourceChunk) {
-                            // ROBUST RANGE SCAN (parity with worker copy and
-                            // placeNeighborTreeLeaves): a single-Y check fails on any
-                            // estimate/actual height delta. Scan the trunk column
-                            // (estimate ± slack) for ANY log.
-                            const sourceBlocks = sourceChunk.blocks || sourceChunk;
-                            const sourceStartX = tree.sourceCx * chunkSize;
-                            const sourceStartZ = tree.sourceCz * chunkSize;
-                            const colBase = (gx - sourceStartX) + (gz - sourceStartZ) * chunkSize;
-                            const scanLo = Math.max(0, groundY - 6);
-                            const scanHi = Math.min(chunkHeight - 1, trunkTopY + 6);
-                            let trunkFound = false;
-                            for (let ty = scanLo; ty <= scanHi; ty++) {
-                                if (isLogBlock(sourceBlocks[colBase + ty * chunkSize * chunkSize])) { trunkFound = true; break; }
-                            }
-                            // If chunk exists but trunk doesn't, tree failed validation - skip leaves
-                            if (!trunkFound) continue;
-                        }
-                        // If sourceChunk is undefined, trust the deterministic generator
-                        // and place leaves now. The trunk will be placed when that chunk generates.
                     }
+                    // Neighbor trees: the deterministic generator guarantees the owning
+                    // chunk places this trunk (same pure-function verdict), so canopy
+                    // leaves are placed unconditionally — no source-chunk log scan needed.
 
                     // Place canopy leaves that fall within THIS chunk
                     // This runs for ALL trees (own and neighbor) whose canopy overlaps.
@@ -19012,13 +18957,8 @@
     // TREE GENERATION SYSTEM - MUST MATCH MAIN THREAD EXACTLY!
     // ============================================================
     const treeMaskCache = new Map();
-    // Empty Map for chunks - worker doesn't have access to main thread chunks
-    // This causes neighbor validation to always trust the deterministic generator
-    const chunks = new Map();
-
-    function getChunkKey(cx, cz) {
-        return cx + ',' + cz;
-    }
+    // [TOMBSTONE PAR-7] Removed the always-empty "chunks" map + getChunkKey — the injected
+    // generateTreesForChunk no longer scans source chunks (deterministic go/no-go).
 
     function seededRandom(seed, gx, gz, x, y, z) {
         let h = seed;
@@ -19042,9 +18982,7 @@
         return LOG_BLOCK_IDS.has(blockId);
     }
 
-    function isValidTreeGround(blockId, allowedGroundBlocks) {
-        return allowedGroundBlocks.has(blockId);
-    }
+    // [TOMBSTONE PAR-7] Removed dead worker isValidTreeGround copy (see main-thread tombstone).
 
 
     function getTreeMaskKey(cx, cz) {
