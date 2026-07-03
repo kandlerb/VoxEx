@@ -25207,6 +25207,11 @@
             }
             function computeNeighborBlockLight(x, y, z) {
                 let maxLight = 0;
+                // TER-1: light entering THIS cell pays 1 (travel) + BLOCKLIGHT_ATTENUATION of
+                // this cell's block (water = 2 extra/block) — matches calculateBlockLight's BFS,
+                // which attenuates by the ENTERED cell's block type.
+                const selfId = getBlock(x, y, z);
+                const selfAttenuation = selfId === undefined ? 0 : BLOCKLIGHT_ATTENUATION[selfId];
                 for (let i = 0; i < NEIGHBOR_OFFSETS.length; i++) {
                     const o = NEIGHBOR_OFFSETS[i];
                     const nx = x + o[0];
@@ -25215,7 +25220,10 @@
                     const neighborId = getBlock(nx, ny, nz);
                     if (neighborId === undefined || !IS_TRANSPARENT[neighborId]) continue;
                     const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
-                    const propagated = nLight > 0 ? nLight - 1 : 0;
+                    const basePropagated = nLight > 0 ? nLight - 1 : 0;
+                    const propagated = selfAttenuation > 0
+                        ? (basePropagated > selfAttenuation ? basePropagated - selfAttenuation : 0)
+                        : basePropagated;
                     if (propagated > maxLight) maxLight = propagated;
                 }
                 return maxLight;
@@ -27434,8 +27442,9 @@ self.onmessage = async (e) => {
             const DB_VERSION = 2;
             const STORE_NAME = "chunks";
             // Bump on any cache-format / lighting change; stamped into every saved chunk and compared on load.
+            // v6: blocklight attenuation wired up (water 2/block) + incremental sunlight aligned with full recalc (TER-1/TER-2/TER-18);
             // v5: re-reconcile trees after deterministic site validation (slope/overhang); v4: canopy-prune fix; v3: water sunlight attenuation.
-            const CURRENT_CACHE_VERSION = 5;
+            const CURRENT_CACHE_VERSION = 6;
             let db = null;
             async function initDatabase() {
                 return new Promise((resolve, reject) => { const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -38906,10 +38915,13 @@ self.onmessage = async (e) => {
                         // Only propagate through transparent blocks
                         if (!IS_TRANSPARENT[nBlockId]) continue;
 
-                        // Apply additional attenuation for semi-transparent blocks (leaves)
+                        // Apply additional attenuation for semi-transparent blocks (leaves, water).
+                        // TER-18: when the light doesn't survive the attenuation, clamp to the
+                        // skylight floor of 1 instead of keeping the unreduced value (that fallback
+                        // was unreachable at attenuation 1, wrong for any future attenuation >= 2).
                         const attenuation = SUNLIGHT_ATTENUATION[nBlockId];
-                        const propagated = attenuation > 0 && basePropagated > attenuation
-                            ? basePropagated - attenuation
+                        const propagated = attenuation > 0
+                            ? (basePropagated > attenuation ? basePropagated - attenuation : 1)
                             : basePropagated;
 
                         // Clamp to minimum 1
@@ -38977,8 +38989,8 @@ self.onmessage = async (e) => {
                     const lz = queue[qIdx++];
                     const level = queue[qIdx++];
 
-                    const propagated = level > 1 ? level - 1 : 0;
-                    if (propagated <= 0) continue;
+                    const basePropagated = level > 1 ? level - 1 : 0;
+                    if (basePropagated <= 0) continue;
 
                     for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
                         const o = NEIGHBOR_OFFSETS[n];
@@ -38989,11 +39001,21 @@ self.onmessage = async (e) => {
                         // Bounds check (stay within chunk)
                         if (nx < 0 || nx >= cs || nz < 0 || nz >= cs || ny < 0 || ny >= chunkHeight) continue;
 
+                        // NOTE: (nz << 4) + (ny << 8) hardcodes chunkSize 16 despite the chunkSize param.
                         const nIdx = nx + (nz << 4) + (ny << 8);
                         const nBlockId = blocks[nIdx];
 
                         // Only propagate through transparent blocks
                         if (!IS_TRANSPARENT[nBlockId]) continue;
+
+                        // TER-1: entering a cell costs 1 (travel) + BLOCKLIGHT_ATTENUATION of the
+                        // entered block (water = 2 extra/block; air/glass = 0). Blocklight floors
+                        // at 0 (unlike skylight's floor of 1).
+                        const attenuation = BLOCKLIGHT_ATTENUATION[nBlockId];
+                        const propagated = attenuation > 0
+                            ? (basePropagated > attenuation ? basePropagated - attenuation : 0)
+                            : basePropagated;
+                        if (propagated <= 0) continue;
 
                         // Only update if we can provide more light
                         if (propagated > blockLight[nIdx]) {
