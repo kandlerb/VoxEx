@@ -5728,8 +5728,8 @@
                         for (let ddx = -spacing; ddx <= spacing && !tooClose; ddx++) {
                             for (let ddz = -spacing; ddz <= spacing && !tooClose; ddz++) {
                                 if (ddx === 0 && ddz === 0) continue;
-                                const dist = Math.sqrt(ddx * ddx + ddz * ddz);
-                                if (dist >= spacing) continue;
+                                const distSq = ddx * ddx + ddz * ddz;
+                                if (distSq >= spacing * spacing) continue;
                                 
                                 const neighborGx = gx + ddx;
                                 const neighborGz = gz + ddz;
@@ -5998,7 +5998,11 @@
                 const trunkMaxZ = trunkD - halfD - 1;
 
                 // PASS 1: Collect all candidate positions
-                // Store as Map with key "dx,y,dz" -> true
+                // Store as Map with a packed-int key -> true (no string alloc/parse):
+                //   key = (dx + 16) | ((dz + 16) << 6) | (y << 12)
+                // dx/dz bounded by scanRadius+1 = ±9 today (max radius 6 + 2 + flood-fill
+                // neighbor) — ±16 headroom, 6 bits each. y is absolute world Y (0..319).
+                // NOTE: if a biome canopy radius ever exceeds 13, widen the bit layout.
                 const candidates = new Map();
 
                 // Helper to check if position is inside trunk column
@@ -6074,8 +6078,8 @@
                                 if (seededRandom(seed, gxCenter, gzCenter, dx, y, dz + 9999) > leafChance) continue;
                             }
 
-                            // Add to candidate set
-                            candidates.set(`${dx},${y},${dz}`, true);
+                            // Add to candidate set (packed-int key)
+                            candidates.set((dx + 16) | ((dz + 16) << 6) | (y << 12), true);
                         }
                     }
                 }
@@ -6108,23 +6112,30 @@
                 // DIAGNOSTIC: Track candidate count before filtering
                 const beforeCount = candidates.size;
 
-                // Face neighbors for initial trunk adjacency check
-                const faceOffsets = [
-                    [1, 0, 0], [-1, 0, 0],  // +X, -X
-                    [0, 1, 0], [0, -1, 0],  // +Y, -Y
-                    [0, 0, 1], [0, 0, -1]   // +Z, -Z
-                ];
-
-                // Extended neighbors for flood fill (face + edge, more lenient)
-                const extendedOffsets = [
-                    // Face neighbors
-                    [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
-                    // Edge neighbors (same Y) - allows horizontal diagonal connections
-                    [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
-                    // Edge neighbors (Y±1) - allows diagonal vertical connections
-                    [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1],
-                    [1, -1, 0], [-1, -1, 0], [0, -1, 1], [0, -1, -1],
-                ];
+                // Offset tables hoisted as lazily-initialized FUNCTION PROPERTIES — not
+                // module scope: forEachCanopyVoxel ships to the worker via
+                // Function.toString() injection, so anything outside the function body
+                // would not be injected. Properties persist across calls on both threads.
+                if (!forEachCanopyVoxel._faceOffsets) {
+                    // Face neighbors for initial trunk adjacency check
+                    forEachCanopyVoxel._faceOffsets = [
+                        [1, 0, 0], [-1, 0, 0],  // +X, -X
+                        [0, 1, 0], [0, -1, 0],  // +Y, -Y
+                        [0, 0, 1], [0, 0, -1]   // +Z, -Z
+                    ];
+                    // Extended neighbors for flood fill (face + edge, more lenient)
+                    forEachCanopyVoxel._extendedOffsets = [
+                        // Face neighbors
+                        [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1],
+                        // Edge neighbors (same Y) - allows horizontal diagonal connections
+                        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],
+                        // Edge neighbors (Y±1) - allows diagonal vertical connections
+                        [1, 1, 0], [-1, 1, 0], [0, 1, 1], [0, 1, -1],
+                        [1, -1, 0], [-1, -1, 0], [0, -1, 1], [0, -1, -1],
+                    ];
+                }
+                const faceOffsets = forEachCanopyVoxel._faceOffsets;
+                const extendedOffsets = forEachCanopyVoxel._extendedOffsets;
 
                 // First, mark all positions adjacent to trunk as definitely connected
                 const connected = new Set();
@@ -6132,7 +6143,9 @@
 
                 // Find initial connected leaves (face-adjacent to trunk)
                 for (const key of candidates.keys()) {
-                    const [dx, y, dz] = key.split(',').map(Number);
+                    const dx = (key & 63) - 16;
+                    const dz = ((key >> 6) & 63) - 16;
+                    const y = key >> 12;
                     // Check if any face neighbor is trunk
                     for (const [ox, oy, oz] of faceOffsets) {
                         const nx = dx + ox;
@@ -6149,13 +6162,15 @@
                 // Flood fill to find all connected leaves using extended adjacency
                 while (toProcess.length > 0) {
                     const currentKey = toProcess.pop();
-                    const [cx, cy, cz] = currentKey.split(',').map(Number);
+                    const cx = (currentKey & 63) - 16;
+                    const cz = ((currentKey >> 6) & 63) - 16;
+                    const cy = currentKey >> 12;
 
                     for (const [ox, oy, oz] of extendedOffsets) {
                         const nx = cx + ox;
                         const ny = cy + oy;
                         const nz = cz + oz;
-                        const neighborKey = `${nx},${ny},${nz}`;
+                        const neighborKey = (nx + 16) | ((nz + 16) << 6) | (ny << 12);
 
                         if (candidates.has(neighborKey) && !connected.has(neighborKey)) {
                             connected.add(neighborKey);
@@ -6179,7 +6194,9 @@
 
                 // PASS 3: Output surviving candidates
                 for (const key of candidates.keys()) {
-                    const [dx, y, dz] = key.split(',').map(Number);
+                    const dx = (key & 63) - 16;
+                    const dz = ((key >> 6) & 63) - 16;
+                    const y = key >> 12;
                     fn(dx, dz, y);
                 }
             }
