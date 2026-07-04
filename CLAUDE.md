@@ -187,7 +187,7 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 - **UI**: world name, seed input, biome selector grid, terrain presets, advanced sliders.
 - **Presets**: Default, Amplified, Flat, Archipelago, Superflat, Caves.
 - **Customization**: tree/cave density, terrain amplitude, sea level, biome size, noise persistence/lacunarity, spawn coords.
-- **Preview**: real-time terrain preview (`WorldPreviewRenderer`) using identical noise algorithms. **Management**: rename, duplicate, import/export, storage stats, clear cache.
+- **Preview**: real-time terrain preview (`WorldPreviewRenderer`) delegating directly to the game's own `blendedHeight()`/`getBiomeParams()` (no separate noise copy to keep in sync). **Management**: rename, duplicate, import/export, storage stats, clear cache.
 
 ### Persistence
 - **RLE Compression**: chunk data (blocks + light) Run-Length Encoded, v2 format; decompressor handles v1 + v2.
@@ -373,7 +373,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 **Refactoring scope**: refactor for correctness/readability/performance; keep diffs focused (no unrelated renames or style-only churn); never break the single-file rule.
 
-**Bug prevention**: before declaring any new `const`/`let`/function, search the file for the name — don't redeclare in the same scope or shadow globals (`scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`). Settings must round-trip via save/load and have real DOM IDs. Keep per-frame code to ≤2 nested loops; batch/cache/limit-to-nearby for expensive work. Terrain changes need worker parity AND `WorldPreviewRenderer` parity.
+**Bug prevention**: before declaring any new `const`/`let`/function, search the file for the name — don't redeclare in the same scope or shadow globals (`scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`). Settings must round-trip via save/load and have real DOM IDs. Keep per-frame code to ≤2 nested loops; batch/cache/limit-to-nearby for expensive work. Terrain changes need worker parity (`buildChunkWorkerCode()` injection); `WorldPreviewRenderer` delegates directly to the same functions, so it needs no separate parity check.
 
 **Logging**: prefer `logDebug(...)` over `console.log(...)` (chunk cache, pre-gen, streaming/eviction, new systems). Keep logs sparse (no per-frame/per-block spam) and tagged (`[PreGen]`, `[Chunks]`, `[Lighting]`, `[ZombieFX]`, `[Settings]`). `#debug-overlay` shows concise high-value info only (FPS, position, chunk/mesh/face counts, seed, biome).
 
