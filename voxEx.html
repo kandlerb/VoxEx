@@ -19503,6 +19503,8 @@
                     getBiomeParams,
                     getBiomeHeightAtCell,
                     sampleBiomeBilinearHeight,
+                    computePreRiverHeight,
+                    applyRiverCarve,
                     blendedHeight,
                     getPreRiverHeight,
                     getLocalSlope,
@@ -38010,7 +38012,16 @@ self.onmessage = async (e) => {
                 const h1 = lerpValue(h01, h11, sx);
                 return lerpValue(h0, h1, sz);
             }
-            function blendedHeight(gx, gz, seed) {
+            /**
+             * Pre-river terrain height plus the ocean factor used to compute it.
+             * Extracted from blendedHeight so precalculateTerrainCaches can
+             * evaluate the expensive surface field exactly once per column (TER-4).
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @returns {{height: number, oceanFactor: number}} Pre-river height and ocean factor
+             */
+            function computePreRiverHeight(gx, gz, seed) {
                 let finalHeight = worldConfig.useNewTerrain
                     ? computeSurfaceHeight(gx, gz)
                     : sampleBiomeBilinearHeight(gx, gz, seed);
@@ -38047,12 +38058,30 @@ self.onmessage = async (e) => {
                     finalHeight = lerpValue(oceanFloor, finalHeight, bank);
                 }
 
+                return { height: finalHeight, oceanFactor };
+            }
+
+            /**
+             * Apply river/delta carving to a pre-river height.
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @param {number} preHeight - Output of computePreRiverHeight().height
+             * @param {number} oceanFactor - Output of computePreRiverHeight().oceanFactor
+             * @param {number} [riverFactor] - Precomputed getRiverFactor value (skips recompute)
+             * @returns {number} Final floored terrain height
+             */
+            function applyRiverCarve(gx, gz, seed, preHeight, oceanFactor, riverFactor) {
+                let finalHeight = preHeight;
+
                 // 5. Apply rivers with delta support. When Rivers are disabled in the
                 //    create-world settings, neutralise both factors (1.0 = no water) so the
                 //    height carve is skipped entirely — the preview and the generated world
                 //    then show no river channels, not just no water fill.
                 const riversOn = worldConfig.enableRivers !== false;
-                const r = riversOn ? getRiverFactor(gx, gz, seed) : 1.0;
+                const r = riversOn
+                    ? (riverFactor !== undefined ? riverFactor : getRiverFactor(gx, gz, seed, preHeight))
+                    : 1.0;
                 const deltaFinger = riversOn ? getDeltaFingerFactor(gx, gz, seed, oceanFactor) : 1.0;
 
                 // River carving: either main river channel OR delta finger channels near ocean
@@ -38094,6 +38123,19 @@ self.onmessage = async (e) => {
                 }
 
                 return Math.floor(finalHeight);
+            }
+
+            /**
+             * Blended terrain height (surface + ocean + river carve).
+             * Signature unchanged — thin composition wrapper since TER-4.
+             * @param {number} gx - Global X coordinate
+             * @param {number} gz - Global Z coordinate
+             * @param {number} seed - World seed
+             * @returns {number} Final floored terrain height
+             */
+            function blendedHeight(gx, gz, seed) {
+                const pre = computePreRiverHeight(gx, gz, seed);
+                return applyRiverCarve(gx, gz, seed, pre.height, pre.oceanFactor);
             }
             // UPDATE getBiomeHeightAtCell to use continentalness properly:
             function getBiomeHeightAtCell(cx, cz, gx, gz, seed, continentFactor) {
@@ -38610,13 +38652,14 @@ self.onmessage = async (e) => {
              * @param {number} gx - Global X coordinate
              * @param {number} gz - Global Z coordinate
              * @param {number} seed - World seed
+             * @param {number} [preHeight] - Precomputed pre-river height (skips a full surface eval)
              * @returns {number} River factor (0 = river center, 1 = not river)
              */
-            function getRiverFactor(gx, gz, seed) {
+            function getRiverFactor(gx, gz, seed, preHeight) {
                 const warpScale = 0.004;
                 const baseWarpStrength = 20.0;
 
-                const terrainHeight = getPreRiverHeight(gx, gz, seed);
+                const terrainHeight = preHeight !== undefined ? preHeight : getPreRiverHeight(gx, gz, seed);
 
                 // Increase meandering at low elevations
                 const elevationFactor = Math.max(0, 1.0 - (terrainHeight - WORLD_DIMS.seaLevel) / 40);
@@ -39084,13 +39127,16 @@ self.onmessage = async (e) => {
                 const biomeCache = new Array(chunkSize * chunkSize);
                 const widthNoiseCache = new Float32Array(chunkSize * chunkSize);
                 const tempCache = worldConfig.useNewTerrain ? new Float32Array(chunkSize * chunkSize) : null;
+                const riversOn = worldConfig.enableRivers !== false;
                 for (let lx = 0; lx < chunkSize; lx++) {
                     for (let lz = 0; lz < chunkSize; lz++) {
                         const idx = lx + lz * chunkSize;
                         const gx = startX + lx;
                         const gz = startZ + lz;
-                        heightCache[idx] = blendedHeight(gx, gz, seed);
-                        riverCache[idx] = getRiverFactor(gx, gz, seed);
+                        const pre = computePreRiverHeight(gx, gz, seed);
+                        const rf = riversOn ? getRiverFactor(gx, gz, seed, pre.height) : 1.0;
+                        riverCache[idx] = rf;
+                        heightCache[idx] = applyRiverCarve(gx, gz, seed, pre.height, pre.oceanFactor, rf);
                         biomeCache[idx] = getBiomeParams(gx, gz);
                         widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
                         if (tempCache) tempCache[idx] = temperature(gx, gz);
