@@ -11,8 +11,10 @@ h1{color:#4caf50;margin-bottom:4px}
 .controls{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px;background:#222;padding:10px 14px;border-radius:8px}
 .controls label{font-size:13px;color:#aaa}
 .controls input,.controls select{background:#333;color:#eee;border:1px solid #555;padding:4px 8px;border-radius:4px;font-size:13px;width:110px}
+.controls input[type=checkbox]{width:auto;vertical-align:middle}
 .controls button{background:#4caf50;color:#fff;border:none;padding:8px 16px;border-radius:4px;font-size:13px;cursor:pointer}
-.controls button:hover{background:#66bb6a}
+.controls button:disabled{background:#555;cursor:default}
+.controls button:hover:not(:disabled){background:#66bb6a}
 #main-canvas{border:1px solid #444;border-radius:4px;cursor:crosshair;display:block;margin-bottom:12px}
 #cross-canvas{border:1px solid #444;border-radius:4px;display:block;margin-bottom:12px}
 .info-bar{background:#222;padding:10px 14px;border-radius:8px;font-size:13px;margin-bottom:12px;min-height:40px;line-height:1.6}
@@ -24,98 +26,143 @@ h1{color:#4caf50;margin-bottom:4px}
 .stats-bar{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
 .stat-chip{background:#222;padding:4px 10px;border-radius:4px;font-size:12px;color:#aaa}
 .stat-chip span{color:#eee;font-weight:bold}
+#banner{display:none;background:#3a1f1f;border:1px solid #a44;color:#fdd;padding:20px;border-radius:8px;line-height:1.7;font-size:14px;margin-bottom:12px}
+#banner code{background:#000;color:#fca;padding:1px 5px;border-radius:3px}
 </style>
 </head>
 <body>
 <h1>VoxEx Terrain Debugger</h1>
-<p class="subtitle">Shaded relief surface view + cross-section. Click the terrain to inspect columns.</p>
+<p class="subtitle">Shaded relief surface view + cross-section. Click the terrain to inspect columns. All terrain data comes live from voxEx.html via the <code>?test=1</code> seam &mdash; no hand-synced copies.</p>
 
 <div class="controls">
     <label>Seed: <input id="seed-input" value="test_seed_42"></label>
     <label>Center X: <input id="cx-input" type="number" value="0" step="32"></label>
     <label>Center Z: <input id="cz-input" type="number" value="0" step="32"></label>
     <label>Size: <select id="size-select"><option value="128">128</option><option value="192" selected>192</option><option value="256">256</option></select></label>
-    <button onclick="generate()">Generate</button>
+    <label title="Flip the live game's terrain pipeline. Both the new climate/spline system and the legacy biome-blend system route through the same VoxEx.blendedHeight / getBiomeParams dispatcher, so this shows exactly what each mode produces."><input type="checkbox" id="newterrain-toggle" checked> New terrain</label>
+    <button id="generate-btn" onclick="generate()" disabled>Generate</button>
 </div>
+<div id="banner"></div>
 <div class="legend" id="legend"></div>
 <div class="stats-bar" id="stats"></div>
-<div class="info-bar" id="info">Click terrain to inspect a column.</div>
+<div class="info-bar" id="info">Booting live game engine&hellip;</div>
 
 <canvas id="main-canvas"></canvas>
 <canvas id="cross-canvas"></canvas>
 
+<!-- Hidden host: boots the real game with its ?test=1 seam so this tool can route ALL
+     terrain/biome/noise sampling through window.VoxEx (no hand-copied duplicates). -->
+<iframe id="game-frame" src="../voxEx.html?test=1" style="display:none" title="hidden voxEx host (terrain functions)"></iframe>
+
 <script>
 // ============================================================
-// CONSTANTS
+// UI-ONLY CONSTANTS (block IDs + color/name lookup tables)
+// These are presentation tables, not terrain logic. All height / biome / noise
+// / ocean / river math is delegated to the live game via `VX` (window.VoxEx).
 // ============================================================
 const AIR=0,GRASS=1,DIRT=2,STONE=3,WOOD=4,LOG=5,LEAVES=6,BEDROCK=7,SAND=8,WATER=9,TORCH=10,SNOW=11,GRAVEL=12,LONGWOOD_LOG=13,LONGWOOD_LEAVES=14;
-const BIOME_CELL_SIZE=64;
-const MOUNTAIN_REGION_FREQ=0.0015;
-const MOUNTAIN_REGION_THRESHOLD=0.28;/* VOXEX-CCR-TERRAIN-002: lowered 0.34->0.28 for isotropic noise (restore ~10% mountain coverage) */
-const WORLD_DIMS={chunkSize:16,chunkHeight:320,yOffset:0,seaLevel:60};
 
 const BLOCK_RGB={[GRASS]:[76,175,80],[DIRT]:[121,85,72],[STONE]:[158,158,158],[BEDROCK]:[26,26,26],[SAND]:[230,214,172],[WATER]:[33,150,243],[SNOW]:[245,245,245],[GRAVEL]:[117,117,117],[LOG]:[93,64,55],[LEAVES]:[46,125,50],[LONGWOOD_LOG]:[61,42,31],[LONGWOOD_LEAVES]:[27,94,32]};
 const BLOCK_NAMES={[AIR]:"Air",[GRASS]:"Grass",[DIRT]:"Dirt",[STONE]:"Stone",[BEDROCK]:"Bedrock",[SAND]:"Sand",[WATER]:"Water",[SNOW]:"Snow",[GRAVEL]:"Gravel",[LOG]:"Log",[LEAVES]:"Leaves"};
 const BIOME_COLORS={plains:"#7cb342",hills:"#9ccc65",forests:"#2E7D32",mountains:"#78909c",mountain_foothills:"#8d6e63",swamp:"#5d4037",longwoods:"#1B5E20"};
 
 // ============================================================
-// NOISE (exact copy from voxEx.html worker)
+// LIVE GAME SEAM (window.VoxEx) — set once the hidden iframe boots.
 // ============================================================
-class SeededRandom{constructor(seed){if(typeof seed==="string"){let h=0xdeadbeef;for(let i=0;i<seed.length;i++){h=Math.imul(h^seed.charCodeAt(i),2654435761);h=(h^(h>>>16))>>>0;}this.seed=h;}else{this.seed=seed>>>0;}}next(){let t=(this.seed+=0x6d2b79f5);t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;}}
-let perm=null,workerNumericSeed=null;
-const FADE_LUT=new Float32Array(256);for(let i=0;i<256;i++){const t=i/255;FADE_LUT[i]=t*t*t*(t*(t*6-15)+10);}
-function fadeFast(t){return FADE_LUT[Math.min(255,Math.max(0,(t*255)|0))];}
-const lerp=(t,a,b)=>a+t*(b-a), lerpValue=(a,b,t)=>a+t*(b-a);
-/* VOXEX-CCR-TERRAIN-002: isotropic 2D gradient — byte-identical to voxEx.html main/worker grad. */
-const GRAD2D=[[1.1726039,0.0000000],[1.0833448,0.4487361],[0.8291562,0.8291562],[0.4487361,1.0833448],[0.0000000,1.1726039],[-0.4487361,1.0833448],[-0.8291562,0.8291562],[-1.0833448,0.4487361],[-1.1726039,0.0000000],[-1.0833448,-0.4487361],[-0.8291562,-0.8291562],[-0.4487361,-1.0833448],[0.0000000,-1.1726039],[0.4487361,-1.0833448],[0.8291562,-0.8291562],[1.0833448,-0.4487361]];
-const grad=(h,x,y)=>{const g=GRAD2D[h&15];return g[0]*x+g[1]*y;};
-const grad3D=(hash,x,y,z)=>{const h=hash&15;const u=h<8?x:y;const v=h<4?y:(h===12||h===14?x:z);return((h&1)===0?u:-u)+((h&2)===0?v:-v);};
-function initNoise(seedStr){perm=new Uint8Array(512);const p=new Uint8Array(256);for(let i=0;i<256;i++)p[i]=i;const rng=new SeededRandom(seedStr);workerNumericSeed=rng.next();for(let i=0;i<256;i++){const r=Math.floor(rng.next()*(256-i))+i;[p[i],p[r]]=[p[r],p[i]];perm[i]=perm[i+256]=p[i];}}
-function noise2D(x,y){const X=Math.floor(x)&255,Y=Math.floor(y)&255;x-=Math.floor(x);y-=Math.floor(y);const u=fadeFast(x),v=fadeFast(y);const A=perm[X]+Y,B=perm[X+1]+Y;return lerp(v,lerp(u,grad(perm[A],x,y),grad(perm[B],x-1,y)),lerp(u,grad(perm[A+1],x,y-1),grad(perm[B+1],x-1,y-1)));}
-function fbm2D(x,z,o=4,p=0.5,l=2.0){let t=0,f=1,a=1,m=0;for(let i=0;i<o;i++){t+=noise2D(x*f,z*f)*a;m+=a;a*=p;f*=l;}return t/m;}
-function fbmWithDomainWarp(x,z,o,p,l){const ws=0.03;return fbm2D(x+fbm2D(x*ws,z*ws,3,0.5,2)*20,z+fbm2D((x+100)*ws,(z+100)*ws,3,0.5,2)*20,o,p,l);}
+/** @type {object|null} The live game's ?test=1 seam (window.VoxEx). Null until the iframe boots. */
+let VX = null;
+const GAME_FRAME_TIMEOUT_MS = 15000;
+
+/**
+ * Poll the hidden game iframe until its window.VoxEx seam exists, then start the tool.
+ * On timeout (e.g. served over file:// or seam removed), show the failure banner.
+ * @returns {void}
+ */
+function bootVoxEx() {
+    const frame = document.getElementById('game-frame');
+    const start = performance.now();
+    (function poll() {
+        let seam = null;
+        try { seam = frame.contentWindow && frame.contentWindow.VoxEx; } catch (e) { seam = null; }
+        if (seam && typeof seam.blendedHeight === 'function' && typeof seam.seedNoise === 'function') {
+            VX = seam;
+            onVoxExReady();
+            return;
+        }
+        if (performance.now() - start > GAME_FRAME_TIMEOUT_MS) {
+            showFailureBanner();
+            return;
+        }
+        setTimeout(poll, 80);
+    })();
+}
+
+/**
+ * Called once the VoxEx seam is available: sync the terrain-mode checkbox to the live
+ * value, enable the Generate button, and render the first view.
+ * @returns {void}
+ */
+function onVoxExReady() {
+    const toggle = document.getElementById('newterrain-toggle');
+    if (VX.WORLD_CONFIG && typeof VX.WORLD_CONFIG.useNewTerrain === 'boolean') {
+        toggle.checked = VX.WORLD_CONFIG.useNewTerrain;
+    }
+    document.getElementById('generate-btn').disabled = false;
+    document.getElementById('info').textContent = 'Click terrain to inspect a column.';
+    generate();
+}
+
+/**
+ * Replace the data UI with a clear message explaining the localhost requirement.
+ * @returns {void}
+ */
+function showFailureBanner() {
+    const banner = document.getElementById('banner');
+    banner.style.display = 'block';
+    banner.innerHTML =
+        '<b>Terrain functions unavailable.</b><br>' +
+        'This tool now uses the live game\'s terrain functions via a hidden ' +
+        '<code>voxEx.html?test=1</code> iframe. Serve the repo over <b>localhost</b> ' +
+        '(like <code>tools/voxex-tests.html</code>) and open this page via ' +
+        '<code>http://localhost/&hellip;</code>. Opening the file directly with ' +
+        '<code>file://</code> will not work (browsers block the iframe\'s scripts / cross-frame access).';
+    for (const id of ['main-canvas', 'cross-canvas', 'stats', 'legend', 'info']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+    }
+    document.getElementById('generate-btn').disabled = true;
+}
 
 // ============================================================
-// BIOMES + HEIGHT (exact from voxEx.html)
+// SURFACE BLOCK CLASSIFIER (local APPROXIMATION)
+// The game's real surface-material selection lives inline in generateTerrainPass
+// (a ~170-line cascade with chunk-border padding context) and is NOT factored into a
+// standalone seam function, so we can't delegate it without duplicating that whole
+// pass. This is a deliberate approximation for the debugger's shaded view — it may
+// disagree with the real game near chunk borders and underwater. Its NOISE sampling,
+// however, is routed through VX.noise2D so it stays seed-consistent with the live game.
 // ============================================================
-// MUST match voxEx.html BIOME_CONFIG exactly
-const BIOME_CONFIG={plains:{weight:2,baseHeight:62,amplitude:8,roughness:0.005,tags:[]},hills:{weight:2,baseHeight:65,amplitude:40,roughness:0.01,tags:[]},forests:{weight:2,baseHeight:62,amplitude:15,roughness:0.008,tags:["forested"]},mountains:{weight:0.5,baseHeight:64,amplitude:180,roughness:0.003,tags:["mountain"]},swamp:{weight:1,baseHeight:58,amplitude:6,roughness:0.008,tags:[]},longwoods:{weight:2,baseHeight:62,amplitude:12,roughness:0.006,tags:["giant_trees"]},mountain_foothills:{weight:0,baseHeight:70,amplitude:55,roughness:0.006,tags:["mountain"]}};
-const BIOME_NAMES=Object.keys(BIOME_CONFIG),BIOME_WEIGHTS=BIOME_NAMES.map(n=>BIOME_CONFIG[n].weight),TOTAL_BIOME_WEIGHT=BIOME_WEIGHTS.reduce((a,b)=>a+b,0);
-const biomeCellCache=new Map();
-/* VOXEX-CCR-TERRAIN-002: recalibrated for the isotropic gradient — matches voxEx.html. */
-const _BIOME_CDF_TABLE=[[0.2805,0.000],[0.3088,0.010],[0.3476,0.050],[0.3659,0.100],[0.3837,0.150],[0.3962,0.200],[0.4052,0.250],[0.4169,0.300],[0.4351,0.350],[0.4586,0.400],[0.4801,0.450],[0.5282,0.550],[0.5495,0.600],[0.5649,0.650],[0.5815,0.700],[0.5986,0.750],[0.6112,0.800],[0.6244,0.850],[0.6395,0.900],[0.6600,0.950],[0.7003,0.990],[0.7254,1.000]];
-function uniformBiomeRoll(v){const n=(v+1)*0.5;for(let i=1;i<_BIOME_CDF_TABLE.length;i++){if(n<=_BIOME_CDF_TABLE[i][0]){const[x0,y0]=_BIOME_CDF_TABLE[i-1],[x1,y1]=_BIOME_CDF_TABLE[i];return y0+(y1-y0)*(n-x0)/(x1-x0);}}return 1;}
-function isMountainRegion(gx,gz){const seed=workerNumericSeed;const wx=noise2D(gx*0.002+seed*5,gz*0.002)*60;const wz=noise2D(gx*0.002+100,gz*0.002+seed*5)*60;const m=noise2D((gx+wx)*MOUNTAIN_REGION_FREQ+seed*0.9,(gz+wz)*MOUNTAIN_REGION_FREQ-seed*0.4);return m>MOUNTAIN_REGION_THRESHOLD;}
-function getRawBiomeCellValue(cx,cz){if(isMountainRegion(cx*BIOME_CELL_SIZE+32,cz*BIOME_CELL_SIZE+32))return{name:'mountains',...BIOME_CONFIG.mountains};const n=uniformBiomeRoll(noise2D(cx*0.1+1000,cz*0.1+1000));let acc=0,sel=BIOME_NAMES[0];for(let i=0;i<BIOME_NAMES.length;i++){const name=BIOME_NAMES[i];if(name==='mountain_foothills'||name==='mountains')continue;acc+=BIOME_WEIGHTS[i]/TOTAL_BIOME_WEIGHT;if(n<=acc){sel=name;break;}}return{name:sel,...BIOME_CONFIG[sel]};}
-function getBiomeCellValue(cx,cz){const key=cx+','+cz;if(biomeCellCache.has(key))return biomeCellCache.get(key);const raw=getRawBiomeCellValue(cx,cz);if(raw.name==='mountains'){biomeCellCache.set(key,raw);return raw;}const MAX_FOOTHILL_RINGS=1;let nearest=Infinity;const _FH=[[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]];for(let i=0;i<8;i++){if(getRawBiomeCellValue(cx+_FH[i][0],cz+_FH[i][1]).name==='mountains'){nearest=1;break;}}if(nearest<=MAX_FOOTHILL_RINGS){const t=(nearest-0.5)/MAX_FOOTHILL_RINGS;const rf=Math.max(0.05,1-t*t);const fh={...BIOME_CONFIG.mountain_foothills,name:'mountain_foothills',_foothillRing:nearest,_maxFoothillRing:MAX_FOOTHILL_RINGS,_ringFactor:rf};biomeCellCache.set(key,fh);return fh;}biomeCellCache.set(key,raw);return raw;}
-function getBiomeParams(gx,gz){const seed=workerNumericSeed;const rwX=noise2D(gx*0.003+seed*0.13,gz*0.003-seed*0.07)+noise2D(gx*0.012+seed*0.31,gz*0.012-seed*0.17)*0.5;const rwZ=noise2D(gx*0.003-seed*0.19,gz*0.003+seed*0.11)+noise2D(gx*0.012-seed*0.43,gz*0.012+seed*0.29)*0.5;const wX=rwX,wZ=rwZ;return getBiomeCellValue(Math.floor(gx/BIOME_CELL_SIZE+wX),Math.floor(gz/BIOME_CELL_SIZE+wZ));}
-
-function continentalHeight(gx,gz,seed){return Math.max(-1,Math.min(1,fbmWithDomainWarp(gx*0.002,gz*0.002,4,0.5,2)*0.7+fbm2D(gx*0.004+seed*3.17,gz*0.004-seed*5.41,3,0.6,1.8)*0.3+0.3));}
-function defaultHeightFunc(gx,gz,b,seed){return b.baseHeight+fbm2D(gx*b.roughness,gz*b.roughness,4,0.5,2)*b.amplitude;}
-function hillsHeightFunc(gx,gz,b,seed){let n=Math.abs(noise2D(gx*b.roughness,gz*b.roughness));return b.baseHeight+n*n*b.amplitude;}
-function plainsHeightFunc(gx,gz,b,seed){return b.baseHeight+(noise2D(gx*0.003,gz*0.003)+noise2D(gx*0.05,gz*0.05)*0.1)*b.amplitude;}
-function foothillsHeightFunc(gx,gz,b,seed){const rf=b._ringFactor??1;const mb=BIOME_CONFIG.mountains;const mH=mountainsHeightFunc(gx,gz,mb,seed);const pb=(BIOME_CONFIG.plains&&BIOME_CONFIG.plains.baseHeight)??62;const eb=pb+(b.baseHeight-pb)*rf;const baseH=eb+noise2D(gx*0.005+seed*3,gz*0.005-seed*3)*15;const mw=rf*0.9;return Math.min(Math.max(baseH+(mH-mb.baseHeight)*mw,pb-10),250);}
-function mountainsHeightFunc(gx,gz,b,seed){const wX=gx+noise2D(gx*0.0015+seed,gz*0.0015)*80,wZ=gz+noise2D(gx*0.0015+100,gz*0.0015+seed)*80;const rn=noise2D(gx*0.0006+seed*0.3,gz*0.0006-seed*0.3),rn2=noise2D(gx*0.001+seed*0.7,gz*0.001+seed*0.2);const rs=0.15+Math.pow((rn+1)*0.5,0.8)*0.55+Math.pow((rn2+1)*0.5,1.2)*0.30;const rx=wX*b.roughness,rz=wZ*b.roughness;let ridgeSum=0,amp=1,freq=1;for(let i=0;i<6;i++){let n=1-Math.abs(noise2D(rx*freq+seed*10,rz*freq+seed*10));n=Math.pow(n,i<2?1.6:1.4);ridgeSum+=n*amp;freq*=2;amp*=0.52;}ridgeSum/=1.9;if(ridgeSum>0.5)ridgeSum+=Math.pow((ridgeSum-0.5)*2,3)*0.4;if(ridgeSum>0.9)ridgeSum+=(ridgeSum-0.9)*1.5;const jf=0.08,j1=1-Math.abs(noise2D(gx*jf+seed*30,gz*jf-seed*30)),j2=1-Math.abs(noise2D(gx*jf*2.3-seed*17,gz*jf*2.3+seed*13));const jagged=(Math.pow(j1,1.8)*0.12+Math.pow(j2,2.2)*0.08)*(0.4+ridgeSum*0.6);const vn=noise2D(gx*0.003+seed*5,gz*0.003-seed*5),vn2=noise2D(gx*0.006-seed*2,gz*0.006+seed*2);const vc=Math.max(0,-vn*0.5-vn2*0.3)*0.35;const sn=noise2D(gx*0.008+seed*8,gz*0.008-seed*8),sf=sn>0.6?(sn-0.6)*0.5:0;const ptn=noise2D(gx*0.004+seed*12,gz*0.004-seed*12);let pb=0;if(ptn>0.3&&ridgeSum>0.55){const sp=noise2D(gx*0.02+seed*15,gz*0.02-seed*15);if(sp>0.45)pb=Math.pow((sp-0.45)*1.8,2.5)*0.35;}else if(ptn<-0.3&&ridgeSum>0.5)pb=ridgeSum*0.1;const en=noise2D(gx*0.08+seed*3,gz*0.08-seed*3),en2=noise2D(gx*0.15-seed*4,gz*0.15+seed*4),en3=noise2D(gx*0.25+seed*7,gz*0.25-seed*7);const ea=(Math.abs(en)*0.05+Math.abs(en2)*0.03+Math.abs(en3)*0.02)*(0.4+ridgeSum*0.6);const gn=1-Math.abs(noise2D(gx*0.025+seed*25,gz*0.025-seed*25)),gc=gn>0.85?(gn-0.85)*0.15:0;const rc1=1-Math.abs(noise2D(gx*0.004+seed*40,gz*0.004-seed*40)),rc2=1-Math.abs(noise2D(gx*0.008-seed*25,gz*0.008+seed*35));const rc=Math.pow(rc1,2)*0.12*ridgeSum+Math.pow(rc2,2.5)*0.08*ridgeSum;/* cell-edge falloff removed: per-cell neighbour lookup created step discontinuities at cell boundaries. Foothill ring system handles the mountain->lowland taper continuously. */let th=(ridgeSum-vc-sf+pb+ea+jagged+rc-gc)*rs;th=(noise2D(gx*0.002,gz*0.002)+1)*0.5*0.04+th*0.96;return Math.min(Math.max(b.baseHeight+th*b.amplitude*(b._amplitudeScale??1),b.baseHeight-10),285);}
-const HEIGHT_FUNCS={plains:plainsHeightFunc,hills:hillsHeightFunc,forests:defaultHeightFunc,mountains:mountainsHeightFunc,mountain_foothills:foothillsHeightFunc,swamp:defaultHeightFunc,longwoods:defaultHeightFunc};
-function getOceanFactor(gx,gz,seed){const on=noise2D(gx*0.0008+seed*1.5,gz*0.0008-seed*0.8),cn=noise2D(gx*0.004+seed*2.1,gz*0.004+seed*1.3),dn=noise2D(gx*0.02-seed*0.5,gz*0.02+seed*0.9)*0.1;const c=on+cn*0.3+dn;if(c<-0.3)return 0;if(c<-0.1){let t=(c+0.3)/0.2;return t*t*(3-2*t);}return 1;}
-function getOceanDepth(of,gx,gz,seed){return 20+(noise2D(gx*0.008+seed*0.9,gz*0.008-seed*0.6)+1)*0.5*15*(1-of);}
-function getBiomeHeightAtCell(cx,cz,gx,gz,seed,cf){const b=getBiomeCellValue(cx,cz);const hf=HEIGHT_FUNCS[b.name]||defaultHeightFunc;let h=hf(gx,gz,b,seed);const t=(cf+1)*0.5;h=b.baseHeight+(h-b.baseHeight)*(0.3+t*0.7);h+=Math.max(0,cf-0.15)*10;return h;}
-function blendedHeight(gx,gz,seed){const c=continentalHeight(gx,gz,seed);const gs=BIOME_CELL_SIZE;const rwX=noise2D(gx*0.003+seed*0.13,gz*0.003-seed*0.07)+noise2D(gx*0.012+seed*0.31,gz*0.012-seed*0.17)*0.5;const rwZ=noise2D(gx*0.003-seed*0.19,gz*0.003+seed*0.11)+noise2D(gx*0.012-seed*0.43,gz*0.012+seed*0.29)*0.5;const wX=rwX,wZ=rwZ;const u=gx/gs-0.5+wX,v=gz/gs-0.5+wZ;const x0=Math.floor(u),z0=Math.floor(v);const wx=u-x0,wz=v-z0;const sx=wx*wx*(3-2*wx),sz=wz*wz*(3-2*wz);const h00=getBiomeHeightAtCell(x0,z0,gx,gz,seed,c),h10=getBiomeHeightAtCell(x0+1,z0,gx,gz,seed,c),h01=getBiomeHeightAtCell(x0,z0+1,gx,gz,seed,c),h11=getBiomeHeightAtCell(x0+1,z0+1,gx,gz,seed,c);let fh=lerpValue(lerpValue(h00,h10,sx),lerpValue(h01,h11,sx),sz);/* peak rescue removed: discontinuous Math.max threshold caused 16-18 block jumps when warp slid the bilinear cell window */const of=getOceanFactor(gx,gz,seed);if(of<1){const bank=of*of*(3-2*of);fh=lerpValue(WORLD_DIMS.seaLevel-getOceanDepth(of,gx,gz,seed),fh,bank);}return Math.floor(fh);}
-
-// ============================================================
-// SURFACE BLOCK LOGIC (exact from generateTerrainPass)
-// ============================================================
+/**
+ * Approximate the surface block for a column (grass/sand/stone/gravel/snow/dirt).
+ * @param {number} gx - Global X.
+ * @param {number} gz - Global Z.
+ * @param {number} worldTopY - Surface height (from VX.blendedHeight).
+ * @param {object} biome - Resolved biome (from VX.getBiomeParams); reads .tags.
+ * @param {number[]} neighborHeights - [W, E, N, S] neighbour heights for slope.
+ * @returns {number} A block ID.
+ */
 function getSurfaceBlock(gx, gz, worldTopY, biome, neighborHeights) {
+    const seaLevel = VX.WORLD_DIMS.seaLevel;
     const isMountain = biome?.tags?.includes("mountain");
     const maxSlope = neighborHeights.reduce((mx, nh) => Math.max(mx, Math.abs(worldTopY - nh)), 0);
     let slopeNorth = 0, slopeSouth = 0;
     if (neighborHeights.length >= 4) { slopeNorth = worldTopY - neighborHeights[2]; slopeSouth = worldTopY - neighborHeights[3]; }
     const isCliff = maxSlope >= 8, isSteep = maxSlope >= 5, isModerate = maxSlope >= 3;
     const northFacing = slopeNorth > slopeSouth + 1, isExposedRidge = slopeNorth > 2 && slopeSouth > 2;
-    const surfaceNoise = noise2D(gx * 0.1, gz * 0.1), patchNoise = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
-    const detailNoise = noise2D(gx * 0.2 + 200, gz * 0.2 + 200), screeNoise = noise2D(gx * 0.08 + 300, gz * 0.08 + 300);
+    const surfaceNoise = VX.noise2D(gx * 0.1, gz * 0.1), patchNoise = VX.noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
+    const detailNoise = VX.noise2D(gx * 0.2 + 200, gz * 0.2 + 200), screeNoise = VX.noise2D(gx * 0.08 + 300, gz * 0.08 + 300);
     let id = GRASS;
-    if (worldTopY < WORLD_DIMS.seaLevel + 2 && worldTopY >= WORLD_DIMS.seaLevel - 1) id = SAND;
+    if (worldTopY < seaLevel + 2 && worldTopY >= seaLevel - 1) id = SAND;
     else if (isMountain || worldTopY >= 85) {
         if (worldTopY >= 190) { if (isCliff) id = STONE; else if (isSteep) id = surfaceNoise > 0.3 ? STONE : GRAVEL; else if (isExposedRidge && detailNoise > 0.4) id = STONE; else id = SNOW; }
         else if (worldTopY >= 160) { if (isCliff) id = STONE; else if (northFacing && !isSteep && patchNoise > 0.2) id = SNOW; else if (!isModerate && patchNoise > 0.5) id = SNOW; else if (isSteep) id = surfaceNoise > 0 ? STONE : GRAVEL; else id = surfaceNoise > 0.3 ? STONE : GRAVEL; }
@@ -128,7 +175,7 @@ function getSurfaceBlock(gx, gz, worldTopY, biome, neighborHeights) {
         else if (detailNoise > 0.8) id = STONE;
         else id = GRASS;
     }
-    if (id === GRASS && worldTopY < WORLD_DIMS.seaLevel) id = DIRT;
+    if (id === GRASS && worldTopY < seaLevel) id = DIRT;
     return id;
 }
 
@@ -136,17 +183,31 @@ function getSurfaceBlock(gx, gz, worldTopY, biome, neighborHeights) {
 // RENDERING
 // ============================================================
 const SCALE = 3; // pixels per block on main view
-let data = null; // { size, startX, startZ, heights, surfaces, biomes, seed }
+let data = null; // { size, startX, startZ, heights, surfaces, biomes, seed, minH, maxH }
 
+/**
+ * Sample a square window of terrain through the live game seam and render both views.
+ * @returns {void}
+ */
 function generate() {
+    if (!VX) return;
     const seedStr = document.getElementById('seed-input').value;
     const centerX = parseInt(document.getElementById('cx-input').value) || 0;
     const centerZ = parseInt(document.getElementById('cz-input').value) || 0;
     const size = parseInt(document.getElementById('size-select').value);
 
-    biomeCellCache.clear();
-    initNoise(seedStr);
-    const seed = workerNumericSeed;
+    // Apply the A/B terrain-mode toggle to the live pipeline (both blendedHeight and
+    // getBiomeParams dispatch on WORLD_CONFIG.useNewTerrain internally).
+    VX.WORLD_CONFIG.useNewTerrain = document.getElementById('newterrain-toggle').checked;
+
+    // Clear the game's legacy biome-cell cache: it's keyed by cell coords only (not seed),
+    // so re-seeding with a new seed would otherwise read stale entries on the legacy path.
+    if (VX.biomeCellCache && typeof VX.biomeCellCache.clear === 'function') VX.biomeCellCache.clear();
+    // Re-seed the game's noise perm tables + worldConfig.seed from the user's seed string
+    // (mirrors WorldPreviewRenderer.init in the live game), then read back the numeric seed.
+    VX.seedNoise(seedStr);
+    const seed = VX.worldSeed;
+    const seaLevel = VX.WORLD_DIMS.seaLevel;
     const startX = centerX - (size >> 1), startZ = centerZ - (size >> 1);
 
     const heights = new Int16Array(size * size);
@@ -155,11 +216,11 @@ function generate() {
     let minH = Infinity, maxH = -Infinity;
     const blockCounts = {};
 
-    // Pass 1: heights + biomes
+    // Pass 1: heights + biomes (delegated to the real game)
     for (let z = 0; z < size; z++) for (let x = 0; x < size; x++) {
         const idx = x + z * size, gx = startX + x, gz = startZ + z;
-        heights[idx] = blendedHeight(gx, gz, seed);
-        biomes[idx] = getBiomeParams(gx, gz);
+        heights[idx] = VX.blendedHeight(gx, gz, seed);
+        biomes[idx] = VX.getBiomeParams(gx, gz);
         if (heights[idx] < minH) minH = heights[idx];
         if (heights[idx] > maxH) maxH = heights[idx];
     }
@@ -180,7 +241,8 @@ function generate() {
     // Stats
     const statsEl = document.getElementById('stats');
     const total = size * size;
-    statsEl.innerHTML = `<div class="stat-chip">Height: <span>${minH}–${maxH}</span></div><div class="stat-chip">Sea: <span>${WORLD_DIMS.seaLevel}</span></div>` +
+    const modeLabel = VX.WORLD_CONFIG.useNewTerrain ? 'new (climate/spline)' : 'legacy (biome-blend)';
+    statsEl.innerHTML = `<div class="stat-chip">Mode: <span>${modeLabel}</span></div><div class="stat-chip">Seed#: <span>${seed.toFixed(4)}</span></div><div class="stat-chip">Height: <span>${minH}&ndash;${maxH}</span></div><div class="stat-chip">Sea: <span>${seaLevel}</span></div>` +
         Object.entries(blockCounts).sort((a,b)=>b[1]-a[1]).map(([bid,count])=>`<div class="stat-chip">${BLOCK_NAMES[bid]||bid}: <span>${(count/total*100).toFixed(1)}%</span></div>`).join('');
 
     // Legend
@@ -192,9 +254,14 @@ function generate() {
     renderCrossSection(Math.floor(size / 2));
 }
 
+/**
+ * Draw the top-down shaded-relief view.
+ * @returns {void}
+ */
 function renderMainView() {
     if (!data) return;
-    const { size, heights, surfaces, biomes, minH, maxH } = data;
+    const { size, heights, surfaces, minH, maxH } = data;
+    const seaLevel = VX.WORLD_DIMS.seaLevel;
     const canvas = document.getElementById('main-canvas');
     canvas.width = size * SCALE;
     canvas.height = size * SCALE;
@@ -222,9 +289,9 @@ function renderMainView() {
         g = Math.min(255, Math.max(0, g * heightBright + slopeShade));
         b = Math.min(255, Math.max(0, b * heightBright + slopeShade));
 
-        // Water: blend with depth
-        if (h < WORLD_DIMS.seaLevel) {
-            const waterDepth = WORLD_DIMS.seaLevel - h;
+        // Water: blend with depth (blendedHeight already carves rivers + oceans below sea level)
+        if (h < seaLevel) {
+            const waterDepth = seaLevel - h;
             const waterAlpha = Math.min(0.9, waterDepth / 30);
             r = r * (1 - waterAlpha) + 25 * waterAlpha;
             g = g * (1 - waterAlpha) + 100 * waterAlpha;
@@ -260,9 +327,15 @@ function renderMainView() {
     };
 }
 
+/**
+ * Draw the vertical cross-section for a given Z slice.
+ * @param {number} sliceZ - Local Z index within the sampled window.
+ * @returns {void}
+ */
 function renderCrossSection(sliceZ) {
     if (!data) return;
     const { size, startX, startZ, heights, surfaces } = data;
+    const seaLevel = VX.WORLD_DIMS.seaLevel;
     const canvas = document.getElementById('cross-canvas');
     const yScale = 2; // Vertical exaggeration
     // Find visible Y range for this slice
@@ -305,11 +378,11 @@ function renderCrossSection(sliceZ) {
         }
 
         // Water column
-        if (h < WORLD_DIMS.seaLevel) {
-            for (let y = h + 1; y <= WORLD_DIMS.seaLevel; y++) {
+        if (h < seaLevel) {
+            for (let y = h + 1; y <= seaLevel; y++) {
                 if (y >= viewMin && y <= viewMax) {
                     const canvasY = (viewMax - y) * yScale;
-                    const waterDepth = WORLD_DIMS.seaLevel - y;
+                    const waterDepth = seaLevel - y;
                     ctx.fillStyle = `rgba(33,150,243,${0.3 + waterDepth/40*0.5})`;
                     ctx.fillRect(x * SCALE, canvasY, SCALE, yScale);
                 }
@@ -318,11 +391,11 @@ function renderCrossSection(sliceZ) {
     }
 
     // Sea level line
-    if (WORLD_DIMS.seaLevel >= viewMin && WORLD_DIMS.seaLevel <= viewMax) {
-        const slY = (viewMax - WORLD_DIMS.seaLevel) * yScale;
+    if (seaLevel >= viewMin && seaLevel <= viewMax) {
+        const slY = (viewMax - seaLevel) * yScale;
         ctx.strokeStyle = '#2196F3'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
         ctx.beginPath(); ctx.moveTo(0, slY); ctx.lineTo(canvas.width, slY); ctx.stroke(); ctx.setLineDash([]);
-        ctx.fillStyle = '#2196F3'; ctx.font = '11px monospace'; ctx.fillText(`sea level (${WORLD_DIMS.seaLevel})`, 4, slY - 3);
+        ctx.fillStyle = '#2196F3'; ctx.font = '11px monospace'; ctx.fillText(`sea level (${seaLevel})`, 4, slY - 3);
     }
 
     // Y-axis labels
@@ -339,33 +412,57 @@ function renderCrossSection(sliceZ) {
     ctx.fillText(`Cross-section at Z=${startZ + sliceZ}`, canvas.width - 220, 14);
 }
 
+/**
+ * Populate the info bar with per-column detail (delegated readouts).
+ * @param {number} x - Local X within the sampled window.
+ * @param {number} z - Local Z within the sampled window.
+ * @returns {void}
+ */
 function showColumnInfo(x, z) {
     if (!data) return;
-    const { size, startX, startZ, heights, surfaces, biomes } = data;
+    const { size, startX, startZ, heights, surfaces, biomes, seed } = data;
     const idx = x + z * size;
     const gx = startX + x, gz = startZ + z;
     const h = heights[idx], block = surfaces[idx], biome = biomes[idx];
-    const sn = noise2D(gx * 0.1, gz * 0.1), pn = noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
-    const dn = noise2D(gx * 0.2 + 200, gz * 0.2 + 200);
+    const sn = VX.noise2D(gx * 0.1, gz * 0.1), pn = VX.noise2D(gx * 0.05 + 100, gz * 0.05 + 100);
+    const dn = VX.noise2D(gx * 0.2 + 200, gz * 0.2 + 200);
+    // River / ocean carve factors (live from the game): 1 = untouched land, 0 = full channel/ocean.
+    const oceanF = VX.getOceanFactor(gx, gz, seed);
+    const riverF = VX.getRiverFactor(gx, gz, seed);
     // Determine slope
     const nh = [[-1,0],[1,0],[0,-1],[0,1]].map(([dx,dz])=>{const ni=(x+dx)+(z+dz)*size;return ni>=0&&ni<size*size&&x+dx>=0&&x+dx<size&&z+dz>=0&&z+dz<size?heights[ni]:h;});
     const maxSlope = nh.reduce((mx,v)=>Math.max(mx,Math.abs(h-v)),0);
     const slopeLabel = maxSlope >= 8 ? 'CLIFF' : maxSlope >= 5 ? 'STEEP' : maxSlope >= 3 ? 'MODERATE' : 'gentle';
 
+    // New-terrain climate fields (cosmetic biome selection inputs). All read worldConfig.seed
+    // internally; present only when the new pipeline is active.
+    let climateLine = '';
+    if (VX.WORLD_CONFIG.useNewTerrain) {
+        climateLine =
+            `<br>temp=<span class="val">${VX.temperature(gx,gz).toFixed(3)}</span> &nbsp; ` +
+            `humid=<span class="val">${VX.humidity(gx,gz).toFixed(3)}</span> &nbsp; ` +
+            `contin=<span class="val">${VX.continentalness(gx,gz).toFixed(3)}</span> &nbsp; ` +
+            `erosion=<span class="val">${VX.erosionParam(gx,gz).toFixed(3)}</span> &nbsp; ` +
+            `peaksValleys=<span class="val">${VX.peaksValleys(gx,gz).toFixed(3)}</span>`;
+    }
+
     const rgb = BLOCK_RGB[block] || [128,128,128];
     document.getElementById('info').innerHTML =
         `<b>Column (${gx}, ${gz})</b> &nbsp; Height: <span class="val">${h}</span> &nbsp; ` +
         `Surface: <span style="color:rgb(${rgb.join(',')})">${BLOCK_NAMES[block]}</span> &nbsp; ` +
-        `Biome: <span style="color:${BIOME_COLORS[biome.name]}">${biome.name}</span> &nbsp; ` +
+        `Biome: <span style="color:${BIOME_COLORS[biome.name]||'#ccc'}">${biome.name}</span> &nbsp; ` +
         `Slope: <span class="val">${maxSlope} (${slopeLabel})</span><br>` +
+        `oceanFactor=<span class="val">${oceanF.toFixed(3)}</span> &nbsp; ` +
+        `riverFactor=<span class="val">${riverF.toFixed(3)}</span> &nbsp; ` +
         `surfaceNoise=<span class="val">${sn.toFixed(3)}</span> &nbsp; ` +
         `patchNoise=<span class="val">${pn.toFixed(3)}</span> &nbsp; ` +
         `detailNoise=<span class="val">${dn.toFixed(3)}</span> &nbsp; ` +
         `isMountain=<span class="val">${biome.tags?.includes("mountain")}</span> &nbsp; ` +
-        `elevation zone: <span class="val">${h>=190?'SNOW':h>=160?'SNOW_PATCHES':h>=140?'HIGH_ROCK':h>=110?'ROCK':h>=85?'ALPINE':'LOWLAND'}</span>`;
+        `elevation zone: <span class="val">${h>=190?'SNOW':h>=160?'SNOW_PATCHES':h>=140?'HIGH_ROCK':h>=110?'ROCK':h>=85?'ALPINE':'LOWLAND'}</span>` +
+        climateLine;
 }
 
-window.addEventListener('load', generate);
+window.addEventListener('load', bootVoxEx);
 </script>
 </body>
 </html>
