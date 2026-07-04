@@ -31,7 +31,7 @@ VoxEx/
 │   ├── docs-viewer.html          # Documentation viewer
 │   ├── KeyFrame_editor.html      # Animation keyframe editor
 │   ├── terrain-parameter-editor.html  # Terrain tuning tool
-│   ├── terrain-visualizer.html   # Shaded relief terrain debugger (cross-section, column inspector)
+│   ├── terrain-visualizer.html   # Shaded relief terrain debugger (cross-section, column inspector; delegates to voxEx.html via ?test=1)
 │   ├── voxelEditor.html          # Voxel model editor
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
 │   ├── voxex-tests.html          # Test suite — REAL voxEx.html functions via ?test=1 seam (window.VoxEx); ~204 tests incl. live worker round-trip. Serve over localhost.
@@ -60,7 +60,7 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 
 - **UI Layer** (HTML/CSS, lines ~1-1550): HUD (crosshair, hotbar, block name, flight/sprint icons); menus (start, pause, settings, world creation, seed select); inventory (E key, drag-drop); world management (rename/duplicate/import/export/storage); perf overlay (O), debug overlay (~); toasts; settings search + profiles.
 - **Game Engine** (Three.js render pipeline): camera (1st + 3rd person, V key, orbit/zoom); lighting (day/night, sun/moon, ≤8 torch point lights); skybox (3 star layers, volumetric clouds); materials (chunk StandardMaterial, 3 water modes, custom GLSL fog/refraction); post-processing (volumetric god rays, color grading, zombie vignette/desat, underwater); ParticleSystem; viewmodel arms + torch. Render layers: 0=world, 1=viewmodel, 2=player body.
-- **World Management** (VoxelWorld + terrain functions): chunk gen 16x16x320 / 20 sections; ChunkWorkerPool (auto-sized, zero-copy transfer); meshing (face cull + AO + greedy + LOD); 6 biomes + foothill transitions; continental height + domain-warped boundaries; gradient-descent rivers (RiverNetworkCache); structures (trees/multi-trunk/caves); cached frustum culling; section analysis; GEN_PASS/RENDER_PASS bitmasks.
+- **World Management** (VoxelWorld + terrain functions): chunk gen 16x16x320 / 20 sections; ChunkWorkerPool (auto-sized, zero-copy transfer); meshing (face cull + AO + greedy + LOD); 6 biomes + foothill transitions; continental height + domain-warped boundaries; domain-warped noise-ribbon rivers (`getRiverFactor`); structures (trees/multi-trunk/caves); cached frustum culling; section analysis; GEN_PASS/RENDER_PASS bitmasks.
 - **Lighting Engine**: SunlightTask (async, pressure-based bailout); torch block light (level 14, 6-direction); deferred lighting for distant chunks; edge lighting reconciliation; watchdog (300ms grace); volumetric cone sampling (7-ray sun, 5-ray point).
 - **Entity & Player Systems**: physics/collision/swim movement; shared `buildArticulatedMesh` (3-segment spine, shoulder/elbow + hip/knee pivots, procedural pixel-art textures); customizable player; procedural zombies (≤10, pooled); zombie AI state machine (wander → chase → attack); spring-damped animation (11+ states); 7-keyframe knockdown ragdoll (3.5s).
 - **Memory & Performance**: MemoryBudgetManager (auto-scale render distance: −1 at 80% warning, −2 + emergency unload 20% at 95% critical); GeometryBufferPool (4K/8K/16K face tiers, auto-upgrade); object pools (Float32/Uint8/Uint32Array, Vector3, ChunkData, GeometryBuffer); PerformanceMonitor (FPS ring buffer, 8ms budget); geometry leak detection (5s, warn at 500+ excess); spatial hash grid (O(1) proximity); SeededRandom PRNG.
@@ -102,20 +102,19 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 | **Plains** | 2 | Flat, sparse oak trees, baseHeight 62, spherical canopies |
 | **Hills** | 2 | Rolling hills with abs() smoothing, moderate trees, amplitude 40 |
 | **Forests** | 2 | Dense oak trees, moderate terrain |
-| **Mountains** | 1 | High peaks (amplitude 180), ridged noise, conical pines, treeline, snow |
+| **Mountains** | 0.5 (unused — mask-placed) | High peaks (amplitude 180), ridged noise, conical pines, treeline, snow |
 | **Swamp** | 1 | Low baseHeight 58, water pools, droopy trees |
 | **Longwoods** | 2 | Giant 2x2/3x3 trunk trees, heights 12-24, wide sparse canopies |
-| **Mountain Foothills** | auto | Transition zone (4-ring Chebyshev distance, quadratic decay, mountain-derived noise) |
+| **Mountain Foothills** | auto | Transition zone (single 64-block cell ring, constant ringFactor 0.75, mountain-derived noise) |
 
 Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `BIOME_DEFAULTS`. Tags: `"mountain"` (treeline + alpine terrain), `"forested"` (high tree density), `"giant_trees"` (multi-block trunks).
 
-**Terrain Generation Pipeline**: continental height + domain warping → weighted cell-based biome selection → per-biome height functions → river carving → structure placement. Mountains: domain-warped ridges → 6-layer ridged noise → peak amplification → valley erosion → jagged detail overlay. Biome boundaries use two-octave domain warping for organic edges.
+**Terrain Generation Pipeline**: **`WORLD_CONFIG.useNewTerrain: true` (the default) routes ALL height queries through the climate+spline surface — `terrainSurface`/`computeSurfaceHeight`/`resolveBiome` (temperature/humidity/continentalness/erosion/peaks-valleys fields + splines). The bilinear biome-cell system documented in this section is the LEGACY A/B path, reachable only by setting the flag false.** Legacy path: continental height + domain warping → weighted cell-based biome selection → per-biome height functions. Shared by BOTH paths: river/ocean carving → structure placement. Legacy mountains: domain-warped ridges → 6-layer ridged noise → peak amplification → valley erosion → jagged detail overlay. Biome boundaries use two-octave domain warping for organic edges.
 
-**Mountain-Foothills Transition**:
+**Mountain-Foothills Transition** (legacy path — inert under the default `useNewTerrain: true`):
 - `foothillsHeightFunc` uses `mountainsHeightFunc` output scaled by ring factor — ridges/valleys align at boundaries (no mismatched noise).
-- `mountainsHeightFunc` edge falloff uses `name === 'mountains'` (not tag check) so foothills trigger height tapering.
-- 4 rings (256 blocks total), quadratic decay `ringFactor = max(0.05, 1 - (ring/4)²)`: Ring 1 ≈ 94% mountain shape, Ring 2 ≈ 75%, Ring 3 ≈ 44%, Ring 4 ≈ 5%. `mountainWeight = ringFactor * 0.9` controls relief passthrough.
-- **Mountain placement**: by a low-frequency domain-warped region mask (`isMountainRegion`) so they cluster into coherent ranges — NOT the per-cell weighted roll (which distributes the other 5 biomes via the noise-calibrated CDF `_BIOME_CDF_TABLE`). Keeps ranges contiguous, avoids plains/foothill notches between scattered peaks.
+- SINGLE ring (`MAX_FOOTHILL_RINGS = 1`, one 64-block biome cell): any non-mountain cell 8-adjacent to a mountain cell becomes foothills with constant `ringFactor = 0.75` (from the ring-centre form `max(0.05, 1 - ((ring - 0.5)/N)²)`). `mountainWeight = ringFactor * 0.9 = 0.675` controls relief passthrough; baseHeight lerps plains (62) → foothills (70) by ringFactor. There is no per-cell edge falloff in `mountainsHeightFunc`.
+- **Mountain placement**: by a low-frequency domain-warped region mask (`isMountainRegion`) so they cluster into coherent ranges — NOT the per-cell weighted roll (which distributes the other 5 biomes via the noise-calibrated CDF `_BIOME_CDF_TABLE`; `rebuildBiomeTable` excludes mountains, so `BIOME_CONFIG.mountains.weight` is unused). Keeps ranges contiguous, avoids plains/foothill notches between scattered peaks.
 
 ## Key Systems Explained
 
@@ -160,9 +159,9 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 - **Swim Wake**: V-pattern foam trail when swimming (>0.5 units/s). **Landing Dust**: block-colored dust on impact (≥5 units/s). **Underwater Shader**: Beer-Lambert absorption (R/G/B), fog density.
 
 ### River System
-- **Algorithm**: gradient-descent tracing from high elevation to sea level.
-- **RiverNetworkCache**: regional LRU (64 max regions, 256-block region size).
-- **Constraints**: max slope 1.0 blocks/block, max elevation 75, 8-block sample distance. River factor carves into `blendedHeight()` output.
+- **Algorithm**: stationary domain-warped noise ribbon — `getRiverFactor(gx, gz, seed)` returns 0 (river center) → 1 (no river) where `|noise2D|` of the warped coordinates falls below the channel half-width. Warp = two-octave coordinate warp + axis-balanced sinusoidal meander + regional macro-meander (`RIVER_WARP_*`). There is NO gradient-descent tracing and NO `RiverNetworkCache` (that class does not exist in the code).
+- **Width & fade**: half-width `RIVER_BASE_WIDTH` (0.064 noise units) ± coastal variation; `heightPenalty = smoothstep(66, 82, preRiverHeight)` fades rivers out on elevated terrain (a mountain river-tunnel punch exists in `generateTerrainPass` but is effectively unreachable — see terrain-gen-audit.md TER-5).
+- **Carving**: `blendedHeight()` blends the pre-river height toward the `getRiverDepth()` bed (canyon/tunnel mix on high ground); river SAND beaches and water fill happen in `generateTerrainPass`/`fillWaterPass`.
 
 ### Character System
 - **Shared**: `buildArticulatedMesh(proportions, materials, options)` — player + zombie. Skeleton: 3-segment spine (lower/mid/upper), head pivot, arm shoulder+elbow, leg hip+knee pivots.
@@ -223,8 +222,7 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 | `ChunkWorkerPool` | 17789 | Web Worker pool for off-thread terrain gen and meshing |
 | `GeometryBufferPool` | 18349 | Tiered GPU buffer pooling (small/medium/large) |
 | `MemoryBudgetManager` | 18714 | Memory monitoring, auto-scaling, emergency unload |
-| `WorldPreviewNoise` | 19408 | Seeded Perlin noise for terrain preview |
-| `WorldPreviewRenderer` | 19504 | Real-time terrain preview during world creation |
+| `WorldPreviewRenderer` | 19504 | Real-time terrain preview during world creation (delegates to the game's own `blendedHeight()`/`getBiomeParams()`; the old `WorldPreviewNoise` class was removed) |
 | `SunlightTask` | 22925 | Async sunlight propagation with pressure-based bailout |
 | `ChunkDiskStorage` | 24112 | OPFS disk cache with inline worker backend |
 
@@ -318,7 +316,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 - **Block Types**: `const AIR`, `const GRASS`, `const LEAVES`, `BLOCK_CONFIG`, `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`
 - **Biomes**: `BIOME_CONFIG`, `BIOME_DEFAULTS`, `getBiomeParams`, `getBiomeCellDirect`, `HEIGHT_FUNCS`
 - **Terrain**: `blendedHeight`, `continentalHeight`, `mountainsHeightFunc`, `plainsHeightFunc`
-- **Rivers**: `RiverNetworkCache`, `getRiverFactor`
+- **Rivers**: `getRiverFactor`, `getRiverDepth`
 - **Gen**: `function generateChunkData`, `function calculateChunkSunlight`, `GEN_PASS`, `RENDER_PASS`
 - **Render**: `function renderChunk`, `renderChunkAsync`, `processChunkQueue`
 - **Light**: `class SunlightTask`, `updateSunlightAt`, `updateBlockLightAt`, `processSunlightQueue`, `processLightQueue`
@@ -398,14 +396,13 @@ Before committing, verify:
 - [ ] Touch handlers start with `if (!touchModeActive) return;`; no allocations/closures/logging in `pointermove`; gameplay gates use `isGameplayActive()` not raw `controls.isLocked`
 - [ ] Chunk size is 16x16x320 (not 128); atlas has 33 tiles (update `NUM_TILES` if adding blocks); block lookup tables updated if adding blocks (`initBlockLookupTables()`)
 - [ ] Worker parity: edit ONLY main-thread terrain functions (~line 36269-36693); worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — keep markers intact
-- [ ] Terrain changes: update `terrain-visualizer.html` to match (biome config, height funcs)
 - [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
 - [ ] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES` (top of voxEx.html, console boot banner)
 - [ ] Worker parity: the worker template's `WORLD_DIMS` (incl. `yOffset`!) and `BIOME_CONFIG` are HAND-MAINTAINED copies — verify they match main thread (a `yOffset` drift of 64 silently broke ALL worker tree generation; found 2026-06-12)
-- [ ] Tree code is SINGLE-SOURCE (2026-06-13): tree mask/placement/canopy functions (`treePlacementValue`, `getTreeDensityForBiome`, `generateTreeMaskForChunk`, `getTreeMaskForChunk`, `getTreeMaskValueGlobal`, `resolveTreeProfile`, `pickTrunkSize`, `wouldHaveValidTree`, `isTreeSiteViable`, `getChunkTreePositions`, `getCanopyLayerRadius`, `forEachCanopyVoxel`, `generateTreesForChunk`) are injected into the worker by `buildChunkWorkerCode()` between the `/* __TREE_FUNCS_START__ */ … __END__ */` markers. Edit ONLY main-thread sources. The worker still hand-maintains leaf helpers (`seededRandom`, `isLeafBlock`/`isLogBlock`/`isValidTreeGround`, `getTreeMaskKey`, `noise2D`), caches (`treeMaskCache`, `treePositionsCache`), `chunks`/`getChunkKey`, `TREE_MAX_RING_SLOPE`; injected tree functions depend on terrain-injected `getBiomeParams`/`blendedHeight`/`getRiverFactor`/`biomeByName`. Keep markers intact.
+- [ ] Tree code is SINGLE-SOURCE (2026-06-13): tree mask/placement/canopy functions (`treePlacementValue`, `getTreeDensityForBiome`, `generateTreeMaskForChunk`, `getTreeMaskForChunk`, `getTreeMaskValueGlobal`, `resolveTreeProfile`, `pickTrunkSize`, `wouldHaveValidTree`, `isTreeSiteViable`, `getChunkTreePositions`, `getCanopyLayerRadius`, `forEachCanopyVoxel`, `generateTreesForChunk`) are injected into the worker by `buildChunkWorkerCode()` between the `/* __TREE_FUNCS_START__ */ … __END__ */` markers. Edit ONLY main-thread sources. The worker still hand-maintains leaf helpers (`seededRandom`, `isLeafBlock`/`isLogBlock`, `getTreeMaskKey` — seed-qualified, `noise2D`), caches (`treeMaskCache`, `treePositionsCache`), `TREE_MAX_RING_SLOPE`; injected tree functions depend on terrain-injected `getBiomeParams`/`blendedHeight`/`getRiverFactor`/`biomeByName`. Keep markers intact.
 
 ## Testing Tools
 
 - **`tools/voxex-tests.html`** — automated suite (~204 tests). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
-- **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Uses extracted copies of terrain functions — **must be kept in sync** with voxEx.html biome config and height functions.
+- **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Delegates to voxEx.html via the `?test=1` seam (requires localhost, like tools/voxex-tests.html); no hand-synced terrain code remains. Surface-block material classification is a local, documented approximation (the real per-column material cascade lives inline in `generateTerrainPass`, not on the seam).
 - **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 33 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
