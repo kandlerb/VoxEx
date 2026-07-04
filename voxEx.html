@@ -5218,9 +5218,8 @@
                     tags: [],
                 },
                 mountains: {
-                    weight: 0.5,      // Rare dramatic terrain. Lowered after CDF transform
-                                      // uniformised the biome distribution — at weight 1, scattered
-                                      // mountains created excessive foothill coverage (>50%).
+                    weight: 0.5,      // UNUSED: mountains are placed by the isMountainRegion mask,
+                                      // not the weighted roll (rebuildBiomeTable skips them).
                     roughness: 0.003, // Large-scale mountain ranges
                     amplitude: 180,   // Max height ~250-290 with regional variation
                     baseHeight: 64,   // Same as other biomes - amplitude handles elevation
@@ -18641,6 +18640,7 @@
             },
         },
         mountains: {
+            // weight UNUSED: mountains are placed by the isMountainRegion mask, not the weighted roll (rebuildBiomeTable skips them)
             weight: 0.5, roughness: 0.003, amplitude: 180, baseHeight: 64, tags: ["mountain"],
             trees: {
                 density: 0.005,
@@ -37775,7 +37775,10 @@ self.onmessage = async (e) => {
 
                 // If we're within foothill range, convert to mountain_foothills
                 if (nearestMountainRing <= MAX_FOOTHILL_RINGS) {
-                    const foothillsConfig = biomeByName.get('mountain_foothills') || biomes.find(b => b.name === 'mountain_foothills');
+                    // biomeByName is always populated (rebuildBiomeTable at startup + applyGenParams).
+                    // A `|| biomes.find(...)` fallback used to sit here, but `biomes` only exists in
+                    // the worker's injected scope — on the main thread it was a ReferenceError trap.
+                    const foothillsConfig = biomeByName.get('mountain_foothills');
                     // Ring factor with quadratic decay using ring-CENTRE distance
                     // (ring-0.5)/N so the single-ring case (N=1) gives rf=0.75 instead
                     // of the boundary value of 0 — without this, a mountain cell drops
@@ -38406,14 +38409,12 @@ self.onmessage = async (e) => {
                 const foothillBase = (baseNoise + 1) * 0.5 * 0.04;
                 totalHeight = foothillBase + totalHeight * 0.96;
 
-                // Apply width-based amplitude scaling (narrow ridges = shorter peaks)
-                const amplitudeScale = biome._amplitudeScale ?? 1.0;
                 // VOXEX-CCR-TERRAIN-002: the isotropic gradient equalized terrain steepness to the
                 // mean of the old (biased) X/Z axes, leaving mountains steeper than the old gentle
                 // (X) axis (mean step ~1.47 vs the ~1.378 ceiling). Scale mountain relief down ~10%
                 // so both axes sit under the old-X step ceiling (mean step is linear in amplitude).
                 const MOUNTAIN_RELIEF_SCALE = 0.90;
-                const effectiveAmplitude = biome.amplitude * amplitudeScale * MOUNTAIN_RELIEF_SCALE;
+                const effectiveAmplitude = biome.amplitude * MOUNTAIN_RELIEF_SCALE;
 
                 // Final height calculation
                 // Returns continuous height - flooring happens in blendedHeight() for smooth interpolation
@@ -38753,11 +38754,12 @@ self.onmessage = async (e) => {
             // Sunlight propagation follows a two-phase approach:
             // Phase 1: Vertical propagation from sky (y = max) downward
             //   - Starts at level 15 (full sunlight)
-            //   - Attenuated by transparent blocks (leaves reduce by 1)
+            //   - Attenuated per SUNLIGHT_ATTENUATION (leaves −1, water −1 per block;
+            //     air/glass 0 = pass unchanged)
             //   - Blocked completely by opaque blocks (falls to level 1)
             // Phase 2: Horizontal BFS propagation
             //   - Light spreads from lit blocks to neighboring air/transparent blocks
-            //   - Reduces by 1 per block traveled
+            //   - Reduces by 1 per block traveled (+ the target cell's SUNLIGHT_ATTENUATION)
             //   - Fills caves, overhangs, and shaded areas
             // Note: Cross-chunk propagation happens in propagateLightFromNeighbors()
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
@@ -38808,7 +38810,9 @@ self.onmessage = async (e) => {
                                 // Partially attenuating block (leaves, etc.) - reduce light
                                 currentLight = currentLight > attenuation ? currentLight - attenuation : 1;
                             }
-                            // attenuation === 0 means fully transparent (air, water) - light passes unchanged
+                            // attenuation === 0 means fully transparent (air, glass) — light passes
+                            // unchanged. WATER has sunlightAttenuation 1 (dims 1/block) and takes
+                            // the branch above, same as leaves.
                         }
                     }
                 }
@@ -40089,14 +40093,16 @@ self.onmessage = async (e) => {
             }
 
             /**
-             * Create merge key from block ID, AO values, and light level.
+             * Create merge key from block ID, shoreline damp level, and AO values.
              * Faces can only merge if merge keys are identical.
-             * This ensures AO gradients and lighting are preserved at block boundaries.
+             * This ensures AO gradients and damp boundaries stay crisp at block edges.
              * Uses direct lookup table access for maximum performance.
              * @param {BlockId} blockId - Block type ID
              * @param {number[]} ao - Array of 4 AO values
-             * @param {number} light - Normalized light level (0-1)
-             * @returns {number} 27-bit merge key: (blockId << 11) | (light << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
+             * @param {number} light - UNUSED since Phase 3 (light is a per-vertex attribute,
+             *   not part of the key); parameter kept for call-shape compatibility.
+             * @param {number} [damp=0] - Wet-shoreline damp level (0-2).
+             * @returns {number} Merge key: (blockId << 10) | ((damp & 3) << 8) | (q0 << 6) | (q1 << 4) | (q2 << 2) | q3
              */
             function getMergeKey(blockId, ao, light, damp = 0) {
                 // PHASE 3: light is NOT in the merge key — it's a per-vertex attribute so light-only
