@@ -39151,6 +39151,11 @@ self.onmessage = async (e) => {
                 // temperature (forceSingleBiome short-circuit or legacy terrain path).
                 const clim = { t: NaN };
                 const riversOn = worldConfig.enableRivers !== false;
+                // TER-7: padded (chunkSize+2)² height field — interior mirrors heightCache,
+                // plus a 1-block ring OUTSIDE the chunk so slope/aspect/lake analysis sees
+                // all 8 neighbors at chunk borders (surface choice = pure function of gx,gz).
+                const pad = chunkSize + 2;
+                const heightPad = new Int16Array(pad * pad);
                 for (let lx = 0; lx < chunkSize; lx++) {
                     for (let lz = 0; lz < chunkSize; lz++) {
                         const idx = lx + lz * chunkSize;
@@ -39159,14 +39164,23 @@ self.onmessage = async (e) => {
                         const pre = computePreRiverHeight(gx, gz, seed);
                         const rf = riversOn ? getRiverFactor(gx, gz, seed, pre.height) : 1.0;
                         riverCache[idx] = rf;
-                        heightCache[idx] = applyRiverCarve(gx, gz, seed, pre.height, pre.oceanFactor, rf);
+                        const h = applyRiverCarve(gx, gz, seed, pre.height, pre.oceanFactor, rf);
+                        heightCache[idx] = h;
+                        heightPad[(lx + 1) + (lz + 1) * pad] = h;
                         clim.t = NaN;
                         biomeCache[idx] = getBiomeParams(gx, gz, clim);
                         widthNoiseCache[idx] = noise2D(gx * 0.005, gz * 0.005);
                         if (tempCache) tempCache[idx] = Number.isNaN(clim.t) ? temperature(gx, gz) : clim.t;
                     }
                 }
-                return { heightCache, riverCache, biomeCache, widthNoiseCache, tempCache };
+                // Ring pass: the 1-block border outside the chunk (+68 blendedHeight calls).
+                for (let pz = 0; pz < pad; pz++) {
+                    for (let px = 0; px < pad; px++) {
+                        if (px > 0 && px < pad - 1 && pz > 0 && pz < pad - 1) continue; // interior already filled
+                        heightPad[px + pz * pad] = blendedHeight(startX + px - 1, startZ + pz - 1, seed);
+                    }
+                }
+                return { heightCache, riverCache, biomeCache, widthNoiseCache, tempCache, heightPad };
             }
             // Pre-calculate cave noise samples for interpolation
             function precalculateCaveNoise(chunkSize, chunkHeight, startX, startZ) {
@@ -39198,8 +39212,9 @@ self.onmessage = async (e) => {
             }
             // Generate terrain and carve caves
             function generateTerrainPass(data, chunkSize, chunkHeight, startX, startZ, caches, caveCaches, set, worldGenSettings) {
-                const { heightCache, riverCache, widthNoiseCache, biomeCache } = caches;
+                const { heightCache, riverCache, widthNoiseCache, biomeCache, heightPad } = caches;
                 const { caveCache1, caveCache2, cxDim, cxzStride } = caveCaches;
+                const pad = chunkSize + 2; // heightPad row stride — see precalculateTerrainCaches
 
                 // ============================================================
                 // ELEVATION THRESHOLDS (adjusted for 320 world height)
@@ -39251,28 +39266,29 @@ self.onmessage = async (e) => {
 
                         // ============================================================
                         // SLOPE ANALYSIS (for all 8 neighbors)
+                        // TER-7: reads the padded height field (heightPad), so border
+                        // columns see all 8 real neighbors — no material/lake seams
+                        // at chunk boundaries.
                         // ============================================================
                         let maxSlope = 0;
                         let slopeNorth = 0, slopeSouth = 0, slopeEast = 0, slopeWest = 0;
+                        let minNeighborSurface = 32767; // TER-8: lowest neighboring surface (lake rim)
                         const neighborOffsets = [
                             [-1, 0], [1, 0], [0, -1], [0, 1],
                             [-1, -1], [1, -1], [-1, 1], [1, 1]
                         ];
+                        const padBase = (lx + 1) + (lz + 1) * pad;
                         for (const [dx, dz] of neighborOffsets) {
-                            const nx = lx + dx;
-                            const nz = lz + dz;
-                            if (nx >= 0 && nx < chunkSize && nz >= 0 && nz < chunkSize) {
-                                const nIdx = nx + nz * chunkSize;
-                                const neighborY = heightCache[nIdx];
-                                const slope = worldTopY - neighborY; // Positive = we're higher
-                                const absSlope = Math.abs(slope);
-                                if (absSlope > maxSlope) maxSlope = absSlope;
-                                // Track directional slopes for aspect calculations
-                                if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
-                                if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
-                                if (dx > 0) slopeEast = Math.max(slopeEast, slope);
-                                if (dx < 0) slopeWest = Math.max(slopeWest, slope);
-                            }
+                            const neighborY = heightPad[padBase + dx + dz * pad];
+                            const slope = worldTopY - neighborY; // Positive = we're higher
+                            const absSlope = Math.abs(slope);
+                            if (absSlope > maxSlope) maxSlope = absSlope;
+                            if (neighborY < minNeighborSurface) minNeighborSurface = neighborY;
+                            // Track directional slopes for aspect calculations
+                            if (dz < 0) slopeNorth = Math.max(slopeNorth, slope);
+                            if (dz > 0) slopeSouth = Math.max(slopeSouth, slope);
+                            if (dx > 0) slopeEast = Math.max(slopeEast, slope);
+                            if (dx < 0) slopeWest = Math.max(slopeWest, slope);
                         }
 
                         const isCliff = maxSlope >= CLIFF_SLOPE;
@@ -39303,7 +39319,8 @@ self.onmessage = async (e) => {
                                          worldTopY < SNOW_PATCHES_LINE &&
                                          maxSlope < 2 && // Flat area
                                          lakeNoise > 0.7 && // Lake location noise
-                                         patchNoise < 0; // Additional filter
+                                         patchNoise < 0 && // Additional filter
+                                         minNeighborSurface > worldTopY; // TER-8: true basin — otherwise water would spill
 
                         // ============================================================
                         // CAVE COLUMN CONSTANTS (hoisted out of the ly loop — TER-12)
@@ -39529,8 +39546,10 @@ self.onmessage = async (e) => {
 
                             // ============================================================
                             // ALPINE LAKE WATER
+                            // TER-8: never fill above the lowest neighboring surface —
+                            // lake water always has a solid rim (no floating slab edges).
                             // ============================================================
-                            if (isLakeBed && worldY > worldTopY && worldY <= worldTopY + 3) {
+                            if (isLakeBed && worldY > worldTopY && worldY <= Math.min(worldTopY + 3, minNeighborSurface)) {
                                 id = WATER;
                             }
                             // River tunnels removed (TER-5): the getRiverFactor height
