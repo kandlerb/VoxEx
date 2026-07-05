@@ -347,7 +347,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 - Typed arrays (Uint8Array, Float32Array) over regular arrays; object pooling for frequently created geometries.
 - Batch chunk updates with `scheduleChunkUpdate()`; keep render distance 8-16 chunks for most devices.
 - Scratch objects in hot paths (`_pickDirTmp`, `_closestZombieResult`, `_scratchOrigin`); hoist functions out of closures (see `extractLightFromChunk`).
-- `blockIndex(lx, ly, lz)` = `lx + lz * 16 + ly * 256`. Lookup tables (BLOCK_IS_SOLID, AO_LOOKUP, FADE_LUT) over branching.
+- `blockIndex(lx, ly, lz)` = `lx + lz * 16 + ly * 256`. Lookup tables (BLOCK_IS_SOLID, AO_LOOKUP) over branching — but NOT for continuous functions sampled by terrain noise: a non-interpolating LUT quantizes the field into visible axis-aligned strips (the deleted FADE_LUT bug, CCR-TERRAIN-006; the exact fade polynomial also benchmarked faster than the LUT).
 - Unroll vertex writing (`writeFaceVertices`); bit-packed merge keys (`getMergeKey(blockId, ao, light)`).
 - Throttle occlusion checks (every 5 frames), shadow updates (>0.5u). Use `shouldYield()` / `checkFrameBudget()` in async ops.
 
