@@ -5,7 +5,7 @@
 **VoxEx** is a fully-featured, browser-based voxel exploration game engine inspired by Minecraft. It runs entirely in the browser without external servers or installations.
 
 - **Type**: Browser-based 3D voxel game engine (HTML5 + JavaScript ES6 modules)
-- **Main File**: `voxEx.html` (single file — no exceptions), ~43K lines / ~43,000 LOC
+- **Main File**: `voxEx.html` (single file — no exceptions), ~46K lines
 - **Architecture**: Self-contained single-page application
 - **Tech Stack**: Three.js r160, WebGL, Web Workers, Web Audio, IndexedDB, OPFS, LocalStorage
 
@@ -18,26 +18,59 @@ Core principles guiding all development decisions:
 3. **Optimized for [Almost] Any Device** — typed arrays, object pooling, face/frustum culling, section-based LOD, tiered geometry buffers (small/medium/large), RLE chunk compression, 16.67ms frame budget with yield points. Targets 60fps on mid-range hardware.
 4. **Flexible Settings** — render distance 4-32 chunks; graphics toggles (AO, smooth lighting, shadows, fog, frustum culling, volumetrics, GI, water refraction, stars, clouds); water effects; particle systems; movement options; 3 profiles (Performance/Balanced/Quality); key bindings in `KEY_BINDINGS` (rebinding UI not built — controls menu is a static display); multi-slot saves with unique seeds; all persisted via LocalStorage.
 
+## How to Work in This Repo (read first)
+
+- **Line numbers in this file DRIFT.** The main file gains thousands of lines per month. Every `~line NNNN` here is a hint from some past build — ALWAYS locate code by grepping the named anchor (`class VoxelWorld`, `const BIOME_CONFIG`, `function terrainSurface`), never by line number.
+- **Read `docs/agent-notes.md`** for hard-won knowledge: the do-not-retry ledger (approaches that failed structurally), three.js gotchas, subsystem as-built notes, terrain lessons, settled aesthetic decisions, and sandbox-environment warnings. Don't re-attempt anything in its ledger; don't re-litigate anything in its decisions list.
+- **Verification ladder** (cheapest first):
+  1. `node tools/parity-check.mjs` — hand-maintained copy lockstep + injection markers (seconds; run after ANY terrain/worker/config change).
+  2. `node tools/terrain-node-checks.mjs [voxEx.html] [seed]` — headless terrain invariants (run on ≥3 seeds for terrain changes).
+  3. `tools/voxex-tests.html` over localhost — the authoritative browser suite (283+ tests: workers, meshing byte-parity, lighting, persistence).
+  4. In-game eyeball for anything visual.
+- **Change docs are "CCRs"** (Change Control Request/Report) — see [Change Workflow](#change-workflow-ccrs).
+- Working in a sandboxed/mounted environment (Cowork)? Read `docs/agent-notes.md` §7 FIRST — the mount silently truncates large-file reads and corrupts the git index.
+
 ## Repository Structure
 
 ```
 VoxEx/
 ├── index.html                # System check & launcher (WebGL, GPU benchmark)
-├── voxEx.html                # Complete game (HTML + CSS + JS, ~43K lines)
-├── CLAUDE.md                 # This file
+├── voxEx.html                # Complete game (HTML + CSS + JS, ~46K lines)
+├── CLAUDE.md                 # This file — rules, registries, checklists
 ├── README.md                 # Project readme
 ├── futureFeatures.md         # Feature roadmap
+├── CCR's/                    # Active change docs (+ Finished/ archive,
+│                             #   _IMPLEMENTATION_RUNBOOK.md, _CROSS_CCR_NOTES.md)
+├── docs/
+│   ├── agent-notes.md            # Hard-won knowledge: do-not-retry ledger, gotchas,
+│   │                             #   as-built subsystem notes, environment warnings
+│   └── superpowers/              # HISTORICAL plans/specs (pre-terrainSurface era)
 ├── tools/                    # Development & testing utilities
-│   ├── docs-viewer.html          # Documentation viewer
-│   ├── KeyFrame_editor.html      # Animation keyframe editor
-│   ├── terrain-parameter-editor.html  # Terrain tuning tool
-│   ├── terrain-visualizer.html   # Shaded relief terrain debugger (cross-section, column inspector; delegates to voxEx.html via ?test=1)
-│   ├── voxelEditor.html          # Voxel model editor
+│   ├── parity-check.mjs          # Lockstep checker — hand-maintained copies + markers
+│   ├── terrain-node-checks.mjs   # Headless terrain invariants (no browser)
+│   ├── voxex-tests.html          # Browser suite (283+ tests) — REAL voxEx.html code via
+│   │                             #   ?test=1 seam (window.VoxEx); serve over localhost
+│   ├── voxex-texture-tests.html  # Visual texture atlas tests (33 tiles + checks)
+│   ├── terrain-visualizer.html   # Terrain debugger (delegates to game via ?test=1)
+│   ├── terrain-parameter-editor.html / voxelEditor.html / KeyFrame_editor.html
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
-│   ├── voxex-tests.html          # Test suite — REAL voxEx.html functions via ?test=1 seam (window.VoxEx); ~204 tests incl. live worker round-trip. Serve over localhost.
-│   └── voxex-texture-tests.html  # Visual texture atlas tests (all 33 tiles + automated checks)
-└── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
+│   ├── docs-viewer.html          # Documentation viewer
+│   └── scratch/                  # GITIGNORED one-off probes — never commit replicas
+└── .github/                  # Issue templates + CI (checks.yml)
 ```
+
+## Version Constants (bump discipline)
+
+All near the top of `voxEx.html` (grep the name). Getting these wrong ships stale caches or silently regenerates every world.
+
+| Constant | Bump when | Effect of bump |
+|---|---|---|
+| `VOXEX_BUILD` | EVERY deploy/change (date-based `YYYY-MM-DD.N`) | Console boot banner; add a `VOXEX_RECENT_CHANGES` entry citing the CCR ID |
+| `TERRAIN_GEN_VERSION` | ANY change to terrain output (incl. float-epsilon shifts, e.g. rerouting through `noise2Dd`) | Saved chunks regenerate |
+| `CURRENT_CACHE_VERSION` | Chunk cache format/lighting-semantics changes (e.g. attenuation values) | Cached chunk lighting recalculates |
+| `SETTINGS_VERSION` | Changing `DEFAULTS` in a way that must override saved settings | Saved settings wiped on mismatch |
+
+Never re-declare these (each is single-source; `CURRENT_CACHE_VERSION` was once duplicated and drifted — CACHE-002).
 
 ## Technology Stack
 
@@ -45,7 +78,7 @@ VoxEx/
 |------------|---------|---------|
 | **Three.js** | 0.160.0 | 3D rendering, lighting, camera control |
 | **PointerLockControls** | Three.js addon | First-person camera/input control |
-| **Web Workers** | Native | Off-thread chunk meshing via `ChunkWorkerPool` |
+| **Web Workers** | Native | Off-thread terrain gen, sunlight, and (unbanded) chunk meshing via `ChunkWorkerPool` |
 | **Web Audio API** | Native | Procedural sound synthesis (zombie growls, etc.) |
 | **IndexedDB** | Native | Chunk data persistence with RLE compression |
 | **OPFS** | Native | Origin Private File System disk cache (`ChunkDiskStorage`) |
@@ -58,13 +91,13 @@ VoxEx/
 
 Layered pipeline (top → bottom). No top-level engine class — the live game is module-level functions plus the classes listed under [Classes](#classes).
 
-- **UI Layer** (HTML/CSS, lines ~1-1550): HUD (crosshair, hotbar, block name, flight/sprint icons); menus (start, pause, settings, world creation, seed select); inventory (E key, drag-drop); world management (rename/duplicate/import/export/storage); perf overlay (O), debug overlay (~); toasts; settings search + profiles.
-- **Game Engine** (Three.js render pipeline): camera (1st + 3rd person, V key, orbit/zoom); lighting (day/night, sun/moon, ≤8 torch point lights); skybox (3 star layers, volumetric clouds); materials (chunk StandardMaterial, 3 water modes, custom GLSL fog/refraction); post-processing (volumetric god rays, color grading, zombie vignette/desat, underwater); ParticleSystem; viewmodel arms + torch. Render layers: 0=world, 1=viewmodel, 2=player body.
-- **World Management** (VoxelWorld + terrain functions): chunk gen 16x16x320 / 20 sections; ChunkWorkerPool (auto-sized, zero-copy transfer); meshing (face cull + AO + greedy + LOD); 6 biomes + foothill transitions; continental height + domain-warped boundaries; domain-warped noise-ribbon rivers (`getRiverFactor`); structures (trees/multi-trunk/caves); cached frustum culling; section analysis; GEN_PASS/RENDER_PASS bitmasks.
-- **Lighting Engine**: SunlightTask (async, pressure-based bailout); torch block light (level 14, 6-direction); deferred lighting for distant chunks; edge lighting reconciliation; watchdog (300ms grace); volumetric cone sampling (7-ray sun, 5-ray point).
+- **UI Layer** (HTML/CSS): HUD (crosshair, hotbar, block name, flight/sprint icons); menus (start, pause, settings, world creation, seed select); inventory (E key, drag-drop); world management (rename/duplicate/import/export/storage); perf overlay (O), debug overlay (~); toasts; settings search + profiles. Menu-overlay perf rules: see `docs/agent-notes.md` §3 (keep heavy overlays out of `#blocker`; no backdrop-filter over scrollable panels).
+- **Game Engine** (Three.js render pipeline): camera (1st + 3rd person, V key, orbit/zoom); lighting (day/night, sun/moon, ≤8 torch point lights); skybox (3 star layers, volumetric clouds); materials (chunk StandardMaterial with per-texel roughnessMap, 3 water modes, separate translucent glass mesh, custom GLSL fog/refraction); post-processing (volumetric god rays, color grading, zombie vignette/desat, underwater); ParticleSystem; viewmodel arms + torch. Render layers: 0=world, 1=viewmodel, 2=player body.
+- **World Management** (VoxelWorld + terrain functions): chunk gen 16x16x320 / 20 sections; ChunkWorkerPool (auto-sized, zero-copy transfer); meshing (face cull + AO + greedy + LOD; worker-meshed for unbanded chunks, main-thread for edited/banded/torch/fire/glass — `WORKER_MESH_PIPELINE_ENABLED`); 6 biomes + foothill transitions; climate+spline `terrainSurface` (default) with legacy biome-cell path behind `useNewTerrain:false`; domain-warped noise-ribbon rivers (`getRiverFactor`); structures (trees/multi-trunk/caves); cached frustum culling; section analysis; GEN_PASS/RENDER_PASS bitmasks.
+- **Lighting Engine**: SunlightTask (async, pressure-based bailout; worker sunlight via `WORKER_LIGHTING_ENABLED`); torch block light (level 14, 6-direction); deferred lighting for distant chunks; edge lighting reconciliation; watchdog (300ms grace); volumetric cone sampling (7-ray sun, 5-ray point).
 - **Entity & Player Systems**: physics/collision/swim movement; shared `buildArticulatedMesh` (3-segment spine, shoulder/elbow + hip/knee pivots, procedural pixel-art textures); customizable player; procedural zombies (≤10, pooled); zombie AI state machine (wander → chase → attack); spring-damped animation (11+ states); 7-keyframe knockdown ragdoll (3.5s).
 - **Memory & Performance**: MemoryBudgetManager (auto-scale render distance: −1 at 80% warning, −2 + emergency unload 20% at 95% critical); GeometryBufferPool (4K/8K/16K face tiers, auto-upgrade); object pools (Float32/Uint8/Uint32Array, Vector3, ChunkData, GeometryBuffer); PerformanceMonitor (FPS ring buffer, 8ms budget); geometry leak detection (5s, warn at 500+ excess); spatial hash grid (O(1) proximity); SeededRandom PRNG.
-- **Data Persistence**: IndexedDB chunk cache (stores: saves/chunks/settings); ChunkDiskStorage OPFS backend (lazy init); RLE compression (v2: blocks + skyLight + blockLight); batch ops; JSON world save (seed, player state, modified chunks, thumbnail); LocalStorage settings/profiles/quick save.
+- **Data Persistence**: IndexedDB chunk cache (stores: saves/chunks/settings); ChunkDiskStorage OPFS backend (lazy init); RLE compression (v2: blocks + skyLight + blockLight); batch ops; JSON world save (seed, player state, genParams, modified chunks, thumbnail); LocalStorage settings/profiles/quick save.
 
 ## Block Types (Current: 19 blocks)
 
@@ -85,14 +118,14 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 | 12 | `GRAVEL` | Gravel block |
 | 13 | `LONGWOOD_LOG` | Longwood biome log (2x2/3x3 trunks) |
 | 14 | `LONGWOOD_LEAVES` | Longwood biome leaves |
-| 15 | `GLASS` | Transparent + collidable (tags: transparent/cutout/collidable), zero light attenuation |
-| 16 | `FIRE` | Transparent, walk-through, emissive separate-render block; clings to adjacent faces; 12-frame anim |
+| 15 | `GLASS` | Transparent + collidable; rendered as a SEPARATE translucent per-chunk mesh (`<cKey>_GLASS`), zero light attenuation |
+| 16 | `FIRE` | Transparent, walk-through separate-render block; clings to adjacent faces; 12-frame anim; bakes ZERO block light (glows via the dynamic `torchLightPool`) |
 | 17 | `BURNT_LOG` | Charred log (fire burn result) |
 | 18 | `BURNT_PLANKS` | Charred planks (fire burn result) |
 | 255 | `UNLOADED_BLOCK` | Placeholder for unloaded chunks |
 
 - **Texture Atlas**: `NUM_TILES = 33` tiles in a horizontal strip (12 fire frames + 3 burnt + base blocks).
-- **Water light**: attenuates sunlight 1/block, blocklight 2/block (chunk cache v3 — bump `CURRENT_CACHE_VERSION` + `_cacheVersion` writes when changing attenuation).
+- **Water light**: attenuates sunlight 1/block, blocklight 2/block. Changing attenuation semantics = bump `CURRENT_CACHE_VERSION` (see [Version Constants](#version-constants-bump-discipline)).
 - **Lookup Tables**: `BLOCK_IS_SOLID[256]`, `BLOCK_IS_OPAQUE[256]`, `IS_TRANSPARENT[256]`, `SUNLIGHT_ATTENUATION[256]`, `BLOCKLIGHT_ATTENUATION[256]` — Uint8Array fast lookups.
 
 ## Biome System (6 Biomes + Foothills)
@@ -102,19 +135,19 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 | **Plains** | 2 | Flat, sparse oak trees, baseHeight 62, spherical canopies |
 | **Hills** | 2 | Rolling hills with abs() smoothing, moderate trees, amplitude 40 |
 | **Forests** | 2 | Dense oak trees, moderate terrain |
-| **Mountains** | 0.5 (unused — mask-placed) | High peaks (amplitude 180), ridged noise, conical pines, treeline, snow |
+| **Mountains** | 0.5 (unused — mask-placed) | High peaks, ridged noise, conical pines, treeline, snow |
 | **Swamp** | 1 | Low baseHeight 58, water pools, droopy trees |
 | **Longwoods** | 2 | Giant 2x2/3x3 trunk trees, heights 12-24, wide sparse canopies |
 | **Mountain Foothills** | auto | Transition zone (single 64-block cell ring, constant ringFactor 0.75, mountain-derived noise) |
 
-Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `BIOME_DEFAULTS`. Tags: `"mountain"` (treeline + alpine terrain), `"forested"` (high tree density), `"giant_trees"` (multi-block trunks).
+Biomes configured in `BIOME_CONFIG`; missing fields inherit from `BIOME_DEFAULTS`. Tags: `"mountain"` (treeline + alpine terrain), `"forested"` (high tree density), `"giant_trees"` (multi-block trunks).
 
-**Terrain Generation Pipeline**: **`WORLD_CONFIG.useNewTerrain: true` (the default) routes ALL height queries through the climate+spline surface — `terrainSurface`/`computeSurfaceHeight`/`resolveBiome` (temperature/humidity/continentalness/erosion/peaks-valleys fields + splines). The bilinear biome-cell system documented in this section is the LEGACY A/B path, reachable only by setting the flag false.** Legacy path: continental height + domain warping → weighted cell-based biome selection → per-biome height functions. Shared by BOTH paths: river/ocean carving → structure placement. Legacy mountains: domain-warped ridges → 6-layer ridged noise → peak amplification → valley erosion → jagged detail overlay. Biome boundaries use two-octave domain warping for organic edges.
+**Terrain Generation Pipeline**: **`WORLD_CONFIG.useNewTerrain: true` (the default) routes ALL height queries through the climate+spline surface — `terrainSurface`/`computeSurfaceHeight`/`resolveBiome` (temperature/humidity/continentalness/erosion/peaks-valleys fields + splines, swiss-turbulence erosion, crest-following peak boost, centered fractal with `HF_PIVOT`/`VALLEY_RATIO`).** The bilinear biome-cell system below is the LEGACY A/B path, reachable only by setting the flag false. Legacy path: continental height + domain warping → weighted cell-based biome selection → per-biome height functions. Shared by BOTH paths: river/ocean carving → structure placement. Biome boundaries use two-octave domain warping for organic edges.
 
 **Mountain-Foothills Transition** (legacy path — inert under the default `useNewTerrain: true`):
 - `foothillsHeightFunc` uses `mountainsHeightFunc` output scaled by ring factor — ridges/valleys align at boundaries (no mismatched noise).
-- SINGLE ring (`MAX_FOOTHILL_RINGS = 1`, one 64-block biome cell): any non-mountain cell 8-adjacent to a mountain cell becomes foothills with constant `ringFactor = 0.75` (from the ring-centre form `max(0.05, 1 - ((ring - 0.5)/N)²)`). `mountainWeight = ringFactor * 0.9 = 0.675` controls relief passthrough; baseHeight lerps plains (62) → foothills (70) by ringFactor. There is no per-cell edge falloff in `mountainsHeightFunc`.
-- **Mountain placement**: by a low-frequency domain-warped region mask (`isMountainRegion`) so they cluster into coherent ranges — NOT the per-cell weighted roll (which distributes the other 5 biomes via the noise-calibrated CDF `_BIOME_CDF_TABLE`; `rebuildBiomeTable` excludes mountains, so `BIOME_CONFIG.mountains.weight` is unused). Keeps ranges contiguous, avoids plains/foothill notches between scattered peaks.
+- SINGLE ring (`MAX_FOOTHILL_RINGS = 1`, one 64-block biome cell): any non-mountain cell 8-adjacent to a mountain cell becomes foothills with constant `ringFactor = 0.75`. `mountainWeight = ringFactor * 0.9 = 0.675` controls relief passthrough; baseHeight lerps plains (62) → foothills (70) by ringFactor.
+- **Mountain placement**: by a low-frequency domain-warped region mask (`isMountainRegion`) so they cluster into coherent ranges — NOT the per-cell weighted roll (which distributes the other 5 biomes via the noise-calibrated CDF `_BIOME_CDF_TABLE`; `rebuildBiomeTable` excludes mountains, so `BIOME_CONFIG.mountains.weight` is unused).
 
 ## Key Systems Explained
 
@@ -122,34 +155,37 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 - **Size**: 16x16x320 (CHUNK_SIZE=16, CHUNK_HEIGHT=320), subdivided into 20 sections (SECTION_HEIGHT=16) for LOD/culling.
 - **Structure**: `{blocks: Uint8Array, skyLight: Uint8Array, blockLight: Uint8Array}` (backward-compatible with old Uint8Array-only format).
 - **Section Analysis**: per-section `isEmpty`, `isFullySolid`, tight bounds for render skipping.
-- **Meshing**: `renderChunk()` builds indexed geometry; `ChunkWorkerPool` offloads to workers (auto-sized CPU cores−1, min 1 / max 4; zero-copy Transferables; 500ms timeout). Face culling, AO baked into vertex colors, face-merge key bit-packing. `ChunkNeighborCache` speeds neighbor lookups.
+- **Meshing**: `renderChunk()` builds indexed geometry on main; `WORKER_MESH_PIPELINE_ENABLED = true` routes UNBANDED (streaming/never-edited) chunks to the worker mesher (single-sourced via injection, byte-parity-gated in the browser suite). Edited/banded/torch/fire/glass chunks mesh on main. Face culling, AO baked into vertex colors, face-merge key bit-packing. `ChunkNeighborCache` speeds neighbor lookups.
+- **Banded meshing (lazy)**: chunks band PER-CHUNK on first edit (`markChunkBanded`; `chunkUsesBands(cKey)`); banded mesh keys are `'cx,cz#band'` (+`_WATER`), stripped by `chunkBaseOfMeshKey()`. 4 bands × 5 sections. Do NOT enable eager banding globally — it ~doubles streaming mesh cost (see agent-notes ledger). Profiler: `meshProfile()`.
 - **Geometry Tiers**: Small (4K faces ~0.78MB), Medium (8K ~1.56MB), Large (16K ~3.12MB), auto-upgrade. Pools: `ChunkDataPool`, `GeometryBufferPool`, `Float32ArrayPool`. `MemoryBudgetManager` auto-scales render distance under pressure.
 - **Pass System**: `GEN_PASS` (TERRAIN=1, WATER=2, DECORATIONS=4, SUNLIGHT=8, BLOCKLIGHT=16, NEIGHBOR_UPDATE=32, TREE_NEIGHBOR_UPDATE=64); `RENDER_PASS` (INITIAL_MESH=1, EDGE_LIGHTING=2, NEIGHBOR_LIGHTING=4, FULL_QUALITY=8).
 
 ### Lighting System
 - **Light Levels**: 1-15 (1 = min visibility, 15 = full sunlight).
-- **SunlightTask**: async propagation, throttle at 80% hard cap, bailout to full recalc at 100%.
-- **Block Light**: torch sources propagate at level 14, 6-direction spread.
+- **SunlightTask**: async propagation, throttle at 80% hard cap, bailout to full recalc at 100%. Fresh-terrain sunlight can compute in the worker (`WORKER_LIGHTING_ENABLED`); `calculateBlockLight` is main-only (fresh terrain has no torches).
+- **Block Light**: torch sources propagate at level 14, 6-direction spread. FIRE bakes zero block light (dynamic `torchLightPool` glow instead) so `setBlock` stays on the light-neutral fast path.
 - **Deferred Lighting**: distant chunks (>16 blocks) use a simplified height-based model.
 - **Edge Lighting**: cross-chunk boundary reconciliation, max 3 passes/chunk. **Watchdog** force-clears stuck pending light (300ms grace).
 - **Semi-Transparent**: leaves reduce light by 1 instead of fully blocking.
-- **Smooth Lighting**: `SETTINGS.smoothLighting` — per-corner sampling (`calculateFaceCornerLight`, same offset table as AO); corner lights packed into greedy merge key (layout: `blockId<<20 | 4×3-bit corner light | AO byte`).
+- **Smooth Lighting**: `SETTINGS.smoothLighting` — per-corner sampling (`calculateFaceCornerLight`, same offset table as AO). Light left the merge key in CCR Phase 3A; the wet-shoreline damp level stays in the key (layout `(blockId<<10)|(damp<<8)|AO`) so the shoreline stays crisp/blocky (user preference).
 - **Normals**: chunk/water geometries carry NO normal attribute — chunk materials use `flatShading: true` (normals derived in-shader via dFdx/dFdy).
 - **Minimum Light**: skylight never < 1; blocklight valid 0-15 (0 = no torch). At mesh time `extractLightFromChunk()` floors combined light at **3** (20% base brightness) so deep caves stay faintly visible.
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`. **Volumetric Sampling**: 7-ray cone (sun/moon), 5-ray cone (point lights) for partial visibility through foliage.
 
 ### Rendering System
 - **Textures**: procedural 16x16 pixel art on canvas (Atlas: 33 tiles).
-- **Terrain Material**: MeshStandardMaterial, vertex colors, roughness, alpha test 0.1.
-- **Water**: three modes — Standard (PBR), Fast (Lambert), Refraction (custom GLSL, Beer-Lambert absorption).
+- **Terrain Material**: MeshStandardMaterial, vertex colors, alpha test 0.1, per-texel `roughnessMap` authored from `MAT_PROFILES` (matte base + color-keyed shiny accents; accents need roughness ≲110 to glint). Live control: `uShininessStrength` uniform driven by the repurposed `SETTINGS.specularIntensity` ("Shininess Strength"); `specularEnabled` off = fully matte AND kills env reflections.
+- **Glass**: separate translucent per-chunk mesh (`<cKey>_GLASS`), non-greedy 1×1 quads emitted at end of `renderChunk`; body opacity baked into texture alpha (`setGlassBodyAlpha()`); glint punch-through via `uGlintReflect`; cutout shadows via `glassDepthMaterial` (see agent-notes §2 for the three.js alphaTest gotcha). Workers route `hasGlass` chunks to main. Screen-space glass refraction was tried and RETIRED — do not retry (agent-notes ledger).
+- **Env Reflections**: analytic sky reflection on shiny terrain texels (`envReflectionEnabled`, default off, not in profiles) — same approach as water, deliberately not PMREM.
+- **Water**: three modes — Standard (PBR), Fast (Lambert), Refraction (custom GLSL, Beer-Lambert absorption). Refraction RT scale: `refractionScale` setting (compounds with pixelRatio).
 - **Fog**: custom cylindrical shader (XZ-only distance, not vertical) via `onBeforeCompile`. **Biome Fog Tinting**: per-biome fog color lerp (plains=neutral, forests=green, mountains=blue, swamp=murky).
 - **Volumetric**: god rays, multi-point-light (≤4 volumetric point lights). **Post-Processing**: EffectComposer (volumetric pass, color grading, underwater, zombie effects).
 - **Color Grading**: sunrise (0.15-0.35 dayTime) warm orange/pink, sunset (0.65-0.85) deep orange/red.
 - **Particles**: `ParticleSystem` (max 500), Chebyshev-distance square shader for voxel-style particles.
 - **Camera**: 1st + 3rd person (V); orbit yaw/pitch, zoom +/-, collision-aware distance. Layers: 0=world, 1=viewmodels, 2=player body (3rd person).
 - **Stars**: 3-layer field (radii 350/400/450), shader sine-wave twinkle, day/night fade. **Clouds**: volumetric particles (1500 base × density), clumped, day/night alpha.
-- **Shadows**: pixel-snapped maps, update only when player moves >0.5u or sun angle >5deg. **Frustum Culling**: cached frustum, inner-radius exception, recompute on >5deg yaw change.
-- **Web Workers**: `ChunkWorkerPool` offloads meshing; identical terrain functions injected via `Function.toString()`.
+- **Shadows**: pixel-snapped maps, update only when player moves >0.5u or sun angle >5deg; two stability paths (blocky ratchet vs light-space texel snap) — mechanics in agent-notes §3. **Frustum Culling**: cached frustum, inner-radius exception, recompute on >5deg yaw change; near ring (`BUILD_AHEAD_RADIUS ≤ 10`) pre-meshes in all directions so rotation doesn't trigger build waves.
+- **Web Workers**: `ChunkWorkerPool` offloads terrain gen, sunlight, and unbanded meshing; identical functions injected via `Function.toString()`.
 
 ### Water Effects System
 - **Ripples**: velocity-scaled expansion, configurable segments (4=diamond, 6=hex, 8=octagon), max 20.
@@ -160,8 +196,8 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 
 ### River System
 - **Algorithm**: stationary domain-warped noise ribbon — `getRiverFactor(gx, gz, seed)` returns 0 (river center) → 1 (no river) where `|noise2D|` of the warped coordinates falls below the channel half-width. Warp = two-octave coordinate warp + axis-balanced sinusoidal meander + regional macro-meander (`RIVER_WARP_*`). There is NO gradient-descent tracing and NO `RiverNetworkCache` (that class does not exist in the code).
-- **Width & fade**: half-width `RIVER_BASE_WIDTH` (0.064 noise units) ± coastal variation; `heightPenalty = smoothstep(60, 72, terrainHeight)` fades rivers out on elevated terrain (TER-6; ends rivers by height ~71, before the canyon-carve blend could leave a dry carved bed above sea level). A mountain river-tunnel punch that once lived in `generateTerrainPass` was fully DELETED, not merely left unreachable (TER-5) — the same heightPenalty width fade already ended rivers before the tunnel's elevation gate could ever fire, so the punch was dead code and was removed.
-- **Carving**: `blendedHeight()` blends the pre-river height toward the `getRiverDepth()` bed, fading out the carve over a band on high ground (the internal constants are still named `CANYON_NONE`/`tunnelMix`, a vestige of the deleted tunnel feature — no tunnel exists); river SAND beaches and water fill happen in `generateTerrainPass`/`fillWaterPass`.
+- **Width & fade**: half-width `RIVER_BASE_WIDTH` (0.064 noise units) ± coastal variation; `getRiverFactor` takes an optional `widthMult` (1 = channel, 3 = valley band). `heightPenalty = smoothstep(75, 95, terrainHeight)` (CCR-RIVER-002): full width ≤75, narrowing 75–95, pinch-out >95. A mountain river-tunnel punch that once lived in `generateTerrainPass` was fully DELETED (TER-5).
+- **Carving (CCR-RIVER-002/003)**: two stages in `applyRiverCarve`. (1) VALLEY depression — terrain around the channel is pulled down toward a valley profile (floor keeps 15% of original relief: `(0.15 + 0.85·vf²)` above seaLevel+2 — a pure vf² clamp made dead-flat sand pans; walls contour-wiggled; influence band = 3× channel width), so rivers sit in valleys instead of slot canyons and hills become valley crossings, not dams. (2) FULL-depth channel incision to the `getRiverDepth()` bed (below sea level → carved columns flood; no `tunnelMix` benches). Both stages have independent strength fades (valley 80–93, channel 82–95 of preHeight) that reach zero BEFORE the width cutoff bites — rivers end as a narrowing valley + dry ravine head, never a cliff ring or dam. Micro-meander is gentle (wavelength 150±60, amp 4+3·ef — the old 80±40/±15 sine serrated banks into sawtooth "cutouts"); the 120-block macro-meander does the large-scale wandering. River SAND hugs the channel core (`rf < 0.5 && y < seaLevel + 3 + surfaceNoise*2`, dithered edge), water fill in `fillWaterPass`. Beach sand is WATER-PROXIMITY gated (`oceanFactor`/`riverFactor` via `caches.oceanCache`) — never a bare Y-band (CCR-TERRAIN-011).
 
 ### Character System
 - **Shared**: `buildArticulatedMesh(proportions, materials, options)` — player + zombie. Skeleton: 3-segment spine (lower/mid/upper), head pivot, arm shoulder+elbow, leg hip+knee pivots.
@@ -186,45 +222,44 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 ### World Creation System
 - **UI**: world name, seed input, biome selector grid, terrain presets, advanced sliders.
 - **Presets**: Default, Amplified, Flat, Archipelago, Superflat, Caves.
-- **Customization**: tree/cave density, terrain amplitude, sea level, biome size, noise persistence/lacunarity, spawn coords.
+- **Customization**: tree/cave density, terrain amplitude, sea level, biome size, noise persistence/lacunarity, spawn coords. The knobs work through LIVE getters on `worldConfig`; the active world's params live in `activeWorldGenParams` (applied via `applyGenParams`, persisted as `savePacket.genParams` v3, restored BEFORE generation). In-session loads must `rebuildChunkWorkerPoolForActiveWorld()` (worker bakes config at pool creation). Details: agent-notes §3.
 - **Preview**: real-time terrain preview (`WorldPreviewRenderer`) delegating directly to the game's own `blendedHeight()`/`getBiomeParams()` (no separate noise copy to keep in sync). **Management**: rename, duplicate, import/export, storage stats, clear cache.
 
 ### Persistence
 - **RLE Compression**: chunk data (blocks + light) Run-Length Encoded, v2 format; decompressor handles v1 + v2.
-- **Run-length limit**: `ChunkCompressor` stores RLE counts as Uint16 — runs > 65535 are SPLIT into multiple [count, value] pairs (`MAX_RUN_LENGTH`). Critical for 320-high chunks (81920 cells) where uniform spans (all-zero blockLight, air above terrain) exceed 65535.
+- **Run-length limit**: `ChunkCompressor` stores RLE counts as Uint16 — runs > 65535 are SPLIT into multiple [count, value] pairs (`MAX_RUN_LENGTH`). Critical for 320-high chunks (81920 cells) where uniform spans exceed 65535.
 - **Cache versioning**: `_cacheVersion` persisted inside the compressed record (`cacheVersion` field), restored on decompress — so cached lighting isn't needlessly recalculated on load.
 - **Dual Caching**: IndexedDB (fast, persistent) + OPFS disk cache (larger capacity via `ChunkDiskStorage` worker).
 - **OPFS binary format**: `serializeChunkForDisk()` / `deserializeChunkFromDisk()` — compact little-endian envelope (magic `'VXC2'`, cacheVersion/renderState/genState, seed, 3x RLE arrays). Legacy JSON-envelope files still readable via fallback in `ChunkDataPool.loadFromDisk()`.
-- **Batch Ops**: `batchLoadChunksFromCache()`, `batchSaveChunksToCache()`. **Save Format**: JSON (seed, player pos/rot, inventory, RLE-compressed modified chunks, thumbnail). **Quick Save/Load**: F5 / F9. **Pre-Generation**: spiral from spawn, async with skip option.
+- **Batch Ops**: `batchLoadChunksFromCache()`, `batchSaveChunksToCache()` (synchronous compression loop — see agent-notes ledger before "optimizing" its scheduling). **Save Format**: JSON (seed, player pos/rot, inventory, genParams, RLE-compressed modified chunks, thumbnail). **Quick Save/Load**: F5 / F9. **Pre-Generation**: spiral from spawn, async with skip option.
 
 ### Settings System
 - **Profiles**: Performance, Balanced, Quality + custom save.
-- **Categories**: Performance, Graphics (Basic, Lighting, Sky, Water, Water Effects, Volumetric, GI, Diffuse/Specular, Stars, Clouds, Torch Particles, Block Break, Footstep), Gameplay (Movement, Physics, Camera, Interaction), Touch Controls, Zombie Effects, Color Grading, Biome Fog.
+- **Categories**: Performance, Graphics (Basic, Lighting, Sky, Water, Water Effects, Volumetric, GI, Materials, Stars, Clouds, Torch Particles, Block Break, Footstep), Gameplay (Movement, Physics, Camera, Interaction), Touch Controls, Zombie Effects, Color Grading, Biome Fog.
 - **Touch settings**: `touchControls` (auto/on/off), `touchLookSensitivity`, `touchJoystickSize`, `touchButtonScale`, `touchLeftHanded` — user prefs, deliberately EXCLUDED from `SETTINGS_PROFILES` (profiles only set keys they list, so touch prefs survive profile switches).
 - **Search**: settings search bar. **Persistence**: LocalStorage, synced to DOM on load via `updateUIFromSettings()`. **Live Updates**: changes apply immediately via side-effect callbacks (material updates, shader uniform sync, chunk rebuilds).
 
 ### Classes
 
-| Class | ~Line | Purpose |
-|-------|-------|---------|
-| `VoxelWorld` | 6186 | World management, chunk loading/unloading, block access |
-| `ChunkDataPool` | 6741 | Object pooling for chunk data structures |
-| `AudioManager` | 7663 | Procedural sound synthesis and playback |
-| `UIManager` | 8020 | HUD, hotbar, inventory, menus, toast notifications |
-| `Uint8ArrayPool` | 8731 | Pool for Uint8Array objects |
-| `Vector3Pool` | 9152 | Pool for Three.js Vector3 objects |
-| `ChunkNeighborCache` | 10001 | Optimized neighbor chunk lookups |
-| `PerformanceMonitor` | 10639 | FPS tracking, frame timing, circular buffer |
-| `ParticleSystem` | 13382 | Particle effects with pooling and custom square shader |
-| `SeededRandom` | 16168 | Deterministic PRNG (worker copy at 16627; nested `SeededRNG` at 28086) |
-| `Float32ArrayPool` | 16228 | Pool for Float32Array objects |
-| `Uint32ArrayPool` | 16312 | Pool for Uint32Array objects |
-| `ChunkWorkerPool` | 17789 | Web Worker pool for off-thread terrain gen and meshing |
-| `GeometryBufferPool` | 18349 | Tiered GPU buffer pooling (small/medium/large) |
-| `MemoryBudgetManager` | 18714 | Memory monitoring, auto-scaling, emergency unload |
-| `WorldPreviewRenderer` | 19504 | Real-time terrain preview during world creation (delegates to the game's own `blendedHeight()`/`getBiomeParams()`; the old `WorldPreviewNoise` class was removed) |
-| `SunlightTask` | 22925 | Async sunlight propagation with pressure-based bailout |
-| `ChunkDiskStorage` | 24112 | OPFS disk cache with inline worker backend |
+Locate any class by grepping `class <Name>` — line numbers are deliberately omitted (they drift by thousands of lines per month).
+
+| Class | Purpose |
+|-------|---------|
+| `VoxelWorld` | World management, chunk loading/unloading, block access |
+| `ChunkDataPool` | Object pooling for chunk data structures |
+| `AudioManager` | Procedural sound synthesis and playback |
+| `UIManager` | HUD, hotbar, inventory, menus, toast notifications |
+| `Uint8ArrayPool` / `Float32ArrayPool` / `Uint32ArrayPool` / `Vector3Pool` | Typed object pools |
+| `ChunkNeighborCache` | Optimized neighbor chunk lookups |
+| `PerformanceMonitor` | FPS tracking, frame timing, circular buffer |
+| `ParticleSystem` | Particle effects with pooling and custom square shader |
+| `SeededRandom` | Deterministic PRNG (hand-copied in the worker template — keep in lockstep) |
+| `ChunkWorkerPool` | Web Worker pool for off-thread terrain gen, sunlight, and meshing |
+| `GeometryBufferPool` | Tiered GPU buffer pooling (small/medium/large) |
+| `MemoryBudgetManager` | Memory monitoring, auto-scaling, emergency unload |
+| `WorldPreviewRenderer` | Real-time terrain preview (delegates to the game's own terrain functions) |
+| `SunlightTask` | Async sunlight propagation with pressure-based bailout |
+| `ChunkDiskStorage` | OPFS disk cache with inline worker backend |
 
 > The old class-based engine (`SettingsManager`, `InputManager`, `TerrainGenerator`, `ChunkMesher`, `RenderEngine`, `EntityManager`, `Mob`, `Zombie`, `PlayerController`, `VoxExGame`) was dead code (never instantiated) and has been removed. The live game uses module-level functions (`generateChunkData`, `renderChunk`, `buildZombieMesh`/`updateZombies`, the global `animate()` loop) plus the classes above. Tombstone comments mark removal sites in `voxEx.html`.
 
@@ -249,12 +284,15 @@ Biomes configured in `BIOME_CONFIG` (~line 3987); missing fields inherit from `B
 | `PARTICLE_CONFIG.maxParticles` | 500 | Max active particles |
 | `MAX_WATER_RIPPLES` | 20 | Max concurrent water ripples |
 | `CLOUD_BASE_COUNT` | 1500 | Base cloud particle count (x density) |
-| `BIOME_CELL_SIZE` | 64 | Grid cell size for biome lookup |
+| `BIOME_CELL_SIZE` | 64 | Grid cell size for biome lookup (legacy path) |
+| `SWISS_WARP` | 10 (hard bound < 14) | Swiss-turbulence erosion drift (mountain flanks) |
+
+Version-gating constants (`TERRAIN_GEN_VERSION`, `CURRENT_CACHE_VERSION`, `SETTINGS_VERSION`, `VOXEX_BUILD`) are in [Version Constants](#version-constants-bump-discipline).
 
 ## Naming Conventions
 
 - `cx, cz`: chunk coords. `lx, ly, lz`: local block coords (0-15 x/z, 0-319 y). `gx, gy, gz`: global block coords.
-- `getChunkKey(cx, cz)`: returns string `"cx,cz"`. `dt`: delta time (s). `distSq`: squared distance (avoids sqrt).
+- `getChunkKey(cx, cz)`: returns string `"cx,cz"`. Banded mesh keys: `'cx,cz#band'` (+`_WATER`, `_GLASS` suffixes) — strip with `chunkBaseOfMeshKey()`. `dt`: delta time (s). `distSq`: squared distance (avoids sqrt).
 - `_scratch*` / `_tmp*`: reusable scratch objects for hot paths. `*Pool`: object pool (acquire/release). `*Pass`: post-processing or generation pass.
 - `GEN_PASS.*` / `RENDER_PASS.*`: bitmask flags. `INPUT_*`: input bitmask (FORWARD=1, BACKWARD=2, LEFT=4, RIGHT=8, JUMP=16, SPRINT=32, CROUCH=64). `MESH_STATE.*`: mesh lifecycle (NONE=0, QUEUED=1, BUILDING=2, READY=3, STALE=4, DISPOSED=5).
 
@@ -301,30 +339,34 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 ### When Modifying `voxEx.html`
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, JS.
-2. **Texture Atlas**: adding blocks → update `NUM_TILES` (~line 4334) + add texture gen in `initTextures`. Current count: **33**.
-3. **Block Config**: add to `BLOCK_CONFIG` (~line 3580; auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()` (~line 11831).
-4. **Biome Config**: add to `BIOME_CONFIG` (~line 3987; inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`.
-5. **Settings**: default in `DEFAULTS` (~line 5284) → wire into `SETTINGS` (~line 5067) → DOM binding in settings UI (event wiring ~line 28800+) → `saveSettings()`.
-6. **UI Overlay**: elements toggled via `controls.lock`/`unlock` events.
+2. **Texture Atlas**: adding blocks → update `NUM_TILES` + add texture gen in `initTextures`. Current count: **33**.
+3. **Block Config**: add to `BLOCK_CONFIG` (auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()`.
+4. **Biome Config**: add to `BIOME_CONFIG` (inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`. Remember the worker template's hand-maintained `BIOME_CONFIG` copy (run `parity-check.mjs`).
+5. **Settings**: default in `DEFAULTS` → wire into `SETTINGS` → DOM binding in settings UI → `saveSettings()`. Settings must round-trip and have real DOM IDs.
+6. **UI Overlay**: elements toggled via `controls.lock`/`unlock` events; keep heavy overlays out of `#blocker` (agent-notes §3).
 7. **Light System**: when changing blocks, call `updateSunlightAt()` + `updateBlockLightAt()`. Use `SunlightTask` for async propagation.
 8. **Chunk Format**: use `chunk.blocks` / `chunk.skyLight` / `chunk.blockLight` (with backward-compat checks).
 9. **Voxel Aesthetic**: BoxGeometry only — no spheres/cylinders/curves.
-10. **Worker Parity**: terrain functions are SINGLE-SOURCE on main thread (`continentalHeight`/`mountainsHeightFunc`/`getRiverFactor`/`getBiomeCellDirect`/`isMountainRegion`, ~line 36269-36693). `buildChunkWorkerCode()` (~line 20007) injects their `Function.toString()` source between the `/* __TERRAIN_FUNCS_START__ */` … `/* __TERRAIN_FUNCS_END__ */` markers (~line 19552). Edit ONLY the main-thread sources — the worker copy is generated. Injection loop ~line 20059-20107; markers MUST stay intact or the worker throws on first terrain call.
+10. **Worker Parity**: terrain/tree/mesh functions are SINGLE-SOURCE on the main thread; `buildChunkWorkerCode()` injects their `Function.toString()` source between the `/* __TERRAIN_FUNCS_START__ */`, `/* __TREE_FUNCS_START__ */`, and `/* __TERRAIN_PASS_START__ */` marker pairs. Edit ONLY the main-thread sources — the worker copies are generated. Markers MUST stay intact (`parity-check.mjs` verifies). The worker template ALSO hand-maintains copies of `WORLD_DIMS`, `BIOME_CONFIG`, `TREE_CONFIG`, `SeededRandom`, `fadeFast`, `GRAD2D`/`grad`, and the `_nd2`/`_fd2`/`_ed2` scratches — see [Lockstep Registry](#lockstep-registry).
 
 ### Common Search Patterns
-- **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`, `SETTINGS_PROFILES`
+- **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`, `SETTINGS_PROFILES`, `activeWorldGenParams`, `applyGenParams`
 - **Block Types**: `const AIR`, `const GRASS`, `const LEAVES`, `BLOCK_CONFIG`, `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`
 - **Biomes**: `BIOME_CONFIG`, `BIOME_DEFAULTS`, `getBiomeParams`, `getBiomeCellDirect`, `HEIGHT_FUNCS`
-- **Terrain**: `blendedHeight`, `continentalHeight`, `mountainsHeightFunc`, `plainsHeightFunc`
-- **Rivers**: `getRiverFactor`, `getRiverDepth`
+- **Terrain (new path)**: `terrainSurface`, `computeSurfaceHeight`, `resolveBiome`, `erosionParam`, `noise2Dd`, `SWISS_WARP`
+- **Terrain (shared/legacy)**: `blendedHeight`, `continentalHeight`, `mountainsHeightFunc`, `plainsHeightFunc`, `precalculateTerrainCaches`
+- **Rivers**: `getRiverFactor`, `getRiverDepth`, `applyRiverCarve`, `computePreRiverHeight`
+- **Trees**: `getChunkTreePositions`, `wouldHaveValidTree`, `isTreeSiteViable`, `isTreeSoilSurface`, `generateTreeMaskForChunk`
 - **Gen**: `function generateChunkData`, `function calculateChunkSunlight`, `GEN_PASS`, `RENDER_PASS`
-- **Render**: `function renderChunk`, `renderChunkAsync`, `processChunkQueue`
-- **Light**: `class SunlightTask`, `updateSunlightAt`, `updateBlockLightAt`, `processSunlightQueue`, `processLightQueue`
+- **Render/Meshing**: `function renderChunk`, `renderChunkAsync`, `processChunkQueue`, `WORKER_MESH_PIPELINE_ENABLED`, `chunkUsesBands`, `markChunkBanded`, `meshProfile`, `getMergeKey`
+- **Light**: `class SunlightTask`, `updateSunlightAt`, `updateBlockLightAt`, `processSunlightQueue`, `processLightQueue`, `WORKER_LIGHTING_ENABLED`
+- **Materials/Glass**: `MAT_PROFILES`, `uShininessStrength`, `glassMaterial`, `glassDepthMaterial`, `setGlassBodyAlpha`, `envReflectionEnabled`
 - **Water**: `waterMaterialRefraction`, `waterMaterialStandard`, `waterMaterialFast`, `applyWaterFastMode`, `spawnWaterRipple`, `updateWaterRipples`
 - **Particles**: `class ParticleSystem`, `spawnBlockBreak`, `spawnTorchEmber`, `updateFootstepParticles`, `spawnWaterEntrySplash`, `spawnSplashColumn`
 - **Stars/Clouds**: `createStarField`, `updateStars`, `createCloudPlane`, `updateClouds`
 - **Atmosphere**: `createColorGradingPass`, `updateColorGrading`, `updateBiomeFogTint`, `BIOME_FOG_TINTS`
 - **Shaders**: `applyCylindricalFog`, `applyCylindricalFogWater`, `underwaterPass`, `volumetric`
+- **Fire**: `chunkFires`, `torchLightPool`, `BURN_TIME`, `BURN_RESULT`
 - **Characters**: `buildArticulatedMesh`, `buildZombieMesh`, `buildPlayerMesh`, `buildPlayerBody`, `buildPlayerViewmodelArms`
 - **Zombie Textures**: `generateZombieHeadTexture`, `generateZombieBodyMaterial`, `ZOMBIE_CLOTHING_THEMES`, `ZOMBIE_SKIN_COLORS`
 - **Player Textures**: `generatePlayerSkinTexture`, `generatePlayerMaterials`, `PLAYER_SKIN_COLORS`, `PLAYER_HAIR_PALETTES`
@@ -334,28 +376,57 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 - **Touch/Mobile**: `touchModeActive`, `isGameplayActive`, `enterGameplay`, `exitGameplay`, `recomputeTouchMode`, `initTouchControls`, `computeJoystickVector`, `touchMoveX`/`touchMoveZ`, `resetTouchInput`, `#touch-controls`, `#touch-look-region`, `#touch-joystick`, `applyTouchControlSettings`, `SETTINGS.touchControls`
 - **Shared actions** (keyboard+touch single-source): `handleJumpPressed`/`handleJumpReleased`, `handleCrouchPressed`/`handleCrouchReleased`, `toggleTorch`, `selectHotbarSlot`, `cycleHotbar`, `stopMining`, `togglePerfOverlay`, `toggleDebugOverlay`
 - **Compression**: `rleEncode`, `rleDecode`, `compressChunkData`, `decompressChunkData`
-- **Save/Load**: `saveWorld`, `loadWorld`, `saveChunkToCache`, `loadChunkFromCache`, `preGenerateSpawnChunks`
-- **Workers**: `class ChunkWorkerPool`, `class ChunkDiskStorage`, `buildChunkWorkerCode`
+- **Save/Load**: `saveWorld`, `loadWorld`, `saveChunkToCache`, `loadChunkFromCache`, `preGenerateSpawnChunks`, `rebuildChunkWorkerPoolForActiveWorld`
+- **Workers**: `class ChunkWorkerPool`, `class ChunkDiskStorage`, `buildChunkWorkerCode`, `__TERRAIN_FUNCS_START__`
 - **Memory/Pools**: `class MemoryBudgetManager`, `class PerformanceMonitor`, `checkGeometryLeaks`, `class ChunkDataPool`, `class GeometryBufferPool`, `class Float32ArrayPool`
 - **World Creation**: `class WorldPreviewRenderer`, `populateBiomeSelector`, `applyTerrainSettings`, `customWorldSettings`
 - **Day/Night**: `updateDayNight`, `dayNightTime`, `btn-time-` (time buttons), `SETTINGS.dayLength`
 
-### Light Level Reference
-15 = full sunlight (exposed to sky). 14 = torch block light; 1 block from sun (under 1 leaf). 12-13 = under canopy (2-3 leaves). 8-11 = medium shade / cave opening. 4-7 = deep shade. 2-3 = deep cave. 1 = minimum stored skylight (blocklight may be 0). Rendering floors combined light at 3 via `extractLightFromChunk()`, so levels 1-2 appear as level 3 on meshes.
+## Change Workflow (CCRs)
 
-### Performance Tips
-- Typed arrays (Uint8Array, Float32Array) over regular arrays; object pooling for frequently created geometries.
-- Batch chunk updates with `scheduleChunkUpdate()`; keep render distance 8-16 chunks for most devices.
-- Scratch objects in hot paths (`_pickDirTmp`, `_closestZombieResult`, `_scratchOrigin`); hoist functions out of closures (see `extractLightFromChunk`).
-- `blockIndex(lx, ly, lz)` = `lx + lz * 16 + ly * 256`. Lookup tables (BLOCK_IS_SOLID, AO_LOOKUP) over branching — but NOT for continuous functions sampled by terrain noise: a non-interpolating LUT quantizes the field into visible axis-aligned strips (the deleted FADE_LUT bug, CCR-TERRAIN-006; the exact fade polynomial also benchmarked faster than the LUT).
-- Unroll vertex writing (`writeFaceVertices`); bit-packed merge keys (`getMergeKey(blockId, ao, light)`).
-- Throttle occlusion checks (every 5 frames), shadow updates (>0.5u). Use `shouldYield()` / `checkFrameBudget()` in async ops.
+The project's change-doc convention: **"CCR" = Change Control Request/Report.** Non-trivial changes get a CCR markdown doc (design → audit → implement → reconcile as-built). Active CCRs live in `CCR's/`; completed ones move to `CCR's/Finished/`. Batch coordination patterns (new-symbol registry, shared-region sequencing) are demonstrated in `CCR's/_CROSS_CCR_NOTES.md` + `_IMPLEMENTATION_RUNBOOK.md`.
 
----
+**Per-change loop** (from the runbook — applies to ANY change, not just CCR batches):
+
+1. **Read** the whole CCR / understand the full change before editing.
+2. **Locate by grep anchor**, never by line number. Confirm the live code matches what the change doc expects (its "Before" snippet, if present). If it doesn't match, STOP and reconcile — don't force the edit.
+3. **Apply the change.** Honor any AUDIT FLAG/NOTE callouts in the CCR — they override contradicting intuition.
+4. **Worker parity**: if the edited function is injected, edit only the main-thread source and keep markers intact; if it touches a hand-maintained copy, update BOTH sides.
+5. **Verify, cheapest first**: `node tools/parity-check.mjs` → `node tools/terrain-node-checks.mjs` (terrain changes, ≥3 seeds) → `tools/voxex-tests.html` over localhost → in-game eyeball for visuals.
+6. **Bump `VOXEX_BUILD`** + add a `VOXEX_RECENT_CHANGES` entry citing the CCR ID. Bump `TERRAIN_GEN_VERSION`/`CURRENT_CACHE_VERSION`/`SETTINGS_VERSION` per [Version Constants](#version-constants-bump-discipline).
+7. **Update docs in the same commit**: the affected CLAUDE.md section, `docs/agent-notes.md` if a lesson/decision changed, and the CCR's as-built section.
+8. **Prototype-first for terrain**: features get probed in Node with measured numbers BEFORE touching voxEx.html (see agent-notes §4). Failed prototypes go in the do-not-retry ledger.
+9. **Commit hygiene**: stage ONLY files you touched; never `git add -A`/`git add .`. Move finished CCRs to `CCR's/Finished/`.
+
+## Lockstep Registry
+
+Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic that must change in tandem. `tools/parity-check.mjs` mechanically verifies the top group; the bottom group is logic-mirroring that only review catches.
+
+**Byte-level copies (parity-check enforced):**
+
+| What | Copies | Rule |
+|---|---|---|
+| `GRAD2D` + `grad()` | main thread + worker template | byte-identical (worker `blendedHeight` byte-parity depends on it) |
+| `fadeFast` | main (arrow) + worker template (function) | identical formula |
+| `_nd2`/`_fd2`/`_ed2` scratches | main + worker template | identical literals |
+| `WORLD_DIMS` (incl. `yOffset`!) | main + worker template | identical values (a yOffset drift of 64 once silently killed ALL worker tree generation) |
+| `BIOME_CONFIG` | main + worker template | biome sets + numeric fields identical |
+| `TREE_CONFIG` | main + worker template | identical values |
+| Injection markers (×6) | `__TERRAIN_FUNCS__`, `__TREE_FUNCS__`, `__TERRAIN_PASS__` pairs | exactly one standalone occurrence each |
+
+**Mirrored logic (review-enforced — comments exist at both sites):**
+
+| What | Mirrors | Breaks if drifted |
+|---|---|---|
+| `isTreeSoilSurface` | `generateTerrainPass`'s flat-ground material cascade (elevation bands, patch/detail noise, sand/lake gates, band-shift floor, dithered beach bound, ocean arm) | trees planted on stone/sand/gravel |
+| `wouldHaveValidTree` | the FULL accept chain in `getChunkTreePositions` | phantom suppression (missing trees) |
+| `SeededRandom` | class hand-copied in worker template | terrain/tree determinism |
+| `precalculateTerrainCaches` | hand-copied in worker (NOT injected) | worker terrain divergence — change both or inject it first |
+| New flat-ground material outcomes (e.g. talus aprons) | must be added to `isTreeSoilSurface` too | trees on non-soil |
 
 ## JavaScript Code Quality Rules
 
-**JSDoc**: typedefs at ~line 3387 (core: `BlockId`, `TileIndex`, `ChunkCoord`, `LocalCoord`, `GlobalCoord`, `ChunkKey`, `HexColor`, `LightLevel`, `AOValue`, `Position3D`, `AABB`, `BlockHit`, `BlockInteractionResult`, `ChunkData`, `BlockConfigEntry`) and ~line 3829 (tree/biome: `NoiseConfig`, `WorldConfig`, `TrunkConfig`, `CanopyConfig`, `CanopyShape`, `TreeConfig`, `BiomeTreeConfig`, `BiomeConfigEntry`, `ResolvedBiome`). All public functions need JSDoc: start with `/**`, lowercase primitives (`number`/`string`/`boolean`), `@param {type} name - desc.`, `@returns` for non-void, `@throws` where applicable, optional as `[name=default]`.
+**JSDoc**: typedef blocks live near the top of the script (grep `@typedef` — core: `BlockId`, `TileIndex`, `ChunkCoord`, `LocalCoord`, `GlobalCoord`, `ChunkKey`, `HexColor`, `LightLevel`, `AOValue`, `Position3D`, `AABB`, `BlockHit`, `BlockInteractionResult`, `ChunkData`, `BlockConfigEntry`; tree/biome: `NoiseConfig`, `WorldConfig`, `TrunkConfig`, `CanopyConfig`, `CanopyShape`, `TreeConfig`, `BiomeTreeConfig`, `BiomeConfigEntry`, `ResolvedBiome`). All public functions need JSDoc: start with `/**`, lowercase primitives (`number`/`string`/`boolean`), `@param {type} name - desc.`, `@returns` for non-void, `@throws` where applicable, optional as `[name=default]`.
 
 **Conventions** (one-liners):
 - Strict equality always (`===`/`!==`) — `==` causes coercion bugs (`"" == 0` is true).
@@ -365,9 +436,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 - Guard clauses at function start for validation; try-catch only at boundaries (save/load, IndexedDB) — not internal pure functions.
 - `var` is banned (use `const`/`let`); named functions in hot paths (profiler names); no allocations/closures in `renderChunk` (30K+ closures per mesh — hoist to module scope); no `delete` on arrays (use `splice`); template literals over string concat in loops.
 
-**Debug console globals**: `window._faceCountHistogram`, `window.printFaceHistogram()`, `window.geometryPool.getStats()`, `window.memoryBudgetManager.getStatus()`. Profile with `console.time('[Tag] …')` / `console.timeEnd(...)`.
-
----
+**Debug console globals**: `window._faceCountHistogram`, `window.printFaceHistogram()`, `window.geometryPool.getStats()`, `window.memoryBudgetManager.getStatus()`, `meshProfile()` / `meshProfile.reset()`, `setBandedMeshing(t/f)`, `setEagerBanding(t/f)`, `setLightRefill(t/f)`. Profile with `console.time('[Tag] …')` / `console.timeEnd(...)`.
 
 ## Claude Code Guidelines
 
@@ -379,12 +448,16 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 **Change reporting** — when proposing changes, format as: **Summary** (2-5 bullets), **Changes** (grouped by subsystem), **Rationale** (why: bug fix / perf / clarity), **Safety Checks** (confirm: no duplicate/shadowed identifiers, DOM IDs + settings wired, no heavy per-frame loops added).
 
-**Commit hygiene** — the working tree frequently carries churn you didn't author (line-ending/EOL normalization, editor/formatter passes) across many files unrelated to your task. Stage ONLY the files your change actually touched — never `git add -A`/`git add .`. Confirm the set with `git diff --stat`, eyeball each file's real changes with `git diff <file>` before staging, and if a file you edited also shows whole-file EOL/whitespace churn, isolate your content edits with `git diff --ignore-all-space <file>`. This applies to whatever you're working on — code, docs, tools, or config.
+**Commit hygiene** — stage ONLY the files your change actually touched — never `git add -A`/`git add .`. Confirm the set with `git diff --stat` and eyeball each file's real changes before staging. (`.gitattributes` now normalizes line endings, so whole-file EOL churn should no longer appear; if it does on an old checkout, isolate real edits with `git diff --ignore-all-space <file>`.) Sandboxed agents: read `docs/agent-notes.md` §7 before ANY git write — the mount can corrupt the index and serve truncated file content to git.
 
 ## Quick Reference Checklist
 
 Before committing, verify:
 
+- [ ] `node tools/parity-check.mjs` GREEN (lockstep copies + injection markers)
+- [ ] Terrain changed? `node tools/terrain-node-checks.mjs` GREEN on ≥3 seeds + `TERRAIN_GEN_VERSION` bumped
+- [ ] Run `tools/voxex-tests.html` (283+ tests) over localhost — no regressions
+- [ ] `VOXEX_BUILD` bumped + `VOXEX_RECENT_CHANGES` entry added (cite CCR ID)
 - [ ] No duplicate `const`/`let`/`function` declarations (search file first)
 - [ ] No shadowing of globals: `scene`, `camera`, `chunks`, `SETTINGS`, `WORLD_CONFIG`
 - [ ] All new functions have JSDoc with `@param` and `@returns`
@@ -394,15 +467,36 @@ Before committing, verify:
 - [ ] Logs use `logDebug()` with `[Tag]` prefix, not `console.log()`
 - [ ] No work added to the per-frame render loop without batching
 - [ ] Touch handlers start with `if (!touchModeActive) return;`; no allocations/closures/logging in `pointermove`; gameplay gates use `isGameplayActive()` not raw `controls.isLocked`
-- [ ] Chunk size is 16x16x320 (not 128); atlas has 33 tiles (update `NUM_TILES` if adding blocks); block lookup tables updated if adding blocks (`initBlockLookupTables()`)
-- [ ] Worker parity: edit ONLY main-thread terrain functions (~line 36269-36693); worker copy is auto-injected by `buildChunkWorkerCode()` (~line 20007) via `Function.toString()` between the `__TERRAIN_FUNCS_*` markers (~line 19552) — keep markers intact
-- [ ] Run `tools/voxex-tests.html` (~204 tests) to verify no regressions (serve over localhost)
-- [ ] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES` (top of voxEx.html, console boot banner)
-- [ ] Worker parity: the worker template's `WORLD_DIMS` (incl. `yOffset`!) and `BIOME_CONFIG` are HAND-MAINTAINED copies — verify they match main thread (a `yOffset` drift of 64 silently broke ALL worker tree generation; found 2026-06-12)
-- [ ] Tree code is SINGLE-SOURCE (2026-06-13): tree mask/placement/canopy functions (`treePlacementValue`, `getTreeDensityForBiome`, `generateTreeMaskForChunk`, `getTreeMaskForChunk`, `getTreeMaskValueGlobal`, `resolveTreeProfile`, `pickTrunkSize`, `wouldHaveValidTree`, `isTreeSiteViable`, `getChunkTreePositions`, `getCanopyLayerRadius`, `forEachCanopyVoxel`, `generateTreesForChunk`) are injected into the worker by `buildChunkWorkerCode()` between the `/* __TREE_FUNCS_START__ */ … __END__ */` markers. Edit ONLY main-thread sources. The worker still hand-maintains leaf helpers (`seededRandom`, `isLeafBlock`/`isLogBlock`, `getTreeMaskKey` — seed-qualified), caches (`treeMaskCache`, `treePositionsCache`), `TREE_MAX_RING_SLOPE`; injected tree functions depend on terrain-injected `getBiomeParams`/`blendedHeight`/`getRiverFactor`/`biomeByName`. Keep markers intact.
+- [ ] Adding blocks? `NUM_TILES` updated + lookup tables via `initBlockLookupTables()`
+- [ ] Worker parity: edited ONLY main-thread sources of injected functions; markers intact; hand-maintained copies updated BOTH sides (see [Lockstep Registry](#lockstep-registry))
+- [ ] Mirrored logic in lockstep: `isTreeSoilSurface` ↔ material cascade; `wouldHaveValidTree` ↔ `getChunkTreePositions`
+- [ ] CLAUDE.md / agent-notes / the CCR's as-built section updated for anything this change made stale
 
 ## Testing Tools
 
-- **`tools/voxex-tests.html`** — automated suite (~204 tests). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
-- **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Delegates to voxEx.html via the `?test=1` seam (requires localhost, like tools/voxex-tests.html); no hand-synced terrain code remains. Surface-block material classification is a local, documented approximation (the real per-column material cascade lives inline in `generateTerrainPass`, not on the seam).
+- **`tools/parity-check.mjs`** — mechanical lockstep checker: hand-maintained main↔worker copies (GRAD2D, grad, fadeFast, scratches, WORLD_DIMS, BIOME_CONFIG, TREE_CONFIG) + injection-marker integrity. Seconds to run; no browser. Run after ANY terrain/worker/config change: `node tools/parity-check.mjs`.
+- **`tools/terrain-node-checks.mjs`** — headless terrain invariants, no browser needed: `node tools/terrain-node-checks.mjs [voxEx.html] [seed]`. Extracts the REAL terrain/river/soil functions from voxEx.html by name (no hand-copied replicas) and checks determinism, bounds, adjacent-column continuity (<30), notch metric, river flood integrity (channel cores must flood), valley-floor pan signature, and the tree-soil elevation gradient. Fast smoke test for terrain changes; the browser suite remains authoritative for workers/meshing/lighting/persistence. Uses its own perm PRNG — internally consistent, not byte-identical to in-game seeds.
+- **`tools/voxex-tests.html`** — the authoritative automated suite (283+ tests and growing; trust the suite's own counter). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing (incl. worker MESH byte-parity), block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
+- **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Delegates to voxEx.html via the `?test=1` seam (requires localhost); no hand-synced terrain code remains. Surface-block material classification is a local, documented approximation (the real per-column material cascade lives inline in `generateTerrainPass`, not on the seam).
 - **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 33 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
+- **CI**: `.github/workflows/checks.yml` runs `parity-check.mjs` + `terrain-node-checks.mjs` (3 seeds) on every push/PR — the browser suite still must be run manually before release.
+
+## Documentation Index
+
+Status legend: **LIVE** = current truth, keep updated · **SHIPPED** = implemented, kept for rationale · **HISTORICAL** = superseded, do not implement from.
+
+| Doc | Status |
+|---|---|
+| `CLAUDE.md`, `docs/agent-notes.md` | LIVE — update in the same commit as the change that stales them |
+| `CCR's/*.md` | LIVE (active changes); `CCR's/Finished/` = SHIPPED |
+| `mountain-overhaul-plan.md` | LIVE roadmap — Phase 1 SHIPPED (build .92); Phases 2-5 gated, not built |
+| `terrain-gen-audit.md`, `terrain-gen-fixes.md` | SHIPPED (2026-07-02 audit + its 5-phase fix plan, implemented) |
+| `terrain-detail-plan.md`, `terrain-architecture-plan.md`, `terrain-climate-fields-plan.md`, `terrain-implementation-guide.md` | SHIPPED — produced the `terrainSurface` rewrite |
+| `terrain-improvement-deep-dive.md`, `terrain-improvement-opportunities.md` | HISTORICAL (exploration that led to the plans above) |
+| `FireImplementation.md`, `SETTINGS_MENU_CCR.md`, `CHUNK-IMPLEMENTATION-PLAN.md`, `CCR-*.md` (repo root) | SHIPPED as-built records |
+| `mobileControlsPlan.md` | SHIPPED (touch controls live) |
+| `ui-mockups.html` + `CCR's/CCR-ui-overhaul.md` | LIVE — approved directions, not yet wired into voxEx.html |
+| `futureFeatures.md`, `magicSystem.md` | LIVE roadmap / design intent |
+| `VoxEx_Bug_Consolidation_Tracker.md` + `VoxEx_Issue_*.md` | LIVE tracker + SHIPPED cleanup reports |
+| `keyframe-audit.md`, `lightRefill-investigation.md`, `zombie-ai-investigation.md`, `tree-generation-bug-report.md` | HISTORICAL investigations |
+| `docs/superpowers/` | HISTORICAL (pre-terrainSurface era — do not implement from) |
