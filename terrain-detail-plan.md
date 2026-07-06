@@ -1,3 +1,5 @@
+> **Status: SHIPPED — produced the terrainSurface rewrite; do not re-implement** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Domain-Warped Multi-Scale Terrain Detail (plan)
 
 Goal: replace the current "smooth macro spline + bolted-on detail + anti-terracing jitter" stack with **one coherent domain-warped fractal surface**, so terrain has natural detail at every scale — no clean terraces, no random speckle — and so tuning is a handful of **orthogonal** knobs instead of whack-a-mole.

@@ -1,3 +1,5 @@
+> **Status: HISTORICAL investigation (lightRefill shipped default-OFF)** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # Investigation Brief — `lightRefill` Visual Artifact (VoxEx)
 
 **Status:** Deferred / optional polish. `SETTINGS.lightRefill` is **OFF by default** and should stay

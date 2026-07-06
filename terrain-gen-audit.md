@@ -1,3 +1,5 @@
+> **Status: SHIPPED — findings implemented via terrain-gen-fixes.md (July 2026)** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx Terrain Generation Audit
 
 **Date:** 2026-07-02 · **Build examined:** 2026-07-01.78 (VOXEX-CCR-TERRAIN-005 era) · **Scope:** terrain generation only — height/biome/river/noise core (voxEx.html ~38063–41939), tree generation (~5803–6336), `generateChunkData` pipeline, worker injection parity, `WorldPreviewRenderer`, and `tools/terrain-visualizer.html`.

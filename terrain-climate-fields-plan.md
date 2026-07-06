@@ -1,3 +1,5 @@
+> **Status: SHIPPED — produced the terrainSurface rewrite; do not re-implement** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Climate Fields & Generation Pipeline Plan
 
 A concrete plan for moving VoxEx from **1‑D biome selection** to a **climate‑driven** model built on a small set of noise fields (temperature, humidity, relief) layered on the existing continentalness. Covers what each field is, how it works, the order the pipeline runs in and *why*, and exactly where each piece plugs into `voxEx.html`.

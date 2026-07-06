@@ -1,3 +1,5 @@
+> **Status: LIVE ROADMAP — Phase 1 SHIPPED (build 2026-07-05.92); Phases 2-5 gated, NOT built** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Mountain Overhaul: Erosion, Gullies, Valleys, Ridges, Peaks (investigation)
 
 Status: **INVESTIGATION ONLY** (2026-07-05, against build .91 / TERRAIN_GEN_VERSION 28). No voxEx.html changes.

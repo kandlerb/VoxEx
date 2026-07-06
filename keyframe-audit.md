@@ -1,3 +1,5 @@
+> **Status: HISTORICAL investigation** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx Keyframe & Pose-Transition Audit
 
 **Scope:** `voxEx.html` knockdown keyframe system + the state-pose blending that feeds it.

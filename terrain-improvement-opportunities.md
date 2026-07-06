@@ -1,3 +1,5 @@
+> **Status: HISTORICAL — exploration; superseded by the terrain plans + shipped rewrite** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Terrain Generation Improvement Opportunities
 
 **Scope:** Findings from a read-only investigation of the terrain-generation pipeline in `voxEx.html`. No code was changed. Each item records **where** it is, **what** the issue is, **why** it matters, and **how** it could be fixed.

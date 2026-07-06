@@ -1,3 +1,5 @@
+> **Status: SHIPPED — all 5 phases implemented (July 2026)** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx Terrain Generation — Fix Implementation Plan
 
 **Date:** 2026-07-02 · **Companion to:** `terrain-gen-audit.md` (same finding IDs) · **Base build:** 2026-07-01.78

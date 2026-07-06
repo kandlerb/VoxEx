@@ -1,3 +1,5 @@
+> **Status: HISTORICAL investigation** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # Zombie AI Investigation — Findings, Fixes & Optimizations
 
 > Investigation round only. No code was changed. All line numbers refer to `voxEx.html` as of 2026-06-13.

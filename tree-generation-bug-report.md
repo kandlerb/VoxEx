@@ -1,3 +1,5 @@
+> **Status: HISTORICAL — bugs fixed (see CCR-TREE-004/005, build 2026-07-05.85)** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # Tree Generation — Bug & Optimization Report
 
 Scope: tree spawning, placement, canopy formation, and appearance in `voxEx.html`.

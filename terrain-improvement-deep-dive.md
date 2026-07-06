@@ -1,3 +1,5 @@
+> **Status: HISTORICAL — exploration; superseded by the terrain plans + shipped rewrite** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Terrain Generation Deep Dive & Method Options
 
 Companion to `terrain-improvement-opportunities.md`. For each of the 9 findings this doc explains **how the code works today** (with verified line refs) and gives **at least 3 concrete methods** you could use to fix or improve it, with trade-offs and a recommendation.

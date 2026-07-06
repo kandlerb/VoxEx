@@ -1,3 +1,5 @@
+> **Status: SHIPPED — produced the terrainSurface rewrite; do not re-implement** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Terrain Generation Architecture Plan (proper rebuild)
 
 The "best/most correct" plan for VoxEx terrain. This supersedes the pragmatic `terrain-climate-fields-plan.md`: that one bolted a climate table onto the existing per‑biome height blend; **this one changes the architecture** so terrain shape and biome identity are fully decoupled — the approach used by modern voxel engines (Minecraft 1.18+ "multi‑noise" + terrain splines). It is more code up front, but it removes more code than it adds once consolidated, and it structurally eliminates findings 1, 2, and 6 rather than patching them.

@@ -1,3 +1,5 @@
+> **Status: SHIPPED — touch controls are live** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx Mobile Controls — Implementation Plan
 
 **Status:** Ready for implementation

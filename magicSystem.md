@@ -1,3 +1,5 @@
+> **Status: DESIGN INTENT — not built** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — Magic System Design Plan
 
 **Status:** Design / planning (no code written yet)

@@ -1,3 +1,5 @@
+> **Status: SHIPPED — implementation record of the terrainSurface rewrite** _(marked 2026-07-06; see CLAUDE.md Documentation Index)_
+
 # VoxEx — New Terrain: Implementation Guide (handoff)
 
 This is a **do-this, step-by-step** guide to implement the climate/spline terrain system in `voxEx.html`. It is self-contained: follow the steps in order, paste the code exactly, and run the test suite after each checkpoint. Design rationale lives in `terrain-architecture-plan.md` (read §0–§4 there if you want the "why"); you do **not** need it to execute this guide.
