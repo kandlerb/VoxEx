@@ -170,6 +170,9 @@ can tell whether circumstances actually changed.
   validated swiss turbulence, rejected flow-aligned gullies, and pre-measured
   every constant in Node probes before touching voxEx.html. Keep that discipline:
   probe → numbers → implement → `terrain-node-checks` → browser suite → in-game.
+  The instruments are first-class now: `tools/terrain-probe.mjs` (point queries,
+  transects with max-step, per-axis anisotropy stats, hillshade PNG renders).
+  Baseline the metric/render BEFORE the change, re-run AFTER, cite both.
 
 ## 5. Product/aesthetic decisions (user-settled; don't re-litigate)
 
