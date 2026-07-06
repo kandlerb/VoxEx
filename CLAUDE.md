@@ -23,11 +23,13 @@ Core principles guiding all development decisions:
 - **Line numbers in this file DRIFT.** The main file gains thousands of lines per month. Every `~line NNNN` here is a hint from some past build — ALWAYS locate code by grepping the named anchor (`class VoxelWorld`, `const BIOME_CONFIG`, `function terrainSurface`), never by line number.
 - **Read `docs/agent-notes.md`** for hard-won knowledge: the do-not-retry ledger (approaches that failed structurally), three.js gotchas, subsystem as-built notes, terrain lessons, settled aesthetic decisions, and sandbox-environment warnings. Don't re-attempt anything in its ledger; don't re-litigate anything in its decisions list.
 - **Verification ladder** (cheapest first):
-  1. `node tools/parity-check.mjs` — hand-maintained copy lockstep + injection markers (seconds; run after ANY terrain/worker/config change).
-  2. `node tools/terrain-node-checks.mjs [voxEx.html] [seed]` — headless terrain invariants (run on ≥3 seeds for terrain changes).
-  3. `tools/voxex-tests.html` over localhost — the authoritative browser suite (283+ tests: workers, meshing byte-parity, lighting, persistence).
-  4. In-game eyeball for anything visual.
-- **Change docs are "CCRs"** (Change Control Request/Report) — see [Change Workflow](#change-workflow-ccrs).
+  1. `node tools/syntax-check.mjs` — every `<script>` block parses (seconds; catches truncation, bad edits, same-scope redeclarations).
+  2. `node tools/parity-check.mjs` — hand-maintained copy lockstep + injection markers (seconds; run after ANY terrain/worker/config change).
+  3. `node tools/terrain-node-checks.mjs [voxEx.html] [seed]` — headless terrain invariants (run on ≥3 seeds for terrain changes).
+  4. `node tools/run-browser-tests.mjs` — the authoritative browser suite (315+ tests: workers, meshing byte-parity, lighting, persistence) run HEADLESSLY against a local Chrome/Edge. Same suite as `tools/voxex-tests.html` in a browser.
+  5. In-game eyeball for anything visual.
+- **Pre-commit hook**: enable once per clone with `git config core.hooksPath .githooks` — it runs gates 1-3 automatically when `voxEx.html` is staged.
+- **Change docs are "CCRs"** (Change Control Request/Report) — see [Change Workflow](#change-workflow-ccrs). New CCRs start from `CCR's/_TEMPLATE.md`.
 - Working in a sandboxed/mounted environment (Cowork)? Read `docs/agent-notes.md` §7 FIRST — the mount silently truncates large-file reads and corrupts the git index.
 
 ## Repository Structure
@@ -45,10 +47,13 @@ VoxEx/
 │   ├── agent-notes.md            # Hard-won knowledge: do-not-retry ledger, gotchas,
 │   │                             #   as-built subsystem notes, environment warnings
 │   └── superpowers/              # HISTORICAL plans/specs (pre-terrainSurface era)
+├── .githooks/                # Pre-commit gate (enable: git config core.hooksPath .githooks)
 ├── tools/                    # Development & testing utilities
+│   ├── syntax-check.mjs          # All <script> blocks parse (truncation/redeclaration gate)
 │   ├── parity-check.mjs          # Lockstep checker — hand-maintained copies + markers
 │   ├── terrain-node-checks.mjs   # Headless terrain invariants (no browser)
-│   ├── voxex-tests.html          # Browser suite (283+ tests) — REAL voxEx.html code via
+│   ├── run-browser-tests.mjs     # Headless runner for the browser suite (zero-dep CDP)
+│   ├── voxex-tests.html          # Browser suite (315+ tests) — REAL voxEx.html code via
 │   │                             #   ?test=1 seam (window.VoxEx); serve over localhost
 │   ├── voxex-texture-tests.html  # Visual texture atlas tests (33 tiles + checks)
 │   ├── terrain-visualizer.html   # Terrain debugger (delegates to game via ?test=1)
@@ -392,7 +397,7 @@ The project's change-doc convention: **"CCR" = Change Control Request/Report.** 
 2. **Locate by grep anchor**, never by line number. Confirm the live code matches what the change doc expects (its "Before" snippet, if present). If it doesn't match, STOP and reconcile — don't force the edit.
 3. **Apply the change.** Honor any AUDIT FLAG/NOTE callouts in the CCR — they override contradicting intuition.
 4. **Worker parity**: if the edited function is injected, edit only the main-thread source and keep markers intact; if it touches a hand-maintained copy, update BOTH sides.
-5. **Verify, cheapest first**: `node tools/parity-check.mjs` → `node tools/terrain-node-checks.mjs` (terrain changes, ≥3 seeds) → `tools/voxex-tests.html` over localhost → in-game eyeball for visuals.
+5. **Verify, cheapest first**: `node tools/syntax-check.mjs` → `node tools/parity-check.mjs` → `node tools/terrain-node-checks.mjs` (terrain changes, ≥3 seeds) → `node tools/run-browser-tests.mjs` (authoritative suite, headless) → in-game eyeball for visuals.
 6. **Bump `VOXEX_BUILD`** + add a `VOXEX_RECENT_CHANGES` entry citing the CCR ID. Bump `TERRAIN_GEN_VERSION`/`CURRENT_CACHE_VERSION`/`SETTINGS_VERSION` per [Version Constants](#version-constants-bump-discipline).
 7. **Update docs in the same commit**: the affected CLAUDE.md section, `docs/agent-notes.md` if a lesson/decision changed, and the CCR's as-built section.
 8. **Prototype-first for terrain**: features get probed in Node with measured numbers BEFORE touching voxEx.html (see agent-notes §4). Failed prototypes go in the do-not-retry ledger.
@@ -454,9 +459,10 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 
 Before committing, verify:
 
+- [ ] `node tools/syntax-check.mjs` GREEN (all script blocks parse; no truncation)
 - [ ] `node tools/parity-check.mjs` GREEN (lockstep copies + injection markers)
 - [ ] Terrain changed? `node tools/terrain-node-checks.mjs` GREEN on ≥3 seeds + `TERRAIN_GEN_VERSION` bumped
-- [ ] Run `tools/voxex-tests.html` (283+ tests) over localhost — no regressions
+- [ ] `node tools/run-browser-tests.mjs` GREEN (the 315+ browser suite, headless) — or run `tools/voxex-tests.html` over localhost manually
 - [ ] `VOXEX_BUILD` bumped + `VOXEX_RECENT_CHANGES` entry added (cite CCR ID)
 - [ ] No duplicate `const`/`let`/`function` declarations (search file first)
 - [ ] No shadowing of globals: `scene`, `camera`, `chunks`, `SETTINGS`, `WORLD_CONFIG`
@@ -474,12 +480,14 @@ Before committing, verify:
 
 ## Testing Tools
 
+- **`tools/syntax-check.mjs`** — extracts every `<script>` block from voxEx.html and `node --check`s it (module semantics for the main script). Catches truncation, unbalanced braces, and same-scope duplicate declarations in seconds, with errors mapped back to real voxEx.html line numbers. `node tools/syntax-check.mjs`.
 - **`tools/parity-check.mjs`** — mechanical lockstep checker: hand-maintained main↔worker copies (GRAD2D, grad, fadeFast, scratches, WORLD_DIMS, BIOME_CONFIG, TREE_CONFIG) + injection-marker integrity. Seconds to run; no browser. Run after ANY terrain/worker/config change: `node tools/parity-check.mjs`.
+- **`tools/run-browser-tests.mjs`** — runs the FULL browser suite headlessly: serves the repo on localhost, drives headless Chrome/Edge/Chromium over the DevTools protocol (zero npm dependencies, Node 22+), clicks Run All Tests, reports failures with suite names. `node tools/run-browser-tests.mjs [--chrome=path] [--timeout=300]`. Exit 0 = all green. This makes the release gate agent-runnable; the interactive page remains for humans.
 - **`tools/terrain-node-checks.mjs`** — headless terrain invariants, no browser needed: `node tools/terrain-node-checks.mjs [voxEx.html] [seed]`. Extracts the REAL terrain/river/soil functions from voxEx.html by name (no hand-copied replicas) and checks determinism, bounds, adjacent-column continuity (<30), notch metric, river flood integrity (channel cores must flood), valley-floor pan signature, and the tree-soil elevation gradient. Fast smoke test for terrain changes; the browser suite remains authoritative for workers/meshing/lighting/persistence. Uses its own perm PRNG — internally consistent, not byte-identical to in-game seeds.
-- **`tools/voxex-tests.html`** — the authoritative automated suite (283+ tests and growing; trust the suite's own counter). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing (incl. worker MESH byte-parity), block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
+- **`tools/voxex-tests.html`** — the authoritative automated suite (315+ tests and growing; trust the suite's own counter). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing (incl. worker MESH byte-parity), block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
 - **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Delegates to voxEx.html via the `?test=1` seam (requires localhost); no hand-synced terrain code remains. Surface-block material classification is a local, documented approximation (the real per-column material cascade lives inline in `generateTerrainPass`, not on the seam).
 - **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 33 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
-- **CI**: `.github/workflows/checks.yml` runs `parity-check.mjs` + `terrain-node-checks.mjs` (3 seeds) on every push/PR — the browser suite still must be run manually before release.
+- **CI**: `.github/workflows/checks.yml` runs `syntax-check.mjs` + `parity-check.mjs` + `terrain-node-checks.mjs` (3 seeds) + the FULL browser suite via `run-browser-tests.mjs` (GitHub runners ship Chrome) on every push/PR. In-game visual checks remain manual.
 
 ## Documentation Index
 

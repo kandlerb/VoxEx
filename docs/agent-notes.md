@@ -209,11 +209,17 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   `git add` voxEx.html from the sandbox without proving the mount view matches
   the real file (git reads through the mount → commits truncated content).
   New files sync fine; bash-side writes (`cp`, heredoc) are coherent.
+  **Edit-tool edits to ANY pre-existing file can leave the mount stale for
+  that file** — after editing, verify (`grep` the new text via bash) before
+  any `git add`; if stale, rewrite the full file to the outputs folder and
+  `cp` it over (the cp makes the mount the writer, restoring coherence).
 - **Sandbox git corrupts `.git/index` intermittently** ("bad signature") and
-  cannot always unlink its own `.lock` files. Workaround: `rm -f .git/index*`,
-  then run git with `GIT_INDEX_FILE=/tmp/vox.index` (+ `git read-tree HEAD`
-  first), and rebuild the real index (`git reset -q`) at the end. Prefer
-  committing from Windows when possible.
+  cannot always unlink its own `.lock` files (needs `allow_cowork_file_delete`).
+  Workaround: `rm -f .git/index*`, then run git with
+  `GIT_INDEX_FILE=/tmp/vox.index` (+ `git read-tree HEAD` first), and rebuild
+  the real index (`git reset -q`) at the end. Prefer committing from Windows
+  when possible. **After EVERY commit, verify the committed blobs aren't
+  truncated**: `git show HEAD:<file> | tail` must end where the real file ends.
 - **Do NOT mix bash file-overwrites with the Edit tool on the same file** —
   it desyncs the harness cache and re-truncates (documented 2.6 MB-file loss;
   recover via `git show HEAD:voxEx.html`).
@@ -221,7 +227,17 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   one — saved worlds/localStorage differ. "Works for me / broken for him" ⇒
   check which profile first.
 - Deployed game: https://kandlerb.github.io/VoxEx/voxEx.html (GitHub Pages from
-  pushed main). Browser suite: /tools/voxex-tests.html (serve over localhost).
-- No sudo in the sandbox, but `apt-get download` + `dpkg -x` + `LD_LIBRARY_PATH`
-  gets a headless Chromium (playwright-chromium) running without root if
-  browser-based verification is ever needed.
+  pushed main). Browser suite: /tools/voxex-tests.html (serve over localhost),
+  or headlessly via `tools/run-browser-tests.mjs`.
+- **Headless Chromium bootstrap without root (VALIDATED 2026-07-06, 315/315
+  green in ~30 s):**
+  ```sh
+  npx -y @puppeteer/browsers install chromium@latest --path /tmp/br
+  apt-get download libxdamage1 && dpkg -x libxdamage1_*.deb /tmp/libs   # the one missing lib
+  LD_LIBRARY_PATH=/tmp/libs/usr/lib/x86_64-linux-gnu \
+    CHROME=/tmp/br/chromium/<snapshot>/chrome-linux/chrome \
+    node tools/run-browser-tests.mjs --timeout=600
+  ```
+  The download is ~160 MB — run it under nohup and poll if the shell has a
+  per-command timeout. `ldd <chrome> | grep "not found"` tells you which libs
+  (if any) still need the apt-get download + dpkg -x treatment.
