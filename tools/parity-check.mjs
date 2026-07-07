@@ -22,6 +22,7 @@
 //   P6 BIOME_CONFIG          — biome name sets + shared numeric fields equal
 //   P7 injection markers     — all 6 __*_FUNCS/PASS__ markers exactly once
 //   P8 TREE_CONFIG           — main vs worker template, deep value equality
+//   P9 NUM_TILES             — atlas tile count, main vs worker template equal
 // NOT covered: behavioral byte-parity of injected functions — that is the
 // browser suite's "worker MESH/blendedHeight byte-parity" tests.
 // ============================================================================
@@ -155,6 +156,24 @@ for (const [tag, name] of [['P5', 'WORLD_DIMS'], ['P8', 'TREE_CONFIG']]) {
   for (const m of markers) {
     const n = lines.filter((l) => l.trim() === m).length;
     check(n === 1, `P7 marker ${m}`, n === 1 ? 'exactly one' : `found ${n} standalone occurrences (must be exactly 1)`);
+  }
+}
+
+// --- P9: NUM_TILES (texture atlas tile count) ---------------------------------------
+// Hand-maintained in two places (main ~4640, worker template ~19005). Drift ships a
+// mis-sliced atlas: worker UVs sample the wrong tile columns for every block.
+{
+  const defs = findLines('const NUM_TILES =');
+  if (defs.length !== 2) {
+    check(false, 'P9 NUM_TILES', `expected exactly 2 declarations (main + worker template), found ${defs.length}`);
+  } else {
+    const vals = defs.map((d) => {
+      const m = d.text.match(/const NUM_TILES = (\d+)\s*;/);
+      return m ? Number(m[1]) : NaN;
+    });
+    if (vals.some(Number.isNaN)) die('NUM_TILES declaration did not parse as an integer literal');
+    check(vals[0] === vals[1], 'P9 NUM_TILES (main vs worker template)',
+      vals[0] === vals[1] ? `both ${vals[0]}` : `line ${defs[0].line}: ${vals[0]} vs line ${defs[1].line}: ${vals[1]}`);
   }
 }
 

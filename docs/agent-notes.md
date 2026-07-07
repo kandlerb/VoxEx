@@ -111,7 +111,11 @@ can tell whether circumstances actually changed.
   `torchLightPool` PointLights (pool scans `chunkFires`) — this keeps `setBlock`
   on the light-neutral fast path. Fire lives in AIR adjacent to burnables,
   climbs biased-up, chars via per-block `BURN_TIME`/`BURN_RESULT`.
-  Known gaps: no fire settings UI, caps not in profiles, no fire tests.
+  Former gaps (settings UI, profile caps, fire tests, VoxelWorld.isSolidBlock,
+  eager cell unregister) were ALL closed in build 2026-06-17.6 (FireImplementation.md
+  §17 G1-G5); `fireMaxActive` default raised 48→128 by CCR-fire-system-limits.
+  `fireMaxEditsPerTick`/`fireConsumeChance`/`fireLightLevel` are dead/deprecated
+  settings (kept for save compat; not consulted by the tick).
 
 ### World-gen params persistence (VOXEX-CCR-UI-001 item 4/4b)
 - `worldConfig` has LIVE getters (biomeFrequency, biomeSizeMultiplier,

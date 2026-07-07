@@ -346,7 +346,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 ### When Modifying `voxEx.html`
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, JS.
-2. **Texture Atlas**: adding blocks → update `NUM_TILES` + add texture gen in `initTextures`. Current count: **33**.
+2. **Texture Atlas**: adding blocks → update `NUM_TILES` in BOTH copies (main + worker template; parity-check P9 enforces equality) + add texture gen in `initTextures`. Current count: **33**.
 3. **Block Config**: add to `BLOCK_CONFIG` (auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()`.
 4. **Biome Config**: add to `BIOME_CONFIG` (inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`. Remember the worker template's hand-maintained `BIOME_CONFIG` copy (run `parity-check.mjs`).
 5. **Settings**: default in `DEFAULTS` → wire into `SETTINGS` → DOM binding in settings UI → `saveSettings()`. Settings must round-trip and have real DOM IDs.
@@ -420,6 +420,7 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 | `BIOME_CONFIG` | main + worker template | biome sets + numeric fields identical |
 | `TREE_CONFIG` | main + worker template | identical values |
 | Injection markers (×6) | `__TERRAIN_FUNCS__`, `__TREE_FUNCS__`, `__TERRAIN_PASS__` pairs | exactly one standalone occurrence each |
+| `NUM_TILES` | main + worker template | equal integer value (atlas strip width; drift = mis-sliced worker UVs) |
 
 **Mirrored logic (review-enforced — comments exist at both sites):**
 
@@ -443,7 +444,7 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 - Guard clauses at function start for validation; try-catch only at boundaries (save/load, IndexedDB) — not internal pure functions.
 - `var` is banned (use `const`/`let`); named functions in hot paths (profiler names); no allocations/closures in `renderChunk` (30K+ closures per mesh — hoist to module scope); no `delete` on arrays (use `splice`); template literals over string concat in loops.
 
-**Debug console globals**: `window._faceCountHistogram`, `window.printFaceHistogram()`, `window.geometryPool.getStats()`, `window.memoryBudgetManager.getStatus()`, `meshProfile()` / `meshProfile.reset()`, `setBandedMeshing(t/f)`, `setEagerBanding(t/f)`, `setLightRefill(t/f)`. Profile with `console.time('[Tag] …')` / `console.timeEnd(...)`.
+**Debug console globals**: `window._faceCountHistogram`, `window.printFaceHistogram()`, `window.geometryPool.getStats()`, `window.memoryBudgetManager.getStatus()`, `meshProfile()` / `meshProfile.reset()`, `setBandedMeshing(t/f)`, `setEagerBanding(t/f)`, `setLightRefill(t/f)`. Logging plumbing (CCR-DEBUG-001): `setDebugChannels('mesh,lighting'|'*'|null)` (per-channel console filter, persists in localStorage, independent of the ~ overlay), `dumpLogs(filter?, limit?)` (500-entry always-recording ring buffer — captures logDebug/logWarn/logError even with all gates off; prints compact JSON), `diagSnapshot()` (one-call state dump: build/seed/pos/counts/memory + recent warn/error entries; TDZ-safe at any boot stage). Profile with `console.time('[Tag] …')` / `console.timeEnd(...)`.
 
 ## Claude Code Guidelines
 
@@ -451,7 +452,7 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 
 **Bug prevention**: before declaring any new `const`/`let`/function, search the file for the name — don't redeclare in the same scope or shadow globals (`scene`, `camera`, `SETTINGS`, `WORLD_CONFIG`, `chunks`). Settings must round-trip via save/load and have real DOM IDs. Keep per-frame code to ≤2 nested loops; batch/cache/limit-to-nearby for expensive work. Terrain changes need worker parity (`buildChunkWorkerCode()` injection); `WorldPreviewRenderer` delegates directly to the same functions, so it needs no separate parity check.
 
-**Logging**: prefer `logDebug(...)` over `console.log(...)` (chunk cache, pre-gen, streaming/eviction, new systems). Keep logs sparse (no per-frame/per-block spam) and tagged (`[PreGen]`, `[Chunks]`, `[Lighting]`, `[ZombieFX]`, `[Settings]`). `#debug-overlay` shows concise high-value info only (FPS, position, chunk/mesh/face counts, seed, biome).
+**Logging**: prefer `logDebug(...)` over `console.log(...)` (chunk cache, pre-gen, streaming/eviction, new systems). Keep logs sparse (no per-frame/per-block spam) and tagged (`[PreGen]`, `[Chunks]`, `[Lighting]`, `[ZombieFX]`, `[Settings]`) — the leading `[Tag]` IS the filter channel for `setDebugChannels` (CCR-DEBUG-001), so ALWAYS tag new logs (untagged → 'misc'). `logWarn` is always-on (5s-throttled, not gated by `isDebug`) — never put per-frame chatter in it. Every logDebug/logWarn/logError call is ring-recorded for `dumpLogs()` regardless of gates. `#debug-overlay` shows concise high-value info only (FPS, position, chunk/mesh/face counts, seed, biome).
 
 **Change reporting** — when proposing changes, format as: **Summary** (2-5 bullets), **Changes** (grouped by subsystem), **Rationale** (why: bug fix / perf / clarity), **Safety Checks** (confirm: no duplicate/shadowed identifiers, DOM IDs + settings wired, no heavy per-frame loops added).
 
@@ -483,7 +484,7 @@ Before committing, verify:
 ## Testing Tools
 
 - **`tools/syntax-check.mjs`** — extracts every `<script>` block from voxEx.html and `node --check`s it (module semantics for the main script). Catches truncation, unbalanced braces, and same-scope duplicate declarations in seconds, with errors mapped back to real voxEx.html line numbers. `node tools/syntax-check.mjs`.
-- **`tools/parity-check.mjs`** — mechanical lockstep checker: hand-maintained main↔worker copies (GRAD2D, grad, fadeFast, scratches, WORLD_DIMS, BIOME_CONFIG, TREE_CONFIG) + injection-marker integrity. Seconds to run; no browser. Run after ANY terrain/worker/config change: `node tools/parity-check.mjs`.
+- **`tools/parity-check.mjs`** — mechanical lockstep checker: hand-maintained main↔worker copies (GRAD2D, grad, fadeFast, scratches, WORLD_DIMS, BIOME_CONFIG, TREE_CONFIG, NUM_TILES) + injection-marker integrity. Seconds to run; no browser. Run after ANY terrain/worker/config change: `node tools/parity-check.mjs`.
 - **`tools/run-browser-tests.mjs`** — runs the FULL browser suite headlessly: serves the repo on localhost, drives headless Chrome/Edge/Chromium over the DevTools protocol (zero npm dependencies, Node 22+), clicks Run All Tests, reports failures with suite names. `node tools/run-browser-tests.mjs [--chrome=path] [--timeout=300]`. Exit 0 = all green. This makes the release gate agent-runnable; the interactive page remains for humans.
 - **`tools/terrain-node-checks.mjs`** — headless terrain invariants, no browser needed: `node tools/terrain-node-checks.mjs [voxEx.html] [seed]`. Extracts the REAL terrain/river/soil functions from voxEx.html by name (no hand-copied replicas) and checks determinism, bounds, adjacent-column continuity (<30), notch metric, river flood integrity (channel cores must flood), valley-floor pan signature, and the tree-soil elevation gradient. Fast smoke test for terrain changes; the browser suite remains authoritative for workers/meshing/lighting/persistence. Uses its own perm PRNG — internally consistent, not byte-identical to in-game seeds.
 - **`tools/terrain-probe.mjs`** — the measure-before-you-touch instrument: `height <gx> <gz>` (point query: heights, riverFactor, biome, tree-soil), `transect x0 z0 x1 z1` (ascii profile + max adjacent step), `stats [cx cz size]` (per-axis anisotropy Z/X, mountain coverage, worst step), `hillshade cx cz size [out.png]` (shaded-relief PNG render — spot striping/rings/sawtooth banks visually). Run probes BEFORE tuning terrain constants and AFTER to prove the effect; renders are attachable evidence. Shares `tools/lib/extract-terrain.mjs` with terrain-node-checks (single-source extraction).
