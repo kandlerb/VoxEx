@@ -1800,6 +1800,159 @@ async function runAllTests() {
         });
     });
 
+    // ===== Magic system: Phase 2 -- castSpell dispatcher + igniteFire (magicSystem.md Phase 2) =====
+    describe("Magic system: castSpell spam guard + dispatch (magicSystem.md §4.5/§10)", () => {
+        it("blocks a second cast within the interval, allows one after lastCastTime resets", () => {
+            const spell = VoxEx.SPELL_BY_ID[VoxEx.SPELL_EXPLOSION];
+            const origCast = spell.cast;
+            let calls = 0;
+            spell.cast = () => { calls++; };
+            VoxEx.lastCastTime = 0; // guard starts open (no prior cast recorded)
+            try {
+                VoxEx.castSpell(VoxEx.SPELL_EXPLOSION, "primary");
+                expect(calls).toBe(1);
+                // Immediately again, same tick -- must be blocked by the ~100ms interval guard.
+                VoxEx.castSpell(VoxEx.SPELL_EXPLOSION, "primary");
+                expect(calls).toBe(1);
+                // Simulate the interval having elapsed (avoids a real sleep in the test).
+                VoxEx.lastCastTime = 0;
+                VoxEx.castSpell(VoxEx.SPELL_EXPLOSION, "primary");
+                expect(calls).toBe(2);
+            } finally {
+                spell.cast = origCast;
+                VoxEx.lastCastTime = 0;
+            }
+        });
+        it("a null castSecondary is a silent no-op (all 4 spells today)", () => {
+            VoxEx.lastCastTime = 0;
+            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER].castSecondary).toBe(null);
+            // Must not throw -- runRegistered's try/catch fails this test if it does.
+            VoxEx.castSpell(VoxEx.SPELL_LASER, "secondary");
+            VoxEx.lastCastTime = 0;
+        });
+        it("a null-secondary no-op does NOT consume the spam guard (a following primary still fires)", () => {
+            const spell = VoxEx.SPELL_BY_ID[VoxEx.SPELL_FREEZE];
+            const origCast = spell.cast;
+            let calls = 0;
+            spell.cast = () => { calls++; };
+            VoxEx.lastCastTime = 0;
+            try {
+                VoxEx.castSpell(VoxEx.SPELL_FREEZE, "secondary"); // null -> no-op, guard untouched
+                // Must be exactly 0 here (not just "0 or 1, doesn't matter yet") -- a broken
+                // dispatcher that fell back to spell.cast for a null secondary would invoke
+                // spell.cast (calls=1) AND likely consume the guard, so the finalexpect(calls
+                // ).toBe(1) below would still pass by coincidence. Asserting 0 here specifically
+                // catches a secondary-falls-back-to-primary regression.
+                expect(calls).toBe(0);
+                VoxEx.castSpell(VoxEx.SPELL_FREEZE, "primary");   // must still fire immediately
+                expect(calls).toBe(1);
+            } finally {
+                spell.cast = origCast;
+                VoxEx.lastCastTime = 0;
+            }
+        });
+        it("SPELL_NONE (unassigned hotbar slot) is a silent no-op", () => {
+            VoxEx.lastCastTime = 0;
+            // Must not throw -- runRegistered's try/catch fails this test if it does.
+            VoxEx.castSpell(VoxEx.SPELL_NONE, "primary");
+        });
+    });
+
+    describe("Magic system: igniteFire guard conditions (magicSystem.md §7.3)", () => {
+        // No existing fire-system tests to mirror in this file (hasFireSupport/hasWaterNeighbor/
+        // tryPlaceBlock's FIRE branch are untested today) -- this borrows the closest established
+        // idiom instead: stub the global voxelWorld singleton's getBlock/setBlock, the same
+        // pattern the carveSphereEdit test above uses. A local `writes` map records every setBlock
+        // call so tests can assert FIRE was (or wasn't) written without needing a real chunk/scene.
+        function withStubbedFireBlocks(presetMap, fn) {
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const writes = new Map();
+            VoxEx.voxelWorld.getBlock = (x, y, z) => {
+                const key = `${x},${y},${z}`;
+                if (writes.has(key)) return writes.get(key);
+                return presetMap.has(key) ? presetMap.get(key) : AIR;
+            };
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { writes.set(`${x},${y},${z}`, id); return true; };
+            try { return fn(writes); } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        }
+
+        it("refuses on a non-AIR/non-FIRE target", () => {
+            withStubbedFireBlocks(new Map([["5,64,5", STONE]]), (writes) => {
+                expect(VoxEx.igniteFire(5, 64, 5)).toBe(false);
+                expect(writes.has("5,64,5")).toBe(false);
+            });
+        });
+
+        it("refuses without fire support (target AIR, all 6 neighbors AIR)", () => {
+            withStubbedFireBlocks(new Map(), (writes) => {
+                expect(VoxEx.igniteFire(5, 64, 5)).toBe(false);
+                expect(writes.has("5,64,5")).toBe(false);
+            });
+        });
+
+        it("refuses adjacent to water when SETTINGS.fireWaterExtinguish is on", () => {
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            VoxEx.SETTINGS.fireWaterExtinguish = true;
+            try {
+                // Floor support (STONE below) so hasFireSupport passes and the water guard is
+                // the one actually under test; a WATER neighbor to the side.
+                withStubbedFireBlocks(new Map([["5,63,5", STONE], ["6,64,5", WATER]]), (writes) => {
+                    expect(VoxEx.igniteFire(5, 64, 5)).toBe(false);
+                    expect(writes.has("5,64,5")).toBe(false);
+                });
+            } finally {
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+            }
+        });
+
+        it("succeeds when support exists and there's no water neighbor (writes FIRE)", () => {
+            withStubbedFireBlocks(new Map([["5,63,5", STONE]]), (writes) => {
+                expect(VoxEx.igniteFire(5, 64, 5)).toBe(true);
+                expect(writes.get("5,64,5")).toBe(FIRE);
+            });
+        });
+    });
+
+    describe("Magic system: igniteCraterRim ignites after a real carve (magicSystem.md §7.1/§7.3)", () => {
+        // Integration test for the carve -> ignite pipeline castExplosion drives. A world stubbed
+        // entirely from WOOD (solid + burnable) means every carved-sphere boundary cell has a
+        // burnable, un-carved neighbor just outside it -- so a working igniteCraterRim MUST
+        // ignite something. This specifically catches a sampling-distance bug the unit test for
+        // igniteFire alone (hand-placed single neighbor) could not: an earlier draft sampled one
+        // block INSIDE the carved sphere, where every neighbor of the sample point is ALSO inside
+        // the sphere (already carved to AIR) -- so _hasBurnableNeighbor was false for every sample,
+        // for every radius >= 2, and this spell's "ignite" feature silently did nothing. Caught in
+        // review before it shipped; this test locks the fix (sampling AT the carve boundary, where
+        // most of a sample's neighbors land just outside the sphere) against regression.
+        it("ignites at least one crater-rim voxel in an all-burnable (WOOD) world", () => {
+            const store = new Map();
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const cx0 = 200, cy0 = 80, cz0 = 200;
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            VoxEx.SETTINGS.fireWaterExtinguish = false; // an all-WOOD world has no water; keep the guard out of the way
+            try {
+                const radius = 4;
+                VoxEx.carveSphereEdit(cx0, cy0, cz0, radius, AIR);
+                const ignited = VoxEx.igniteCraterRim(cx0, cy0, cz0, radius, 5);
+                expect(ignited).toBeGreaterThan(0);
+                let fireCount = 0;
+                for (const id of store.values()) if (id === FIRE) fireCount++;
+                expect(fireCount).toBe(ignited);
+                expect(fireCount).toBeLessThanOrEqual(5); // respects maxIgnitions ("a few", §7.1)
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+            }
+        });
+    });
+
     await runRegistered(updateProgress);
     renderResults();
     renderTerrainVisualizations();
