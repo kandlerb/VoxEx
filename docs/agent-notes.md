@@ -52,6 +52,15 @@ can tell whether circumstances actually changed.
   "attachments not same size" + stalled chunks reproduced only in one Chrome
   profile — GPU-process crash fallback, not code. When something reproduces in
   one profile only, suspect the profile.
+- **`velocity.x`/`velocity.z` are INPUT-space (camera-relative), NOT world-space**:
+  `applyCollisionStep`/`computeMovementBasis()` expand them through the current
+  movement basis (`_physFwd`/`_physRight`) before applying world displacement. Any
+  code that adds a WORLD-space vector (explosion knockback, wind, a future push
+  effect) directly into these fields is wrong — it only looks correct facing one
+  direction and inverts/goes sideways facing others. This bit the first draft of
+  magicSystem.md's player-knockback (Phase 2): project world-space pushes through
+  `computeMovementBasis()`'s output first. Mob knockback (`damageMob`'s `kbX`/`kbZ`)
+  is unaffected — already world-space, consumed by a different code path.
 
 ## 3. Subsystem as-built notes
 
@@ -116,6 +125,35 @@ can tell whether circumstances actually changed.
   §17 G1-G5); `fireMaxActive` default raised 48→128 by CCR-fire-system-limits.
   `fireMaxEditsPerTick`/`fireConsumeChance`/`fireLightLevel` are dead/deprecated
   settings (kept for save compat; not consulted by the tick).
+
+### Magic system (magicSystem.md, Phases 0-4 SHIPPED + Phase 5 polish, `ccr/magic-system`)
+- **ICE (block 19) ships FROSTED** (sunlight/blocklight attenuation 1/1), not clear
+  (0/0) — LOCKED before an in-game eyeball because flipping it later is a relight-
+  semantics change requiring a `CURRENT_CACHE_VERSION` bump (CLAUDE.md Version
+  Constants). Not yet confirmed to look right in-game; flip now (before more systems
+  depend on the current semantics) if it reads wrong.
+- **Multi-phase atlas tile numbering**: when a design doc assigns fixed tile indices
+  across several phases as one literal step (e.g. "NUM_TILES 33→37"), and phases
+  actually land sequentially, each phase should claim the NEXT OPEN index rather than
+  reserving indices a later phase hasn't landed yet. Phase 0 claimed indices 33-35 for
+  its 3 spell icons; Phase 1 appended ICE at 36 (not the design doc's literal 33). Net
+  atlas size and tile identities end up identical either way — only the exact index
+  differs from a literal reading of the doc. Don't "fix" the index to match the doc;
+  the doc's as-built section is what gets corrected.
+- **Projectile pool size and projectile LIGHT count are separate budgets** —
+  `MAX_PROJECTILES` (pool cap, 12) vs `MAX_PROJECTILE_LIGHTS` (visible-light cap, 3,
+  oldest-eviction): every projectile always gets a mesh, only a subset gets a light,
+  so cast spam can't stack lights against the real 8-light torch pool
+  (`MAX_POINT_LIGHTS`) or the separate 4-cap `activeSpellLights`/`activeBeams`. The
+  first draft gave every in-flight projectile an always-visible light before this was
+  caught in review. Any future per-entity effect with both a "how many exist" cap and
+  a "how many are lit/loud/expensive" cap needs the same two-tier treatment.
+- **Movement friction is a single centralized scalar** (`dampingFactor` in
+  `applyPlayerVelocity()`), with no per-surface lookup precedent before ICE
+  slipperiness (Phase 5): sample the block below the feet when grounded
+  (`canJump && !isFlying`) and swap in `ICE_DAMPING_BASE` (0.1) instead of the default
+  `0.00001`. This is the hook point for any future per-block movement effect (mud,
+  honey, etc.) — don't build a parallel friction system.
 
 ### World-gen params persistence (VOXEX-CCR-UI-001 item 4/4b)
 - `worldConfig` has LIVE getters (biomeFrequency, biomeSizeMultiplier,

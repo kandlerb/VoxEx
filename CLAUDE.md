@@ -57,7 +57,7 @@ VoxEx/
 │   ├── run-browser-tests.mjs     # Headless runner for the browser suite (zero-dep CDP)
 │   ├── voxex-tests.html          # Browser suite (315+ tests) — REAL voxEx.html code via
 │   │                             #   ?test=1 seam (window.VoxEx); serve over localhost
-│   ├── voxex-texture-tests.html  # Visual texture atlas tests (33 tiles + checks)
+│   ├── voxex-texture-tests.html  # Visual texture atlas tests (own local tile set + checks)
 │   ├── terrain-visualizer.html   # Terrain debugger (delegates to game via ?test=1)
 │   ├── terrain-parameter-editor.html / voxelEditor.html / KeyFrame_editor.html
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
@@ -227,6 +227,16 @@ Biomes configured in `BIOME_CONFIG`; missing fields inherit from `BIOME_DEFAULTS
 - **Type**: 3D voxel model (BoxGeometry), MeshLambertMaterial w/ emissive. Stick (0.04x0.25x0.04, brown); Flame (0.06x0.08x0.06, orange, 0.5 emissive); Glow (0.04³, yellow, inside flame).
 - **Rendering**: Layer 1, `depthTest: false`, `renderOrder: 1000`. Configurable smoke/flame particles (spawn rate, size, decay, color).
 
+### Magic System
+- **Toggle**: `M` (`KEY_BINDINGS.magic`) flips `magicMode` via shared `toggleMagicMode()` (same F-key/`toggleTorch()` pattern) — re-skins the 9 hotbar slots, empties/restores the first-person held-block viewmodel, live-swaps an open inventory, `stopMining()` to clear any half-mined block. `#mode-badge` (pure CSS via `body.magic-mode`) is the HUD indicator.
+- **Spells** (`SPELL_CONFIG`/`SPELL_BY_ID`, mirrors `BLOCK_CONFIG`'s data-driven pattern): Explosion (instant-point, sphere carve r=4 + crater-rim ignition + mob knockback/damage), Laser (instant-beam, tube carve), Fireball (projectile, gravity arc, ignites on impact via `igniteFire()`), Freeze (cone, WATER→ICE + douses FIRE in-cone via `extinguishAt`). `cast`/`castSecondary` dispatch through `castSpell(id, "primary"|"secondary")`; all 4 `castSecondary` are `null` (unspecified — right-click / `#touch-btn-cast2` reserved for future use, no behavior defined). Spam guard: `SPELL_CAST_INTERVAL_MS = 100` (plain const, not a setting).
+- **Hotbar/inventory**: parallel `HOTBAR_SLOT_TO_SPELL` array + `UIManager.spellHotbarSlots` mirror the block versions; `selectHotbarSlot`/`cycleHotbar` route to `selectSpellSlot`/`cycleSpellSlot` twins when `magicMode`. Icons are atlas tiles (`TILE.ICON_EXPLOSION`/`ICON_LASER`/`ICON_FREEZE`; fireball reuses `TILE.FIRE_FREE_0`) — zero new icon-rendering plumbing.
+- **Terrain edits (Stage 1 only)**: `carveSphereEdit`/`carveTubeEdit`/`convertConeEdit` (+ shared `shouldSkipShapeEdit` skip rule) loop the facade `setBlock` and batch one `updateLocalArea()` per touched chunk. No Stage-2 `bulkEdit` — deferred pending a real in-game carve-cost measurement (magicSystem.md §8.2/§15.5).
+- **Projectiles**: `activeProjectiles` pool (`MAX_PROJECTILES = 12`), gravity arc, hooked into `animate()`'s existing gameplay block; separate `MAX_PROJECTILE_LIGHTS = 3` light cap (oldest-eviction) distinct from the 4-cap `activeSpellLights`/`activeBeams` and the real 8-light torch pool (`MAX_POINT_LIGHTS = 8`).
+- **ICE** (block 19, see [Block Types](#block-types-current-20-blocks)): meshes through the standard cutout terrain path (LEAVES-style), NOT the `_GLASS` blended mesh; frosted lighting (1/1 attenuation, locked decision). Slippery underfoot: `ICE_DAMPING_BASE = 0.1` overrides the centralized movement-damping scalar in `applyPlayerVelocity()` when grounded (`canJump && !isFlying`) on ICE.
+- **Touch**: `#touch-btn-magic` (toggle) + `#touch-btn-cast2` (secondary cast, CSS-gated to `body.magic-mode`); tap = primary cast (`touchPlaceBlock()`), hold = repeated primary casts (`castHeld` flag, consumed per-frame, throttled by the same spam guard). This tap/hold/button mapping is the CCR's own proposed default, not yet play-feel-confirmed on a real device.
+- Full design + as-built record (concrete deviations from the original design, what shipped vs. was deferred): `magicSystem.md` §15.
+
 ### World Creation System
 - **UI**: world name, seed input, biome selector grid, terrain presets, advanced sliders.
 - **Presets**: Default, Amplified, Flat, Archipelago, Superflat, Caves.
@@ -313,6 +323,7 @@ Version-gating constants (`TERRAIN_GEN_VERSION`, `CURRENT_CACHE_VERSION`, `SETTI
 | C | Crouch / Fly Down |
 | SHIFT | Sprint |
 | F | Toggle Torch |
+| M | Toggle Magic Mode (see [Magic System](#magic-system)) |
 | E | Open/Close Inventory |
 | V | Toggle Third-Person Camera |
 | +/- | Zoom In/Out (third-person) |
@@ -340,6 +351,8 @@ Activated by `touchControls` (`auto`/`on`/`off`); `auto` detects coarse-pointer/
 | 1-9 / scroll hotbar | Tap hotbar slot; horizontal swipe cycles |
 | E / F / V | Inventory / Torch / Camera buttons |
 | ESC pause | Pause button (top); F5/F9/O/~ are pause-menu buttons in touch mode |
+| M toggle magic mode | `#touch-btn-magic` button |
+| Right-click secondary cast (magic mode) | `#touch-btn-cast2` button (CSS-gated to `body.magic-mode`; currently always a no-op — all `castSecondary` are `null`) |
 
 Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay gates (pointer-lock on desktop OR `virtualGameplayFocus` on touch); `enterGameplay()`/`exitGameplay()` are the single enter/leave transitions (desktop locks/unlocks; touch sets virtual focus + runs shared `onGameplayFocusGained()`/`onGameplayFocusLost()`). Pointer events (`pointerdown/move/up/cancel`) with `setPointerCapture` and per-`pointerId` ownership drive all touch input. **Every touch listener body starts with `if (!touchModeActive) return;`** and the three window-level mouse handlers (`onMouseClick`/`onMouseUp`/`onMouseWheel`) early-return in touch mode to suppress synthesized mouse events.
 
@@ -491,7 +504,7 @@ Before committing, verify:
 - **`tools/terrain-probe.mjs`** — the measure-before-you-touch instrument: `height <gx> <gz>` (point query: heights, riverFactor, biome, tree-soil), `transect x0 z0 x1 z1` (ascii profile + max adjacent step), `stats [cx cz size]` (per-axis anisotropy Z/X, mountain coverage, worst step), `hillshade cx cz size [out.png]` (shaded-relief PNG render — spot striping/rings/sawtooth banks visually). Run probes BEFORE tuning terrain constants and AFTER to prove the effect; renders are attachable evidence. Shares `tools/lib/extract-terrain.mjs` with terrain-node-checks (single-source extraction).
 - **`tools/voxex-tests.html`** — the authoritative automated suite (315+ tests and growing; trust the suite's own counter). Tests REAL `voxEx.html` code via a `?test=1` seam exposing `window.VoxEx` (inert without the flag). Loads the game in a hidden iframe; must be served over localhost (Workers + IndexedDB). Covers bootstrap, terrain (determinism/finite/ocean-river/trees), lighting, compression, meshing (incl. worker MESH byte-parity), block-table invariants, VoxelWorld/collision/raycast, live chunk-worker round-trip + `blendedHeight` parity, persistence codec (`ChunkCompressor` RLE run-splitting + binary OPFS round-trip), and IndexedDB persistence round-trip.
 - **`tools/terrain-visualizer.html`** — terrain debugger. Shaded relief top-down + cross-section; click to inspect height, biome, surface block, slope, noise, elevation zone. Delegates to voxEx.html via the `?test=1` seam (requires localhost); no hand-synced terrain code remains. Surface-block material classification is a local, documented approximation (the real per-column material cascade lives inline in `generateTerrainPass`, not on the seam).
-- **`tools/voxex-texture-tests.html`** — visual texture tests. Renders all 33 atlas tiles; automated opacity/transparency/color-sanity/atlas-dimension checks.
+- **`tools/voxex-texture-tests.html`** — visual texture tests. Renders its own hand-maintained local tile set (independently numbered from the real `NUM_TILES` — see the file's own header comment; do not assume the two counts match); automated opacity/transparency/color-sanity/atlas-dimension checks.
 - **CI**: `.github/workflows/checks.yml` runs `syntax-check.mjs` + `parity-check.mjs` + `terrain-node-checks.mjs` (3 seeds) + the FULL browser suite via `run-browser-tests.mjs` (GitHub runners ship Chrome) on every push/PR. In-game visual checks remain manual.
 
 ## Documentation Index
@@ -509,7 +522,8 @@ Status legend: **LIVE** = current truth, keep updated · **SHIPPED** = implement
 | `FireImplementation.md`, `SETTINGS_MENU_CCR.md`, `CHUNK-IMPLEMENTATION-PLAN.md`, `CCR-*.md` (repo root) | SHIPPED as-built records |
 | `mobileControlsPlan.md` | SHIPPED (touch controls live) |
 | `ui-mockups.html` + `CCR's/CCR-ui-overhaul.md` | LIVE — approved directions, not yet wired into voxEx.html |
-| `futureFeatures.md`, `magicSystem.md` | LIVE roadmap / design intent |
+| `futureFeatures.md` | LIVE roadmap / design intent |
+| `magicSystem.md` | SHIPPED — all 5 phases built on branch `ccr/magic-system` (M toggle, 4 spells, ICE block, touch casting; NOT yet merged to `main`); §15 is the as-built record with concrete deviations from the original design |
 | `VoxEx_Bug_Consolidation_Tracker.md` + `VoxEx_Issue_*.md` | LIVE tracker + SHIPPED cleanup reports |
 | `keyframe-audit.md`, `lightRefill-investigation.md`, `zombie-ai-investigation.md`, `tree-generation-bug-report.md` | HISTORICAL investigations |
 | `docs/superpowers/` | HISTORICAL (pre-terrainSurface era — do not implement from) |
