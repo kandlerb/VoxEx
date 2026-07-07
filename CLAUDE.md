@@ -106,7 +106,7 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 - **Memory & Performance**: MemoryBudgetManager (auto-scale render distance: −1 at 80% warning, −2 + emergency unload 20% at 95% critical); GeometryBufferPool (4K/8K/16K face tiers, auto-upgrade); object pools (Float32/Uint8/Uint32Array, Vector3, ChunkData, GeometryBuffer); PerformanceMonitor (FPS ring buffer, 8ms budget); geometry leak detection (5s, warn at 500+ excess); spatial hash grid (O(1) proximity); SeededRandom PRNG.
 - **Data Persistence**: IndexedDB chunk cache (stores: saves/chunks/settings); ChunkDiskStorage OPFS backend (lazy init); RLE compression (v2: blocks + skyLight + blockLight); batch ops; JSON world save (seed, player state, genParams, modified chunks, thumbnail); LocalStorage settings/profiles/quick save.
 
-## Block Types (Current: 19 blocks)
+## Block Types (Current: 20 blocks)
 
 | ID | Constant | Description |
 |----|----------|-------------|
@@ -129,9 +129,10 @@ Layered pipeline (top → bottom). No top-level engine class — the live game i
 | 16 | `FIRE` | Transparent, walk-through separate-render block; clings to adjacent faces; 12-frame anim; bakes ZERO block light (glows via the dynamic `torchLightPool`) |
 | 17 | `BURNT_LOG` | Charred log (fire burn result) |
 | 18 | `BURNT_PLANKS` | Charred planks (fire burn result) |
+| 19 | `ICE` | Transparent + collidable; magic-system Freeze spell result (magicSystem.md Phase 1). Unlike GLASS, meshes through the STANDARD cutout terrain path (LEAVES-style) — no separate translucent mesh, no worker re-route. Frosted: sunlight/blocklight attenuation 1/1 (locked decision; not yet eyeballed in-game — flipping to 0/0 clear later requires a `CURRENT_CACHE_VERSION` bump) |
 | 255 | `UNLOADED_BLOCK` | Placeholder for unloaded chunks |
 
-- **Texture Atlas**: `NUM_TILES = 36` tiles in a horizontal strip (12 fire frames + 3 burnt + base blocks + 3 magic-system spell-icon tiles — magicSystem.md Phase 0; icon tiles are inert atlas columns, never meshed).
+- **Texture Atlas**: `NUM_TILES = 37` tiles in a horizontal strip (12 fire frames + 3 burnt + base blocks + 3 magic-system spell-icon tiles + ICE — magicSystem.md Phases 0-1; icon tiles are inert atlas columns, never meshed).
 - **Water light**: attenuates sunlight 1/block, blocklight 2/block. Changing attenuation semantics = bump `CURRENT_CACHE_VERSION` (see [Version Constants](#version-constants-bump-discipline)).
 - **Lookup Tables**: `BLOCK_IS_SOLID[256]`, `BLOCK_IS_OPAQUE[256]`, `IS_TRANSPARENT[256]`, `SUNLIGHT_ATTENUATION[256]`, `BLOCKLIGHT_ATTENUATION[256]` — Uint8Array fast lookups.
 
@@ -180,7 +181,7 @@ Biomes configured in `BIOME_CONFIG`; missing fields inherit from `BIOME_DEFAULTS
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`. **Volumetric Sampling**: 7-ray cone (sun/moon), 5-ray cone (point lights) for partial visibility through foliage.
 
 ### Rendering System
-- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 36 tiles).
+- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 37 tiles).
 - **Terrain Material**: MeshStandardMaterial, vertex colors, alpha test 0.1, per-texel `roughnessMap` authored from `MAT_PROFILES` (matte base + color-keyed shiny accents; accents need roughness ≲110 to glint). Live control: `uShininessStrength` uniform driven by the repurposed `SETTINGS.specularIntensity` ("Shininess Strength"); `specularEnabled` off = fully matte AND kills env reflections.
 - **Glass**: separate translucent per-chunk mesh (`<cKey>_GLASS`), non-greedy 1×1 quads emitted at end of `renderChunk`; body opacity baked into texture alpha (`setGlassBodyAlpha()`); glint punch-through via `uGlintReflect`; cutout shadows via `glassDepthMaterial` (see agent-notes §2 for the three.js alphaTest gotcha). Workers route `hasGlass` chunks to main. Screen-space glass refraction was tried and RETIRED — do not retry (agent-notes ledger).
 - **Env Reflections**: analytic sky reflection on shiny terrain texels (`envReflectionEnabled`, default off, not in profiles) — same approach as water, deliberately not PMREM.
@@ -280,7 +281,7 @@ Locate any class by grepping `class <Name>` — line numbers are deliberately om
 | `SECTION_HEIGHT` | 16 | Blocks per vertical section |
 | `SECTIONS_PER_CHUNK` | 20 | Sections per chunk (320/16) |
 | `CHUNK_DATA_SIZE` | 81920 | Bytes per chunk (16x16x320) |
-| `NUM_TILES` | 36 | Texture atlas tile count |
+| `NUM_TILES` | 37 | Texture atlas tile count |
 | `MAX_FACES_PER_CHUNK` | 16384 | Hard cap on faces per chunk mesh |
 | `GEO_TIER_SMALL` / `_MEDIUM` / `_LARGE` | 4096 / 8192 / 16384 | Geometry tier max faces |
 | `MAX_POINT_LIGHTS` | 8 | Max simultaneous torch lights |
@@ -346,7 +347,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 ### When Modifying `voxEx.html`
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, JS.
-2. **Texture Atlas**: adding blocks → update `NUM_TILES` in BOTH copies (main + worker template; parity-check P9 enforces equality) + add texture gen in `initTextures`. Current count: **36** (magicSystem.md Phase 0 added 3 spell-icon tiles; Phase 1 adds ICE as a 37th).
+2. **Texture Atlas**: adding blocks → update `NUM_TILES` in BOTH copies (main + worker template; parity-check P9 enforces equality) + add texture gen in `initTextures`. Current count: **37** (magicSystem.md Phase 0 added 3 spell-icon tiles; Phase 1 added ICE as the 37th).
 3. **Block Config**: add to `BLOCK_CONFIG` (auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()`.
 4. **Biome Config**: add to `BIOME_CONFIG` (inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`. Remember the worker template's hand-maintained `BIOME_CONFIG` copy (run `parity-check.mjs`).
 5. **Settings**: default in `DEFAULTS` → wire into `SETTINGS` → DOM binding in settings UI → `saveSettings()`. Settings must round-trip and have real DOM IDs.

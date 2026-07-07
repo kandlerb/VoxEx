@@ -171,7 +171,8 @@ async function runAllTests() {
     VoxEx = await loadRealCode();
     // Bind real code into locals used by suites:
     const { AIR, GRASS, DIRT, STONE, WOOD, LOG, LEAVES, BEDROCK, SAND, WATER, TORCH,
-            SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, GLASS, UNLOADED_BLOCK,
+            SNOW, GRAVEL, LONGWOOD_LOG, LONGWOOD_LEAVES, GLASS, UNLOADED_BLOCK, ICE,
+            carveSphereEdit, carveTubeEdit, convertConeEdit,
             SECTION_HEIGHT, SECTIONS_PER_CHUNK, BIOME_CELL_SIZE, LEAF_BLOCK_IDS,
             WORLD_DIMS, NEIGHBOR_OFFSETS, BIOME_CONFIG, HEIGHT_FUNCS,
             BLOCK_IS_SOLID, BLOCK_IS_OPAQUE, IS_TRANSPARENT, SUNLIGHT_ATTENUATION,
@@ -1715,6 +1716,88 @@ async function runAllTests() {
         it("virtual focus only => true", () => { expect(g(false, true)).toBe(true); });
         it("both => true", () => { expect(g(true, true)).toBe(true); });
         it("neither => false", () => { expect(g(false, false)).toBe(false); });
+    });
+
+    // ===== Magic system: ICE block + Stage-1 bulk-edit shape helpers (magicSystem.md Phase 1) =====
+    describe("Magic system: ICE block-table invariants", () => {
+        it("BLOCK_IS_SOLID / IS_TRANSPARENT / attenuation (frosted 1/1, magicSystem.md §5.1)", () => {
+            expect(BLOCK_IS_SOLID[ICE]).toBe(1);       // collidable tag
+            expect(IS_TRANSPARENT[ICE]).toBe(1);       // transparent tag
+            expect(SUNLIGHT_ATTENUATION[ICE]).toBe(1);
+            expect(BLOCKLIGHT_ATTENUATION[ICE]).toBe(1);
+        });
+        it("worker's REAL hasTorchFire/hasGlass re-route scan does not mention ICE (magicSystem.md §5.1/§11)", () => {
+            // Inspects the actual generated worker source (not a hand-rolled duplicate set, which
+            // could never fail if the real scan were broken) — regexes the exact scan line out of
+            // buildChunkWorkerCode()'s output and confirms it only tests TORCH/FIRE/GLASS.
+            const workerSrc = VoxEx.buildChunkWorkerCode();
+            const scanMatch = workerSrc.match(/if \(b === TORCH \|\| b === FIRE\) hasTorchFire = true; else if \(b === GLASS\) hasGlass = true;/);
+            expect(scanMatch).toBeTruthy(); // the scan line must actually exist in the generated worker source
+            expect(scanMatch[0].includes("ICE")).toBe(false);
+        });
+    });
+
+    describe("Magic system: ICE persistence round-trip", () => {
+        it("survives compressChunkData / decompressChunkData (mirrors the STONE round-trip test)", () => {
+            const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE), skyLight: new Uint8Array(CHUNK_DATA_SIZE).fill(15), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData(), renderState: 3, genState: 127 };
+            ch.blocks[blockIndex(5, 64, 5)] = ICE;
+            const d = decompressChunkData(compressChunkData(ch));
+            expect(d.blocks[blockIndex(5, 64, 5)]).toBe(ICE);
+            expect(d.skyLight[0]).toBe(15);
+        });
+    });
+
+    describe("Magic system: shouldSkipShapeEdit (Stage-1 shared skip rule)", () => {
+        it("skips BEDROCK, UNLOADED_BLOCK, and already-at-target; nothing else", () => {
+            expect(VoxEx.shouldSkipShapeEdit(BEDROCK, AIR)).toBe(true);
+            expect(VoxEx.shouldSkipShapeEdit(255 /* UNLOADED_BLOCK */, AIR)).toBe(true);
+            expect(VoxEx.shouldSkipShapeEdit(AIR, AIR)).toBe(true);
+            expect(VoxEx.shouldSkipShapeEdit(STONE, AIR)).toBe(false);
+            expect(VoxEx.shouldSkipShapeEdit(WATER, ICE)).toBe(false);
+        });
+    });
+
+    describe("Magic system: carveSphereEdit (Stage-1 shape helper, magicSystem.md §8.2/§8.3)", () => {
+        // No real chunk is generated in test mode (the iframe never runs init()), so this stubs the
+        // GLOBAL voxelWorld singleton's getBlock/setBlock — the SAME pattern the collision suite uses
+        // (see "VoxelWorld: keys + Y-bounds" / withSolidAtCellY above) — rather than inventing a new
+        // access path. carveSphereEdit calls the real facade setBlock/getBlock, which close over this
+        // same voxelWorld instance, so the stub is transparently exercised by the real code under test.
+        it("converts the expected voxel count to target, skips BEDROCK, no-ops on voxels already at target", () => {
+            const store = new Map();
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const cx0 = 100, cy0 = 80, cz0 = 100; // arbitrary but fixed/deterministic test point
+            const bedrockPos = { x: cx0 + 1, y: cy0, z: cz0 };   // inside the carve radius
+            const alreadyAirPos = { x: cx0 - 1, y: cy0, z: cz0 }; // inside the carve radius, already AIR
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            VoxEx.voxelWorld.getBlock = (x, y, z) => {
+                if (x === bedrockPos.x && y === bedrockPos.y && z === bedrockPos.z) return BEDROCK;
+                if (x === alreadyAirPos.x && y === alreadyAirPos.y && z === alreadyAirPos.z) return AIR;
+                return store.has(k(x, y, z)) ? store.get(k(x, y, z)) : STONE;
+            };
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => {
+                if (x === bedrockPos.x && y === bedrockPos.y && z === bedrockPos.z) throw new Error("carveSphereEdit must never write to a BEDROCK voxel");
+                if (x === alreadyAirPos.x && y === alreadyAirPos.y && z === alreadyAirPos.z && id === AIR) throw new Error("carveSphereEdit must no-op on a voxel already at the target id");
+                store.set(k(x, y, z), id);
+                return true;
+            };
+            try {
+                const radius = 3;
+                const changed = carveSphereEdit(cx0, cy0, cz0, radius, AIR);
+                // Exact expected count, not just >0: 123 integer lattice points satisfy
+                // dx^2+dy^2+dz^2 <= 9 (independently verified), minus the 2 stubbed-out
+                // voxels (BEDROCK skip + already-AIR no-op) this test also plants = 121.
+                // A wrong radius^2 comparison, off-by-one rCeil, or cube-instead-of-sphere
+                // bug would all still pass a bare ">0" check but must fail this one.
+                expect(changed).toBe(121);
+                for (const id of store.values()) expect(id).toBe(AIR); // every written voxel converted to target
+                expect(VoxEx.voxelWorld.getBlock(bedrockPos.x, bedrockPos.y, bedrockPos.z)).toBe(BEDROCK); // untouched
+                expect(store.has(k(alreadyAirPos.x, alreadyAirPos.y, alreadyAirPos.z))).toBe(false); // never re-written
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        });
     });
 
     await runRegistered(updateProgress);
