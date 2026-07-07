@@ -1858,6 +1858,18 @@ async function runAllTests() {
         });
     });
 
+    // igniteFire (and anything built on it: igniteCraterRim, igniteFireballBurst) has a REAL side
+    // effect beyond the stubbed voxelWorld.setBlock write -- it also registers with the actual
+    // fireSystem.cells map and addFireModel's chunk-model tracking, which the setBlock stub can't
+    // intercept. Left uncleaned, a passing ignite test leaks phantom fire-cell registrations into
+    // the shared test iframe (dormant today since the fire tick is gameplay-gated here, but a risk
+    // for any future test that inspects fireSystem state). Call this in a finally block for every
+    // (x,y,z) a test ignited.
+    function clearFireCell(x, y, z) {
+        VoxEx.fireSystem.cells.delete(`${x},${y},${z}`);
+        VoxEx.removeFireModel(x, y, z);
+    }
+
     describe("Magic system: igniteFire guard conditions (magicSystem.md §7.3)", () => {
         // No existing fire-system tests to mirror in this file (hasFireSupport/hasWaterNeighbor/
         // tryPlaceBlock's FIRE branch are untested today) -- this borrows the closest established
@@ -1913,6 +1925,7 @@ async function runAllTests() {
                 expect(VoxEx.igniteFire(5, 64, 5)).toBe(true);
                 expect(writes.get("5,64,5")).toBe(FIRE);
             });
+            clearFireCell(5, 64, 5); // igniteFire also registered a REAL fire cell -- see note above
         });
     });
 
@@ -1942,13 +1955,137 @@ async function runAllTests() {
                 const ignited = VoxEx.igniteCraterRim(cx0, cy0, cz0, radius, 5);
                 expect(ignited).toBeGreaterThan(0);
                 let fireCount = 0;
-                for (const id of store.values()) if (id === FIRE) fireCount++;
+                for (const [key, id] of store) {
+                    if (id !== FIRE) continue;
+                    fireCount++;
+                    const [x, y, z] = key.split(",").map(Number);
+                    clearFireCell(x, y, z); // igniteFire also registered REAL fire cells -- see note above
+                }
                 expect(fireCount).toBe(ignited);
                 expect(fireCount).toBeLessThanOrEqual(5); // respects maxIgnitions ("a few", §7.1)
             } finally {
                 VoxEx.voxelWorld.getBlock = origGet;
                 VoxEx.voxelWorld.setBlock = origSet;
                 VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+            }
+        });
+    });
+
+    // ===== Magic system: Phase 3 -- projectile fireball/freeze helpers (magicSystem.md Phase 3) =====
+    describe("Magic system: igniteFireballBurst guard + count (magicSystem.md §7.3)", () => {
+        // Unlike igniteCraterRim's integration test (a real carveSphereEdit produces the AIR
+        // pockets), a fireball impact never carves anything -- the impact cell itself is expected
+        // to stay SOLID (that's what stopped the projectile). So this stubs a few explicit AIR
+        // pockets adjacent to an otherwise all-WOOD world to simulate "scorched-but-open cells
+        // near the impact," the way a real burst would find gaps between solid burnable blocks.
+        it("ignites only the planted AIR pockets with a burnable neighbor, respects maxIgnitions", () => {
+            const store = new Map();
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const ix = 300, iy = 80, iz = 300;
+            const airPockets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]];
+            for (const [dx, dy, dz] of airPockets) store.set(k(ix + dx, iy + dy, iz + dz), AIR);
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            VoxEx.SETTINGS.fireWaterExtinguish = false; // all-WOOD world has no water; keep the guard out of the way
+            try {
+                const ignited = VoxEx.igniteFireballBurst(ix, iy, iz, 2, 4);
+                expect(ignited).toBeGreaterThan(0);
+                expect(ignited).toBeLessThanOrEqual(4); // respects maxIgnitions ("a handful", §7.3)
+                let fireCount = 0;
+                for (const [key, id] of store) {
+                    if (id !== FIRE) continue;
+                    fireCount++;
+                    const [x, y, z] = key.split(",").map(Number);
+                    clearFireCell(x, y, z); // igniteFire also registered REAL fire cells -- see note above
+                }
+                expect(fireCount).toBe(ignited);
+                // The impact cell itself (ix,iy,iz) is WOOD (solid), never AIR -- must be untouched.
+                expect(store.has(k(ix, iy, iz))).toBe(false);
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+            }
+        });
+        it("ignites nothing when no cell has a burnable neighbor (all-AIR world)", () => {
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const writes = new Map();
+            VoxEx.voxelWorld.getBlock = () => AIR; // no support, no fuel, anywhere
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { writes.set(`${x},${y},${z}`, id); return true; };
+            try {
+                const ignited = VoxEx.igniteFireballBurst(400, 80, 400, 2, 4);
+                expect(ignited).toBe(0);
+                expect(writes.size).toBe(0);
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        });
+    });
+
+    describe("Magic system: convertConeEdit WATER->ICE geometry (freeze cone, magicSystem.md §7.4)", () => {
+        // Same call pattern castFreeze/window.debugFreezeCone use: convertConeEdit(origin, dir,
+        // range, halfAngleDeg, ICE, id => id === WATER). Verifies the cone actually GATES by angle
+        // (not just distance) and leaves non-WATER blocks alone.
+        it("converts WATER strictly ahead, leaves behind/off-axis WATER and non-WATER untouched", () => {
+            const store = new Map();
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const origin = { x: 0, y: 64, z: 0 };
+            const dir = { x: 0, y: 0, z: 1 }; // looking along +Z
+            const ahead = { x: 0, y: 64, z: 5 };       // dead ahead, inside range+angle
+            const behind = { x: 0, y: 64, z: -5 };     // opposite direction -- cosAngle < 0, must be excluded
+            const offAxis = { x: 8, y: 64, z: 2 };     // dist ~8.87 (inside range=10) but angle ~74deg > 30deg half-angle -- excluded by ANGLE specifically, not distance
+            const stoneAhead = { x: 1, y: 64, z: 5 };  // inside the cone but not WATER -- predicate must reject it
+            store.set(k(ahead.x, ahead.y, ahead.z), WATER);
+            store.set(k(behind.x, behind.y, behind.z), WATER);
+            store.set(k(offAxis.x, offAxis.y, offAxis.z), WATER);
+            store.set(k(stoneAhead.x, stoneAhead.y, stoneAhead.z), STONE);
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : AIR;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            try {
+                const changed = convertConeEdit(origin, dir, 10, 30, ICE, (id) => id === WATER);
+                expect(changed).toBe(1); // only `ahead` qualifies
+                expect(store.get(k(ahead.x, ahead.y, ahead.z))).toBe(ICE);
+                expect(store.get(k(behind.x, behind.y, behind.z))).toBe(WATER); // untouched -- wrong side of the cone
+                expect(store.get(k(offAxis.x, offAxis.y, offAxis.z))).toBe(WATER); // untouched -- outside half-angle
+                expect(store.get(k(stoneAhead.x, stoneAhead.y, stoneAhead.z))).toBe(STONE); // untouched -- predicate rejects non-WATER
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        });
+    });
+
+    describe("Magic system: extinguishFireInCone (fire-dousing bonus pass, magicSystem.md §7.4)", () => {
+        // Same cone geometry as the WATER->ICE test above, but exercises the SEPARATE fire-dousing
+        // pass -- confirms it actually calls the real extinguish primitive (FIRE -> AIR) on cells
+        // inside the cone and leaves FIRE outside the cone alone.
+        it("douses FIRE strictly ahead, leaves behind/off-axis FIRE untouched", () => {
+            const store = new Map();
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const origin = { x: 0, y: 64, z: 0 };
+            const dir = { x: 0, y: 0, z: 1 };
+            const ahead = { x: 0, y: 64, z: 5 };
+            const behind = { x: 0, y: 64, z: -5 };
+            const offAxis = { x: 8, y: 64, z: 2 };     // dist ~8.87 (inside range) but angle ~74deg > 30deg half-angle
+            store.set(k(ahead.x, ahead.y, ahead.z), FIRE);
+            store.set(k(behind.x, behind.y, behind.z), FIRE);
+            store.set(k(offAxis.x, offAxis.y, offAxis.z), FIRE);
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : AIR;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            try {
+                const doused = VoxEx.extinguishFireInCone(origin, dir, 10, 30);
+                expect(doused).toBe(1); // only `ahead` qualifies
+                expect(store.get(k(ahead.x, ahead.y, ahead.z))).toBe(AIR); // extinguishAt sets AIR
+                expect(store.get(k(behind.x, behind.y, behind.z))).toBe(FIRE); // untouched
+                expect(store.get(k(offAxis.x, offAxis.y, offAxis.z))).toBe(FIRE); // untouched
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
             }
         });
     });
