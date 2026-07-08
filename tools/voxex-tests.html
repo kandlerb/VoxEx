@@ -1825,36 +1825,212 @@ async function runAllTests() {
         });
         it("a null castSecondary is a silent no-op (all 4 spells today)", () => {
             VoxEx.lastCastTime = 0;
-            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER].castSecondary).toBe(null);
+            // SPELL_FIRE stays instant-delivery through Phase C -- a plain params.castSecondary
+            // null-check case, distinct from the channeled-secondary-guard case below.
+            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_FIRE].castSecondary).toBe(null);
             // Must not throw -- runRegistered's try/catch fails this test if it does.
-            VoxEx.castSpell(VoxEx.SPELL_LASER, "secondary");
+            VoxEx.castSpell(VoxEx.SPELL_FIRE, "secondary");
             VoxEx.lastCastTime = 0;
         });
         it("a null-secondary no-op does NOT consume the spam guard (a following primary still fires)", () => {
-            const spell = VoxEx.SPELL_BY_ID[VoxEx.SPELL_FREEZE];
+            // CCR-MAGIC-006 B2/B3: SPELL_LASER/SPELL_FREEZE became delivery:"channeled" and no
+            // longer read spell.cast at all -- this test now uses SPELL_FIRE (still instant
+            // delivery through Phase C) to keep exercising the original castSpell null-secondary
+            // invariant via a stubbed spell.cast.
+            const spell = VoxEx.SPELL_BY_ID[VoxEx.SPELL_FIRE];
             const origCast = spell.cast;
             let calls = 0;
             spell.cast = () => { calls++; };
             VoxEx.lastCastTime = 0;
             try {
-                VoxEx.castSpell(VoxEx.SPELL_FREEZE, "secondary"); // null -> no-op, guard untouched
+                VoxEx.castSpell(VoxEx.SPELL_FIRE, "secondary"); // null -> no-op, guard untouched
                 // Must be exactly 0 here (not just "0 or 1, doesn't matter yet") -- a broken
                 // dispatcher that fell back to spell.cast for a null secondary would invoke
                 // spell.cast (calls=1) AND likely consume the guard, so the finalexpect(calls
                 // ).toBe(1) below would still pass by coincidence. Asserting 0 here specifically
                 // catches a secondary-falls-back-to-primary regression.
                 expect(calls).toBe(0);
-                VoxEx.castSpell(VoxEx.SPELL_FREEZE, "primary");   // must still fire immediately
+                VoxEx.castSpell(VoxEx.SPELL_FIRE, "primary");   // must still fire immediately
                 expect(calls).toBe(1);
             } finally {
                 spell.cast = origCast;
                 VoxEx.lastCastTime = 0;
             }
         });
+        it("a channeled spell's secondary start mechanically arms the channel but produces no visible effect (CCR-MAGIC-006 B1)", () => {
+            VoxEx.lastCastTime = 0;
+            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER].delivery).toBe("channeled");
+            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER].castSecondary).toBe(null);
+            // ACCEPTED QUIRK (found writing this test): beginChannel (CCR-MAGIC-006 B1, exact
+            // given code) sets channelActive=true for ANY mode once delivery==="channeled" --
+            // it never consults castSecondary, unlike the instant-cast dispatch path. What keeps
+            // "secondary today is a no-op" true is laserChannelStart/Tick/End's own
+            // channelCastMode==="secondary" guard (no beam/carve/light happens) -- not
+            // castSpell/beginChannel refusing to start. Must not throw either way.
+            VoxEx.castSpell(VoxEx.SPELL_LASER, "secondary");
+            expect(VoxEx.channelActive).toBe(true);
+            expect(VoxEx.channelCastMode).toBe("secondary");
+            VoxEx.endChannel(); // clean up -- must not throw (laserChannelEnd's own guard)
+            expect(VoxEx.channelActive).toBe(false);
+            VoxEx.lastCastTime = 0;
+        });
         it("SPELL_NONE (unassigned hotbar slot) is a silent no-op", () => {
             VoxEx.lastCastTime = 0;
             // Must not throw -- runRegistered's try/catch fails this test if it does.
             VoxEx.castSpell(VoxEx.SPELL_NONE, "primary");
+        });
+    });
+
+    // ===== Magic system: CCR-MAGIC-006 Phase B -- channeled Laser + Freeze =====
+    // beginChannel/tickChannel/endChannel are the GENERIC B1 machinery shared by every channeled
+    // spell -- these tests stub SPELL_LASER's onChannelStart/Tick/End with counters (the same
+    // stub-and-restore idiom the castSpell dispatch tests above use for spell.cast) so the
+    // lifecycle itself is exercised independent of the real laser beam/carve behavior, which
+    // needs a live camera/controls/scene not reachable via the ?test=1 seam.
+    describe("Magic system: CCR-MAGIC-006 B1 -- channel lifecycle", () => {
+        function withStubbedLaserChannel(fn) {
+            const spell = VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER];
+            const orig = { start: spell.onChannelStart, tick: spell.onChannelTick, end: spell.onChannelEnd };
+            const calls = { start: 0, tick: 0, end: 0 };
+            spell.onChannelStart = () => { calls.start++; };
+            spell.onChannelTick = () => { calls.tick++; };
+            spell.onChannelEnd = () => { calls.end++; };
+            VoxEx.lastCastTime = 0;
+            VoxEx.channelActive = false;
+            try {
+                fn(calls);
+            } finally {
+                spell.onChannelStart = orig.start; spell.onChannelTick = orig.tick; spell.onChannelEnd = orig.end;
+                if (VoxEx.channelActive) VoxEx.endChannel();
+                VoxEx.lastCastTime = 0;
+            }
+        }
+        it("beginChannel starts once per press: a second start within the interval is blocked", () => {
+            withStubbedLaserChannel((calls) => {
+                expect(VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary")).toBe(true);
+                expect(calls.start).toBe(1);
+                expect(VoxEx.channelActive).toBe(true);
+                // Immediately again, same tick -- must be blocked by the spam guard on STARTS.
+                expect(VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary")).toBe(false);
+                expect(calls.start).toBe(1);
+            });
+        });
+        it("a quick tap (start then end) fires exactly one tick", () => {
+            withStubbedLaserChannel((calls) => {
+                VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                expect(calls.tick).toBe(1); // F4: beginChannel's own forced tickChannel(1/60)
+                VoxEx.endChannel();
+                expect(calls.end).toBe(1);
+                expect(VoxEx.channelActive).toBe(false);
+                // tickChannel is a no-op once the channel is inactive.
+                VoxEx.tickChannel(1 / 60);
+                expect(calls.tick).toBe(1);
+            });
+        });
+        it("tickChannel ticks every held frame while active", () => {
+            withStubbedLaserChannel((calls) => {
+                VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                VoxEx.tickChannel(1 / 60);
+                VoxEx.tickChannel(1 / 60);
+                expect(calls.tick).toBe(3); // 1 forced (start) + 2 explicit
+            });
+        });
+        it("stopMining() ends an active channel (CCR-MAGIC-006 B1 wiring point 3)", () => {
+            withStubbedLaserChannel((calls) => {
+                VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                expect(VoxEx.channelActive).toBe(true);
+                VoxEx.stopMining();
+                expect(calls.end).toBe(1);
+                expect(VoxEx.channelActive).toBe(false);
+            });
+        });
+        it("stopMining() is a harmless no-op when no channel is active", () => {
+            withStubbedLaserChannel((calls) => {
+                expect(VoxEx.channelActive).toBe(false);
+                VoxEx.stopMining(); // must not throw, must not call onChannelEnd
+                expect(calls.end).toBe(0);
+            });
+        });
+        it("onMouseUp's magic-mode branch ends an active channel on either button release (CCR-MAGIC-006 B1 wiring point 2)", () => {
+            withStubbedLaserChannel((calls) => {
+                const origMagicMode = VoxEx.magicMode;
+                const origTouchMode = VoxEx.touchModeActive;
+                VoxEx.magicMode = true;
+                // onMouseUp's first line is `if (touchModeActive) return;` -- this headless
+                // Chrome test environment reports no fine pointer, so recomputeTouchMode() (run
+                // once at boot) resolves touchModeActive to true, making onMouseUp's desktop
+                // branches otherwise unreachable from tests.
+                VoxEx.touchModeActive = false;
+                try {
+                    VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                    expect(VoxEx.channelActive).toBe(true);
+                    // button:2 (right-release) does NOT call stopMining() -- isolates onMouseUp's
+                    // own `if (magicMode) endChannel();` line from stopMining's separate endChannel call.
+                    VoxEx.onMouseUp({ button: 2 });
+                    expect(calls.end).toBe(1);
+                    expect(VoxEx.channelActive).toBe(false);
+                } finally {
+                    VoxEx.magicMode = origMagicMode;
+                    VoxEx.touchModeActive = origTouchMode;
+                }
+            });
+        });
+        it("channelCastMode records which slot started the channel", () => {
+            withStubbedLaserChannel(() => {
+                VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                expect(VoxEx.channelCastMode).toBe("primary");
+            });
+        });
+        it("toggleMagicMode() (mode-toggle mid-channel) ends an active channel via its own stopMining() call (CCR-MAGIC-006 B1)", () => {
+            withStubbedLaserChannel((calls) => {
+                const origMagicMode = VoxEx.magicMode;
+                const win = VoxEx._doc.defaultView;
+                const origSetSlotIcon = win.setSlotIcon;
+                // refreshHotbarForMode() (pre-existing Phase 0 code, called by toggleMagicMode)
+                // reaches through window.setSlotIcon, which initTextures() only assigns during a
+                // real init() -- never run in this headless iframe. Stub it (on the IFRAME's own
+                // window, via _doc.defaultView) so the REAL toggleMagicMode can run end-to-end
+                // without an unrelated throw from hotbar-icon rendering this test isn't about.
+                win.setSlotIcon = () => {};
+                VoxEx.magicMode = false; // toggleMagicMode() flips it -- start from a known state
+                try {
+                    VoxEx.beginChannel(VoxEx.SPELL_LASER, "primary");
+                    expect(VoxEx.channelActive).toBe(true);
+                    VoxEx.toggleMagicMode();
+                    expect(calls.end).toBe(1);
+                    expect(VoxEx.channelActive).toBe(false);
+                } finally {
+                    win.setSlotIcon = origSetSlotIcon;
+                    VoxEx.magicMode = origMagicMode;
+                }
+            });
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 B2 -- laser channel depth clamp (nextLaserChannelDepth, F5/F17)", () => {
+        it("accumulates by digRate*dt when nothing constrains it", () => {
+            // depth=0, wide-open solidDist (=maxRange, i.e. no pickVoxel hit) -- pure accumulate.
+            const next = VoxEx.nextLaserChannelDepth(0, 24, 12, 1, 24);
+            expect(next).toBe(12); // min(0, 24.5) + 12*1 = 12
+        });
+        it("F5: clamps DOWN to solidDist+0.5 when a closer wall appears after a turn", () => {
+            // depth built up to 10 while facing open sky, then the player turns onto a wall 3
+            // blocks away -- the dig frontier must re-ground near the new wall, not keep the
+            // stale depth from the old facing.
+            const next = VoxEx.nextLaserChannelDepth(10, 3, 12, 1 / 60, 24);
+            expect(next).toBe(3.5 + 12 * (1 / 60)); // grounded to 3.5, then one frame's worth of digRate
+            expect(next).toBeLessThan(10); // must have dropped, not kept growing from the old depth
+        });
+        it("clamps the UPPER bound to maxRange (params.range) even with a large dt/digRate", () => {
+            const next = VoxEx.nextLaserChannelDepth(20, 24, 12, 1, 24);
+            expect(next).toBe(24); // min(24, 20+12=32) = 24
+        });
+        it("does not exceed solidDist+0.5 in a single frame even at low digRate (steady-state grounding)", () => {
+            // Repeated small ticks against a fixed nearby wall should converge toward solidDist,
+            // never overshoot solidDist+0.5 by more than one frame's digRate*dt.
+            let depth = 0;
+            for (let i = 0; i < 300; i++) depth = VoxEx.nextLaserChannelDepth(depth, 5, 8, 1 / 60, 24);
+            expect(depth).toBeLessThanOrEqual(5.5 + 8 * (1 / 60) + 1e-9);
         });
     });
 
