@@ -5,6 +5,8 @@
 
 **READ FIRST, implementer:** (1) CLAUDE.md sections "How to Work in This Repo", "Magic System", "Lockstep Registry", "JavaScript Code Quality Rules". (2) `magicSystem.md` §15 (as-built record — the code you are extending). (3) This CCR end-to-end BEFORE editing anything. Every "Before" snippet below is verbatim from build `2026-07-07.102` — if a Before snippet no longer matches the live file, STOP and reconcile (the code drifted after this audit); do not force the edit. Locate by grep anchor, never by line number. AUDIT FLAG / AUDIT NOTE callouts override your intuition — obey them.
 
+**If you are an orchestrator agent that can spawn subagents:** the [Orchestration plan](#orchestration-plan-nested-subagents) section defines the agent tree, work packets, and copy-paste subagent prompts. Follow it instead of improvising a delegation structure.
+
 ---
 
 ## Audit record (2026-07-08, applied to this revision)
@@ -80,6 +82,82 @@ Four pillars, in dependency order. (1) **True-aim range + power scaling foundati
 | `TILE.CRACKED_STONE: 37/.._DIRT: 38/.._PLANKS: 39` | TILE entries | `TILE.ICE: 36` | C |
 | `placeWallEdit(...)` | function | `convertConeEdit` | E4 |
 | `SPELL_LIGHTNING` (=5), `SPELL_TERRAFORM` (=6), `SPELL_BLINK` (=7) + config entries + icon tiles 40–42 | const/config | `SPELL_CONFIG` | E5–E7 |
+
+## Orchestration plan (nested subagents)
+
+This CCR is written to be implemented by an orchestrator agent (e.g., Sonnet in Claude Code) that spawns subagents, which may spawn their own subagents. **Approved scope for this run: Phases A → B → C, committed per phase** (decisions log #8/#9). Phase D (gated on the carve measurement) and Phase E are later runs.
+
+### Ground rules (violating any of these has caused real damage in this repo)
+
+1. **ONE writer at a time.** `voxEx.html` is a single ~48K-line file. Never let two subagents edit it concurrently — no exceptions, including "they're touching different regions." Parallelism is for READ-ONLY work only (scouting code, reviewing diffs).
+2. **Subagents start with ZERO context.** Every subagent prompt must be self-contained: absolute file paths, the CCR path + the exact section names to read, the grep anchors, and the required report format. Never write "as discussed above" in a subagent prompt.
+3. **The orchestrator runs the gates itself** after every packet — do not accept a subagent's claim of green. `node tools/syntax-check.mjs` + `node tools/parity-check.mjs` after each packet; `node tools/run-browser-tests.mjs` at each phase end.
+4. **Before-snippet mismatch = full stop.** If any subagent reports that a Before snippet doesn't match the live file, halt the phase, reconcile the drift yourself (re-audit that edit site), update this CCR, then resume. Subagents never improvise around drift.
+5. **The reviewer is never the implementer.** Spawn a FRESH agent for review; its prompt gets only the diff, the CCR section, and the do-not list — not the implementer's reasoning (prior phases caught real bugs exactly this way; see magicSystem.md §15 "FIXES FROM REVIEW").
+6. **Environment check first:** running in a Cowork/FUSE sandbox → read `docs/agent-notes.md` §7 before ANY git write and verify every commit with `git show HEAD:voxEx.html | tail` (must end `</html>`). Native Claude Code on Windows → §7 does not apply.
+7. **Model budget:** scouts and reviewers work fine on a cheap/fast model; implementer packets should use the strongest model available to you. Keep each subagent's job small enough to finish well inside its context (that is what the packet boundaries below are for).
+
+### Agent tree (per phase)
+
+```
+Orchestrator (persistent: owns the task list, gates, commits, this CCR's As-built notes)
+└─ Phase coordinator (one per phase, spawned fresh; may spawn its own subagents ↓)
+   ├─ Scout        (Explore-type, read-only, cheap — may run BEFORE the phase in parallel with the
+   │                previous phase's review: re-grep every anchor in the phase, return verbatim
+   │                current code per edit site, flag any drift vs this CCR's Before snippets)
+   ├─ Implementer  (edits voxEx.html; ONE packet at a time, sequential)
+   ├─ Test-writer  (edits tools/voxex-tests.html only, after the implementer finishes)
+   └─ Reviewer     (fresh read-only agent; PASS/FAIL per requirement against the diff;
+                    may spawn its own Explore sub-subagent to pull surrounding code context)
+```
+
+A phase coordinator that cannot spawn subagents (tool-restricted) should degrade gracefully: do scout → implement → test → self-review sequentially itself, but tell the orchestrator review was not independent so the orchestrator can spawn the fresh reviewer.
+
+### Work packets (each row = one implementer-subagent dispatch, in order)
+
+| Packet | CCR sections | Files touched | Done when |
+|---|---|---|---|
+| A-1 | A1 + A2 + A3 (+ registry, findings F1/F2) | voxEx.html | syntax+parity green; wheel/power/params compile |
+| A-2 | A4 | voxEx.html (HTML+CSS+JS) | pips + 2 touch buttons exist, IDs match |
+| A-3 | tests from A2/A3 Verify lines | tools/voxex-tests.html | suite green incl. new tests |
+| A-4 | reviewer + phase gates + commit | — | review PASS, 3 gates green, committed |
+| B-1 | B1 (+ F3/F4/F18 — all 5 wiring points incl. the cast2 hold-button) | voxEx.html | channel lifecycle works from console |
+| B-2 | B2 (+ F5/F17) | voxEx.html | solid beam, depth clamp, collapse |
+| B-3 | B3 (+ F16) | voxEx.html | frost stream + 150 ms sweeps |
+| B-4 | tests from B1/B2 Verify lines | tools/voxex-tests.html | suite green |
+| B-5 | reviewer + gates + commit | — | as A-4 |
+| C-1 | C1 (+ F6) | voxEx.html | deterministic-impact suite test passes |
+| C-2 | C2 (+ F14) | voxEx.html | char core works, power-gated |
+| C-3 | C3 (+ F15; NUM_TILES BOTH copies; texture-tests) | voxEx.html + tools/voxex-texture-tests.html | parity P9 = 40; texture tests green |
+| C-4 | tests from C Verify lines | tools/voxex-tests.html | suite green |
+| C-5 | reviewer + gates + commit | — | as A-4 |
+
+### Subagent prompt templates (copy, fill [brackets], send verbatim)
+
+**Scout (Explore-type, read-only):**
+> Read `D:\Projects\voxex\CCR's\CCR-MAGIC-006-spell-polish.md` sections [X]. For EVERY grep anchor and Before snippet in those sections, grep `D:\Projects\voxex\voxEx.html`, and return: the anchor, the current line number, the verbatim current code at that site, and MATCH or DRIFT vs the CCR's Before snippet. Do not edit anything. Report DRIFT items first.
+
+**Implementer:**
+> You are editing `D:\Projects\voxex\voxEx.html` (a single-file browser game — all code stays in this one file). First read, in `D:\Projects\voxex\CCR's\CCR-MAGIC-006-spell-polish.md`: section(s) [X], the "New-symbol registry", the "Implementer do NOT list", and audit findings [F-list]. Also read `D:\Projects\voxex\CLAUDE.md` section "JavaScript Code Quality Rules". Implement section(s) [X] EXACTLY as specified. Rules: before each edit, grep the anchor and confirm the Before snippet matches verbatim — on ANY mismatch, stop immediately and report the mismatch instead of adapting; declare ONLY symbol names from the registry, and search the file for each name before declaring it; obey every AUDIT FLAG/NOTE even where it contradicts your judgment; touch no code between `__TERRAIN_FUNCS`/`__TREE_FUNCS`/`__TERRAIN_PASS` markers. When done run `node tools/syntax-check.mjs` and `node tools/parity-check.mjs` and paste their full output, then list every edit site as (grep anchor → one-line description of the change).
+
+**Reviewer (fresh agent, read-only):**
+> Do not fix anything — report only. Read `D:\Projects\voxex\CCR's\CCR-MAGIC-006-spell-polish.md` section(s) [X], its "Implementer do NOT list", and audit findings [F-list]. Then review the working-tree diff of `D:\Projects\voxex` ([git diff command or attached diff]). For each numbered requirement and each AUDIT FLAG in section(s) [X], output PASS or FAIL with the exact evidence (anchor + code line). Additionally check: no duplicate declarations of [registry symbols in scope], no edits between worker injection markers, every do-not-list item respected. You may spawn a read-only Explore subagent to pull surrounding context from voxEx.html. End with a single verdict line: APPROVE or REJECT(reasons).
+
+**Test-writer:**
+> Read `D:\Projects\voxex\CCR's\CCR-MAGIC-006-spell-polish.md` section(s) [X] "Verify" lines. Add the tests they name to `D:\Projects\voxex\tools\voxex-tests.html`, following that file's existing suite/test registration pattern (read a nearby suite first and copy its shape; tests access game internals via the `window.VoxEx` ?test=1 seam). Any test that registers real fire cells or edits real chunks must clean up in a finally block (see the Phase-3 precedent noted in `VOXEX_RECENT_CHANGES`). Then run `node tools/run-browser-tests.mjs` and paste the result.
+
+### Per-phase closeout (orchestrator, after the reviewer APPROVEs)
+
+1. Gates: syntax → parity → full browser suite, all green (run them yourself).
+2. Bump `VOXEX_BUILD` (date `.N`) + add a `VOXEX_RECENT_CHANGES` entry citing `VOXEX-MAGIC-006 Phase [A]` — include a NEEDS VERIFICATION list of in-game items.
+3. Commit: stage ONLY touched files (never `git add -A`); message `feat(magic): CCR-MAGIC-006 Phase [A] — [summary]`; sandboxed → §7 procedure + truncation check.
+4. Append a short as-built note to this CCR's As-built section (deviations, test count).
+
+### Failure handling
+
+- A gate fails after a packet → do NOT proceed; revert that packet's edits, re-dispatch the SAME packet with the failure output pasted into the implementer prompt.
+- The same packet fails twice → stop the run and escalate to the human with the diff + failure output. Do not attempt a third variation.
+- Reviewer REJECTs → implementer (new instance) gets the reviewer's evidence list as its input; reviewer re-reviews. One cycle only, then escalate.
 
 ## Changes
 
@@ -472,9 +550,24 @@ Suggested order: E1–E4 (complete existing spells) → E7 (cheapest new spell) 
 5. **Fireball arc (C1)** — `dist * 0.08` approved as starting point.
 6. **Touch power controls (A4)** — two buttons approved.
 7. **Phase E scope** — ALL of E1–E7 approved.
+8. **First implementation run scope** — Phases A → B → C only (Phase D gated on the carve measurement; D2/D3 + E in later runs). Run by a subagent-spawning orchestrator per the Orchestration plan.
+9. **Commits** — one commit per phase as it lands (repo convention), with the §7 truncation check when committing from a sandbox.
 
 **Still open (minor):** additional cracked variants beyond the first three (2 lines each); power-pip visual style.
 
 ## As-built (fill in AFTER implementation)
 
 _(pending — MUST include: the r=4/6/8 carve measurements and the Stage-1 vs Stage-2 decision; per-phase deviations; final NUM_TILES; test count.)_
+
+### Phase A (build 2026-07-08.1)
+
+Implemented per the Orchestration plan: implementer edits done directly against `voxEx.html` (a fresh general-purpose subagent was used only for the independent Reviewer role, per ground rule 5; scouting/gate-running/committing done by the orchestrator itself, per ground rules 3/6/7). Packets A-1/A-2/A-3/A-4 all landed.
+
+- **A1/A2/A3/A4 implemented as specified.** `SPELL_TARGET_RANGE=96`, wheel-routes-to-power (branch lives in `onMouseWheel`, not `cycleHotbar`, per the AUDIT FLAG), `powerScale` tables + `spellParam`/`powerFactor` accessors, `EXPLOSION_POWER_CAP=3` gate, `#power-pips` HUD + 2 touch buttons.
+- **Deviation (correct, not a bug):** the CCR's A2 snippet calls `uiManager.showToast(...)`; the live codebase's actual pattern (used by `toggleMagicMode` itself, ~30 call sites) is the bare module-level `showToast(...)` — `uiManager` has no `showToast` method. Implemented using the real `showToast(...)` to match the live convention; the CCR's snippet would have thrown.
+- **Review-caught gap (fixed before commit):** the first implementation pass wired `spellParam`/power scaling into `castExplosion` only — `spellParam()` was dead code everywhere else, so the power dial had zero effect on Laser, Fireball, or Freeze. A fresh independent reviewer subagent caught this (REJECT, first cycle); fixed by wiring `castLaser` (`boreRadius`), `castFreeze` (`range`, `halfAngleDeg`), and `onFireballImpact` (`burstRadius`, `igniteMax` — the now-dead `FIREBALL_TUNING.igniteMax` constant was removed) through `spellParam`. Reviewer re-reviewed the fix and APPROVEd (second cycle, per the CCR's one-cycle-then-escalate rule — not needed here since the second review passed).
+- Explosion's dead `params.knockback` (a radius, mismatched against the new power-scaled carve radius per F2) removed from the SPELL_EXPLOSION config entry; knockback radius is now always `carveRadius + 2`, unconditionally applied (previously guarded by `params.knockback > 0`).
+- No terrain/worker/atlas changes this phase; `NUM_TILES` unchanged at 37. No `SETTINGS`/`DEFAULTS` entries added.
+- **Test count: 342 → 344** (spellParam/powerFactor/EXPLOSION_POWER_CAP/power-HUD coverage in the first pass, +2 regression tests added after the review fix that directly exercise `onFireballImpact`'s burstRadius/igniteMax scaling — the only one of the three fixed cast functions reachable via the `?test=1` seam without a live camera/controls).
+- Gates: `syntax-check` GREEN, `parity-check` GREEN, full browser suite 344/344 GREEN.
+- **NEEDS VERIFICATION (in-game, real hardware — this environment can't render):** wheel/button power changes feel right and don't fight zoom (`-`/`=` unchanged in both modes); power 1 vs 5 fireball/laser/freeze visibly differ; power 1 vs 3 explosion craters differ; number keys still select spells in magic mode; touch swipe still cycles spells.

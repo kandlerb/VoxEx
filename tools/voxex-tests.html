@@ -1858,6 +1858,175 @@ async function runAllTests() {
         });
     });
 
+    // ===== Magic system: CCR-MAGIC-006 Phase A -- true-aim range + power scaling =====
+    describe("Magic system: CCR-MAGIC-006 A1/A3 -- SPELL_TARGET_RANGE + spellParam", () => {
+        it("SPELL_TARGET_RANGE is the shared long-range constant", () => {
+            expect(VoxEx.SPELL_TARGET_RANGE).toBe(96);
+        });
+        it("spellParam returns the powerScale table value at every power for every scaled key", () => {
+            const origPower = VoxEx.spellPower;
+            try {
+                const cases = [
+                    [VoxEx.SPELL_EXPLOSION, "radius"],
+                    [VoxEx.SPELL_LASER, "boreRadius"], [VoxEx.SPELL_LASER, "digRate"],
+                    [VoxEx.SPELL_FIRE, "burstRadius"], [VoxEx.SPELL_FIRE, "igniteMax"],
+                    [VoxEx.SPELL_FIRE, "charRadius"], [VoxEx.SPELL_FIRE, "meshScale"],
+                    [VoxEx.SPELL_FREEZE, "halfAngleDeg"], [VoxEx.SPELL_FREEZE, "range"],
+                ];
+                for (const [id, key] of cases) {
+                    const spell = VoxEx.SPELL_BY_ID[id];
+                    for (let p = 1; p <= 5; p++) {
+                        VoxEx.spellPower = p;
+                        expect(VoxEx.spellParam(spell, key)).toBe(spell.powerScale[key][p - 1]);
+                    }
+                }
+            } finally {
+                VoxEx.spellPower = origPower;
+            }
+        });
+        it("spellParam falls back to the base params value when no powerScale table exists for the key", () => {
+            const origPower = VoxEx.spellPower;
+            try {
+                VoxEx.spellPower = 4;
+                const laser = VoxEx.SPELL_BY_ID[VoxEx.SPELL_LASER];
+                expect(VoxEx.spellParam(laser, "beamMs")).toBe(laser.params.beamMs); // unscaled key
+                const freeze = VoxEx.SPELL_BY_ID[VoxEx.SPELL_FREEZE];
+                expect(VoxEx.spellParam(freeze, "surfaceFreeze")).toBe(freeze.params.surfaceFreeze);
+            } finally {
+                VoxEx.spellPower = origPower;
+            }
+        });
+        it("explosion's base params no longer carries a dead 'knockback' field (F2)", () => {
+            expect(VoxEx.SPELL_BY_ID[VoxEx.SPELL_EXPLOSION].params.knockback).toBe(undefined);
+        });
+    });
+
+    // Regression coverage for a Phase-A review finding: castLaser/castFreeze/onFireballImpact
+    // must actually READ their power-scaled values through spellParam(), not just have the
+    // powerScale tables sit unused. onFireballImpact is the only one of the three reachable via
+    // the ?test=1 seam without a live camera/controls (see the seam comment above
+    // igniteFireballBurst); it touches only p.pos + module-level helpers.
+    describe("Magic system: CCR-MAGIC-006 A3 -- power scaling actually wired into onFireballImpact", () => {
+        it("burstRadius scales with spellPower: a pocket at distance 3 ignites only once burstRadius reaches it", () => {
+            const origPower = VoxEx.spellPower;
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            const ix = 700, iy = 80, iz = 700;
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const pocket = { x: ix + 3, y: iy, z: iz }; // dist 3: outside power-1 burstRadius=1, inside power-5 burstRadius=4
+            const store = new Map();
+            store.set(k(pocket.x, pocket.y, pocket.z), AIR);
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            VoxEx.SETTINGS.fireWaterExtinguish = false;
+            try {
+                VoxEx.spellPower = 1; // powerScale.burstRadius[0] = 1 -> distance-3 pocket unreachable
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(store.get(k(pocket.x, pocket.y, pocket.z))).toBe(AIR); // untouched at low power
+
+                VoxEx.spellPower = 5; // powerScale.burstRadius[4] = 4 -> distance-3 pocket now in range
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(store.get(k(pocket.x, pocket.y, pocket.z))).toBe(FIRE);
+            } finally {
+                // Cleanup runs even if the assertion above throws, so a failed run can't leak a
+                // phantom fire-cell registration into later tests (see clearFireCell's own note).
+                if (store.get(k(pocket.x, pocket.y, pocket.z)) === FIRE) clearFireCell(pocket.x, pocket.y, pocket.z);
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+                VoxEx.spellPower = origPower;
+            }
+        });
+        it("igniteMax scales with spellPower: caps at 2 of 5 adjacent pockets at power 1, all 5 at power 5", () => {
+            const origPower = VoxEx.spellPower;
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            const ix = 720, iy = 80, iz = 720;
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const offsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]]; // all distance 1 -- burstRadius irrelevant here
+            const freshStore = () => { const s = new Map(); for (const [dx, dy, dz] of offsets) s.set(k(ix + dx, iy + dy, iz + dz), AIR); return s; };
+            const countAndClearFire = (store) => {
+                let count = 0;
+                for (const [key, id] of store) {
+                    if (id !== FIRE) continue;
+                    count++;
+                    const [x, y, z] = key.split(",").map(Number);
+                    clearFireCell(x, y, z);
+                }
+                return count;
+            };
+            VoxEx.SETTINGS.fireWaterExtinguish = false;
+            try {
+                let store = freshStore();
+                VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+                VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+                VoxEx.spellPower = 1; // powerScale.igniteMax[0] = 2
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(countAndClearFire(store)).toBe(2);
+
+                store = freshStore();
+                VoxEx.spellPower = 5; // powerScale.igniteMax[4] = 12, only 5 pockets available
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(countAndClearFire(store)).toBe(5);
+            } finally {
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+                VoxEx.spellPower = origPower;
+            }
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 A3 -- powerFactor + EXPLOSION_POWER_CAP", () => {
+        it("powerFactor(power) matches the documented [0.5,0.75,1,1.4,1.8] table", () => {
+            const table = [0.5, 0.75, 1, 1.4, 1.8];
+            for (let p = 1; p <= 5; p++) expect(VoxEx.powerFactor(p)).toBe(table[p - 1]);
+        });
+        it("powerFactor() with no argument defaults to the global spellPower", () => {
+            const origPower = VoxEx.spellPower;
+            try {
+                VoxEx.spellPower = 5;
+                expect(VoxEx.powerFactor()).toBe(1.8);
+            } finally {
+                VoxEx.spellPower = origPower;
+            }
+        });
+        it("EXPLOSION_POWER_CAP is 3 pending the carve-measurement gate (do NOT raise without recording it in the CCR As-built)", () => {
+            expect(VoxEx.EXPLOSION_POWER_CAP).toBe(3);
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 A2/A4 -- power HUD", () => {
+        it("adjustSpellPower clamps to [SPELL_POWER_MIN, SPELL_POWER_MAX] and updates the #power-pips HUD", () => {
+            const origPower = VoxEx.spellPower;
+            try {
+                VoxEx.spellPower = 3;
+                VoxEx.adjustSpellPower(-10); // clamp to MIN
+                expect(VoxEx.spellPower).toBe(VoxEx.SPELL_POWER_MIN);
+                const pips = VoxEx._doc.getElementById("power-pips");
+                expect(pips).toBeTruthy();
+                expect(pips.dataset.power).toBe(String(VoxEx.SPELL_POWER_MIN));
+                let filled = 0;
+                for (const child of pips.children) if (child.classList.contains("filled")) filled++;
+                expect(filled).toBe(VoxEx.SPELL_POWER_MIN);
+
+                VoxEx.adjustSpellPower(100); // clamp to MAX
+                expect(VoxEx.spellPower).toBe(VoxEx.SPELL_POWER_MAX);
+                filled = 0;
+                for (const child of pips.children) if (child.classList.contains("filled")) filled++;
+                expect(filled).toBe(VoxEx.SPELL_POWER_MAX);
+            } finally {
+                VoxEx.spellPower = origPower;
+                VoxEx.updatePowerDisplay();
+            }
+        });
+        it("#touch-btn-power-down/up exist alongside #touch-btn-cast2", () => {
+            const doc = VoxEx._doc;
+            expect(doc.getElementById("touch-btn-power-down")).toBeTruthy();
+            expect(doc.getElementById("touch-btn-power-up")).toBeTruthy();
+        });
+    });
+
     // igniteFire (and anything built on it: igniteCraterRim, igniteFireballBurst) has a REAL side
     // effect beyond the stubbed voxelWorld.setBlock write -- it also registers with the actual
     // fireSystem.cells map and addFireModel's chunk-model tracking, which the setBlock stub can't
