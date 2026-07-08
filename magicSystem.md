@@ -2,7 +2,7 @@
 
 # VoxEx — Magic System Design Plan
 
-**Status:** Design / planning (no code written yet)
+**Status:** SHIPPED (all 5 phases, branch `ccr/magic-system`) — see the header note above and §15 for the as-built record; §1-§14 below are the Rev 2 design intent as written pre-implementation
 **Author:** Planning pass 2026-06-15 (Rev 1); full code audit + rewrite 2026-07-07 (Rev 2)
 **Scope:** Add a player "magic mode" (toggle with **M**) that swaps the hotbar and inventory to a spell loadout, plus four spells: **Explosion**, **Laser (carve)**, **Fire**, **Freeze**.
 
