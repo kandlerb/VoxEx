@@ -1,8 +1,8 @@
-> **Status: ALL 5 PHASES BUILT + COMMITTED, on branch `ccr/magic-system` (build `2026-07-07.102`) — NOT YET MERGED to `main`.** All four spells work end-to-end on desktop AND touch. See **§15 As-built summary** for what shipped, concrete deviations from this doc's literal text, and what Phase 5 explicitly did not build. The design intent below (§1-§14) is Rev 2 as originally written — re-grep anchors before trusting any `~line NNNN` reference or code excerpt, per this doc's own rule. _(Rev 2 design intent audited 2026-07-07 against build `2026-07-07.96`; see CLAUDE.md Documentation Index.)_
+> **Status: ALL 5 PHASES BUILT + COMMITTED, on `main`.** All four spells work end-to-end on desktop AND touch. See **§15 As-built summary** for what shipped, concrete deviations from this doc's literal text, and what Phase 5 explicitly did not build. The design intent below (§1-§14) is Rev 2 as originally written — re-grep anchors before trusting any `~line NNNN` reference or code excerpt, per this doc's own rule. _(Rev 2 design intent audited 2026-07-07 against build `2026-07-07.96`; see CLAUDE.md Documentation Index.)_ Follow-on polish (true-aim range/power scaling, channeled Laser/Freeze, deterministic fireball, generic cracked-block scarring) landed via `CCR-MAGIC-006-spell-polish.md` Phases A-C, also on `main`.
 
 # VoxEx — Magic System Design Plan
 
-**Status:** SHIPPED (all 5 phases, branch `ccr/magic-system`) — see the header note above and §15 for the as-built record; §1-§14 below are the Rev 2 design intent as written pre-implementation
+**Status:** SHIPPED (all 5 phases, on `main`) — see the header note above and §15 for the as-built record; §1-§14 below are the Rev 2 design intent as written pre-implementation
 **Author:** Planning pass 2026-06-15 (Rev 1); full code audit + rewrite 2026-07-07 (Rev 2)
 **Scope:** Add a player "magic mode" (toggle with **M**) that swaps the hotbar and inventory to a spell loadout, plus four spells: **Explosion**, **Laser (carve)**, **Fire**, **Freeze**.
 

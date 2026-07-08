@@ -2034,6 +2034,185 @@ async function runAllTests() {
         });
     });
 
+    // ===== Magic system: CCR-MAGIC-006 Phase C -- deterministic fireball + instant char + generic CRACKED_ =====
+    describe("Magic system: CCR-MAGIC-006 C1 -- computeFireballTarget (F6)", () => {
+        it("targets the AIR side of the hit face, not the solid block center", () => {
+            const origin = { x: 0, y: 64, z: 0 };
+            const dir = { x: 0, y: 0, z: 1 };
+            const hit = { x: 0, y: 64, z: 10, face: [0, 0, -1] }; // ray hit the -Z face of the block
+            const target = VoxEx.computeFireballTarget(origin, dir, hit, 96);
+            // Block center would be (0.5, 64.5, 10.5); the AIR side (face -Z) is half a block back.
+            expect(target.x).toBe(0.5);
+            expect(target.y).toBe(64.5);
+            expect(target.z).toBe(10);
+        });
+        it("defaults to the block center when hit.face is null/undefined", () => {
+            const hit = { x: 5, y: 64, z: 5, face: null };
+            const target = VoxEx.computeFireballTarget({ x: 0, y: 64, z: 0 }, { x: 1, y: 0, z: 0 }, hit, 96);
+            expect(target.x).toBe(5.5);
+            expect(target.y).toBe(64.5);
+            expect(target.z).toBe(5.5);
+        });
+        it("falls back to origin + dir*maxRange when there is no hit (open sky / unloaded)", () => {
+            const origin = { x: 10, y: 64, z: 10 };
+            const dir = { x: 1, y: 0, z: 0 };
+            const target = VoxEx.computeFireballTarget(origin, dir, null, 96);
+            expect(target.x).toBe(106);
+            expect(target.y).toBe(64);
+            expect(target.z).toBe(10);
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 C1 -- pathProjectilePosition (guaranteed deterministic arrival)", () => {
+        it("t=0 returns exactly `from`", () => {
+            const p = VoxEx.pathProjectilePosition({ x: 0, y: 64, z: 0 }, { x: 40, y: 64, z: 0 }, 0, 5);
+            expect(p.x).toBe(0); expect(p.y).toBe(64); expect(p.z).toBe(0);
+        });
+        it("t=1 returns exactly `to` -- the deterministic-arrival guarantee (CCR C1 Verify line)", () => {
+            const p = VoxEx.pathProjectilePosition({ x: 0, y: 64, z: 0 }, { x: 40, y: 70, z: 12 }, 1, 5);
+            expect(p.x).toBe(40); expect(p.y).toBe(70); expect(p.z).toBe(12);
+        });
+        it("arcs ABOVE the straight line at t=0.5 (parabola peak; AUDIT NOTE: do not special-case ceilings)", () => {
+            const from = { x: 0, y: 64, z: 0 }, to = { x: 40, y: 64, z: 0 }; // flat straight line (from.y === to.y)
+            const arcHeight = 3.2;
+            const p = VoxEx.pathProjectilePosition(from, to, 0.5, arcHeight);
+            expect(p.x).toBe(20);
+            expect(p.y).toBe(64 + arcHeight); // arcHeight*4*0.5*(1-0.5) = arcHeight
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 C2 -- instant char core at impact (F14)", () => {
+        it("power-5 chars a nearby burnable block instantly (charRadius=2) and still ignites farther out", () => {
+            const origPower = VoxEx.spellPower;
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            const ix = 900, iy = 80, iz = 900;
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const logPos = { x: ix + 1, y: iy, z: iz };   // dist 1 -- inside power-5's charRadius=2
+            const airPocket = { x: ix + 4, y: iy, z: iz }; // dist 4 -- inside burstRadius=4, outside charRadius=2
+            const store = new Map();
+            store.set(k(logPos.x, logPos.y, logPos.z), LOG);
+            store.set(k(airPocket.x, airPocket.y, airPocket.z), AIR);
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            VoxEx.SETTINGS.fireWaterExtinguish = false;
+            try {
+                VoxEx.spellPower = 5; // powerScale.charRadius[4] = 2, burstRadius[4] = 4
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(store.get(k(logPos.x, logPos.y, logPos.z))).toBe(BURNT_LOG); // instant char, skipped the burn timer
+                expect(store.get(k(airPocket.x, airPocket.y, airPocket.z))).toBe(FIRE); // burst still ignites farther out
+            } finally {
+                if (store.get(k(airPocket.x, airPocket.y, airPocket.z)) === FIRE) clearFireCell(airPocket.x, airPocket.y, airPocket.z);
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+                VoxEx.spellPower = origPower;
+            }
+        });
+        it("power-1 chars nothing (charRadius=0) but still ignites", () => {
+            const origPower = VoxEx.spellPower;
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
+            const ix = 920, iy = 80, iz = 920;
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const logPos = { x: ix + 1, y: iy, z: iz };     // dist 1 -- would be well within a nonzero charRadius
+            const airPocket = { x: ix, y: iy, z: iz + 1 };   // dist 1 -- inside power-1's burstRadius=1
+            const store = new Map();
+            store.set(k(logPos.x, logPos.y, logPos.z), LOG);
+            store.set(k(airPocket.x, airPocket.y, airPocket.z), AIR);
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            VoxEx.SETTINGS.fireWaterExtinguish = false;
+            try {
+                VoxEx.spellPower = 1; // powerScale.charRadius[0] = 0 -- char-core loop skipped entirely
+                VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
+                expect(store.get(k(logPos.x, logPos.y, logPos.z))).toBe(LOG); // unchanged -- NOT charred
+                expect(store.get(k(airPocket.x, airPocket.y, airPocket.z))).toBe(FIRE); // ignition unaffected
+            } finally {
+                if (store.get(k(airPocket.x, airPocket.y, airPocket.z)) === FIRE) clearFireCell(airPocket.x, airPocket.y, airPocket.z);
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+                VoxEx.SETTINGS.fireWaterExtinguish = prevExtinguish;
+                VoxEx.spellPower = origPower;
+            }
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 C3 -- CRACKED_VARIANT lookup (F15)", () => {
+        it("CRACKED_VARIANT[STONE] === CRACKED_STONE, and CRACKED_STONE never re-cracks", () => {
+            expect(VoxEx.CRACKED_VARIANT[STONE]).toBe(VoxEx.CRACKED_STONE);
+            expect(VoxEx.CRACKED_VARIANT[VoxEx.CRACKED_STONE]).toBe(0);
+        });
+        it("CRACKED_VARIANT[DIRT] === CRACKED_DIRT and CRACKED_VARIANT[WOOD] === CRACKED_PLANKS, neither re-cracks", () => {
+            expect(VoxEx.CRACKED_VARIANT[DIRT]).toBe(VoxEx.CRACKED_DIRT);
+            expect(VoxEx.CRACKED_VARIANT[VoxEx.CRACKED_DIRT]).toBe(0);
+            expect(VoxEx.CRACKED_VARIANT[WOOD]).toBe(VoxEx.CRACKED_PLANKS);
+            expect(VoxEx.CRACKED_VARIANT[VoxEx.CRACKED_PLANKS]).toBe(0);
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 C3 -- scarExplosionRim (crater rim scarring)", () => {
+        it("scars STONE in the radius..radius+1 shell, leaves the carved sphere and far field untouched", () => {
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            // Math.random must be stubbed on the IFRAME's own window -- scarExplosionRim runs
+            // inside the hidden test iframe (a separate JS realm from this parent test page), so
+            // overriding the parent's Math.random would never be seen by its bare Math.random()
+            // calls (caught in review: this originally made the test non-deterministic/flaky).
+            const gameMath = VoxEx._doc.defaultView.Math;
+            const origRandom = gameMath.random;
+            const cx = 950, cy = 80, cz = 950, radius = 4;
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const store = new Map();
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : STONE;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            gameMath.random = () => 0.1; // force every scar dice-roll (< 0.6) to succeed
+            try {
+                VoxEx.scarExplosionRim(cx, cy, cz, radius);
+                expect(store.get(k(cx + radius + 1, cy, cz))).toBe(VoxEx.CRACKED_STONE); // exactly at radius+1: in the shell
+                expect(store.has(k(cx + radius - 1, cy, cz))).toBe(false); // inside the carved sphere: untouched
+                expect(store.has(k(cx + radius + 3, cy, cz))).toBe(false); // well outside the shell: untouched
+            } finally {
+                gameMath.random = origRandom;
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        });
+    });
+
+    describe("Magic system: CCR-MAGIC-006 C3 -- scarTubeWalls (laser bore-wall scarring)", () => {
+        it("scars STONE just outside the bore's true radial distance, leaves the on-axis interior untouched", () => {
+            const origGet = VoxEx.voxelWorld.getBlock, origSet = VoxEx.voxelWorld.setBlock;
+            // Math.random must be stubbed on the IFRAME's own window -- see the note in the
+            // scarExplosionRim test above.
+            const gameMath = VoxEx._doc.defaultView.Math;
+            const origRandom = gameMath.random;
+            const origin = { x: 970, y: 80, z: 970 };
+            const dir = { x: 0, y: 0, z: 1 };
+            const range = 5;
+            const boreRadius = 1; // innerRadius=1 (innerR2=1), outerRadius=2 (outerR2=4)
+            const k = (x, y, z) => `${x},${y},${z}`;
+            const store = new Map();
+            VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : STONE;
+            VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
+            gameMath.random = () => 0.1;
+            try {
+                VoxEx.scarTubeWalls(origin, dir, range, boreRadius);
+                // (971,80,972): perpendicular offset ~1.5 laterally at z=972 (within the segment,
+                // clamped along-axis) -- true radial distance^2 = 2.5, inside the (1, 4] shell.
+                expect(store.get(k(971, 80, 972))).toBe(VoxEx.CRACKED_STONE);
+                // (970,80,972): dead on the tube's own axis (radial distance^2 = 0.5) -- must stay
+                // untouched regardless of which DDA step's perspective classifies it (this is
+                // exactly the axial-misclassification bug caught in review: a per-step-distance
+                // version could flag an on-axis point as "shell" from a later step's viewpoint).
+                expect(store.has(k(970, 80, 972))).toBe(false);
+            } finally {
+                gameMath.random = origRandom;
+                VoxEx.voxelWorld.getBlock = origGet;
+                VoxEx.voxelWorld.setBlock = origSet;
+            }
+        });
+    });
+
     // ===== Magic system: CCR-MAGIC-006 Phase A -- true-aim range + power scaling =====
     describe("Magic system: CCR-MAGIC-006 A1/A3 -- SPELL_TARGET_RANGE + spellParam", () => {
         it("SPELL_TARGET_RANGE is the shared long-range constant", () => {
@@ -2119,8 +2298,15 @@ async function runAllTests() {
             const prevExtinguish = VoxEx.SETTINGS.fireWaterExtinguish;
             const ix = 720, iy = 80, iz = 720;
             const k = (x, y, z) => `${x},${y},${z}`;
-            const offsets = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]]; // all distance 1 -- burstRadius irrelevant here
-            const freshStore = () => { const s = new Map(); for (const [dx, dy, dz] of offsets) s.set(k(ix + dx, iy + dy, iz + dz), AIR); return s; };
+            // Distance-1 pockets for power 1 (charRadius=0 -- no char-core interference at all).
+            // Distance-3 pockets for power 5 (CCR-MAGIC-006 C2: charRadius=2 at power 5 would
+            // instantly char any WOOD within distance 2 to BURNT_PLANKS -- NOT burnable -- before
+            // igniteFireballBurst ever runs, starving _hasBurnableNeighbor of fuel right at the
+            // pockets used here. Distance 3 sits outside charRadius=2 (d^2=9 > 4) but still well
+            // inside power-5's burstRadius=4 (d^2=9 <= 16).
+            const offsets1 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1]];
+            const offsets5 = [[3, 0, 0], [-3, 0, 0], [0, 3, 0], [0, -3, 0], [0, 0, 3]];
+            const freshStore = (offsets) => { const s = new Map(); for (const [dx, dy, dz] of offsets) s.set(k(ix + dx, iy + dy, iz + dz), AIR); return s; };
             const countAndClearFire = (store) => {
                 let count = 0;
                 for (const [key, id] of store) {
@@ -2133,14 +2319,14 @@ async function runAllTests() {
             };
             VoxEx.SETTINGS.fireWaterExtinguish = false;
             try {
-                let store = freshStore();
+                let store = freshStore(offsets1);
                 VoxEx.voxelWorld.getBlock = (x, y, z) => store.has(k(x, y, z)) ? store.get(k(x, y, z)) : WOOD;
                 VoxEx.voxelWorld.setBlock = (x, y, z, id) => { store.set(k(x, y, z), id); return true; };
                 VoxEx.spellPower = 1; // powerScale.igniteMax[0] = 2
                 VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
                 expect(countAndClearFire(store)).toBe(2);
 
-                store = freshStore();
+                store = freshStore(offsets5);
                 VoxEx.spellPower = 5; // powerScale.igniteMax[4] = 12, only 5 pockets available
                 VoxEx.onFireballImpact({ pos: { x: ix, y: iy, z: iz } }, null);
                 expect(countAndClearFire(store)).toBe(5);
