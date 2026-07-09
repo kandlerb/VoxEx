@@ -593,6 +593,15 @@ Two laser-channel bugs Kandler hit in-game, fixed directly (small surgical diff,
 - **Beam rendered out of the player's face:** B2 spec said "rescale/position the mesh from hand to current carve head" but the implementation (and the spec's own targeting text) used `getPlayerWorldPosition()` — the EYE — as the visual origin, putting the beam dead-center in first person. Fix: visual-only muzzle offset (`LASER_MUZZLE_RIGHT = 0.35`, `LASER_MUZZLE_DOWN = 0.28`, degenerate-safe at straight up/down) converging on the true aim head; aim/pick/carve keep the eye ray; the collapse animation anchors to the muzzle-based beam.
 - Gates: syntax + parity green; suite **374/374** (369 + 5). NEEDS VERIFICATION (in-game): sweep-carving a trench, muzzle look in 1st + 3rd person, collapse along the visible beam; tune `LASER_MUZZLE_*` to taste.
 
+### Play-test round 2 quick fixes (build 2026-07-08.5)
+
+Four items from Kandler's second session, fixed directly (validated on a git-archive copy, 374/374 incl. an updated cap guard test); the bigger asks (hand-anchored beam + casting arm raise, webbed crack texture, fireball juice) moved to **CCR-MAGIC-007**:
+
+- **Tap-stuck channel (bug, F18's blind spot):** F18 fixed the cast2 BUTTON but nobody noticed `touchPlaceBlock`'s tap path also dispatches channeled spells — and a tap classifies only after the finger is up, so the channel had no release and ran forever (stuck beam, max-depth carve, leaked lights). Tap on a channeled spell is now a single pulse: `beginChannel` (self-ticks once, F4) + immediate `endChannel`.
+- **Explosion power 4-5 enabled (owner decision superseding the A3 measurement gate):** `EXPLOSION_POWER_CAP` 3→5; in exchange every power ≥ 4 cast self-measures (`performance.now()` around `carveSphereEdit`, logged to the always-on ring — `dumpLogs('magic')`). The organic logs ARE the Stage-1 measurement; re-lower or build Stage-2 `bulkEdit` if r=8 hitches.
+- **Whole-beam laser lighting:** channel owns 3 persistent spell lights (head 2.0 + two mid-beam 1.1 at 1/3 / 2/3 of the carve ray), all released on end — 3 of the 4-light budget, safe because nothing else can cast mid-channel.
+- **Freeze stream density:** `FREEZE_CHANNEL_PARTICLES_PER_FRAME` 6→12.
+
 ### Phase C (build 2026-07-08.3)
 
 Implemented per the Orchestration plan (same division of labor as Phases A/B). Packets C-1/C-2/C-3/C-4/C-5 all landed. Review took 2 cycles against the same reviewer instance, per the failure-handling rule — this time the reviewer caught a genuine implementation defect (not just a coverage gap), which was fixed before commit.
