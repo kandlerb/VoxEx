@@ -269,6 +269,20 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
 - **Do NOT mix bash file-overwrites with the Edit tool on the same file** —
   it desyncs the harness cache and re-truncates (documented 2.6 MB-file loss;
   recover via `git show HEAD:voxEx.html`).
+- **Mount truncation is typically NEAR-EOF — a "grep for my new text" coherence
+  check is NOT sufficient** (2026-07-10, CCR-LIGHT-004 Phase 0): after Edit-tool
+  edits, the mount served both voxEx.html and voxex-tests.html cut off mid-line
+  ~30/~135 lines before the true end while everything BEFORE the cut was
+  byte-correct — greps for the edited text matched fine. `node tools/syntax-check.mjs`
+  is the real coherence gate (catches "script never closes"/"no </html>").
+  Recovery that worked: truncate the mount file at the last good byte and append
+  the correct tail (read via the authoritative Read tool), then re-run
+  syntax/parity/suite. Verify the REAL file via Read afterward.
+- **Each bash call runs in its own bwrap PID sandbox — background jobs
+  (`nohup`/`setsid`/`&`) do NOT survive across calls** (2026-07-10). Long steps
+  (Chromium download, browser suite) must complete within one call's timeout;
+  both fit synchronously in practice (download ~160 MB is the tight one — it may
+  already be cached under `/tmp/br*` from a prior run; check before downloading).
 - Kandler PLAYS VoxEx in a different Chrome profile than the extension-connected
   one — saved worlds/localStorage differ. "Works for me / broken for him" ⇒
   check which profile first.

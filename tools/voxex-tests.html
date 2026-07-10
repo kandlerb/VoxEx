@@ -613,6 +613,136 @@ async function runAllTests() {
         it("light decays to 0 at range", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(0, 64, 0)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(15, 64, 0)]).toBeLessThanOrEqual(1); });
     });
 
+    // ============================================================
+    // CCR-LIGHT-004 Phase 0: characterization tests. Point-value tests above exist already but don't
+    // catch a wrong value in an unasserted cell. These two suites add (a) full-array checksum tests for
+    // both full-recalc calculators on one fixed synthetic chunk, and (b) an incremental edit-script test
+    // driving the REAL updateSunlightAt/updateBlockLightAt/SunlightTask path -- the only coverage of the
+    // code CCR-LIGHT-004 Phase 3 restructures. See CCR's/CCR-LIGHT-004-propagation-kernel.md.
+    // ============================================================
+
+    // FNV-1a 32-bit checksum over a Uint8Array. Local helper -- grepped the file first, no existing
+    // checksum utility. Deterministic and order-sensitive, so it catches any single wrong byte anywhere
+    // in a full skyLight/blockLight array, not just the cells a point test happens to assert.
+    function fnv1aChecksum(bytes) {
+        let hash = 0x811c9dc5;
+        for (let i = 0; i < bytes.length; i++) {
+            hash ^= bytes[i];
+            hash = Math.imul(hash, 0x01000193);
+        }
+        return hash >>> 0;
+    }
+
+    // ONE fixed synthetic chunk, built deterministically (no RNG): stone terrain up to y=99, a carved
+    // cave pocket (y=70-90, x/z 4-9) with a vertical chimney at column (6,6) from y=91-99 opening the
+    // cave to the surface (y=100+ is open air by default), a 3-deep water pool resting on the surface
+    // (x/z 0-3, y=100-102), a 4-layer floating LEAVES canopy above the surface (x/z 10-13, y=103-106),
+    // and one TORCH inside the cave pocket (away from the chimney column).
+    function buildLightCharacterizationBlocks() {
+        const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+        for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[blockIndex(x, y, z)] = STONE;
+        for (let y = 70; y <= 90; y++) for (let z = 4; z <= 9; z++) for (let x = 4; x <= 9; x++) blocks[blockIndex(x, y, z)] = AIR;
+        for (let y = 91; y <= 99; y++) blocks[blockIndex(6, y, 6)] = AIR;
+        for (let y = 100; y <= 102; y++) for (let z = 0; z <= 3; z++) for (let x = 0; x <= 3; x++) blocks[blockIndex(x, y, z)] = WATER;
+        for (let y = 103; y <= 106; y++) for (let z = 10; z <= 13; z++) for (let x = 10; x <= 13; x++) blocks[blockIndex(x, y, z)] = LEAVES;
+        blocks[blockIndex(5, 72, 5)] = TORCH;
+        return blocks;
+    }
+
+    describe("lighting: full-array checksum (CCR-LIGHT-004 Phase 0)", () => {
+        it("calculateChunkSunlight full-array checksum on the fixed synthetic chunk", () => {
+            const chunk = { blocks: buildLightCharacterizationBlocks() };
+            calculateChunkSunlight(chunk, 16, 320);
+            const checksum = fnv1aChecksum(chunk.skyLight);
+            // CCR-LIGHT-004 Phase 0 characterization — expected value captured on build 2026-07-09.4; a
+            // change here means light VALUES changed (Phase 1 must be byte-identical; Phase 2 changes are
+            // expected and must update this fixture in the same commit).
+            expect(checksum).toBe(1821834511);
+        });
+        it("calculateBlockLight full-array checksum on the fixed synthetic chunk", () => {
+            const chunk = { blocks: buildLightCharacterizationBlocks() }; // fresh copy, independent of the sunlight test above
+            calculateBlockLight(chunk, 16, 320);
+            const checksum = fnv1aChecksum(chunk.blockLight);
+            // CCR-LIGHT-004 Phase 0 characterization — expected value captured on build 2026-07-09.4; a
+            // change here means light VALUES changed (Phase 1 must be byte-identical; Phase 2 changes are
+            // expected and must update this fixture in the same commit).
+            expect(checksum).toBe(725244334);
+        });
+    });
+
+    describe("lighting: incremental edit-script (CCR-LIGHT-004 Phase 0 — covers updateSunlightAt/updateBlockLightAt/SunlightTask, which Phase 3 restructures)", () => {
+        it("place/break torch + place/break stone over water via the real incremental path; checksums + queue quiescence", () => {
+            const { chunkDataPool, voxelWorld, updateSunlightAt, updateBlockLightAt, processSunlightQueue } = VoxEx;
+            const CX = 36000, CZ = 36000, KEY = getChunkKey(CX, CZ);
+            const bi = (x, y, z) => x + z * 16 + y * 256; // matches blockIndex's local-coord formula
+
+            // A flat chunk: stone to y=99, open air above (the chimney-less, canopy-less half of the
+            // checksum fixture's terrain shape) -- reused for the center chunk and the 4 cardinal
+            // neighbors so cross-chunk BFS has somewhere to go.
+            function makeFlatChunk() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                const ch = { blocks, skyLight: new Uint8Array(CHUNK_DATA_SIZE), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData() };
+                calculateChunkSunlight(ch, 16, 320);
+                calculateBlockLight(ch, 16, 320);
+                return ch;
+            }
+
+            const center = makeFlatChunk();
+            // 3-deep water pool resting on the surface (x/z 0-3), same shape as the checksum fixture.
+            for (let y = 100; y <= 102; y++) for (let z = 0; z <= 3; z++) for (let x = 0; x <= 3; x++) center.blocks[bi(x, y, z)] = WATER;
+            calculateChunkSunlight(center, 16, 320);
+            calculateBlockLight(center, 16, 320);
+
+            const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            const neighborKeys = dirs.map(([dx, dz]) => getChunkKey(CX + dx, CZ + dz));
+            chunkDataPool.chunks.set(KEY, center);
+            for (const nk of neighborKeys) chunkDataPool.chunks.set(nk, makeFlatChunk());
+
+            try {
+                const drainSunlight = () => { let guard = 0; while (VoxEx.sunlightWorkQueueLength > 0 && guard++ < 10000) processSunlightQueue(); };
+                const baseX = CX * 16, baseZ = CZ * 16;
+                const torchX = baseX + 8, torchY = 100, torchZ = baseZ + 8; // open air above the surface
+                const stoneX = baseX + 1, stoneY = 103, stoneZ = baseZ + 1; // directly above the water pool
+
+                function applyEdit(x, y, z, oldId, newId) {
+                    center.blocks[bi(x & 15, y, z & 15)] = newId;
+                    // Mirrors the real caller's argument logic (setBlock's lightUpdateQueue push, grep
+                    // "primeColumn: IS_TRANSPARENT"): only prime when transitioning opaque -> transparent.
+                    const primeColumn = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
+                    updateSunlightAt(x, y, z, oldId, newId, null, primeColumn);
+                    updateBlockLightAt(x, y, z, oldId, newId, null);
+                    drainSunlight();
+                }
+
+                // (1) place TORCH in open air
+                applyEdit(torchX, torchY, torchZ, AIR, TORCH);
+                // (2) break the torch
+                applyEdit(torchX, torchY, torchZ, TORCH, AIR);
+                // (3) place STONE above the water pool
+                applyEdit(stoneX, stoneY, stoneZ, AIR, STONE);
+                // (4) break it
+                applyEdit(stoneX, stoneY, stoneZ, STONE, AIR);
+
+                const skyChecksum = fnv1aChecksum(center.skyLight);
+                const blockChecksum = fnv1aChecksum(center.blockLight);
+                // CCR-LIGHT-004 Phase 0 characterization — expected value captured on build 2026-07-09.4;
+                // a change here means light VALUES changed (Phase 1 must be byte-identical; Phase 2
+                // changes are expected and must update this fixture in the same commit).
+                expect(skyChecksum).toBe(568040165);
+                expect(blockChecksum).toBe(362651077);
+
+                expect(VoxEx.lightUpdateQueueLength).toBe(0); // unused by this test (direct calls bypass the job queue) -- trivially 0
+                expect(VoxEx.sunlightWorkQueueLength).toBe(0); // drained after every edit above
+            } finally {
+                chunkDataPool.chunks.delete(KEY);
+                for (const nk of neighborKeys) chunkDataPool.chunks.delete(nk);
+                voxelWorld._lastChunkKey = null; // cleanup: don't leave the per-instance chunk cache pointing at a deleted chunk
+                voxelWorld._lastChunk = null;
+            }
+        });
+    });
+
     // ---- analyzeChunkSections ----
     describe("analyzeChunkSections", () => {
         it("all-air chunk -> all empty", () => { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR), sections: createSectionData() }; analyzeChunkSections(ch); ch.sections.forEach(s => { expect(s.isEmpty).toBe(true); expect(s.isFullySolid).toBe(false); expect(s.analyzed).toBe(true); }); });
