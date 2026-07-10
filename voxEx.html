@@ -4301,7 +4301,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-07-10.3"; // CCR-LIGHT-004 Phase 2: edge lighting charges entered-cell attenuation; blockLight spreads inward from borders; CURRENT_CACHE_VERSION bumped
+            const VOXEX_BUILD = "2026-07-10.6"; // CCR-LIGHT-004 Phase 4: calculateBlockLight seeds from BLOCK_LIGHT_EMISSION (shared with getBlockEmission); blockLight init zero-fill consistency
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -4310,6 +4310,9 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 31; // bumped 30→31: CCR-TERRAIN-011 — beach sand gated by WATER PROXIMITY (oceanCache/riverFactor), no more Y-band sand fields
             const VOXEX_RECENT_CHANGES = [
+                "CCR-LIGHT-004 PHASE 4: shared emission-table seeding + blockLight zero-fill hygiene (build 2026-07-10.6, final phase of CCR-LIGHT-004's buildable scope). calculateBlockLight's full-recalc seed loop previously hardcoded TORCH/FIRE (b === FIRE ? fireLevel : (b === TORCH ? torchLevel : 0)), ignoring BLOCK_LIGHT_EMISSION -- so any future emissive block would light correctly on placement (via updateBlockLightAt/getBlockEmission) but go dark on the next full recalc (audit finding #4 / D7). Fixed to b === TORCH ? torchLevel : BLOCK_LIGHT_EMISSION[b], exactly getBlockEmission()'s rule; the early-out (if (torchLevel <= 0 && fireLevel <= 0) return;) was dropped entirely rather than generalized -- the seed scan is cheap relative to the BFS, and the emission table can gain new entries without the loop needing to be re-taught about them. Added a Lockstep Registry row (CLAUDE.md) plus matching comments at both getBlockEmission and the seed loop. VoxelWorld.setBlock's three blockLight: ...fill(1) sites (new-chunk create, legacy-format upgrade, missing-array backfill) changed to a plain zero-filled Uint8Array -- 0 = 'no torch light' everywhere else; these arrays are always recomputed before use, so no observable behavior change. BLOCK_LIGHT_EMISSION added to the window.VoxEx seam export (previously seam-invisible) to support a new headless test. tools/voxex-tests.html: new test in the calculateBlockLight describe -- temporarily sets BLOCK_LIGHT_EMISSION[GLASS] = 10, seeds a GLASS block, asserts the seeded cell reads 10 and its air neighbor reads 9, restores the table entry in a finally block. No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump (seeding of blocks that do not exist yet + a zero-fill of arrays that were always recomputed before use). This completes CCR-LIGHT-004's buildable scope; remaining items are Kandler's in-game gates (Phase 2 border eyeballs, Phase 3A hitch-vs-baseline + 10-minute soak, Phase 3B torch-beside-water eyeball) and deferred follow-ups (CCR-LIGHT-005 full-recalc edge re-import orchestration, a measurement-gated heightmap CCR, watchdog demotion after soak per D5).",
+                "CCR-LIGHT-004 PHASE 3B: incremental ADD loops charge entered-cell attenuation, drift #7 fix (build 2026-07-10.5). The last two hand-copied propagation-rule sites converge on the shared kernel rule: stepLightTask's two ADD branches (sky and block) previously charged only the -1 travel cost and skipped the entered cell's SUNLIGHT_ATTENUATION/BLOCKLIGHT_ATTENUATION -- light added incrementally through WATER/LEAVES/ICE arrived too bright until some later full recalc silently corrected it. New shared helper lightRuleEnter(traveled, attenuation, floor) is a pure extraction of propagateLightBFS's inline expression (attenuation > 0 ? (traveled > attenuation ? traveled - attenuation : floor) : traveled), inserted next to the kernel and added to the WORKER_LIGHTING_ENABLED injection list; the kernel body now calls it instead of repeating the ternary (byte-identical, worker parity gates this). LightTask's constructor gains this.attenTable (SUNLIGHT_ATTENUATION for 'sky', BLOCKLIGHT_ATTENUATION for 'block'), added in 3B specifically (not 3A) so the field never sat around unused. stepLightTask's sky ADD branch: traveled = level > 1 ? level - 1 : 1; propagated = lightRuleEnter(traveled, task.attenTable[nId], 1). Block ADD branch: traveled = level > 0 ? level - 1 : 0; propagated = lightRuleEnter(traveled, task.attenTable[nId], 0). REMOVE branches untouched (their computeNeighborSunlight/computeNeighborBlockLight desired-value queries were always attenuation-aware). CURRENT_CACHE_VERSION 7 -> 8: edited/cached chunks may carry over-bright baked light from the old add rule, so existing worlds relight once on load to correct it (expected one-time cost, not a bug). Test fixtures (tools/voxex-tests.html): the incremental edit-script checksums (CCR-LIGHT-004 Phase 0) moved -- sky 568040165 -> 1768186114, block 362651077 -> 1948544033 -- but only after EXTENDING the script: the original 4-step script (torch place/break far from water; stone place/break directly over the water pool) turned out NOT to move either checksum on the first characterization run -- a genuine coverage gap per the CCR's own (if it does not move, extend it) instruction, not a pass. Root cause: the torch place+break fully self-cancels via the (already attenuation-aware) REMOVE path, and the stone-over-water edit's effect is dominated by the pool's other 15 columns, which stay continuously open to full sun the whole time and were correctly lit by the (unaffected) full-recalc kernel from the very first calculateChunkSunlight call. Fixed by adding two small SEALED pockets to the same script (same isolation design as the new spot tests below) that persist their effect to the final checksum: a 2-deep WATER pocket beside a torch opening (left in place, not broken) and a WATER pocket behind a 2-thick removable wall (mined open, not resealed). With those two extra steps, both checksums genuinely move. The four OTHER fixtures (full-recalc sunlight 1821834511 / blockLight 725244334, edge-pipeline sky 1889740755 / block 787091577) are BYTE-IDENTICAL and unedited -- those paths were untouched by this phase. New describe ('lighting: incremental ADD attenuation fix (CCR-LIGHT-004 Phase 3B -- drift #7)'): two hand-computed spot-value tests via the same registered-chunks pattern as the Phase 0 edit-script test -- (1) block channel: a TORCH placed beside a 2-deep WATER column, the pair FULLY ENCLOSED by STONE on every face except the single torch-side opening; torch cell = 15 (emission E), first water cell = E - 1 - 2 = 12, second (vertical) water cell = first - 3 = 9; (2) sky channel: a WATER cell sealed by a roof + 3 walls + a 2-THICK removable east wall, mined open via two incremental edits (outer layer, then inner), landing at 15 - 1 (travel) - 1 (SUNLIGHT_ATTENUATION[WATER]) = 13, not the pre-3B 14. Both designs went through one characterization-time correction each (documented in-test): the block test's first draft used only single-cell side walls, which let light reach the second water cell via a cheaper indirect path (up through open air, then sideways into the pool, paying WATER's attenuation only once instead of twice) that legitimately beat the straight-through value under monotone-max BFS -- full enclosure on every face fixed it. The sky test's first draft used a single-cell plug directly under open sky and broke it in one edit, which produced NO propagation at all: calculateChunkSunlight/primeSunlightColumn store the light ARRIVING at a cell (TER-2), which for a lone solid block under open sky already equals 15 whether or not that block is solid, so breaking a single plug registers no detectable value change to enqueue -- a 2-thick wall mined in two real edits (mirroring actual incremental gameplay) reproduces a genuine transition. Neither correction implicated the production fix itself; both were test-geometry bugs caught by the characterization discipline (actuals compared against hand computation before baking anything in). The Phase 0 edit-script fixture ALSO needed extending for the same reason as the block test's first draft: its original 4 steps (torch far from water, place/break stone over the already-open pool) didn't move either checksum -- the torch place+break self-cancels via the (already attenuation-aware) REMOVE path, and the stone-over-water edit's effect was dominated by the pool's other 15 columns, continuously open to full sun since the very first (unaffected) full-recalc call. Added two small sealed pockets (steps 5-7, same isolation design as the spot tests) whose effects persist to the final checksum -- both checksums now genuinely move. Verified: syntax+parity green; full browser suite 385/385 headless (383 pre-existing + 2 new); worker sunlight byte-parity green (kernel was touched, gate confirms the pure-extraction refactor stayed byte-identical). NEEDS VERIFICATION (in-game, Kandler): a torch placed beside water / under a leaf canopy now reads dimmer through the medium IMMEDIATELY on placement (previously only after a reload or full recalc corrected it); first load of an existing save takes one-time longer (relight pass) then behaves normally. NEXT: CCR-LIGHT-004 Phase 4 (shared seeding via BLOCK_LIGHT_EMISSION, blockLight zero-fill consistency).",
+                "CCR-LIGHT-004 PHASE 3A: block light joins the budgeted LightTask machinery (build 2026-07-10.4). Renamed SunlightTask -> LightTask (constructor gains a channel param, 'sky'|'block', storing this.channel/this.floor/this.dedupe); sunlightWorkQueue -> lightWorkQueue; stepSunlightTask -> stepLightTask; finalizeSunlightTask -> finalizeLightTask -- all internal only, the seam-exported keys (updateSunlightAt, updateBlockLightAt, processSunlightQueue, sunlightWorkQueueLength) keep their names per D9 so existing tests are untouched. updateBlockLightAt's old fully-synchronous, unbudgeted inline BFS (no caps, no bailout, no task queue) is gone: it now constructs a LightTask(...,'block') and returns it; its wasSource/isSource/transparent decision tree is byte-for-byte unchanged (the removing-a-source comment is load-bearing), only the seeding target changed (task.enqueueAdd/enqueueRemove instead of local arrays), and its tail now mirrors updateSunlightAt (initial burst stepLightTask(task, SUNLIGHT_STEPS_PER_FRAME*0.5), then ensureQueued()+checkPressure() if not done). stepLightTask branches on task.channel inline per neighbor in both the remove and add loops -- no function indirection in the hot path; the block branches are copied VERBATIM from the old inline loops, including the previously-unfixed missing-attenuation bug in the add branch (level>0?level-1:0, no attenuation of the entered cell) -- that fix is Phase 3B's job, not this one (D8: never mix a byte-identical mechanical move with a deliberate value change in the same gate). New LightTask semantics knob: this.dedupe (true only for 'sky') -- resolveVisit skips the per-chunk Uint8Array visit-map allocation/check entirely for block tasks (the old block loop never had one, and adding one is not value-neutral: a deduped re-raised cell can strand its neighbors at a stale-lower value) while keeping the Y-bounds check, touchedChunks tracking, and tracker.mark for both channels. New module helper markLightChunkAt(task, x, z) replaces the old per-call markBlockLightChunk closure, called at the exact same pre-check position (before the loaded/transparent checks) so the tracker gets marked for every scanned neighbor, not just successfully-propagated ones. applyLocalizedRelight now holds a tiny two-task completion refcount (pending++/onComplete for whichever of sunTask/blockTask are still in flight) so the light tracker only finalizes once BOTH channels are done, instead of only ever waiting on sunTask. D6: isCriticalLightJob's player-chunk exemption is now capped -- new const CRITICAL_LIGHT_JOBS_PER_FRAME=4; processLightQueue tracks criticalProcessed and breaks once a critical job has run past both its own cap AND the ordinary per-frame limit, so a carve at the player's feet can no longer process an unbounded number of queued jobs in one frame; jobs beyond the cap simply wait a frame (FIFO, no starvation). VALUES UNCHANGED BY DESIGN (D4/D8): this phase is scheduling-only. Verified: syntax+parity green; ALL SIX existing checksum fixtures byte-identical (Phase 0's sunlight/blockLight/edit-script-sky/edit-script-block + Phase 2's edge-pipeline sky/block) with ZERO test-file edits; worker parity green (nothing touched here is injected -- confirmed via the WORKER_LIGHTING_ENABLED injection list, which still only lists propagateLightBFS/_chunkLocalLightCtx/the 4 ctx accessors/calculateChunkSunlight). No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump (mechanical move, no output change -- Phase 3B carries the deliberate value-changing fix and its own cache bump). NEEDS VERIFICATION (in-game, Kandler): torch place/break in a large open cave shows no visible hitch vs the Phase 0 baseline; power-5 explosion carve ms via dumpLogs('magic') compared against baseline; a 10-minute streaming soak with zero watchdog force-clears (dumpLogs filter ChunkUpdate). NEXT: CCR-LIGHT-004 Phase 3B (incremental ADD loops charge entered-cell attenuation, CURRENT_CACHE_VERSION 7->8).",
                 "CCR-LIGHT-004 PHASE 2: edge-lighting semantics fix + queue cleanup (build 2026-07-10.3). propagateEdgeLighting's single-step border transfer now charges the ENTERED (target) cell's attenuation exactly like the shared propagateLightBFS kernel rule (TER-1/TER-2) instead of only the -1 travel cost -- sky floored at 1 via SUNLIGHT_ATTENUATION[targetBlocks[targetIdx]], block floored at 0 via BLOCKLIGHT_ATTENUATION[targetBlocks[targetIdx]] (the function already skips non-transparent targets, so the fully-opaque case never reaches this math). propagateLightFromEdgesInward's hand-rolled interior BFS (skylight-only) is now two sequential propagateLightBFS kernel calls sharing the module-scope _edgeInwardQueue scratch: the sky pass keeps the existing seed loops (incl. the VOXEX-CCR-LIGHT-003 top-of-column dark-column guard), and a NEW blockLight pass seeds from the same four edges WITHOUT that guard (a skylight-only heuristic -- torch light lives in dark columns, which is exactly where it needs to spread) so neighbor torch light now propagates past the single border cell it used to be stuck at. Deleted the vestigial chunksNeedingLightingUpdate Set (6 sites: declaration; queueChunkForLightingUpdate now adds straight to edgeLightingUpdateQueue, and its now-orphaned hasAllNeighborsWithLighting check + hasNeighborWithLighting helper are gone with it, confirmed no other callers; the wholesale drain loop at the top of processEdgeLightingUpdates; the purgeChunkData cleanup line; the frame-loop gate's stale OR-clause; the debug overlay's Wait: N readout, now just EdgeLight: N) -- processEdgeLightingUpdates already drained the whole set unconditionally every call, so the neighbor-readiness split it implied never actually gated anything. Also deleted the dead const hasWaterMesh = false two-liner in the same function (folded into hasTerrainMesh via isChunkMeshed already). CURRENT_CACHE_VERSION 6 -> 7: baked border light values near chunk seams change (both the attenuation fix and the new blockLight inward spread), so existing worlds relight on first load -- expected one-time longer first load per world, not a bug. New seam exports (window.VoxEx, CCR-LIGHT-004 Phase 2 group): propagateEdgeLighting, propagateLightFromEdgesInward. New characterization test (tools/voxex-tests.html, describe 'lighting: edge-pipeline characterization (CCR-LIGHT-004 Phase 2)'): two synthetic chunks sharing an X border -- stone-floored, target's receiving edge column has a 3-deep WATER pool (y100-102) with a 2-layer LEAVES canopy above (y103-104) straddling the border, source has a torch 2 cells from the shared border in open air -- run both calculators on both chunks, propagateEdgeLighting(target, source, 15, 0, 'x', 16, 320), propagateLightFromEdgesInward(target, 16, 320); FNV-1a checksums the target's post-transfer skyLight/blockLight (captured values baked in) PLUS hand-computed spot values documenting the rule itself: the border water cell's sky value lands at 15-1(travel)-1(water atten)=13 (not the pre-fix 14), the same cell's block value (torch reaches the border at sourceBlockLight 13 after its own in-chunk BFS) lands at 13-1(travel)-2(water block atten)=10 (not the pre-fix 12), and a cell two steps inland from the border (previously stuck at 0 -- blockLight imported exactly 1 cell deep and never propagated further) is now nonzero (8), proving the inward-spread fix. The four Phase 0 checksum fixtures (sunlight 1821834511, blockLight 725244334, edit-script sky 568040165 / block 362651077) are UNCHANGED in this phase -- neither full-recalc calculator nor the incremental SunlightTask/updateBlockLightAt path is touched here; only the edge-import/inward-spread pipeline changed. Verified: syntax+parity green; full browser suite green (382 pre-existing + 1 new, all Phase 0 checksums confirmed byte-identical). NEXT: CCR-LIGHT-004 Phase 3 (block light joins the budgeted task machinery).",
                 "CCR-LIGHT-004 PHASE 1: unified light-propagation kernel (build 2026-07-10.2). Extracted the propagation rule that was hand-copied at both full-recalc calculators into ONE function: propagateLightBFS(queue, qStart, ctx) (module scope, above calculateChunkSunlight) -- monotone-max BFS flood fill, rule = 1 travel cost + ctx.attenTable[enteredBlockId], floored at ctx.floor (1 for skylight, 0 for blocklight). Ctx is worker-injectable: NEIGHBOR_OFFSETS/IS_TRANSPARENT are read as module globals (both already serialized into the worker), everything else (blocks/light arrays, attenuation table, floor, chunk height) arrives via a module-scope scratch (_lightCtxScratch) populated by a small helper (_chunkLocalLightCtx(blocks, light, attenTable, floor, height)) plus four static named accessor functions (_ctxGetBlockLocal/_ctxGetLightLocal/_ctxSetLightLocal/_ctxInBoundsLocal) that read/write the scratch's mutable fields -- no per-call closures/allocations (hot-path ban), and no worker-side declaration-order issue since the helper assigns every field including the function references on each call. calculateChunkSunlight's Phase 2 (grep 'Phase 2: BFS horizontal propagation') and calculateBlockLight's BFS (grep 'BFS propagation within chunk bounds') now both call the shared kernel instead of running their own copy of the loop; column seeding in both functions is untouched. Worker plumbing: propagateLightBFS + _chunkLocalLightCtx + the 4 accessors joined the WORKER_LIGHTING_ENABLED injection list alongside calculateChunkSunlight, and the _lightCtxScratch object literal got its own meshCode data line (same precedent as _aoResult/_lightResult). BYTE-IDENTICAL output by design (D2 of CCR-LIGHT-004) -- the Phase 0 full-array checksum tests (sunlight 1821834511, blockLight 725244334, edit-script sky 568040165 / block 362651077) are UNCHANGED and still green, proving the equivalence. No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump (no output or terrain change). Verified: syntax+parity green; terrain-node-checks green on seeds 1337/42/9001 (kernel touches lighting only, confirms zero terrain coupling); full browser suite 382/382 headless, including worker skyLight/blockLight byte-parity and all 3 Phase-0 checksum tests with their original hard-coded values. NEXT: CCR-LIGHT-004 Phase 2 (edge-lighting semantics fix through the same kernel, CURRENT_CACHE_VERSION bump).",
                 "CCR-LIGHT-004 PHASE 0: characterization + seam extension (build 2026-07-10.1). NO BEHAVIOR CHANGE -- this is test infrastructure only, ahead of the propagation-kernel refactor (CCR-LIGHT-004). Added to tools/voxex-tests.html: (1) a full-array FNV-1a checksum test for calculateChunkSunlight and calculateBlockLight over a fixed synthetic chunk (stone terrain, a carved cave pocket with a chimney opening to the surface, a 3-deep surface water pool, a 4-layer floating LEAVES canopy, one TORCH in the cave) -- point-value tests already existed but didn't catch a wrong value in an unasserted cell. (2) an incremental edit-script test (place/break TORCH, place/break STONE over the water pool) driving the REAL updateSunlightAt/updateBlockLightAt/processSunlightQueue path directly (mirroring applyLocalizedRelight's call shape, tracker=null) against a registered synthetic chunk + 4 flat cardinal neighbors, checksummed and asserting queue quiescence at the end -- this is the only test coverage of the incremental path Phase 3 will restructure. Extended the ?test=1 seam (window.VoxEx) with updateSunlightAt, updateBlockLightAt, processSunlightQueue, processLightQueue, and get-accessors lightUpdateQueueLength/sunlightWorkQueueLength to make the above possible. Both checksum fixtures are BAKED-IN VALUES captured on this build -- Phase 1 of CCR-LIGHT-004 must reproduce them byte-identically (kernel extraction, no output change); Phase 2 (edge-lighting semantics fix) is expected to change them, and must update the fixtures in that same commit.",
@@ -8075,7 +8078,7 @@
                         chunk = {
                             blocks: new Uint8Array(size),
                             skyLight: new Uint8Array(size).fill(15),
-                            blockLight: new Uint8Array(size).fill(1),
+                            blockLight: new Uint8Array(size), // CCR-LIGHT-004 Phase 4: zero-fill (0 = 'no torch light', matches every other producer)
                             cx: cx,
                             cz: cz,
                             startX: cx * WORLD_DIMS.chunkSize,
@@ -8092,14 +8095,14 @@
                         chunk = {
                             blocks: legacy,
                             skyLight: new Uint8Array(legacySize).fill(15),
-                            blockLight: new Uint8Array(legacySize).fill(1),
+                            blockLight: new Uint8Array(legacySize), // CCR-LIGHT-004 Phase 4: zero-fill for consistency (see new-chunk site above)
                             sections: createSectionData(), // Per-section metadata for rendering optimization
                         };
                         this.chunks.set(key, chunk);
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.register(key, chunk);
                     } else {
                         if (!chunk.skyLight) chunk.skyLight = new Uint8Array(chunk.blocks.length).fill(15);
-                        if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length).fill(1);
+                        if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length); // CCR-LIGHT-004 Phase 4: zero-fill for consistency
                         if (!chunk.sections) chunk.sections = createSectionData(); // Ensure sections exist
                         // Update LRU access time for existing chunk
                         if (typeof chunkDataPool !== 'undefined') chunkDataPool.touch(key);
@@ -14816,6 +14819,7 @@
             const lightUpdateQueue = [];
             const queuedLightUpdates = new Set();
             const MAX_LIGHT_UPDATES_PER_FRAME = 12;
+            const CRITICAL_LIGHT_JOBS_PER_FRAME = 4; // D6 (CCR-LIGHT-004 3A): was an UNLIMITED bypass
             const SUNLIGHT_STEPS_PER_FRAME = 1024;
             let lastChunkUpdate = 0;
             let selectedBlockId = GRASS;
@@ -17961,7 +17965,7 @@
                 // defeated by leaked-count markers whose lastSeen keeps getting bumped by OTHER
                 // completing jobs in the same chunk (clearPendingLight bumps lastSeen even on
                 // non-zeroing decrements), which stranded chunks for minutes after big carves.
-                const noLightWork = lightUpdateQueue.length === 0 && sunlightWorkQueue.length === 0;
+                const noLightWork = lightUpdateQueue.length === 0 && lightWorkQueue.length === 0;
                 for (const [key, entry] of pendingLightChunks) {
                     const firstSeen = entry.firstSeen ?? entry.lastSeen ?? now;
                     const lastSeen = entry.lastSeen ?? firstSeen;
@@ -20447,7 +20451,7 @@
                     writeFaceVerticesIndexed, writeFaceColorsIndexed, writeFaceColorsWaterIndexed, computeWaterFaceColor, writeFaceUVsIndexed, writeFaceIndices,
                     addFaceWaterIndexed, addMergedFaceIndexed,
                     cellCornerLightDamped, extractLightFromChunk, clearGreedyBuffers, greedyMeshSection,
-                    ...(WORKER_LIGHTING_ENABLED ? [propagateLightBFS, _chunkLocalLightCtx,
+                    ...(WORKER_LIGHTING_ENABLED ? [lightRuleEnter, propagateLightBFS, _chunkLocalLightCtx,
                         _ctxGetBlockLocal, _ctxGetLightLocal, _ctxSetLightLocal, _ctxInBoundsLocal,
                         calculateChunkSunlight] : []) // VOXEX-CCR-PERF-013 + CCR-LIGHT-004
                 ];
@@ -25909,6 +25913,9 @@
              * everything else reads the static BLOCK_LIGHT_EMISSION table. NOTE: FIRE bakes 0
              * (it glows via the dynamic PointLight pool, not baked light) to avoid per-edit
              * light floods — see the FIRE BLOCK_CONFIG entry and setBlock's light-neutral skip.
+             * Mirrored logic (review-enforced, CLAUDE.md Lockstep Registry, CCR-LIGHT-004 Phase 4
+             * / D7): calculateBlockLight's full-recalc seed loop duplicates this exact rule by
+             * hand -- keep both sites in lockstep.
              * @param {BlockId} id @returns {LightLevel}
              */
             function getBlockEmission(id) {
@@ -25989,7 +25996,7 @@
                 // Neighbor relights reuse current IDs and should not reprime columns without an opacity change
                 lightUpdateQueue.push({ x, y, z, oldId: neighborId,newId: neighborId, key, primeColumn: false, pendingLightChunks: new Set([chunkKey]), });
             }
-            const sunlightWorkQueue = [];
+            const lightWorkQueue = []; // CCR-LIGHT-004 Phase 3A: renamed from sunlightWorkQueue; shared by both channels now
             function isCriticalLightJob(job) {
                 if (!job || !controls || !controls.getObject) return false;
                 const player = controls.getObject();
@@ -26005,14 +26012,17 @@
             }
             function processLightQueue(limit = MAX_LIGHT_UPDATES_PER_FRAME, sunlightBudget = SUNLIGHT_STEPS_PER_FRAME) {
                 let processed = 0;
+                let criticalProcessed = 0; // D6 (CCR-LIGHT-004 3A): caps the player-chunk exemption
                 while (lightUpdateQueue.length > 0) {
                     const job = lightUpdateQueue[0];
                     const critical = isCriticalLightJob(job);
                     if (!critical && processed >= limit) break;
+                    if (critical && criticalProcessed >= CRITICAL_LIGHT_JOBS_PER_FRAME && processed >= limit) break;
                     lightUpdateQueue.shift();
                     queuedLightUpdates.delete(job.key);
                     applyLocalizedRelight(job);
                     processed++;
+                    if (critical) criticalProcessed++;
                 }
                 if (sunlightBudget > 0) { processSunlightQueue(sunlightBudget); } // Spread sunlight work across frames to avoid spikes during large edits
                 flushAllDeferredChunkUpdates("light-queue-idle"); // Flush any deferred chunks whose local neighborhood lighting is complete
@@ -26052,15 +26062,21 @@
                 const prevId = oldId ?? existingId ?? AIR;
                 const nextId = newId ?? existingId ?? AIR;
                 const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker, job.primeColumn);
-                updateBlockLightAt(x, y, z, prevId, nextId, tracker);
 
                 // NOTE: Removed redundant calculateBlockLight() call here.
                 // updateBlockLightAt() already handles full BFS propagation for block light changes.
                 // Calling calculateBlockLight() would overwrite the propagated values since it
                 // fills the array with 0 and only sets torch positions without propagation.
+                const blockTask = updateBlockLightAt(x, y, z, prevId, nextId, tracker);
 
-                if (!sunTask || sunTask.done || sunTask.bailedOut) { finalizeLightTracker(tracker);
-                } else { sunTask.onComplete = () => finalizeLightTracker(tracker); }
+                // CCR-LIGHT-004 Phase 3A: block light now runs through the same budgeted LightTask
+                // machinery as sunlight, so the tracker must wait on BOTH tasks (whichever are still
+                // pending) before finalizing -- a simple completion refcount.
+                let pending = 0;
+                const onTaskDone = () => { pending--; if (pending <= 0) finalizeLightTracker(tracker); };
+                if (sunTask && !sunTask.done && !sunTask.bailedOut) { pending++; sunTask.onComplete = onTaskDone; }
+                if (blockTask && !blockTask.done && !blockTask.bailedOut) { pending++; blockTask.onComplete = onTaskDone; }
+                if (pending === 0) finalizeLightTracker(tracker);
             }
             function primeSunlightColumn(task, x, z, tracker) {
                 // VOXEX-CCR-LIGHT-002 (Lever 1): one fixed (x,z) => one fixed chunk for the whole column.
@@ -26087,7 +26103,7 @@
                 for (let cy = maxY; cy >= minY; cy--) {
                     const idx = colBase + ((cy + WORLD_DIMS.yOffset) << 8);
                     const blockId = blocks[idx];
-                    const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;   // ?? 0 now unreachable (Uint8 read) — kept for parity
+                    const attenuation = SUNLIGHT_ATTENUATION[blockId]; // Uint8Array read, never undefined (CCR-LIGHT-004 Phase 4: dropped the now-provably-dead ?? 0 guard, audit finding #12)
                     const target = currentLight > 1 ? currentLight : 1;
                     const prev = sky[idx];
                     if (target !== prev) {
@@ -26104,16 +26120,25 @@
                 if (anyChange) { tracker?.mark(chunkKey); task?.ensureQueued(); }
                 return anyChange;
             }
-            // SunlightTask class - Encapsulates sunlight update state and operations
+            // LightTask class - Encapsulates light update state and operations (CCR-LIGHT-004
+            // Phase 3A: renamed from SunlightTask -- now shared by BOTH the sky and block channels)
             // Extracted from updateSunlightAt for clarity and maintainability
-            class SunlightTask {
-                constructor(x, y, z, oldId, newId, tracker) {
+            class LightTask {
+                constructor(x, y, z, oldId, newId, tracker, channel) {
                     // Position and block info
                     this.x = x;
                     this.y = y;
                     this.z = z;
                     this.oldId = oldId;
                     this.newId = newId;
+                    // CCR-LIGHT-004 Phase 3A: channel knobs -- 'sky' dedupes via per-chunk visit
+                    // arrays (existing behavior); 'block' does not (see resolveVisit/markLightChunkAt).
+                    this.channel = channel;
+                    this.floor = channel === 'sky' ? 1 : 0;
+                    // CCR-LIGHT-004 Phase 3B: added now (not 3A) -- avoids an unused field
+                    // sitting around tempting early use before the ADD-branch fix lands.
+                    this.attenTable = channel === 'sky' ? SUNLIGHT_ATTENUATION : BLOCKLIGHT_ATTENUATION;
+                    this.dedupe = channel === 'sky';
                     // World dimensions (cached to avoid repeated WORLD_DIMS lookups)
                     this.chunkSize = WORLD_DIMS.chunkSize;
                     this.chunkHeight = WORLD_DIMS.chunkHeight;
@@ -26156,21 +26181,27 @@
                 // Add task to work queue if not already queued
                 ensureQueued() {
                     if (this.inQueue || this.done || this.bailedOut) return;
-                    sunlightWorkQueue.push(this);
+                    lightWorkQueue.push(this);
                     this.inQueue = true;
                 }
-                // Resolve world coordinates to chunk/local coords and track visits
+                // Resolve world coordinates to chunk/local coords and track visits.
+                // CCR-LIGHT-004 Phase 3A: when !this.dedupe (block channel), skip the visitMap
+                // allocation/check entirely -- the old block-light loop had NO visit dedup, and
+                // adding one is not value-neutral (a re-raised cell's neighbors could strand at
+                // stale-lower values). Y-bounds check, touchedChunks tracking, and tracker.mark
+                // stay for BOTH channels.
                 resolveVisit(visitMap, qx, qy, qz) {
                     this.resolveVisitCalls++;
                     const ly = qy + this.yOffset;
                     if (ly < 0 || ly >= this.chunkHeight) return null;
                     const cx = Math.floor(qx / this.chunkSize);
                     const cz = Math.floor(qz / this.chunkSize);
-                    const lx = ((qx % this.chunkSize) + this.chunkSize) % this.chunkSize;
-                    const lz = ((qz % this.chunkSize) + this.chunkSize) % this.chunkSize;
                     const chunkKey = getChunkKey(cx, cz);
                     this.touchedChunks.add(chunkKey);
                     this.tracker?.mark(chunkKey);
+                    if (!this.dedupe) return chunkKey;
+                    const lx = ((qx % this.chunkSize) + this.chunkSize) % this.chunkSize;
+                    const lz = ((qz % this.chunkSize) + this.chunkSize) % this.chunkSize;
                     let visitTracker = visitMap.get(chunkKey);
                     if (!visitTracker) {
                         visitTracker = new Uint8Array(this.chunkVolume);
@@ -26269,7 +26300,7 @@
                     this.cleanupPendingUpdates(targets);
                     // Schedule chunk mesh rebuilds
                     this.scheduleChunkRebuilds(rebuildTargets);
-                    finalizeSunlightTask(this);
+                    finalizeLightTask(this);
                     return true;
                 }
                 // Collect affected chunks and their neighbors
@@ -26398,7 +26429,7 @@
                 const becameMoreTransparent = newAttenuation < oldAttenuation;
                 const shouldPrimeColumn = primeColumn || becameMoreTransparent;
                 // Create task to manage the update
-                const task = new SunlightTask(x, y, z, oldId, newId, tracker);
+                const task = new LightTask(x, y, z, oldId, newId, tracker, 'sky');
                 // Prime the sunlight column if needed (when block becomes transparent)
                 if (shouldPrimeColumn) {
                     primeSunlightColumn(task, x, z, tracker);
@@ -26423,7 +26454,7 @@
                 }
                 // Process initial steps and re-check pressure
                 if (!task.bailedOut) {
-                    const used = stepSunlightTask(task, Math.floor(SUNLIGHT_STEPS_PER_FRAME * 0.5));
+                    const used = stepLightTask(task, Math.floor(SUNLIGHT_STEPS_PER_FRAME * 0.5));
                     if (!task.done && !task.bailedOut) {
                         task.ensureQueued();
                         task.checkPressure();
@@ -26431,7 +26462,13 @@
                 }
                 return task;
             }
-            function stepSunlightTask(task, budget = SUNLIGHT_STEPS_PER_FRAME) {
+            // CCR-LIGHT-004 Phase 3A: single stepper for BOTH channels -- branches on
+            // task.channel inline per neighbor (no function indirection in the hot loop).
+            // Sky branches are byte-identical to the old stepSunlightTask; block branches are
+            // copied verbatim from updateBlockLightAt's old inline remove/add loops (values
+            // unchanged, only WHEN they run changes -- D4/D8; the missing-attenuation bug in
+            // both add branches is intentionally preserved here, fixed in Phase 3B).
+            function stepLightTask(task, budget = SUNLIGHT_STEPS_PER_FRAME) {
                 if (!task || task.bailedOut || task.done) return 0;
                 let steps = 0;
                 if (!task.enqueueBlocked && (task.blockedAddBuffer.length || task.blockedRemoveBuffer.length)) { task.flushBlocked(); }
@@ -26445,25 +26482,44 @@
                         const nx = lx + o[0];
                         const ny = ly + o[1];
                         const nz = lz + o[2];
-                        const nId = getBlock(nx, ny, nz);
-                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = getSkyLight(nx, ny, nz);
-                        if (nLight <= 1) continue;
+                        if (task.channel === 'block') {
+                            markLightChunkAt(task, nx, nz);
+                            const nId = getBlock(nx, ny, nz);
+                            if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                            const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
+                            if (nLight === 0) continue;
+                            if (nLight < level) {
+                                setBlockLight(nx, ny, nz, 0);
+                                task.enqueueRemove(nx, ny, nz, nLight);
+                            } else {
+                                const desiredNeighbor = Math.max(computeNeighborBlockLight(nx, ny, nz), getBlockEmission(nId));
+                                if (desiredNeighbor < nLight) {
+                                    setBlockLight(nx, ny, nz, desiredNeighbor);
+                                    task.enqueueRemove(nx, ny, nz, nLight);
+                                } else if (desiredNeighbor > nLight) {
+                                    task.enqueueAdd(nx, ny, nz, desiredNeighbor);
+                                }
+                            }
+                        } else {
+                            const nId = getBlock(nx, ny, nz);
+                            if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                            const nLight = getSkyLight(nx, ny, nz);
+                            if (nLight <= 1) continue;
 
-                        // ALWAYS compute what the neighbor's light should be based on all its sources
-                        // Don't assume dependency just because neighbor light < source light
-                        const desiredNeighbor = computeNeighborSunlight(nx, ny, nz);
+                            // ALWAYS compute what the neighbor's light should be based on all its sources
+                            // Don't assume dependency just because neighbor light < source light
+                            const desiredNeighbor = computeNeighborSunlight(nx, ny, nz);
 
-                        if (desiredNeighbor < nLight) {
-                            // Neighbor had too much light - reduce it and propagate the reduction
-                            setSkyLight(nx, ny, nz, desiredNeighbor);
-                            task.enqueueRemove(nx, ny, nz, nLight);
-                        } else if (desiredNeighbor > nLight) {
-                            // Neighbor should have MORE light (rare during removal, but handle it)
-                            task.enqueueAdd(nx, ny, nz, desiredNeighbor);
+                            if (desiredNeighbor < nLight) {
+                                // Neighbor had too much light - reduce it and propagate the reduction
+                                setSkyLight(nx, ny, nz, desiredNeighbor);
+                                task.enqueueRemove(nx, ny, nz, nLight);
+                            } else if (desiredNeighbor > nLight) {
+                                // Neighbor should have MORE light (rare during removal, but handle it)
+                                task.enqueueAdd(nx, ny, nz, desiredNeighbor);
+                            }
+                            // If desiredNeighbor === nLight, no change needed
                         }
-                        // If desiredNeighbor === nLight, no change needed
-
                         if (task.bailedOut) break;
                     }
                     if (task.checkPressure()) break;
@@ -26479,11 +26535,31 @@
                         const nx = lx + o[0];
                         const ny = ly + o[1];
                         const nz = lz + o[2];
-                        const nId = getBlock(nx, ny, nz);
-                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = getSkyLight(nx, ny, nz);
-                        const propagated = level > 1 ? level - 1 : 1;
-                        if (propagated > nLight) { setSkyLight(nx, ny, nz, propagated); task.enqueueAdd(nx, ny, nz, propagated); }
+                        if (task.channel === 'block') {
+                            markLightChunkAt(task, nx, nz);
+                            const nId = getBlock(nx, ny, nz);
+                            if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                            const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
+                            // CCR-LIGHT-004 3B (drift #7): was `level > 0 ? level - 1 : 0` with no
+                            // attenuation of the entered cell -- now charges the same entered-cell
+                            // cost as the full-recalc kernel/propagateLightBFS, via lightRuleEnter.
+                            const traveled = level > 0 ? level - 1 : 0;
+                            const propagated = lightRuleEnter(traveled, task.attenTable[nId], 0);
+                            if (propagated > nLight) {
+                                setBlockLight(nx, ny, nz, propagated);
+                                task.enqueueAdd(nx, ny, nz, propagated);
+                            }
+                        } else {
+                            const nId = getBlock(nx, ny, nz);
+                            if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
+                            const nLight = getSkyLight(nx, ny, nz);
+                            // CCR-LIGHT-004 3B (drift #7): was `level > 1 ? level - 1 : 1` with no
+                            // attenuation of the entered cell -- now charges the same entered-cell
+                            // cost as the full-recalc kernel/propagateLightBFS, via lightRuleEnter.
+                            const traveled = level > 1 ? level - 1 : 1;
+                            const propagated = lightRuleEnter(traveled, task.attenTable[nId], 1);
+                            if (propagated > nLight) { setSkyLight(nx, ny, nz, propagated); task.enqueueAdd(nx, ny, nz, propagated); }
+                        }
                         if (task.bailedOut) break;
                     }
                     if (task.checkPressure()) break;
@@ -26498,14 +26574,25 @@
                 }
                 return steps;
             }
-            function finalizeSunlightTask(task) { if (!task || task._finalized) return; task._finalized = true; if (typeof task.onComplete === "function") { task.onComplete(task); }}
+            // CCR-LIGHT-004 Phase 3A: marks the tracker for a scanned neighbor cell during
+            // block-light propagation, at the SAME pre-check position the old inline
+            // updateBlockLightAt loops called their local markBlockLightChunk closure --
+            // i.e. BEFORE the loaded/transparent checks. Does NOT touch touchedChunks (only
+            // real enqueues should grow the hard-cap accounting).
+            function markLightChunkAt(task, x, z) {
+                const chunkKey = getChunkKey(Math.floor(x / task.chunkSize), Math.floor(z / task.chunkSize));
+                task.tracker?.mark(chunkKey);
+            }
+            function finalizeLightTask(task) { if (!task || task._finalized) return; task._finalized = true; if (typeof task.onComplete === "function") { task.onComplete(task); }}
             function processSunlightQueue(stepBudget = SUNLIGHT_STEPS_PER_FRAME) {
+                // CCR-LIGHT-004 Phase 3A: drains lightWorkQueue -- both sky and block LightTasks
+                // share this single budgeted queue now. Name kept (seam-exported, D9).
                 let remaining = stepBudget;
-                for (let i = 0; i < sunlightWorkQueue.length && remaining > 0; ) {
-                    const task = sunlightWorkQueue[i];
-                    const used = stepSunlightTask(task, remaining);
+                for (let i = 0; i < lightWorkQueue.length && remaining > 0; ) {
+                    const task = lightWorkQueue[i];
+                    const used = stepLightTask(task, remaining);
                     remaining -= used;
-                    if (task.done || task.bailedOut) { finalizeSunlightTask(task); task.inQueue = false; sunlightWorkQueue.splice(i, 1); } else { i++; }
+                    if (task.done || task.bailedOut) { finalizeLightTask(task); task.inQueue = false; lightWorkQueue.splice(i, 1); } else { i++; }
                 }
             }
             function updateBlockLightAt(x, y, z, oldId, newId, tracker) {
@@ -26513,18 +26600,17 @@
                 const wasSource = getBlockEmission(oldId) > 0;
                 const isSource = getBlockEmission(newId) > 0;
                 const currentLight = clampBlockLight(getBlockLight(x, y, z));
-                const addQueue = [];
-                const removeQueue = [];
                 const baseLevel = isSource ? getBlockEmission(newId) : 0;
                 const transparent = IS_TRANSPARENT[newId];
-                const chunkSize = WORLD_DIMS.chunkSize;
-                const markBlockLightChunk = (qx, qz) => { if (!tracker) return; const chunkKey = getChunkKey(Math.floor(qx / chunkSize), Math.floor(qz / chunkSize)); tracker.mark(chunkKey); };
-                markBlockLightChunk(x, z);
+                // CCR-LIGHT-004 Phase 3A: block light now runs through the same budgeted
+                // LightTask machinery as sunlight (mechanical move; values byte-identical, D4/D8).
+                const task = new LightTask(x, y, z, oldId, newId, tracker, 'block');
+                tracker?.mark(getChunkKey(Math.floor(x / WORLD_DIMS.chunkSize), Math.floor(z / WORLD_DIMS.chunkSize)));
                 if (!transparent) {
                     if (currentLight !== baseLevel) {
                         setBlockLight(x, y, z, baseLevel);
-                        if (currentLight > baseLevel) removeQueue.push(x, y, z, currentLight);
-                        else if (baseLevel > currentLight) addQueue.push(x, y, z, baseLevel);
+                        if (currentLight > baseLevel) task.enqueueRemove(x, y, z, currentLight);
+                        else if (baseLevel > currentLight) task.enqueueAdd(x, y, z, baseLevel);
                     }
                 } else {
                     // FIX: When removing a light source (torch), don't compute from neighbors.
@@ -26534,58 +26620,23 @@
                     if (wasSource && !isSource) {
                         if (currentLight > 0) {
                             setBlockLight(x, y, z, 0);
-                            removeQueue.push(x, y, z, currentLight);
+                            task.enqueueRemove(x, y, z, currentLight);
                         }
                     } else {
                         const desired = Math.max(baseLevel, computeNeighborBlockLight(x, y, z));
-                        if (desired > currentLight) { setBlockLight(x, y, z, desired); addQueue.push(x, y, z, desired);
-                        } else if (desired < currentLight) { setBlockLight(x, y, z, desired); removeQueue.push(x, y, z, currentLight); }
+                        if (desired > currentLight) { setBlockLight(x, y, z, desired); task.enqueueAdd(x, y, z, desired);
+                        } else if (desired < currentLight) { setBlockLight(x, y, z, desired); task.enqueueRemove(x, y, z, currentLight); }
                     }
                 }
-                for (let i = 0; i < removeQueue.length; ) {
-                    const lx = removeQueue[i++];
-                    const ly = removeQueue[i++];
-                    const lz = removeQueue[i++];
-                    const level = clampBlockLight(removeQueue[i++]);
-                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
-                        const o = NEIGHBOR_OFFSETS[n];
-                        const nx = lx + o[0];
-                        const ny = ly + o[1];
-                        const nz = lz + o[2];
-                        markBlockLightChunk(nx, nz);
-                        const nId = getBlock(nx, ny, nz);
-                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
-                        if (nLight === 0) continue;
-                        if (nLight < level) { setBlockLight(nx, ny, nz, 0); removeQueue.push(nx, ny, nz, nLight);
-                        } else {
-                            const desiredNeighbor = Math.max(computeNeighborBlockLight(nx, ny, nz), getBlockEmission(nId));
-                            if (desiredNeighbor < nLight) { setBlockLight(nx, ny, nz, desiredNeighbor); removeQueue.push(nx, ny, nz, nLight);
-                            } else if (desiredNeighbor > nLight) { addQueue.push(nx, ny, nz, desiredNeighbor); }
-                        }
+                // Process initial steps and re-check pressure (mirrors updateSunlightAt's tail)
+                if (!task.bailedOut) {
+                    const used = stepLightTask(task, Math.floor(SUNLIGHT_STEPS_PER_FRAME * 0.5));
+                    if (!task.done && !task.bailedOut) {
+                        task.ensureQueued();
+                        task.checkPressure();
                     }
                 }
-                for (let i = 0; i < addQueue.length; ) {
-                    const lx = addQueue[i++];
-                    const ly = addQueue[i++];
-                    const lz = addQueue[i++];
-                    const level = clampBlockLight(addQueue[i++]);
-                    for (let n = 0; n < NEIGHBOR_OFFSETS.length; n++) {
-                        const o = NEIGHBOR_OFFSETS[n];
-                        const nx = lx + o[0];
-                        const ny = ly + o[1];
-                        const nz = lz + o[2];
-                        markBlockLightChunk(nx, nz);
-                        const nId = getBlock(nx, ny, nz);
-                        if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
-                        const nLight = clampBlockLight(getBlockLight(nx, ny, nz));
-                        const propagated = level > 0 ? level - 1 : 0;
-                        if (propagated > nLight) {
-                            setBlockLight(nx, ny, nz, propagated);
-                            addQueue.push(nx, ny, nz, propagated);
-                        }
-                    }
-                }
+                return task;
             }
             /**
              * setBlock - Facade function for block modifications with full side effects.
@@ -28206,9 +28257,13 @@ self.onmessage = async (e) => {
             // attenuation (kernel rule) instead of only -1 travel cost, and blockLight spreads inward
             // from chunk borders (previously imported exactly 1 cell deep); baked border light values
             // near chunk seams change, so existing worlds relight on first load (one-time cost);
+            // v8: CCR-LIGHT-004 Phase 3B -- incremental block/sky ADD loops (stepLightTask) now charge
+            // the entered cell's attenuation (previously only -1 travel cost, drift #7); edited/cached
+            // chunks may carry over-bright baked light from the old add rule, so existing worlds relight
+            // once on load to correct it;
             // v6: blocklight attenuation wired up (water 2/block) + incremental sunlight aligned with full recalc (TER-1/TER-2/TER-18);
             // v5: re-reconcile trees after deterministic site validation (slope/overhang); v4: canopy-prune fix; v3: water sunlight attenuation.
-            const CURRENT_CACHE_VERSION = 7;
+            const CURRENT_CACHE_VERSION = 8;
             let db = null;
             async function initDatabase() {
                 return new Promise((resolve, reject) => { const request = indexedDB.open(DB_NAME, DB_VERSION);
@@ -40131,7 +40186,8 @@ self.onmessage = async (e) => {
             //
             // OPTIMIZATION AUDIT: updateSunlightAt / updateBlockLightAt
             //   - LIGHTING: Called on block changes (event-driven)
-            //   - Creates SunlightTask for incremental updates
+            //   - Creates a LightTask for incremental updates (CCR-LIGHT-004 Phase 3A: both
+            //     the sky and block channels now share this task type)
             //   - Uses BFS remove/add queues for efficient propagation
             //   - Spreads work across frames via processSunlightQueue
             //   - No-op: Already optimized with task-based spreading
@@ -40242,10 +40298,25 @@ self.onmessage = async (e) => {
             }
 
             /**
+             * Entered-cell cost of the propagation rule (CCR-LIGHT-004 3B) -- pure extraction
+             * from propagateLightBFS's inline expression, single-sourcing the rule so the
+             * incremental stepLightTask ADD branches can share it (drift #7 fix: those branches
+             * used to charge only the -1 travel cost and skip the entered cell's attenuation).
+             * @param {number} traveled - level after the -1 travel cost (already floored)
+             * @param {number} attenuation - attenTable[enteredBlockId]
+             * @param {number} floor - minimum light value (1 = sky, 0 = block)
+             * @returns {number} light level arriving in the entered cell
+             */
+            function lightRuleEnter(traveled, attenuation, floor) {
+                return attenuation > 0 ? (traveled > attenuation ? traveled - attenuation : floor) : traveled;
+            }
+
+            /**
              * Monotone-max light flood fill over a flat [x,y,z,level,...] queue.
              * SINGLE SOURCE for the propagation rule (TER-1/TER-2/TER-18):
              *   entering a cell costs 1 (travel) + attenTable[enteredBlockId], floored at
-             *   `floor` (1 for skylight, 0 for blocklight).
+             *   `floor` (1 for skylight, 0 for blocklight). See lightRuleEnter for the entered-cell
+             *   cost as a standalone helper (CCR-LIGHT-004 3B), shared with stepLightTask's ADD branches.
              * Self-contained by design: all state arrives via `ctx` (worker-injectable,
              * CCR-LIGHT-004 D1). NEIGHBOR_OFFSETS and IS_TRANSPARENT are read as module
              * globals — both are already serialized into the worker (buildChunkWorkerCode);
@@ -40270,9 +40341,7 @@ self.onmessage = async (e) => {
                         const nId = getBlockId(nx, ny, nz);
                         if (nId === undefined || !IS_TRANSPARENT[nId]) continue;
                         const attenuation = attenTable[nId];
-                        const propagated = attenuation > 0
-                            ? (basePropagated > attenuation ? basePropagated - attenuation : floor)
-                            : basePropagated;
+                        const propagated = lightRuleEnter(basePropagated, attenuation, floor);
                         if (propagated <= floor) continue;
                         if (propagated > getLight(nx, ny, nz)) {
                             setLight(nx, ny, nz, propagated);
@@ -40286,8 +40355,8 @@ self.onmessage = async (e) => {
 
             function calculateChunkSunlight(chunk, chunkSize, chunkHeight) {
                 // ARCHITECTURE NOTE: This is the FULL-RECALC path for chunk lighting.
-                // Used during: (1) initial chunk generation, (2) SunlightTask bailout.
-                // For single-block changes, the incremental path uses SunlightTask instead.
+                // Used during: (1) initial chunk generation, (2) LightTask bailout.
+                // For single-block changes, the incremental path uses LightTask instead.
                 const blocks = chunk.blocks || chunk;
                 const expectedSize = chunkSize * chunkSize * chunkHeight;
                 // Ensure skyLight array is correct size (handles old cached chunks with different height)
@@ -40368,13 +40437,19 @@ self.onmessage = async (e) => {
 
                 const cs = chunkSize; // 16
                 const torchLevel = getTorchBlockLightLevel();
-                const fireLevel = BLOCK_LIGHT_EMISSION[FIRE];
-                if (torchLevel <= 0 && fireLevel <= 0) return;
 
                 // BFS queue for light propagation: [lx, ly, lz, level]
                 const queue = [];
 
-                // Seed every emissive block (torch OR fire) and propagate
+                // Seed every emissive block and propagate. CCR-LIGHT-004 Phase 4 / D7: mirrors
+                // getBlockEmission() exactly (TORCH special-cased via getTorchBlockLightLevel(),
+                // everything else via BLOCK_LIGHT_EMISSION) so a full recalc lights any emissive
+                // block the same way an incremental setBlock() edit would -- a future emissive
+                // block no longer goes dark on the next full recalc (audit finding #4). The old
+                // early-out (torchLevel <= 0 && fireLevel <= 0) was dropped rather than
+                // generalized -- the seed scan is cheap relative to the BFS.
+                // Mirrored logic (review-enforced, CLAUDE.md Lockstep Registry): keep this loop
+                // in lockstep with getBlockEmission() above.
                 for (let ly = 0; ly < chunkHeight; ly++) {
                     const yOff = ly << 8;
                     for (let lz = 0; lz < cs; lz++) {
@@ -40382,7 +40457,7 @@ self.onmessage = async (e) => {
                         for (let lx = 0; lx < cs; lx++) {
                             const idx = lx + zOff + yOff;
                             const b = blocks[idx];
-                            const emit = b === FIRE ? fireLevel : (b === TORCH ? torchLevel : 0);
+                            const emit = b === TORCH ? torchLevel : BLOCK_LIGHT_EMISSION[b];
                             if (emit > 0) {
                                 blockLight[idx] = emit;
                                 queue.push(lx, ly, lz, emit);
@@ -50021,7 +50096,8 @@ self.onmessage = async (e) => {
                     // --- CCR-LIGHT-004 Phase 0: incremental lighting path (characterization tests) ---
                     updateSunlightAt, updateBlockLightAt, processSunlightQueue, processLightQueue,
                     get lightUpdateQueueLength() { return lightUpdateQueue.length; },
-                    get sunlightWorkQueueLength() { return sunlightWorkQueue.length; },
+                    get sunlightWorkQueueLength() { return lightWorkQueue.length; }, // CCR-LIGHT-004 Phase 3A: renamed internally to lightWorkQueue; export key frozen (D9)
+                    BLOCK_LIGHT_EMISSION, // CCR-LIGHT-004 Phase 4: seam export for the emission-table-seeding characterization test
                     // --- CCR-LIGHT-004 Phase 2: edge-lighting pipeline (characterization tests) ---
                     propagateEdgeLighting, propagateLightFromEdgesInward,
                     // --- table init (data-driven from BLOCK_CONFIG) ---

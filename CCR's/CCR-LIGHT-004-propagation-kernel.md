@@ -22,8 +22,8 @@ hand-copied in **six places**, with divergent architectures around them:
 |---|---|---|---|
 | 1 | Full-recalc sunlight BFS (phase 2) | `function calculateChunkSunlight` | correct (TER-18) |
 | 2 | Full-recalc block-light BFS | `function calculateBlockLight` | correct (TER-1), but **seeding hardcodes TORCH/FIRE** and ignores `BLOCK_LIGHT_EMISSION` |
-| 3 | Incremental sunlight add/remove | `class SunlightTask` / `stepSunlightTask` | correct; budgeted + pressure-managed |
-| 4 | Incremental block-light add/remove | `function updateBlockLightAt` | correct rule, but **synchronous and unbudgeted** — no caps, no bailout, no task queue |
+| 3 | Incremental sunlight add/remove | `class SunlightTask` / `stepSunlightTask` | budgeted + pressure-managed; remove path correct, but **the ADD loop skips entered-cell attenuation** (charges only −1 travel — found in Phase 3 design review, 2026-07-10; fixed in Phase 3B) |
+| 4 | Incremental block-light add/remove | `function updateBlockLightAt` | remove path correct, but **synchronous and unbudgeted** — no caps, no bailout, no task queue — and **the ADD loop skips entered-cell attenuation** (same drift as #3; fixed in Phase 3B) |
 | 5 | Point queries | `computeNeighborSunlight` / `computeNeighborBlockLight` | correct (TER-1/TER-2 comments exist precisely to keep them in sync by hand) |
 | 6 | Edge lighting | `propagateEdgeLighting` + `propagateLightFromEdgesInward` | **WRONG — already drifted.** Charges only the −1 travel cost; ignores `SUNLIGHT_ATTENUATION`/`BLOCKLIGHT_ATTENUATION` of the entered cell, checks only `IS_TRANSPARENT`. And the inward BFS spreads **skylight only** — neighbor blockLight is imported exactly 1 cell deep and never propagated. |
 
@@ -107,12 +107,14 @@ plain task ownership and the watchdog to a diagnostic.
 | D5 | Watchdog | Stays fully active through Phase 3 + a soak period; demote to diagnostic-only in a LATER cleanup once `dumpLogs` shows zero watchdog-forced clears across sessions | CCR-LIGHT-001 humility — don't remove the safety net in the same change that touches the thing it guards |
 | D6 | `isCriticalLightJob` | Keep the player-chunk exemption but cap it (`CRITICAL_LIGHT_JOBS_PER_FRAME = 4`, tunable) once block light is budgeted — a capped critical lane preserves "my edit lights up immediately" without the unbounded frame | responsiveness vs hitch balance |
 | D7 | Seeding | `calculateBlockLight` seeds from `BLOCK_LIGHT_EMISSION[id]` with TORCH special-cased through `getTorchBlockLightLevel()` — i.e. exactly `getBlockEmission()`'s logic, shared | kills the mirrored-logic drift (audit finding #4) |
+| D8 | Incremental-add attenuation fix is its OWN gate (Phase 3B) | Phase 3A moves block light into the task machinery with values BYTE-IDENTICAL (bug preserved); Phase 3B then fixes both channels' ADD loops to charge entered-cell attenuation via a shared rule helper, with its own fixture update + `CURRENT_CACHE_VERSION` bump | never mix "provably no behavior change" and "deliberate behavior change" in one gate — that's what made Phases 1 and 2 independently verifiable |
+| D9 | Seam-name stability | Exported keys on `window.VoxEx` never change once a test uses them (`updateSunlightAt`, `updateBlockLightAt`, `processSunlightQueue`, `sunlightWorkQueueLength`, ...) — internal renames hide behind the same export keys | Phase 0 fixtures are the byte-parity instrument; breaking their imports invalidates the instrument mid-experiment |
 
 ## Version impact
 
 - `VOXEX_BUILD`: bump per phase + `VOXEX_RECENT_CHANGES` entry citing CCR-LIGHT-004 phase (always)
 - `TERRAIN_GEN_VERSION`: **no** (no terrain output change in any phase)
-- `CURRENT_CACHE_VERSION`: **Phase 2 only — yes** (edge-lighting semantics change baked light values); Phases 1/3/4 **no** (byte-identical / scheduling-only / seeding-of-blocks-that-don't-exist-yet + zero-fill fix)
+- `CURRENT_CACHE_VERSION`: **Phase 2 — yes** (6→7, SHIPPED); **Phase 3B — yes** (7→8: incremental-add attenuation fix changes light values baked into edited/cached chunks; relight-on-load corrects them). Phases 1/3A/4 **no** (byte-identical / scheduling-only / seeding-of-blocks-that-don't-exist-yet + zero-fill fix)
 - `SETTINGS_VERSION`: **no** (no `DEFAULTS` changes)
 
 ---
@@ -400,53 +402,218 @@ of neighbor torch light after flying away and back (streaming re-light).
 
 ---
 
-# PHASE 3 — Block light joins the task machinery (budgeted, one lifecycle)
+# PHASE 3 — Block light joins the task machinery (split 3A/3B per D8)
 
-**Goal:** `updateBlockLightAt`'s add/remove BFS (copies #4) runs through the same
-budgeted task type as sunlight; one finalize path; carve hitch shrinks. VALUES
-unchanged (D4).
+> **Expanded 2026-07-10 (Fable design pass)** from a constraints list into the
+> prescriptive plan below, after the design review found drift #7 (both incremental
+> ADD loops skip entered-cell attenuation — see Problem table rows 3/4 and the audit
+> addendum). 3A is the mechanical move (byte-identical, bug preserved); 3B is the
+> deliberate semantics fix with its own fixtures and cache bump. Never merge them.
 
-**Steps (this phase is design-heavy — implementer writes the detailed diff, these are
-the constraints):**
+## PHASE 3A — mechanical: one task type, both channels, values byte-identical
 
-1. Generalize `SunlightTask` → `LightTask` with a `channel` field (`'sky'`|`'block'`)
-   selecting attenuation table, floor, and get/set accessors. The class's queues,
-   visited maps, pressure caps, bailout, and stats stay channel-agnostic (they already
-   are). `stepSunlightTask`'s add loop becomes a kernel-shaped step (it may keep its
-   own loop for budget-slicing, but the RULE expression must be the shared one —
-   extract a tiny `propagateStep` helper from the kernel if needed rather than
-   copying the expression).
-2. `updateBlockLightAt` keeps its signature and its source-removal special case
-   (`wasSource && !isSource` → zero + remove, never `computeNeighborBlockLight` — that
-   comment block is load-bearing, keep it) but pushes its add/remove work into a
-   `LightTask('block')` instead of running inline loops to completion.
-3. `applyLocalizedRelight` finalizes ONE tracker for both channels (it already does —
-   the sun task's `onComplete` pattern extends to the block task; both tasks share the
-   job's tracker).
-4. **Bailout for the block channel** reuses `bailoutToFullRecalc` — which after Phase 4
-   recalcs with correct seeding. (Its missing edge re-import is CCR-LIGHT-005, not
-   here.)
-5. Cap the critical lane per D6: grep `isCriticalLightJob` usage in
-   `processLightQueue`; critical jobs get their own per-frame counter
-   (`CRITICAL_LIGHT_JOBS_PER_FRAME = 4`) instead of unlimited bypass.
-6. Delete the dead `level` read in the remove loop while restructuring it
-   (audit finding #12).
-7. `pendingLightChunks` refcount SURVIVES this phase untouched (D5) — but every
-   mark/clear now flows through exactly two places (task create / task finalize),
-   which is what makes the later watchdog demotion safe.
+**Goal:** `updateBlockLightAt`'s inline BFS runs through the same budgeted task
+machinery as sunlight; one finalize path; the critical lane gets capped (D6). Light
+VALUES at quiescence unchanged — all existing checksum fixtures must pass untouched,
+and **no test-file edits are allowed in 3A**.
+
+**Why values survive the move:** the two channels are independent (separate arrays;
+block reads `blockLight`+`blocks`, sky reads `skyLight`+`blocks`; `blocks` doesn't
+change during light processing), so interleaving their work across frames commutes;
+within a task, remove-before-add is preserved (see AUDIT FLAG below); and the block
+channel keeps its exact per-cell rules (bug included, per D8).
+
+### #3A.1 — Renames (internal only; seam export KEYS frozen per D9)
+
+- `class SunlightTask` → `class LightTask`; constructor `(x, y, z, oldId, newId,
+  tracker, channel)` storing `this.channel = channel;`,
+  `this.floor = channel === 'sky' ? 1 : 0;`, and `this.dedupe = channel === 'sky';`
+  (see #3A.2 for why block must NOT dedupe).
+- `sunlightWorkQueue` → `lightWorkQueue` (sites: declaration, `ensureQueued`,
+  `processSunlightQueue`, the watchdog's `noLightWork` check — grep
+  `sunlightWorkQueue.length === 0` — and the seam getter BODY; the exported key
+  `sunlightWorkQueueLength` keeps its name with a comment).
+- `stepSunlightTask` → `stepLightTask`; `finalizeSunlightTask` → `finalizeLightTask`
+  (callers: `updateSunlightAt`, `processSunlightQueue`, `bailoutToFullRecalc`).
+- `processSunlightQueue`, `updateSunlightAt`, `updateBlockLightAt` KEEP their names
+  (seam-exported); update `processSunlightQueue`'s comment: it drains
+  `lightWorkQueue`, both channels.
+- `updateSunlightAt`'s construction site: `new LightTask(x, y, z, oldId, newId,
+  tracker, 'sky')`.
+- After all renames: grep `SunlightTask`, `sunlightWorkQueue`, `stepSunlightTask`,
+  `finalizeSunlightTask` → remaining hits must be comments/changelog strings only.
+  Update CLAUDE.md's Classes table row in the same commit.
+
+### #3A.2 — `LightTask` semantics knobs (the two places the channels really differ)
+
+**Dedup:** sky tasks use the per-chunk `visited` Uint8Arrays (existing `resolveVisit`
+behavior). The old block code had NO visited dedup — and adding it is NOT
+value-neutral: `setLight` happens at the propagation site but the queue insertion is
+what re-propagates, so deduping a re-raised cell can strand its neighbors at
+stale-lower values. (Sunlight lives with this today; block must not inherit it in a
+byte-identical phase.) So: when `!this.dedupe`, `resolveVisit` skips the visitMap
+allocation/check entirely but KEEPS the Y-bounds check, `touchedChunks.add`, and
+`tracker.mark`. Bonus: block tasks allocate zero 80 KB visit arrays, which
+neutralizes the GC residual-risk for the common case.
+
+*(Bounds-check note: the old block loop tolerated out-of-Y-range walk — `getBlock`
+returns AIR out of range, `setBlockLight` no-ops — a bounded useless walk. Adding the
+bounds check cannot change values: any propagation re-entering range from a virtual
+out-of-range cell is strictly dimmer than the in-range path that fed it.)*
+
+**Chunk marking:** the old `markBlockLightChunk` marked the tracker for EVERY
+scanned neighbor — before the transparency/loaded checks. Preserve exactly: new
+module helper `markLightChunkAt(task, x, z)` (computes the chunk key, calls
+`task.tracker?.mark(key)`; does NOT touch `touchedChunks` — caps must keep growing
+only via real enqueues) — called in the block branches at the same pre-check position
+the old code called `markBlockLightChunk`. Grep-before-declare.
+
+### #3A.3 — `stepLightTask` channel branches
+
+Both loops read all four queue entries (the previously-dead `level` read becomes
+live — the block remove branch uses it; audit finding #12 resolves itself).
+
+**Remove loop** (`while (!task.bailedOut && task.removeIndex < ...)`), per neighbor:
+
+- sky branch: existing code verbatim (transparent check → `nLight <= 1` skip →
+  `computeNeighborSunlight` → set/enqueue on `<`/`>`).
+- block branch (verbatim from `updateBlockLightAt`'s remove loop):
+  `markLightChunkAt(task, nx, nz);` FIRST; then loaded/transparent checks;
+  `nLight = clampBlockLight(getBlockLight(...))`; `if (nLight === 0) continue;`
+  `if (nLight < level) { setBlockLight(nx, ny, nz, 0); task.enqueueRemove(nx, ny, nz, nLight); }
+  else { const desired = Math.max(computeNeighborBlockLight(nx, ny, nz), getBlockEmission(nId));
+  if (desired < nLight) { setBlockLight(...desired); task.enqueueRemove(...nLight); }
+  else if (desired > nLight) { task.enqueueAdd(...desired); } }`
+
+**Add loop**, per neighbor:
+
+- sky branch: existing code verbatim (`propagated = level > 1 ? level - 1 : 1` — the
+  missing-attenuation bug stays in 3A, per D8).
+- block branch: `markLightChunkAt` first; `propagated = level > 0 ? level - 1 : 0;`
+  write+enqueue on `propagated > nLight` (bug stays likewise).
+
+Branch on `task.channel === 'block'` inline — two readable branches, no function
+indirection in the hot loop.
+
+### #3A.4 — `updateBlockLightAt` rewrite
+
+Keeps its signature and NOW RETURNS the task. The `wasSource`/`isSource`/transparent
+decision tree at the top stays verbatim (the "don't compute from neighbors when
+removing a source" comment is load-bearing); its seeds go to
+`task.enqueueRemove`/`task.enqueueAdd` instead of local arrays; the inline add/remove
+loops are DELETED (they now live in `stepLightTask`'s block branches). Tail mirrors
+`updateSunlightAt`: initial burst `stepLightTask(task, Math.floor(
+SUNLIGHT_STEPS_PER_FRAME * 0.5))`, then `ensureQueued()` + `checkPressure()` if not
+done, return task. The old local `markBlockLightChunk` closure is deleted
+(superseded by `markLightChunkAt`); the initial `markBlockLightChunk(x, z)` call
+becomes `tracker?.mark(<this chunk's key>)` exactly as before.
+
+### #3A.5 — `applyLocalizedRelight` finalizes when BOTH tasks complete
+
+```js
+const sunTask = updateSunlightAt(x, y, z, prevId, nextId, tracker, job.primeColumn);
+const blockTask = updateBlockLightAt(x, y, z, prevId, nextId, tracker);
+let pending = 0;
+const onTaskDone = () => { pending--; if (pending <= 0) finalizeLightTracker(tracker); };
+if (sunTask && !sunTask.done && !sunTask.bailedOut) { pending++; sunTask.onComplete = onTaskDone; }
+if (blockTask && !blockTask.done && !blockTask.bailedOut) { pending++; blockTask.onComplete = onTaskDone; }
+if (pending === 0) finalizeLightTracker(tracker);
+```
+
+(The existing code already allocates an `onComplete` closure here — per-job, not
+per-cell, so this stays within the hot-path rules. Keep the explanatory comment
+about the removed redundant `calculateBlockLight()` call.)
+
+**Bailout:** block tasks inherit `bailoutToFullRecalc` unchanged — it already recalcs
+BOTH channels over the 3×3 neighborhood and fires `finalizeLightTask` → `onComplete`.
+Its known cross-chunk truncation is CCR-LIGHT-005 scope, and block-channel bailouts
+are no worse than today's sunlight bailouts.
+
+### #3A.6 — Critical-lane cap (D6)
+
+New const next to `MAX_LIGHT_UPDATES_PER_FRAME` (grep):
+`const CRITICAL_LIGHT_JOBS_PER_FRAME = 4; // D6 (CCR-LIGHT-004 3A): was an UNLIMITED bypass`.
+In `processLightQueue`: add `let criticalProcessed = 0;`; replace the break condition:
+
+```js
+if (!critical && processed >= limit) break;
+if (critical && criticalProcessed >= CRITICAL_LIGHT_JOBS_PER_FRAME && processed >= limit) break;
+```
+
+…and `if (critical) criticalProcessed++;` beside `processed++`. (Criticals beyond
+the cap may still consume the ordinary budget; the queue stays FIFO — a capped
+critical head simply waits a frame, same as any over-budget job.)
 
 **AUDIT FLAG (ordering):** block-light REMOVE must fully drain before its paired ADD
-processes (the two-phase remove-then-readd algorithm assumes it). `SunlightTask`
-already enforces remove-before-add inside one task (`removeIndex >= removeQueue.length`
-gate in `stepSunlightTask`) — the block channel inherits that for free. Do NOT split
-a single edit's remove and add into two separate tasks.
+processes (the two-phase remove-then-readd algorithm assumes it). `stepLightTask`'s
+structure (add loop gated on `removeIndex >= removeQueue.length`) enforces this
+inside one task. Do NOT split a single edit's remove and add into two tasks.
 
-**PHASE 3 ACCEPTANCE GATE:** suite GREEN, checksum test byte-identical to Phase 2
-fixture (values unchanged — only timing moved); in-game: torch place/break in a big
-cave shows no visible lag in the lit result and no frame hitch (compare Phase 0
-baseline `console.time` numbers — record both in As-built); power-5 explosion carve
-ms via `dumpLogs('magic')` compared against Phase 0 baseline; 10-minute streaming
-soak with zero watchdog force-clears (`dumpLogs` filter `ChunkUpdate`).
+**PHASE 3A ACCEPTANCE GATE:** suite GREEN with ALL existing checksum fixtures
+byte-identical (four Phase 0 values + the Phase 2 edge pair) and zero test-file
+edits; worker parity GREEN (nothing injected changed — confirm, don't assume);
+in-game: torch place/break in a big cave shows no visible lag in the lit result and
+no frame hitch vs the Phase 0 baseline numbers; power-5 explosion carve ms via
+`dumpLogs('magic')` vs baseline; 10-minute streaming soak with zero watchdog
+force-clears (`dumpLogs` filter `ChunkUpdate`). `VOXEX_BUILD` bump; NO cache bump.
+
+## PHASE 3B — incremental ADD loops charge entered-cell attenuation (drift #7 fix)
+
+**Goal:** the last two rule copies converge on the kernel rule. Deliberate values
+change: `CURRENT_CACHE_VERSION` 7 → 8.
+
+### #3B.1 — Shared rule helper (pure extraction from the kernel)
+
+Next to `propagateLightBFS`:
+
+```js
+/** Entered-cell cost of the propagation rule — see propagateLightBFS. */
+function lightRuleEnter(traveled, attenuation, floor) {
+    return attenuation > 0 ? (traveled > attenuation ? traveled - attenuation : floor) : traveled;
+}
+```
+
+Refactor the kernel's inline expression to call it (byte-identical extraction — the
+worker parity test gates this), and add `lightRuleEnter` to the
+`WORKER_LIGHTING_ENABLED` injection list.
+
+### #3B.2 — Apply in `stepLightTask`'s add branches
+
+Constructor gains `this.attenTable = channel === 'sky' ? SUNLIGHT_ATTENUATION :
+BLOCKLIGHT_ATTENUATION;` (added now, not in 3A — 3A must not carry unused fields
+that tempt early use). Sky add branch: `const traveled = level > 1 ? level - 1 : 1;
+const propagated = lightRuleEnter(traveled, task.attenTable[nId], 1);` — write
+condition `propagated > nLight` unchanged (a floor-value result never beats the ≥1
+sky pre-fill / ≥0 block default, same argument as Phase 1's AUDIT FLAG). Block add
+branch: same with `traveled = level > 0 ? level - 1 : 0` and floor 0. The REMOVE
+branches need nothing — their `computeNeighbor*` desired-value queries were always
+attenuation-aware.
+
+### #3B.3 — Fixtures + new spot test
+
+- The edit-script checksums (`568040165` / `362651077`) are EXPECTED to change —
+  re-capture and update in the same commit. If either does NOT change, the script
+  doesn't exercise attenuated adds — extend it until it does (that's a test gap,
+  not a pass).
+- Full-recalc (`1821834511` / `725244334`) and edge-pipeline fixtures MUST NOT
+  change (those paths are untouched).
+- New spot test beside the edit-script suite: place a TORCH adjacent to the water
+  pool, drain to quiescence, assert hand-computed values — first water cell
+  `= emission − 1 − 2`, second `= first − 3`; plus one sky case (break a block so
+  light enters water horizontally, cell pays `1 + 1`). Actuals must match hand
+  computation before baking (Phase 2 discipline).
+
+### #3B.4 — Version impact
+
+`CURRENT_CACHE_VERSION` 7 → 8 (comment cites CCR-LIGHT-004 3B — edited chunks carry
+over-bright baked light from the old add rule; relight-on-load corrects them).
+`VOXEX_BUILD` bump + recent-changes entry noting the one-time relight.
+
+**PHASE 3B ACCEPTANCE GATE:** suite GREEN; ONLY the edit-script + new spot fixtures
+changed, every delta explained by hand computation; worker parity GREEN (kernel was
+touched); in-game: a torch placed beside water / under a leaf canopy reads dimmer
+through the medium IMMEDIATELY (previously only after a reload or full recalc
+corrected it).
 
 ---
 
@@ -589,6 +756,20 @@ file (Read/Grep tools — authoritative per agent-notes §7; bash mount never tr
 3. **Phase 0 rewritten** from "confirm whether tests exist" to the audited fact list
    plus the two specific missing tests.
 
+**Addendum (2026-07-10, Phase 3 design pass) — drift #7, missed by the original
+audit:** the incremental ADD loops in BOTH channels charge only the −1 travel cost
+and skip the entered cell's attenuation (as of build 2026-07-10.3: grep
+`const propagated = level > 1 ? level - 1 : 1;` in `stepSunlightTask`'s add loop and
+`const propagated = level > 0 ? level - 1 : 0;` in `updateBlockLightAt`'s add loop —
+after 3A these live in `stepLightTask`'s two add branches) — while the same
+functions' REMOVE paths (via the
+attenuation-aware `computeNeighbor*` queries) and both full-recalc calculators apply
+it. Net effect: light added incrementally through water/leaves/ICE is too bright
+until some later full recalc corrects it. The original audit marked rows 3/4
+"correct" — table corrected, fix scheduled as Phase 3B with its own gate (D8). The
+original residual-risk note below about visit-array GC pressure is addressed by
+3A's `dedupe=false` design for the block channel (no visit arrays allocated at all).
+
 **Residual risks the implementer should hold in mind (no spec change needed):**
 
 - `LightTask` visited maps allocate a `Uint8Array(chunkVolume)` (80 KB) per touched
@@ -621,6 +802,34 @@ file (Read/Grep tools — authoritative per agent-notes §7; bash mount never tr
   - Gates: `syntax-check` + `parity-check` GREEN. CRLF invariant (`tr -cd '\r' | wc -c == wc -l`) held on both files after every edit — no truncation/desync incident this session (the bash-mount-only edit method with `count()==1` uniqueness asserts avoided the Edit-tool cache-desync class of failure entirely). Full browser suite **383/383** headless (382 pre-existing + 1 new); the four Phase 0 checksums (`1821834511`/`725244334`/`568040165`/`362651077`) confirmed UNCHANGED and passing.
   - In-game seam observations: NOT performed this run (sandboxed, headless-only environment per agent-notes §7 — no live renderer). The acceptance gate's in-game eyeball items (torch-behind-water-at-a-border reads equally dim from both sides; cave-under-canopy-crossing-a-border shows no brightness step; no dark 1-cell rim of neighbor torch light after streaming re-light) are OPEN, for the user's own hands-on session.
   - Deviations: none from the CCR's #2.1-#2.5 text. No git operations performed (sandbox note honored).
-- Phase 3: <before/after hitch numbers; soak result>
-- Phase 4: <deviations>
-- Follow-ups spawned: CCR-LIGHT-005 (full-recalc edge re-import), heightmap CCR (only if numbers demand), watchdog demotion (after soak per D5)
+- **Phase 3A — DONE 2026-07-10, build `2026-07-10.4`** (Sonnet subagent; sandbox session, uncommitted -- commit from Windows):
+  - `voxEx.html` (18 replacements, all via bash-mount Python edits per agent-notes §7, zero Edit-tool use on voxEx.html/tools/voxex-tests.html this session): `class SunlightTask` -> `class LightTask`, constructor gains a `channel` param (`'sky'`|`'block'`) storing `this.channel`/`this.floor` (`1`/`0`)/`this.dedupe` (`true` only for `'sky'`); `sunlightWorkQueue` -> `lightWorkQueue` (declaration, `ensureQueued`, `processSunlightQueue`'s loop, the watchdog's `noLightWork` check); `stepSunlightTask` -> `stepLightTask`; `finalizeSunlightTask` -> `finalizeLightTask`. Seam-exported keys unchanged per D9 (`updateSunlightAt`, `updateBlockLightAt`, `processSunlightQueue`, `sunlightWorkQueueLength` -- the getter body now reads `lightWorkQueue.length` under the frozen key name). `resolveVisit` gained the `dedupe` branch (#3A.2): when `!this.dedupe` it returns the chunk key right after the Y-bounds check + `touchedChunks.add` + `tracker.mark`, skipping the 80 KB visit-array allocation/check entirely -- block tasks never allocate one. New module helper `markLightChunkAt(task, x, z)` (tracker-mark only, no `touchedChunks`) replaces the old per-call `markBlockLightChunk` closure, called at the identical pre-check position in both of `stepLightTask`'s channel branches (#3A.3) -- copied verbatim from `updateBlockLightAt`'s old inline remove/add loops, missing-attenuation bug in the add branches preserved on purpose (Phase 3B's job, per D8). `updateBlockLightAt` rewritten (#3A.4): the `wasSource`/`isSource`/transparent decision tree is untouched (load-bearing comment intact), seeds now go through `task.enqueueAdd`/`enqueueRemove` instead of local arrays, the inline loops are gone (they live in `stepLightTask` now), tail mirrors `updateSunlightAt` (initial burst `stepLightTask(task, SUNLIGHT_STEPS_PER_FRAME*0.5)`, then `ensureQueued()`+`checkPressure()` if not done), function now **returns the task**. `applyLocalizedRelight` (#3A.5) holds both tasks and only finalizes the tracker once both are done/bailed via a small completion refcount, matching the CCR's exact snippet. `processLightQueue` (#3A.6) gained `const CRITICAL_LIGHT_JOBS_PER_FRAME = 4` and a second break condition (`critical && criticalProcessed >= cap && processed >= limit`) plus `criticalProcessed++` beside `processed++` -- exactly the D6 text. Two doc comments (`OPTIMIZATION AUDIT: updateSunlightAt / updateBlockLightAt`, and the `ARCHITECTURE NOTE` above `calculateChunkSunlight`) updated from `SunlightTask` to `LightTask` for accuracy (not required by the CCR, done for consistency -- both are live doc comments, not changelog strings). `VOXEX_BUILD` -> `2026-07-10.4` + a `VOXEX_RECENT_CHANGES` entry. `CLAUDE.md` updated in the same pass (Lighting Engine bullets, Classes table row, Development Guidelines item 7, Common Search Patterns line) via the same bash-Python method for consistency, even though CLAUDE.md wasn't bash-written this session.
+  - Grep confirmation: `SunlightTask`/`stepSunlightTask`/`finalizeSunlightTask` have zero remaining hits outside historical `VOXEX_RECENT_CHANGES` changelog strings and two explanatory comments that explicitly reference the old name for context (`// Phase 3A: renamed from SunlightTask...`, `// Sky branches are byte-identical to the old stepSunlightTask...`). `sunlightWorkQueue` survives ONLY as the frozen seam property name `sunlightWorkQueueLength` (D9) plus a comment explaining the internal rename. `class LightTask`/`function stepLightTask`/`function markLightChunkAt`/`function finalizeLightTask` each declared exactly once (grep-before-declare honored). Worker injection list (grep `WORKER_LIGHTING_ENABLED ?`) unchanged -- still only `propagateLightBFS`/`_chunkLocalLightCtx`/the 4 ctx accessors/`calculateChunkSunlight`; nothing touched in this phase is injected, confirmed.
+  - Gates: `tr -cd '\r' < voxEx.html | wc -c` == `wc -l` held throughout (no truncation/desync incident -- the bash-mount-only edit method with `count()==1` uniqueness asserts continues to avoid the Edit-tool cache-desync class of failure). `syntax-check` + `parity-check` GREEN. Full browser suite **383/383** headless -- IDENTICAL count to the post-Phase-2 baseline (zero new tests, as required -- 3A explicitly forbids test-file edits), confirming all six existing checksum fixtures (Phase 0's sunlight `1821834511`/blockLight `725244334`/edit-script-sky `568040165`/edit-script-block `362651077`, Phase 2's edge-pipeline sky `1889740755`/block `787091577`) passed byte-identical without modification. No `CURRENT_CACHE_VERSION`/`TERRAIN_GEN_VERSION`/`SETTINGS_VERSION` bump, per plan.
+  - Deviations from the CCR text: none of substance. Minor: the explicit `tracker?.mark(...)` call retained at the top of `updateBlockLightAt` per the CCR's own instruction is technically redundant with `LightTask`'s constructor already marking the same base chunk key -- kept anyway exactly as directed (harmless, `mark()` is idempotent). Two extra doc-comment renames (noted above) beyond the CCR's explicit scope, done for accuracy.
+  - In-game gate items pending (Kandler): torch place/break in a large open cave shows no visible hitch vs the Phase 0 baseline numbers; power-5 explosion carve ms via `dumpLogs('magic')` compared against baseline; a 10-minute streaming soak with zero watchdog force-clears (`dumpLogs` filter `ChunkUpdate`). This sandbox session is headless-only (agent-notes §7) and cannot perform these.
+- **Phase 3B — DONE 2026-07-10, build `2026-07-10.5`** (Sonnet subagent; sandbox session, uncommitted — commit from Windows):
+  - `voxEx.html` (9 replacements, all via bash-mount Python edits per agent-notes §7, zero Edit-tool use on voxEx.html/tools/voxex-tests.html this session): new `lightRuleEnter(traveled, attenuation, floor)` helper inserted directly above `propagateLightBFS` (grep `UNIFIED LIGHT-PROPAGATION KERNEL`) — a pure extraction of the kernel's inline ternary; the kernel body now calls it (`const propagated = lightRuleEnter(basePropagated, attenuation, floor);`), and `lightRuleEnter` joined the `WORKER_LIGHTING_ENABLED` injection list immediately before `propagateLightBFS` (order is cosmetic — function declarations hoist). `LightTask`'s constructor gains `this.attenTable = channel === 'sky' ? SUNLIGHT_ATTENUATION : BLOCKLIGHT_ATTENUATION;` next to `this.floor`, added in 3B specifically per D8 (not carried unused through 3A). `stepLightTask`'s two ADD branches (sky and block) each gained a `traveled` local (unchanged formula: `level > 1 ? level - 1 : 1` sky / `level > 0 ? level - 1 : 0` block) followed by `const propagated = lightRuleEnter(traveled, task.attenTable[nId], <floor>);` replacing the old un-attenuated `propagated` — the write condition (`propagated > nLight`) is untouched. REMOVE branches were not touched (their `computeNeighborSunlight`/`computeNeighborBlockLight` desired-value queries were already attenuation-aware, confirmed by re-reading both before editing). `CURRENT_CACHE_VERSION` 7 → 8 with a new `v8:` comment line citing this phase. `VOXEX_BUILD` → `2026-07-10.5` + a `VOXEX_RECENT_CHANGES` entry (see build banner for the full text, including the two test-geometry corrections below).
+  - `tools/voxex-tests.html`: new describe `lighting: incremental ADD attenuation fix (CCR-LIGHT-004 Phase 3B — drift #7)` with 2 spot-value tests, PLUS an extension of the existing Phase 0 edit-script test (steps 5-7). **Two characterization-time corrections, both caught by comparing actuals to hand computation before baking anything in (Phase 2 discipline honored) — neither implicated the production fix:**
+    1. The block-channel spot test's first draft (torch beside a 2-deep water column with only single-cell side walls) failed `Expected 9, got 11` on the second water cell. Root cause: with only single-cell walls, light from the torch could reach the second cell via a cheaper indirect path (up through open air beside the first cell, then sideways into the pool from above) that pays WATER's attenuation only once instead of twice — a LEGITIMATE higher value under monotone-max BFS, not a bug. Fixed by fully enclosing the 2-cell water column in STONE on every face except the single torch-side opening, eliminating the alternate path. First water cell = 12 (`15-1-2`), second = 9 (`12-1-2`), confirmed on the corrected geometry.
+    2. The sky-channel spot test's first draft (a single-cell STONE plug directly under open sky, broken in one edit) failed `Expected 13, got 1` — the water cell never received ANY light. Root cause: `calculateChunkSunlight`/`primeSunlightColumn` store the light ARRIVING at a cell (TER-2 convention), computed from what's strictly ABOVE it, independent of the cell's OWN material — so a lone solid block sitting directly under open sky already reads phantom-15 in the array WHILE STILL SOLID, identical to what it reads once broken. Breaking it therefore registers `target === prev`, no enqueue, no propagation — not a production bug, a property of the phantom-value convention (confirmed by tracing `calculateChunkSunlight`'s phase-1 loop and `primeSunlightColumn` line-by-line: `skyLight[idx] = currentLight > 1 ? currentLight : 1` is written BEFORE that cell's own attenuation is applied, using light arriving from above only). Fixed with a 2-thick removable wall (an outer plug stacked directly above an inner plug, both adjacent to the water only through the inner one) mined via two real incremental edits, mirroring actual gameplay: breaking the OUTER layer first genuinely changes the INNER layer's own phantom value (1 → 15, since it's no longer shadowed), which correctly enqueues and propagates — verified against the fixed code, not assumed. Final: water cell = 13 (`15-1-1`), asserted after both edits; the opened cell itself (now genuinely AIR) also asserted at 15, satisfying the CCR's literal "air cell at skylight 15 beside a water cell" wording.
+  - **Fixture re-capture (characterization workflow: run headless → read actual from the failing assertion → bake in → re-run green), per #3B.3:** the existing Phase 0 edit-script checksums did NOT move on the first post-fix run with the ORIGINAL 4-step script (torch far from water, place/break stone directly over the already-open water pool) — exactly the coverage gap the CCR warned about, not a pass. Root cause (same class as correction #1 above): the torch's place-then-break fully self-cancels via the REMOVE path (already attenuation-aware, untouched by 3B), and the stone-over-water edit's effect is dominated by the pool's other 15 columns, which stay continuously open to full sun for the whole test and were correctly lit by the (unaffected) full-recalc kernel during the very first `calculateChunkSunlight` call — so nothing the incremental ADD path computes for that one column ever wins the monotone-max comparison. Fixed by extending the SAME script (not replacing it) with steps (5)-(7): a sealed 2-deep water pocket with a torch placed in its one opening (left in place, not broken, so the effect persists to the final checksum) and a sealed water pocket behind a 2-thick wall mined open (also left open). With those three extra edits, both checksums genuinely move: sky `568040165 → 1768186114`, block `362651077 → 1948544033`. The four OTHER fixtures (full-recalc sunlight `1821834511` / blockLight `725244334`, edge-pipeline sky `1889740755` / block `787091577`) are confirmed BYTE-IDENTICAL and untouched — those paths are not exercised by this phase.
+  - Gates: CRLF invariant (`tr -cd '\r' < voxEx.html | wc -c` == `wc -l`; same for `tools/voxex-tests.html`) held through every edit, including the two test-geometry iterations and a changelog-string fix (an unescaped literal `"..."` quote pair inside the double-quoted `VOXEX_RECENT_CHANGES` entry broke `syntax-check` once — caught immediately by the syntax gate, fixed by rewording, no other impact). `node tools/syntax-check.mjs` and `node tools/parity-check.mjs` GREEN after the final edit. Full browser suite **385/385** headless (383 pre-existing + 2 new spot tests), confirmed on the FINAL corrected geometry — worker sunlight byte-parity green (gates the kernel's pure-extraction refactor, confirming it stayed byte-identical despite the `lightRuleEnter` call replacing the inline ternary).
+  - In-game gate items pending (Kandler, headless sandbox cannot perform): a torch placed beside water / under a leaf canopy now reads dimmer through the medium IMMEDIATELY on placement (previously only corrected by a reload or full recalc); first load of an existing save takes one-time longer (relight pass) then behaves normally.
+  - Deviations from the CCR text: none of substance to the PRODUCTION code (#3B.1/#3B.2 implemented exactly as specced). Test design deviated from the CCR's sketch geometry in the two ways documented above (full enclosure for the block test; a 2-thick wall + two edits for the sky test, instead of a single plug) — both are refinements the CCR anticipated in spirit ("Actuals must match hand computation before baking" / "if it doesn't move, extend it") rather than deviations from its intent. `CLAUDE.md`'s Lighting Engine section and Classes/Development-Guidelines references were updated in the same pass (bash-Python method) to describe `lightRuleEnter`/`this.attenTable` and drop the stale "Phases 3-4 not yet built" wording.
+- **Phase 4 -- DONE 2026-07-10, build `2026-07-10.6`** (Sonnet subagent; sandbox session, uncommitted -- commit from Windows):
+  - `voxEx.html` (9 replacements, all via bash-mount Python edits per agent-notes Sec.7, zero Edit-tool use on voxEx.html/tools/voxex-tests.html this session): `calculateBlockLight`'s seed loop (#4.1) rewritten from `const emit = b === FIRE ? fireLevel : (b === TORCH ? torchLevel : 0);` (with the `fireLevel` const and the `if (torchLevel <= 0 && fireLevel <= 0) return;` early-out) to `const emit = b === TORCH ? torchLevel : BLOCK_LIGHT_EMISSION[b];` -- exactly `getBlockEmission()`'s rule (D7). Chose to DROP the early-out entirely rather than generalize it (the CCR's own suggested option): the seed scan is a cheap O(chunkVolume) pass relative to the BFS it feeds, and a dropped early-out means the emission table can gain new entries with zero further changes to this loop. Confirmed via grep that `calculateBlockLight` is absent from every `WORKER_LIGHTING_ENABLED` injection list (still only `lightRuleEnter`/`propagateLightBFS`/`_chunkLocalLightCtx`/the 4 ctx accessors/`calculateChunkSunlight`) -- it stays main-only, as the CCR's worker-parity table requires (fresh terrain has no torches, PERF-013 invariant). Added matching lockstep comments at both mirror sites: a new paragraph in `getBlockEmission`'s existing JSDoc block (inserted just above `@param`, anchored on ASCII-only text to sidestep the em-dash-laden line above it) and a comment block above the seed loop, both citing "Mirrored logic (review-enforced, CLAUDE.md Lockstep Registry)". `VoxelWorld.setBlock`'s three `blockLight: ...fill(1)` sites (#4.2 -- new-chunk create at the `size` allocation, legacy-format upgrade at the `legacySize` allocation, and the missing-array backfill `if (!chunk.blockLight) chunk.blockLight = new Uint8Array(chunk.blocks.length)`) all dropped `.fill(1)` in favor of the zero-filled default, each with an inline comment citing this phase; grep confirmed these were the only three `blockLight`+`fill(1)` producers file-wide, matching the audit's count. `BLOCK_LIGHT_EMISSION` added to the `window.VoxEx` seam export (it was a main-thread table with no seam visibility before this phase) in the existing `CCR-LIGHT-004 Phase 0` export group, with a comment noting it exists to support the new characterization test. #4.3 (dead-guard sweep): grepped `kept for parity` and found exactly ONE site (`const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;` in the sunlight point-query helper, two lines below the `TER-2` convention comment) -- its adjacent comment already read "?? 0 now unreachable (Uint8 read) -- kept for parity", an unambiguous single-site match, so it was deleted (`?? 0` dropped, comment reworded to cite this phase and audit finding #12) rather than skipped; the diff stayed trivial (one line). `VOXEX_BUILD` -> `2026-07-10.6` + a `VOXEX_RECENT_CHANGES` entry (both per the Version impact table -- no cache/terrain/settings bump, as this phase only seeds blocks that do not exist yet and zero-fills arrays that were always recomputed before use).
+  - `tools/voxex-tests.html`: `BLOCK_LIGHT_EMISSION` added to the top-of-file `VoxEx` destructure (alongside `SUNLIGHT_ATTENUATION`/`BLOCKLIGHT_ATTENUATION`). One new test in the existing `calculateBlockLight` describe (after "light decays to 0 at range"): temporarily sets `BLOCK_LIGHT_EMISSION[GLASS] = 10` (GLASS chosen because it is TRANSPARENT with a confirmed-zero baseline emission -- grepped `lightEmission` in `BLOCK_CONFIG` and found only FIRE sets the field, to `0`, so every other block including GLASS defaults to 0 going in), seeds a single GLASS block in a synthetic chunk, runs `calculateBlockLight`, asserts the seeded cell reads exactly 10 and its air neighbor reads 9 (10 - 1 travel - 0 attenuation of the entered AIR cell), and restores the table entry inside a `finally` block so the mutation cannot leak into later tests even on assertion failure. Matches the CCR's suggested design; `BLOCK_LIGHT_EMISSION` did need the seam export described above (it was absent).
+  - Gates: CRLF invariant (`tr -cd '\r' < voxEx.html | wc -c` == `wc -l`; same for `tools/voxex-tests.html`) held through every edit, including the follow-up #4.3 edit. `node tools/syntax-check.mjs` and `node tools/parity-check.mjs` GREEN after each pass. Full browser suite **386/386** headless (385 pre-existing + 1 new), confirmed BOTH immediately after the #4.1/#4.2 edits and again after the #4.3 dead-guard removal (no regression) -- all prior fixtures (full-recalc sunlight `1821834511` / blockLight `725244334`, edge-pipeline sky `1889740755` / block `787091577`, edit-script sky `1768186114` / block `1948544033`) held byte-identical, as expected (TORCH seeding is value-identical under the rewritten rule, and FIRE's own emission is 0 by config either way, so no fixture was expected to move).
+  - In-game gate item from this phase's own acceptance text (Kandler, headless sandbox cannot perform): place a test emissive block via console (a temporary `BLOCK_CONFIG` entry with `lightEmission`), confirm it survives a quick save/load and a forced `rebuildTorchLightingForActiveChunks()` with light intact.
+  - Deviations from the CCR text: none of substance. #4.1 took the CCR's explicitly-offered "drop the early-out" option rather than generalizing it -- documented as a choice, not a deviation. #4.3 resolved the CCR's open "delete or keep, lowest priority" judgment call by deleting the one site found, since it was unambiguous and the diff was a single line. `CLAUDE.md` was updated in the same pass (bash-Python method): the Lighting System section's "Unified propagation kernel" bullet now reads "Phases 0-4 SHIPPED -- buildable scope COMPLETE at build 2026-07-10.6" and its closing sentence describes Phase 4 (previously "specced ... but not yet built"); a new Lockstep Registry row (`getBlockEmission` <-> `calculateBlockLight`'s seed loop) was added to the "Mirrored logic (review-enforced)" table.
+- **CCR-LIGHT-004 buildable scope COMPLETE at build `2026-07-10.6`.** All four phases (0-4) are implemented, gated, and green (386/386 browser suite, syntax-check, parity-check). What remains is NOT further implementation but two categories of follow-through:
+  1. **Kandler's in-game gate items** (cannot be performed from this headless sandbox; see each phase's own acceptance-gate text above for full context):
+     - Phase 2: torch-behind-a-water-column-at-a-chunk-border reads equally dim from both sides; a cave crossing a border under a leaf canopy shows no brightness step at the seam; no dark 1-cell rim of neighbor torch light after flying away and back (streaming re-light).
+     - Phase 3A: torch place/break in a large open cave shows no visible hitch vs the Phase 0 baseline numbers; a power-5 explosion's carve ms via `dumpLogs('magic')` compared against the Phase 0 baseline; a 10-minute streaming soak with zero watchdog force-clears (`dumpLogs` filter `ChunkUpdate`).
+     - Phase 3B: a torch placed beside water / under a leaf canopy now reads dimmer through the medium IMMEDIATELY on placement (previously only corrected by a reload or full recalc); first load of an existing save takes a one-time-longer relight pass, then behaves normally.
+     - Phase 4: a temporary emissive `BLOCK_CONFIG` entry (via console) lights correctly and survives save/load + a forced full recalc.
+  2. **Deferred follow-ups** (explicitly out of this CCR's scope, per the Approach section):
+     - **CCR-LIGHT-005** -- the full-recalc edge re-import orchestration fix (`bailoutToFullRecalc`/`rebuildTorchLightingForActiveChunks`/`rebuildSkylightForActiveChunks` recalc chunk-local light with no neighbor re-import afterward, causing dark border seams after big carves or settings changes). Deliberately sequenced after this CCR so the edge pass it invokes has correct physics.
+     - A **measurement-gated heightmap CCR** for O(1) direct-sky queries -- only if Phase 0/3 numbers still show `computeDirectSkyLight` column-walk cost as a real bottleneck.
+     - **Watchdog demotion to diagnostic-only** (D5) -- after a soak period shows zero watchdog-forced clears across sessions; do not remove the safety net until that evidence exists.

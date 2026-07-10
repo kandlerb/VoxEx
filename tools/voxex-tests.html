@@ -177,6 +177,7 @@ async function runAllTests() {
             WORLD_DIMS, NEIGHBOR_OFFSETS, BIOME_CONFIG, HEIGHT_FUNCS,
             BLOCK_IS_SOLID, BLOCK_IS_OPAQUE, IS_TRANSPARENT, SUNLIGHT_ATTENUATION,
             BLOCKLIGHT_ATTENUATION, AO_QUANT_LOOKUP, LIGHT_QUANT_LOOKUP,
+            BLOCK_LIGHT_EMISSION, // CCR-LIGHT-004 Phase 4: emission-table seeding test
             blockIndex, safeGetBlock, getChunkKey, chunkDistanceSq, getSectionIndex,
             getSectionYRange, createSectionData, isLeafBlock, shouldMergeBlocks, getMergeKey,
             writeFaceVertices, estimateChunkFaces, playerIntersectsBlock, computeTightChunkBounds,
@@ -611,6 +612,24 @@ async function runAllTests() {
         });
         it("no light without torch", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; calculateBlockLight(chunk, 16, 320); for (let i = 0; i < 100; i++) expect(chunk.blockLight[blockIndex((Math.random()*16)|0, (Math.random()*320)|0, (Math.random()*16)|0)]).toBe(0); });
         it("light decays to 0 at range", () => { const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) }; chunk.blocks[blockIndex(0, 64, 0)] = TORCH; calculateBlockLight(chunk, 16, 320); expect(chunk.blockLight[blockIndex(15, 64, 0)]).toBeLessThanOrEqual(1); });
+        it("full recalc seeds via BLOCK_LIGHT_EMISSION, not a TORCH/FIRE hardcode (CCR-LIGHT-004 Phase 4, D7)", () => {
+            // Proves calculateBlockLight's seed loop reads BLOCK_LIGHT_EMISSION directly (mirroring
+            // getBlockEmission()) instead of the old `b === FIRE ? fireLevel : (b === TORCH ? torchLevel : 0)`
+            // hardcode -- a future emissive block would otherwise light on placement (via
+            // updateBlockLightAt/getBlockEmission) but go dark on the next full recalc. GLASS is transparent
+            // with zero baseline emission, so temporarily granting it one exercises the fix in isolation.
+            const original = BLOCK_LIGHT_EMISSION[GLASS];
+            try {
+                BLOCK_LIGHT_EMISSION[GLASS] = 10;
+                const chunk = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR) };
+                chunk.blocks[blockIndex(8, 64, 8)] = GLASS;
+                calculateBlockLight(chunk, 16, 320);
+                expect(chunk.blockLight[blockIndex(8, 64, 8)]).toBe(10);
+                expect(chunk.blockLight[blockIndex(9, 64, 8)]).toBe(9);
+            } finally {
+                BLOCK_LIGHT_EMISSION[GLASS] = original;
+            }
+        });
     });
 
     // ============================================================
@@ -691,6 +710,40 @@ async function runAllTests() {
             const center = makeFlatChunk();
             // 3-deep water pool resting on the surface (x/z 0-3), same shape as the checksum fixture.
             for (let y = 100; y <= 102; y++) for (let z = 0; z <= 3; z++) for (let x = 0; x <= 3; x++) center.blocks[bi(x, y, z)] = WATER;
+            // CCR-LIGHT-004 Phase 3B EXTENSION (drift #7 coverage): the original 4-step script below
+            // (torch place/break far from water; stone place/break directly over the ALREADY-open
+            // water pool) turns out NOT to move either checksum under the 3B fix -- the torch's
+            // place+break fully self-cancels via the (already attenuation-aware) REMOVE path, and the
+            // stone-over-water edit's effect is dominated by the pool's other 15 columns, which stay
+            // continuously open to full sun the whole time and were correctly lit by the (unaffected)
+            // full-recalc kernel from the very first calculateChunkSunlight call -- a real coverage gap
+            // per the CCR's own "if it doesn't move, extend it" instruction. Two small SEALED pockets
+            // (same isolation design proven in the "incremental ADD attenuation fix" spot tests below)
+            // are added so the incremental ADD path is unambiguously exercised and PERSISTS to the final
+            // checksum (no canceling place+break, no dominating alternate path):
+            // (a) a 2-deep WATER pocket at x=9-11,z=3-5, sealed on every face except one opening at
+            //     (9,100,4) where step (5) below places a torch that is NOT broken again;
+            // (b) a WATER pocket at (13,100,8), sealed on every face except a 2-thick removable wall at
+            //     x=14 (mirroring why the wall must be 2 thick, not 1 -- see the spot test's comment),
+            //     mined open by steps (6)-(7) below and NOT re-sealed.
+            center.blocks[bi(10, 100, 4)] = WATER;
+            center.blocks[bi(10, 101, 4)] = WATER;
+            center.blocks[bi(11, 100, 4)] = STONE;  // east wall (first cell)
+            center.blocks[bi(10, 100, 3)] = STONE;  // north wall (first cell)
+            center.blocks[bi(10, 100, 5)] = STONE;  // south wall (first cell)
+            center.blocks[bi(9, 101, 4)] = STONE;   // west wall (second cell) -- seals the shortcut
+            center.blocks[bi(11, 101, 4)] = STONE;  // east wall (second cell)
+            center.blocks[bi(10, 101, 3)] = STONE;  // north wall (second cell)
+            center.blocks[bi(10, 101, 5)] = STONE;  // south wall (second cell)
+            center.blocks[bi(10, 102, 4)] = STONE;  // roof (above second cell)
+            // (9,100,4) stays AIR -- torch placed here in step (5).
+            center.blocks[bi(13, 100, 8)] = WATER;
+            center.blocks[bi(13, 101, 8)] = STONE;  // roof directly above the water
+            center.blocks[bi(12, 100, 8)] = STONE;  // west wall
+            center.blocks[bi(13, 100, 7)] = STONE;  // north wall
+            center.blocks[bi(13, 100, 9)] = STONE;  // south wall
+            center.blocks[bi(14, 100, 8)] = STONE;  // plug1 (east, adjacent to the water) -- broken in step (7)
+            center.blocks[bi(14, 101, 8)] = STONE;  // plug2 (stacked above plug1) -- broken in step (6)
             calculateChunkSunlight(center, 16, 320);
             calculateBlockLight(center, 16, 320);
 
@@ -723,14 +776,24 @@ async function runAllTests() {
                 applyEdit(stoneX, stoneY, stoneZ, AIR, STONE);
                 // (4) break it
                 applyEdit(stoneX, stoneY, stoneZ, STONE, AIR);
+                // (5) place TORCH in the sealed block pocket's one opening (left in place -- not broken)
+                applyEdit(baseX + 9, 100, baseZ + 4, AIR, TORCH);
+                // (6) mine the sealed sky pocket's 2-thick wall, outer layer first (left open -- not resealed)
+                applyEdit(baseX + 14, 101, baseZ + 8, STONE, AIR);
+                // (7) ...then the inner layer
+                applyEdit(baseX + 14, 100, baseZ + 8, STONE, AIR);
 
                 const skyChecksum = fnv1aChecksum(center.skyLight);
                 const blockChecksum = fnv1aChecksum(center.blockLight);
-                // CCR-LIGHT-004 Phase 0 characterization — expected value captured on build 2026-07-09.4;
-                // a change here means light VALUES changed (Phase 1 must be byte-identical; Phase 2
-                // changes are expected and must update this fixture in the same commit).
-                expect(skyChecksum).toBe(568040165);
-                expect(blockChecksum).toBe(362651077);
+                // CCR-LIGHT-004 Phase 0 characterization, RE-CAPTURED Phase 3B (build 2026-07-10.5):
+                // incremental adds now charge entered-cell attenuation (drift #7 fix) -- steps (5)-(7)
+                // above were added specifically because the original 4-step script didn't move either
+                // checksum (self-canceling torch + dominated-by-full-recalc water edit; see the long
+                // comment above the pocket setup). A change here means light VALUES changed (Phase 1
+                // was byte-identical; Phase 2 changed the edge-pipeline fixtures, not these; Phase 3B
+                // deliberately changes these two).
+                expect(skyChecksum).toBe(1768186114);
+                expect(blockChecksum).toBe(1948544033);
 
                 expect(VoxEx.lightUpdateQueueLength).toBe(0); // unused by this test (direct calls bypass the job queue) -- trivially 0
                 expect(VoxEx.sunlightWorkQueueLength).toBe(0); // drained after every edit above
@@ -738,6 +801,178 @@ async function runAllTests() {
                 chunkDataPool.chunks.delete(KEY);
                 for (const nk of neighborKeys) chunkDataPool.chunks.delete(nk);
                 voxelWorld._lastChunkKey = null; // cleanup: don't leave the per-instance chunk cache pointing at a deleted chunk
+                voxelWorld._lastChunk = null;
+            }
+        });
+    });
+
+    // ============================================================
+    // CCR-LIGHT-004 Phase 3B: stepLightTask's incremental ADD branches (sky + block) now charge
+    // the entered cell's attenuation via the shared lightRuleEnter helper, same as propagateLightBFS
+    // (drift #7 fix -- previously these branches charged only the -1 travel cost). Two hand-computed
+    // spot-value tests, same registered-chunks pattern as the Phase 0 edit-script test above. See
+    // CCR's/CCR-LIGHT-004-propagation-kernel.md #3B.3.
+    // ============================================================
+    describe("lighting: incremental ADD attenuation fix (CCR-LIGHT-004 Phase 3B — drift #7)", () => {
+        it("block channel: torch beside a water column charges entered-cell attenuation on each incremental step", () => {
+            const { chunkDataPool, voxelWorld, updateSunlightAt, updateBlockLightAt, processSunlightQueue } = VoxEx;
+            const CX = 38000, CZ = 38000, KEY = getChunkKey(CX, CZ);
+            const bi = (x, y, z) => x + z * 16 + y * 256; // matches blockIndex's local-coord formula
+
+            function makeFlatChunk() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                const ch = { blocks, skyLight: new Uint8Array(CHUNK_DATA_SIZE), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData() };
+                calculateChunkSunlight(ch, 16, 320);
+                calculateBlockLight(ch, 16, 320);
+                return ch;
+            }
+
+            const center = makeFlatChunk();
+            // A 2-deep WATER column at (5,100-101,5), FULLY ENCLOSED by STONE on every side except
+            // one horizontal opening at (4,100,5) (where the torch goes) -- this is deliberate:
+            // without full enclosure, light from the torch can reach the second (upper) water cell
+            // via a shorter, less-attenuated path (up through open air, then sideways into the pool
+            // from above, paying WATER's attenuation only once instead of twice) and legitimately
+            // beats the straight-through value under monotone-max BFS. Sealing every other face
+            // forces the ONLY path to be the straight chain torch -> first cell -> second cell.
+            center.blocks[bi(5, 100, 5)] = WATER;
+            center.blocks[bi(5, 101, 5)] = WATER;
+            center.blocks[bi(6, 100, 5)] = STONE;  // east wall (first cell)
+            center.blocks[bi(5, 100, 4)] = STONE;  // north wall (first cell)
+            center.blocks[bi(5, 100, 6)] = STONE;  // south wall (first cell)
+            center.blocks[bi(4, 101, 5)] = STONE;  // west wall (second cell) -- seals the shortcut
+            center.blocks[bi(6, 101, 5)] = STONE;  // east wall (second cell)
+            center.blocks[bi(5, 101, 4)] = STONE;  // north wall (second cell)
+            center.blocks[bi(5, 101, 6)] = STONE;  // south wall (second cell)
+            center.blocks[bi(5, 102, 5)] = STONE;  // roof (above second cell)
+            // (4,100,5) stays AIR -- the torch goes here. (5,99,5) is already STONE (flat floor).
+            calculateChunkSunlight(center, 16, 320);
+            calculateBlockLight(center, 16, 320);
+
+            const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            const neighborKeys = dirs.map(([dx, dz]) => getChunkKey(CX + dx, CZ + dz));
+            chunkDataPool.chunks.set(KEY, center);
+            for (const nk of neighborKeys) chunkDataPool.chunks.set(nk, makeFlatChunk());
+
+            try {
+                const drainSunlight = () => { let guard = 0; while (VoxEx.sunlightWorkQueueLength > 0 && guard++ < 10000) processSunlightQueue(); };
+                const baseX = CX * 16, baseZ = CZ * 16;
+                const torchX = baseX + 4, torchY = 100, torchZ = baseZ + 5; // the sealed pocket's one opening
+
+                function applyEdit(x, y, z, oldId, newId) {
+                    center.blocks[bi(x & 15, y, z & 15)] = newId;
+                    const primeColumn = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
+                    updateSunlightAt(x, y, z, oldId, newId, null, primeColumn);
+                    updateBlockLightAt(x, y, z, oldId, newId, null);
+                    drainSunlight();
+                }
+
+                // place TORCH in the pocket's only opening
+                applyEdit(torchX, torchY, torchZ, AIR, TORCH);
+
+                // HAND-COMPUTED (CCR-LIGHT-004 3B, drift #7): the torch cell itself is the emission
+                // source E -- set directly by updateBlockLightAt's baseLevel branch (isSource), not
+                // through the ADD loop this phase touches.
+                const E = center.blockLight[bi(4, 100, 5)];
+                expect(E).toBe(15);
+
+                // First water cell entered by the ADD loop pays 1 (travel) + BLOCKLIGHT_ATTENUATION[WATER]
+                // (2) via lightRuleEnter: 15 - 1 - 2 = 12. Pre-3B this incremental path charged only the
+                // -1 travel cost (would read 14 here, matching only what a later full recalc would fix).
+                const first = center.blockLight[bi(5, 100, 5)];
+                expect(first).toBe(E - 1 - 2);
+                expect(first).toBe(12);
+
+                // Second water cell (propagating from the first, straight up into the sealed pool --
+                // the ONLY path now that every other face is walled off) pays the SAME entered-cell
+                // cost again (still entering WATER): 12 - 1 - 2 = 9.
+                const second = center.blockLight[bi(5, 101, 5)];
+                expect(second).toBe(first - 3);
+                expect(second).toBe(9);
+            } finally {
+                chunkDataPool.chunks.delete(KEY);
+                for (const nk of neighborKeys) chunkDataPool.chunks.delete(nk);
+                voxelWorld._lastChunkKey = null;
+                voxelWorld._lastChunk = null;
+            }
+        });
+
+        it("sky channel: horizontal entry into a water cell charges entered-cell attenuation (mining down through a 2-thick wall)", () => {
+            const { chunkDataPool, voxelWorld, updateSunlightAt, updateBlockLightAt, processSunlightQueue } = VoxEx;
+            const CX = 39000, CZ = 39000, KEY = getChunkKey(CX, CZ);
+            const bi = (x, y, z) => x + z * 16 + y * 256; // matches blockIndex's local-coord formula
+
+            function makeFlatChunk() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                const ch = { blocks, skyLight: new Uint8Array(CHUNK_DATA_SIZE), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData() };
+                calculateChunkSunlight(ch, 16, 320);
+                calculateBlockLight(ch, 16, 320);
+                return ch;
+            }
+
+            const center = makeFlatChunk();
+            // A fully-enclosed water pocket: WATER at (8,100,8), a STONE roof directly above it, and
+            // STONE walls on 3 of its 4 horizontal sides. The 4th (east, x=9) is a TWO-BLOCK-THICK
+            // wall (plug1 at y=100 adjacent to the water, plug2 stacked directly above it at y=101) --
+            // deliberately two-thick rather than one: calculateChunkSunlight/primeSunlightColumn store
+            // the light ARRIVING at a cell (TER-2), which for a lone solid block directly under open
+            // sky already equals 15 whether or not that block is solid -- so breaking a SINGLE plug
+            // registers no value change at all (nothing to propagate). Mining the wall in two real
+            // steps (break the outer layer, then the inner one) mirrors actual incremental gameplay
+            // and reproduces a genuine value transition on the inner plug once the outer one is gone.
+            center.blocks[bi(8, 100, 8)] = WATER;
+            center.blocks[bi(8, 101, 8)] = STONE;  // roof directly above the water (blocks vertical entry)
+            center.blocks[bi(7, 100, 8)] = STONE;  // west wall
+            center.blocks[bi(8, 100, 7)] = STONE;  // north wall
+            center.blocks[bi(8, 100, 9)] = STONE;  // south wall
+            center.blocks[bi(9, 100, 8)] = STONE;  // plug1 (east, adjacent to the water) -- broken 2nd
+            center.blocks[bi(9, 101, 8)] = STONE;  // plug2 (stacked above plug1) -- broken 1st
+            calculateChunkSunlight(center, 16, 320);
+            calculateBlockLight(center, 16, 320);
+
+            const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+            const neighborKeys = dirs.map(([dx, dz]) => getChunkKey(CX + dx, CZ + dz));
+            chunkDataPool.chunks.set(KEY, center);
+            for (const nk of neighborKeys) chunkDataPool.chunks.set(nk, makeFlatChunk());
+
+            try {
+                const drainSunlight = () => { let guard = 0; while (VoxEx.sunlightWorkQueueLength > 0 && guard++ < 10000) processSunlightQueue(); };
+                const baseX = CX * 16, baseZ = CZ * 16;
+
+                // Precondition: the pocket is fully enclosed -- no path in yet.
+                expect(center.skyLight[bi(8, 100, 8)]).toBe(1);
+
+                function applyEdit(x, y, z, oldId, newId) {
+                    center.blocks[bi(x & 15, y, z & 15)] = newId;
+                    const primeColumn = IS_TRANSPARENT[newId] && !IS_TRANSPARENT[oldId];
+                    updateSunlightAt(x, y, z, oldId, newId, null, primeColumn);
+                    updateBlockLightAt(x, y, z, oldId, newId, null);
+                    drainSunlight();
+                }
+
+                // Mine the 2-thick wall in two real incremental steps: outer layer (plug2) first --
+                // this is the edit that actually flips plug1's OWN arriving-light value from 1 to 15
+                // (still solid at this point) and, via the fixed sky ADD branch, relays the correctly
+                // attenuated value into the water cell immediately (CCR-LIGHT-004 3B, drift #7).
+                applyEdit(baseX + 9, 101, baseZ + 8, STONE, AIR);
+                // HAND-COMPUTED (CCR-LIGHT-004 3B): the water cell's only light path is this one
+                // horizontal step, entering WATER: 15 - 1 (travel) - 1 (SUNLIGHT_ATTENUATION[WATER]) = 13,
+                // NOT the pre-3B value of 14 (which charged only the -1 travel cost).
+                expect(center.skyLight[bi(8, 100, 8)]).toBe(13);
+
+                // Then the inner layer (plug1) -- this finishes the mine, turning the cell genuinely
+                // solid->AIR. Its stored value doesn't move again here (already 15 from the previous
+                // step), so the water cell's value is unaffected; this just confirms the CCR's literal
+                // "an air cell at skylight 15 beside a water cell" precondition is now materially true.
+                applyEdit(baseX + 9, 100, baseZ + 8, STONE, AIR);
+                expect(center.skyLight[bi(9, 100, 8)]).toBe(15);
+                expect(center.skyLight[bi(8, 100, 8)]).toBe(13);
+            } finally {
+                chunkDataPool.chunks.delete(KEY);
+                for (const nk of neighborKeys) chunkDataPool.chunks.delete(nk);
+                voxelWorld._lastChunkKey = null;
                 voxelWorld._lastChunk = null;
             }
         });
