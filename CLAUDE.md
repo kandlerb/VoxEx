@@ -185,7 +185,7 @@ Biomes configured in `BIOME_CONFIG`; missing fields inherit from `BIOME_DEFAULTS
 - **Formula**: `vertexColor = AO x (lightLevel / 15.0)`. **Volumetric Sampling**: 7-ray cone (sun/moon), 5-ray cone (point lights) for partial visibility through foliage.
 
 ### Rendering System
-- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 37 tiles).
+- **Textures**: procedural 16x16 pixel art on canvas (Atlas: 40 tiles).
 - **Terrain Material**: MeshStandardMaterial, vertex colors, alpha test 0.1, per-texel `roughnessMap` authored from `MAT_PROFILES` (matte base + color-keyed shiny accents; accents need roughness ≲110 to glint). Live control: `uShininessStrength` uniform driven by the repurposed `SETTINGS.specularIntensity` ("Shininess Strength"); `specularEnabled` off = fully matte AND kills env reflections.
 - **Glass**: separate translucent per-chunk mesh (`<cKey>_GLASS`), non-greedy 1×1 quads emitted at end of `renderChunk`; body opacity baked into texture alpha (`setGlassBodyAlpha()`); glint punch-through via `uGlintReflect`; cutout shadows via `glassDepthMaterial` (see agent-notes §2 for the three.js alphaTest gotcha). Workers route `hasGlass` chunks to main. Screen-space glass refraction was tried and RETIRED — do not retry (agent-notes ledger).
 - **Env Reflections**: analytic sky reflection on shiny terrain texels (`envReflectionEnabled`, default off, not in profiles) — same approach as water, deliberately not PMREM.
@@ -299,7 +299,7 @@ Locate any class by grepping `class <Name>` — line numbers are deliberately om
 | `SECTION_HEIGHT` | 16 | Blocks per vertical section |
 | `SECTIONS_PER_CHUNK` | 20 | Sections per chunk (320/16) |
 | `CHUNK_DATA_SIZE` | 81920 | Bytes per chunk (16x16x320) |
-| `NUM_TILES` | 37 | Texture atlas tile count |
+| `NUM_TILES` | 40 | Texture atlas tile count |
 | `MAX_FACES_PER_CHUNK` | 16384 | Hard cap on faces per chunk mesh |
 | `GEO_TIER_SMALL` / `_MEDIUM` / `_LARGE` | 4096 / 8192 / 16384 | Geometry tier max faces |
 | `MAX_POINT_LIGHTS` | 8 | Max simultaneous torch lights |
@@ -369,7 +369,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 
 ### When Modifying `voxEx.html`
 1. **Single File Rule**: ALL code stays in this ONE file — CSS, HTML, JS.
-2. **Texture Atlas**: adding blocks → update `NUM_TILES` in BOTH copies (main + worker template; parity-check P9 enforces equality) + add texture gen in `initTextures`. Current count: **37** (magicSystem.md Phase 0 added 3 spell-icon tiles; Phase 1 added ICE as the 37th).
+2. **Texture Atlas**: adding blocks → update `NUM_TILES` in BOTH copies (main + worker template; parity-check P9 enforces equality) + add texture gen in `initTextures`. Current count: **40** (magicSystem.md Phase 0 added 3 spell-icon tiles; Phase 1 added ICE as the 37th; CCR-MAGIC-006 C3 added 3 cracked-variant tiles as 38-40).
 3. **Block Config**: add to `BLOCK_CONFIG` (auto-derives inventory/textures/transparency). Also update `BLOCK_IS_SOLID`/`BLOCK_IS_OPAQUE`/`IS_TRANSPARENT` + attenuation tables via `initBlockLookupTables()`.
 4. **Biome Config**: add to `BIOME_CONFIG` (inherits from `BIOME_DEFAULTS`) + a height function to `HEIGHT_FUNCS`. Remember the worker template's hand-maintained `BIOME_CONFIG` copy (run `parity-check.mjs`).
 5. **Settings**: default in `DEFAULTS` → wire into `SETTINGS` → DOM binding in settings UI → `saveSettings()`. Settings must round-trip and have real DOM IDs.
@@ -524,16 +524,20 @@ Status legend: **LIVE** = current truth, keep updated · **SHIPPED** = implement
 |---|---|
 | `CLAUDE.md`, `docs/agent-notes.md` | LIVE — update in the same commit as the change that stales them |
 | `CCR's/*.md` | LIVE (active changes); `CCR's/Finished/` = SHIPPED |
-| `mountain-overhaul-plan.md` | LIVE roadmap — Phase 1 SHIPPED (build .92); Phases 2-5 gated, not built |
-| `terrain-gen-audit.md`, `terrain-gen-fixes.md` | SHIPPED (2026-07-02 audit + its 5-phase fix plan, implemented) |
-| `terrain-detail-plan.md`, `terrain-architecture-plan.md`, `terrain-climate-fields-plan.md`, `terrain-implementation-guide.md` | SHIPPED — produced the `terrainSurface` rewrite |
-| `terrain-improvement-deep-dive.md`, `terrain-improvement-opportunities.md` | HISTORICAL (exploration that led to the plans above) |
-| `FireImplementation.md`, `SETTINGS_MENU_CCR.md`, `CHUNK-IMPLEMENTATION-PLAN.md`, `CCR-*.md` (repo root) | SHIPPED as-built records |
-| `mobileControlsPlan.md` | SHIPPED (touch controls live) |
+| `docs/live/mountain-overhaul-plan.md` | LIVE roadmap — Phase 1 SHIPPED (build .92); Phases 2-5 gated, not built |
+| `docs/live/VoxEx_Bug_Consolidation_Tracker.md` | LIVE tracker |
+| `docs/shipped/terrain-gen-audit.md`, `docs/shipped/terrain-gen-fixes.md` | SHIPPED (2026-07-02 audit + its 5-phase fix plan, implemented) |
+| `docs/shipped/terrain-detail-plan.md`, `docs/shipped/terrain-architecture-plan.md`, `docs/shipped/terrain-climate-fields-plan.md`, `docs/shipped/terrain-implementation-guide.md` | SHIPPED — produced the `terrainSurface` rewrite |
+| `docs/historical/terrain-improvement-deep-dive.md`, `docs/historical/terrain-improvement-opportunities.md` | HISTORICAL (exploration that led to the plans above) |
+| `docs/shipped/FireImplementation.md`, `docs/shipped/SETTINGS_MENU_CCR.md`, `docs/shipped/CHUNK-IMPLEMENTATION-PLAN.md`, `CCR-*.md` (in `CCR's/`) | SHIPPED as-built records |
+| `docs/shipped/mobileControlsPlan.md` | SHIPPED (touch controls live) |
 | `ui-mockups.html` + `CCR's/CCR-ui-overhaul.md` | LIVE — approved directions, not yet wired into voxEx.html |
-| `futureFeatures.md` | LIVE roadmap / design intent |
-| `magicSystem.md` | SHIPPED on `main` — all 5 phases (M toggle, 4 spells, ICE block, touch casting); §15 is the as-built record with concrete deviations from the original design |
+| `futureFeatures.md` | LIVE roadmap / design intent (stays in repo root) |
+| `docs/shipped/magicSystem.md` | SHIPPED on `main` — all 5 phases (M toggle, 4 spells, ICE block, touch casting); §15 is the as-built record with concrete deviations from the original design |
 | `CCR's/CCR-MAGIC-006-spell-polish.md` | Phases A-C SHIPPED on `main` (true-aim range/power scaling, channeled Laser/Freeze, deterministic fireball + instant char + generic cracked variants); Phases D-E not yet built. Move to `CCR's/Finished/` once D/E land or are formally dropped |
-| `VoxEx_Bug_Consolidation_Tracker.md` + `VoxEx_Issue_*.md` | LIVE tracker + SHIPPED cleanup reports |
-| `keyframe-audit.md`, `lightRefill-investigation.md`, `zombie-ai-investigation.md`, `tree-generation-bug-report.md` | HISTORICAL investigations |
+| `docs/shipped/VoxEx_Issue_Cleanup_Report.md` | SHIPPED cleanup report (executed the findings below) |
+| `docs/historical/VoxEx_Issue_Triage.md`, `docs/historical/VoxEx_Issue_Validation.md` | HISTORICAL — one-time GitHub issue snapshots (Jun 24/27 2026) superseded by the cleanup report above and the live issue tracker |
+| `docs/historical/keyframe-audit.md`, `docs/historical/lightRefill-investigation.md`, `docs/historical/zombie-ai-investigation.md`, `docs/historical/tree-generation-bug-report.md` | HISTORICAL investigations |
 | `docs/superpowers/` | HISTORICAL (pre-terrainSurface era — do not implement from) |
+
+Non-core root `.md` files were reorganized into `docs/{live,shipped,historical}/` on 2026-07-09 to declutter repo root; only `CLAUDE.md`, `README.md`, and `futureFeatures.md` remain at top level. `CCR's/` is unaffected — it stays reserved for `CCR-`-prefixed change docs following the design → audit → implement → reconcile lifecycle described in [Change Workflow](#change-workflow-ccrs); none of the moved docs follow that convention.

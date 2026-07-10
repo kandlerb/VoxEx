@@ -11,23 +11,33 @@ The launcher page runs browser compatibility tests (WebGL, GPU benchmarks) befor
 
 ## Architecture
 
-VoxEx is a **single-file application** - the entire game (~41K lines) runs from one HTML file with embedded CSS and JavaScript. No build tools, no bundlers, no external dependencies beyond Three.js from CDN.
+VoxEx is a **single-file application** - the entire game (~46K lines) runs from one HTML file with embedded CSS and JavaScript. No build tools, no bundlers, no external dependencies beyond Three.js from CDN.
 
 ### Repository Structure
 
 ```
 VoxEx/
 ├── index.html                # System check & launcher
-├── voxEx.html                # Complete game (single file, ~41K lines)
+├── voxEx.html                # Complete game (single file, ~46K lines)
 ├── CLAUDE.md                 # AI assistant guidelines
 ├── futureFeatures.md         # Feature roadmap
+├── CCR's/                    # Change docs (design → implement → as-built)
+├── docs/                     # Agent notes + live/shipped/historical docs
 ├── tools/                    # Development utilities
 │   ├── KeyFrame_editor.html
 │   ├── terrain-parameter-editor.html
+│   ├── terrain-visualizer.html
 │   ├── voxelEditor.html
 │   ├── voxex-sound-formula.html
+│   ├── voxex-texture-tests.html
+│   ├── docs-viewer.html
+│   ├── syntax-check.mjs          # All <script> blocks parse
+│   ├── parity-check.mjs          # Main↔worker lockstep copies in sync
+│   ├── terrain-node-checks.mjs   # Headless terrain invariants
+│   ├── run-browser-tests.mjs     # Runs the browser suite headlessly
 │   └── voxex-tests.html          # Test suite — runs against the real voxEx.html code via a ?test=1 seam
-└── .github/ISSUE_TEMPLATE/   # Bug/feature request templates
+├── .githooks/                # Pre-commit gate (git config core.hooksPath .githooks)
+└── .github/                  # Issue templates + CI
 ```
 
 ### Design Philosophy
@@ -58,9 +68,13 @@ VoxEx/
 | Swamp | Low wetlands with droopy trees and water pools |
 | Longwoods | Giant trees (2x2 and 3x3 trunks), heights 12-24 blocks |
 
-### 15 Block Types
+### 23 Block Types
 
-Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water, Torch, Snow, Gravel, Longwood Log, Longwood Leaves
+Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water, Torch, Snow, Gravel, Longwood Log, Longwood Leaves, Glass, Fire, Burnt Log, Burnt Planks, Ice, Cracked Stone, Cracked Dirt, Cracked Planks
+
+### Magic System
+
+Press **M** to toggle magic mode: four spells (Explosion, Laser, Freeze, Fireball) with scroll-wheel power scaling (1-5), channeled casting, terrain carving, and block scarring. Fully touch-playable.
 
 ### Lighting System
 - 15-level sunlight propagation
@@ -94,6 +108,7 @@ Air, Grass, Dirt, Stone, Wood Planks, Oak Log, Oak Leaves, Bedrock, Sand, Water,
 | C | Crouch / Fly Down |
 | SHIFT | Sprint |
 | F | Toggle Torch |
+| M | Toggle Magic Mode |
 | E | Inventory |
 | V | Toggle Third-Person Camera |
 | +/- | Zoom In/Out (third-person) |
@@ -121,7 +136,7 @@ VoxEx is fully touch-playable on phones and tablets. Touch controls auto-activat
 | IndexedDB | Browser API | Chunk persistence with RLE compression |
 | OPFS | Browser API | Origin Private File System disk cache |
 | LocalStorage | Browser API | Settings and save slots |
-| Canvas API | Browser API | Procedural 16x16 textures (17-tile atlas) |
+| Canvas API | Browser API | Procedural 16x16 textures (40-tile atlas) |
 
 ## For Developers
 
@@ -150,7 +165,7 @@ Three.js is loaded from CDN via import map:
 
 ### Running the Tests
 
-The automated test suite (`tools/voxex-tests.html`) loads the real `voxEx.html` in a hidden iframe via a `?test=1` seam that exposes `window.VoxEx`. It runs ~193 tests covering bootstrap, terrain, lighting, compression, meshing, block-table invariants, VoxelWorld/collision/raycast, a live chunk-worker round-trip, and an IndexedDB persistence round-trip.
+The automated test suite (`tools/voxex-tests.html`) loads the real `voxEx.html` in a hidden iframe via a `?test=1` seam that exposes `window.VoxEx`. It runs 375+ tests (trust the suite's own counter) covering bootstrap, terrain, lighting, compression, meshing (including worker byte-parity), block-table invariants, VoxelWorld/collision/raycast, a live chunk-worker round-trip, persistence codecs, and an IndexedDB round-trip. It can also run headlessly: `node tools/run-browser-tests.mjs`.
 
 Because the suite uses Workers and IndexedDB it **must** be served over a local web server — `file://` will not work.
 
