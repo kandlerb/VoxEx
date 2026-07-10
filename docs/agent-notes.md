@@ -127,6 +127,38 @@ can tell whether circumstances actually changed.
   `fireMaxEditsPerTick`/`fireConsumeChance`/`fireLightLevel` are dead/deprecated
   settings (kept for save compat; not consulted by the tick).
 
+### Lighting kernel (CCR-LIGHT-004, Phases 0-2 SHIPPED; Phases 3-4 not yet built)
+- One propagation rule, single-sourced: `propagateLightBFS(queue, qStart, ctx)` (module
+  scope, above `calculateChunkSunlight`) — monotone-max BFS flood fill, rule = 1 travel
+  cost + `ctx.attenTable[enteredBlockId]`, floored at `ctx.floor` (1 sky / 0 block).
+  `ctx` is worker-injectable: `NEIGHBOR_OFFSETS`/`IS_TRANSPARENT` are read as module
+  globals (both already serialized into the worker); everything else arrives via the
+  module-scope `_lightCtxScratch` populated by `_chunkLocalLightCtx(blocks, light,
+  attenTable, floor, height)` + 4 static accessor functions — no per-call
+  closures/allocations. `calculateChunkSunlight`'s phase-2 BFS and `calculateBlockLight`'s
+  BFS both call the kernel (Phase 1, byte-identical output, no cache bump).
+- **Phase 2 (build 2026-07-10.3, `CURRENT_CACHE_VERSION` 6→7)**: `propagateEdgeLighting`
+  (the cross-chunk border transfer) and `propagateLightFromEdgesInward` (the interior
+  BFS after a border import) were DRIFTED from the kernel rule — they charged only the
+  −1 travel cost and ignored the entered cell's attenuation, and the inward BFS spread
+  skylight only (blockLight was imported exactly 1 cell deep and never propagated
+  further). Both fixed: `propagateEdgeLighting` now applies `SUNLIGHT_ATTENUATION`/
+  `BLOCKLIGHT_ATTENUATION` of the ENTERED (target) cell inline (same expression as the
+  kernel); `propagateLightFromEdgesInward` now runs the kernel TWICE (sky, then block —
+  the block seed pass deliberately has NO top-of-column dark-column guard, since that
+  guard is a skylight-only heuristic and torch light lives in dark columns). This is a
+  real baked-light-VALUE change near chunk borders, hence the cache bump — old saves
+  relight (one-time cost) on first load.
+- Vestigial `chunksNeedingLightingUpdate` Set removed in the same phase —
+  `processEdgeLightingUpdates` drained it into `edgeLightingUpdateQueue` unconditionally
+  every call, so the neighbor-readiness split it implied never gated anything.
+  `queueChunkForLightingUpdate` now adds straight to the real queue.
+- Phases 3 (block light joins the budgeted task machinery) and 4 (shared seeding via
+  `BLOCK_LIGHT_EMISSION`, blockLight zero-fill consistency) are SPECCED in
+  `CCR's/CCR-LIGHT-004-propagation-kernel.md` but not yet built — don't assume
+  `updateBlockLightAt` is budgeted or that `calculateBlockLight` reads the full emission
+  table until that phase lands.
+
 ### Magic system (magicSystem.md, Phases 0-4 SHIPPED + Phase 5 polish, `ccr/magic-system`)
 - **ICE (block 19) ships FROSTED** (sunlight/blocklight attenuation 1/1), not clear
   (0/0) — LOCKED before an in-game eyeball because flipping it later is a relight-
@@ -278,6 +310,10 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   Recovery that worked: truncate the mount file at the last good byte and append
   the correct tail (read via the authoritative Read tool), then re-run
   syntax/parity/suite. Verify the REAL file via Read afterward.
+  **The appended tail must preserve CRLF** — a Phase 1 recovery re-appended an
+  LF-only tail into the otherwise-CRLF voxEx.html (caught in review, not by any
+  gate). Check: `tr -cd '\r' < voxEx.html | wc -c` must equal `wc -l`. Fix:
+  `sed -i 's/\r\?$/\r/'` (safe — restores the pre-truncation byte state).
 - **Each bash call runs in its own bwrap PID sandbox — background jobs
   (`nohup`/`setsid`/`&`) do NOT survive across calls** (2026-07-10). Long steps
   (Chromium download, browser suite) must complete within one call's timeout;

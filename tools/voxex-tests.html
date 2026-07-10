@@ -743,6 +743,99 @@ async function runAllTests() {
         });
     });
 
+    // ============================================================
+    // CCR-LIGHT-004 Phase 2: edge-lighting pipeline characterization. propagateEdgeLighting
+    // and propagateLightFromEdgesInward are now routed through the shared propagateLightBFS
+    // kernel (attenuation of the ENTERED cell charged on the border transfer; blockLight now
+    // spreads inward past the single imported border cell). See CCR's/CCR-LIGHT-004-propagation-kernel.md #2.5.
+    // ============================================================
+    describe("lighting: edge-pipeline characterization (CCR-LIGHT-004 Phase 2)", () => {
+        it("propagateEdgeLighting + propagateLightFromEdgesInward: entered-cell attenuation on the border transfer, blockLight spreads inward", () => {
+            const { propagateEdgeLighting, propagateLightFromEdgesInward } = VoxEx;
+            const bi = (x, y, z) => x + z * 16 + y * 256; // matches blockIndex's local-coord formula
+
+            // Target chunk: stone floor to y=99, open air above, EXCEPT the receiving-edge
+            // column (lx=15, lz=8): a 3-deep WATER pool (y100-102) with a 2-layer LEAVES
+            // canopy above it (y103-104) straddling the border -- both attenuating block
+            // types sit at the exact face propagateEdgeLighting imports through.
+            function makeTargetBlocks() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                blocks[bi(15, 100, 8)] = WATER; blocks[bi(15, 101, 8)] = WATER; blocks[bi(15, 102, 8)] = WATER;
+                blocks[bi(15, 103, 8)] = LEAVES; blocks[bi(15, 104, 8)] = LEAVES;
+                return blocks;
+            }
+            // Source chunk: same stone floor, open air above, with one TORCH 2 cells in
+            // from the shared border (lx=2, border is lx=0) at the same row/height as the
+            // target's water column so its light reaches straight across.
+            function makeSourceBlocks() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                blocks[bi(2, 100, 8)] = TORCH;
+                return blocks;
+            }
+
+            const target = { blocks: makeTargetBlocks() };
+            const source = { blocks: makeSourceBlocks() };
+            calculateChunkSunlight(target, 16, 320);
+            calculateBlockLight(target, 16, 320);
+            calculateChunkSunlight(source, 16, 320);
+            calculateBlockLight(source, 16, 320);
+
+            // Precondition (documents the setup): source's own in-chunk BFS carries the
+            // torch (level 15 at lx=2) across 2 steps of open air to the border:
+            // 15 - 1 - 1 = 13 at (lx=0, y=100, z=8).
+            expect(source.blockLight[bi(0, 100, 8)]).toBe(13);
+
+            // propagateEdgeLighting(target, source, 15, 0, 'x', ...): target's lx=15 face
+            // receives from source's lx=0 face (one edge, both channels transferred).
+            propagateEdgeLighting(target, source, 15, 0, 'x', 16, 320);
+
+            // HAND-COMPUTED SPOT VALUE (sky): the border water cell was at target's own
+            // 11 (computed by calculateChunkSunlight from the LEAVES+WATER stack above
+            // it); the edge import from source's full-sun (15) column now wins:
+            // 15 - 1 (travel) - 1 (WATER sunlightAttenuation) = 13, NOT the pre-fix 14
+            // (pre-fix charged only the -1 travel cost and ignored the entered cell's
+            // attenuation entirely).
+            expect(target.skyLight[bi(15, 100, 8)]).toBe(13);
+
+            // HAND-COMPUTED SPOT VALUE (block): the torch's light reaches the border at
+            // source level 13 (precondition above); crossing into target's WATER cell
+            // costs 1 (travel) + 2 (WATER blocklightAttenuation) = 13 - 3 = 10, NOT the
+            // pre-fix 12 (pre-fix charged only the -1 travel cost).
+            expect(target.blockLight[bi(15, 100, 8)]).toBe(10);
+
+            // Before propagateLightFromEdgesInward, blockLight has not yet spread past
+            // the single imported border cell (the pre-fix ceiling: "imported exactly 1
+            // cell deep and never propagated").
+            expect(target.blockLight[bi(14, 100, 8)]).toBe(0);
+            expect(target.blockLight[bi(13, 100, 8)]).toBe(0);
+
+            propagateLightFromEdgesInward(target, 16, 320);
+
+            // HAND-COMPUTED SPOT VALUE: the blockLight channel now spreads inward from
+            // the border past the single imported cell via the shared kernel -- 2 cells
+            // inland (lx=13) is nonzero, proving the inward-spread fix (pre-fix,
+            // propagateLightFromEdgesInward only ever spread SKYLIGHT inward; the
+            // blockLight channel did not exist there at all, so this cell stayed stuck
+            // at 0 forever).
+            expect(target.blockLight[bi(14, 100, 8)]).toBe(9);
+            expect(target.blockLight[bi(13, 100, 8)]).toBe(8);
+            expect(target.blockLight[bi(13, 100, 8)]).toBeGreaterThan(0);
+
+            // CCR-LIGHT-004 Phase 2 characterization -- expected values captured on build
+            // 2026-07-10.3 (this phase). A change here means the edge-lighting pipeline's
+            // VALUES changed; the four Phase 0 checksums (both full-recalc calculators +
+            // the incremental edit-script path) are UNCHANGED by this phase and must stay
+            // green (neither is touched here -- only the edge-import/inward-spread
+            // pipeline changed).
+            const skyChecksum = fnv1aChecksum(target.skyLight);
+            const blockChecksum = fnv1aChecksum(target.blockLight);
+            expect(skyChecksum).toBe(1889740755);
+            expect(blockChecksum).toBe(787091577);
+        });
+    });
+
     // ---- analyzeChunkSections ----
     describe("analyzeChunkSections", () => {
         it("all-air chunk -> all empty", () => { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR), sections: createSectionData() }; analyzeChunkSections(ch); ch.sections.forEach(s => { expect(s.isEmpty).toBe(true); expect(s.isFullySolid).toBe(false); expect(s.analyzed).toBe(true); }); });

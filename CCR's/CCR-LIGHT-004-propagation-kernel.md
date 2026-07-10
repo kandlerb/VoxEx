@@ -370,8 +370,30 @@ finding #12).
 **Why:** #2.1/#2.2 change baked light VALUES near chunk borders; cached lighting must
 recalculate (CLAUDE.md Version Constants).
 
-**PHASE 2 ACCEPTANCE GATE:** suite GREEN (checksum test EXPECTED to change — update
-the fixture in the same commit, note it in As-built); in-game eyeball: torch behind a
+### #2.5 — NEW edge-pipeline characterization test (correction from Phase 1 review)
+
+The Phase 0 checksum fixtures cover ONLY the calculators and the incremental path —
+neither is touched by this phase, so they must pass UNCHANGED (editing them in
+Phase 2 is as forbidden as it was in Phase 1; an earlier revision of this gate
+wrongly said they were "expected to change"). The edge functions have no
+characterization coverage at all; add it here, capturing the POST-change
+(corrected) physics:
+
+- Seam: export `propagateEdgeLighting` and `propagateLightFromEdgesInward` (both
+  pure on their arguments — no global `chunks` access) in a
+  `// --- CCR-LIGHT-004 Phase 2 ---` group.
+- Test (new describe in `tools/voxex-tests.html` next to the Phase 0 suites): two
+  synthetic chunks sharing a border — water column and leaf layer straddling the
+  target's edge, torch near the source chunk's edge; run both calculators on both
+  chunks, then `propagateEdgeLighting` (one edge, both channels) +
+  `propagateLightFromEdgesInward`; FNV-1a checksum the target's `skyLight` AND
+  `blockLight`, hard-code captured values with the standard characterization
+  comment. Also assert two hand-computed spot values (one water cell paying
+  1 + attenuation for sky, one for block) so the test documents the rule, not
+  just the hash.
+
+**PHASE 2 ACCEPTANCE GATE:** suite GREEN with the four Phase 0 checksums UNCHANGED
+and the new edge characterization test(s) green; in-game eyeball: torch behind a
 water column at a chunk border reads equally dim from both sides; cave crossing a
 border under a leaf canopy shows no brightness step at the seam; no dark 1-cell rim
 of neighbor torch light after flying away and back (streaming re-light).
@@ -585,8 +607,20 @@ file (Read/Grep tools — authoritative per agent-notes §7; bash mount never tr
   - Gates: syntax + parity GREEN; browser suite **382/382** headless (379 pre-existing + 3 new). No git run.
   - Deviation: none on test design. Environment incident: Edit-tool edits left both files' bash-mount views truncated near EOF; recovered by splicing the correct tail onto the mount view (verified byte-correct via Read tools + full suite after). Lessons recorded in agent-notes §7.
 - **Phase 0 (step 3) baselines — PENDING (Kandler, in-game):** <carve ms via dumpLogs('magic') / torch place+break console.time / pendingLight high-water + watchdog counts>
-- Phase 1: <deviations>
-- Phase 2: <checksum fixture delta note; in-game seam observations>
+- **Phase 1 — DONE 2026-07-10, build `2026-07-10.2`** (Sonnet subagent, Fable-reviewed; sandbox session, uncommitted — commit from Windows):
+  - Kernel block inserted above `calculateChunkSunlight` (grep `UNIFIED LIGHT-PROPAGATION KERNEL`): `propagateLightBFS` + `_chunkLocalLightCtx` + `_lightCtxScratch` + 4 static accessors (`_ctxGetBlockLocal`/`_ctxGetLightLocal`/`_ctxSetLightLocal`/`_ctxInBoundsLocal`). Ctx helper signature finalized as `(blocks, light, attenTable, floor, height)` — the sketch's `cs` param dropped (index math hardcodes 16; noted deviation, accepted).
+  - `calculateChunkSunlight` phase-2 loop and `calculateBlockLight` BFS loop replaced with kernel calls (grep `propagateLightBFS(queue, 0, _chunkLocalLightCtx` — exactly 2 call sites). Seeding loops untouched.
+  - Worker: `_lightCtxScratch` data line added to the `WORKER_LIGHTING_ENABLED` block; injection list now kernel + helper + 4 accessors + `calculateChunkSunlight`.
+  - Gates: syntax + parity GREEN; terrain-node-checks GREEN on seeds 1337/42/9001; suite **382/382** with all four Phase 0 checksums UNCHANGED (byte-parity confirmed) incl. worker skyLight parity. No cache/terrain/settings bumps, per plan.
+  - Environment incidents: near-EOF mount truncation recurred (caught by syntax-check, spliced tail recovery). Review caught a recovery defect: the re-appended 80-line tail was LF-only in an otherwise-CRLF file — normalized back to CRLF (`tr -cd '\r' | wc -c` == line count is the check), suite re-run green. Lesson: tail-splice recovery MUST preserve CRLF.
+  - NOTE for next phase: voxEx.html was bash-written this session — per agent-notes §7 do NOT Edit-tool it again in the same session; run Phase 2 in a FRESH session (or native Windows Claude Code).
+- Phase 1: no deviations from the plan beyond the ctx-helper param order noted above (dropped the sketch's redundant `cs` param — index math hardcodes 16 either way).
+- **Phase 2 — DONE 2026-07-10, build `2026-07-10.3`** (Sonnet subagent; sandbox session, uncommitted — commit from Windows):
+  - `voxEx.html` (14 replacements, all via bash-mount Python edits per agent-notes §7, zero Edit-tool use on voxEx.html/tools/voxex-tests.html this session): `propagateEdgeLighting`'s sky/block branches now compute `traveledX = source > 1 ? source - 1 : floor` then apply `SUNLIGHT_ATTENUATION`/`BLOCKLIGHT_ATTENUATION` of `targetBlocks[targetIdx]` (the ENTERED cell) with the kernel's `atten > 0 ? (traveled > atten ? traveled - atten : floor) : traveled` expression, citing `propagateLightBFS` as the rule's single source. `propagateLightFromEdgesInward` rewritten: same 4-edge sky seed loops (incl. the LIGHT-003 top-of-column guard) now feed one `propagateLightBFS(queue, 0, _chunkLocalLightCtx(blocks, skyLight, SUNLIGHT_ATTENUATION, 1, chunkHeight))` call; a NEW second pass reseeds the same 4 edges from `chunk.blockLight` (guarded `if (chunk.blockLight)`, NO top-of-column guard — audited as skylight-only) and calls the kernel again with `BLOCKLIGHT_ATTENUATION`/floor 0. Deleted `chunksNeedingLightingUpdate` at all 6 confirmed sites (declaration; `queueChunkForLightingUpdate` — now adds straight to `edgeLightingUpdateQueue`, with `hasAllNeighborsWithLighting` + the now-orphaned `hasNeighborWithLighting` helper removed, confirmed zero other callers; the wholesale drain loop atop `processEdgeLightingUpdates`; the `purgeChunkData` cleanup line; the frame-loop gate's `|| chunksNeedingLightingUpdate.size > 0`; the debug overlay's `Wait: N` segment, now bare `EdgeLight: N`). Reworded the `[CCR002-verify]` comment's dangling `hasNeighborWithLighting` reference. Deleted the dead `const hasWaterMesh = false;` two-liner (folded into `hasTerrainMesh`). `CURRENT_CACHE_VERSION` 6 → 7 with a new `v7:` comment line. `VOXEX_BUILD` → `2026-07-10.3` + a `VOXEX_RECENT_CHANGES` entry. Seam: added `propagateEdgeLighting, propagateLightFromEdgesInward` to the `window.VoxEx` export under a new `CCR-LIGHT-004 Phase 2` group.
+  - `tools/voxex-tests.html`: one new describe (`lighting: edge-pipeline characterization (CCR-LIGHT-004 Phase 2)`), one test. Two synthetic 16×320-column chunks (stone floor to y=99): target has a 3-deep WATER pool (y100-102) + 2-layer LEAVES canopy (y103-104) at its receiving edge (lx=15, lz=8); source has one TORCH at (lx=2, ly=100, lz=8), 2 cells in from the shared border (lx=0). Ran both calculators on both chunks, then `propagateEdgeLighting(target, source, 15, 0, 'x', 16, 320)` + `propagateLightFromEdgesInward(target, 16, 320)`. Hand-computed spot values ALL PASSED ON THE FIRST HEADLESS RUN (no implementation bugs found): `source.blockLight` at the border = 13 (torch 15, 2 air steps); post-edge-transfer `target.skyLight[15,100,8]` = 13 (15−1 travel−1 WATER sky atten, not the pre-fix 14); post-edge-transfer `target.blockLight[15,100,8]` = 10 (13−1 travel−2 WATER block atten, not the pre-fix 12); pre-inward-spread `target.blockLight` at lx=14/13 = 0 (pre-fix ceiling); post-inward-spread lx=14 = 9, lx=13 = 8 (proves the 2+-cell inward spread fix — pre-fix, blockLight never left the single imported border cell). Checksum fixture captured via the documented placeholder→headless-run→bake-in workflow (2 intermediate runs, one per checksum since the first failing `expect` in the `it` short-circuits the rest): `skyChecksum` = `1889740755`, `blockChecksum` = `787091577`.
+  - Gates: `syntax-check` + `parity-check` GREEN. CRLF invariant (`tr -cd '\r' | wc -c == wc -l`) held on both files after every edit — no truncation/desync incident this session (the bash-mount-only edit method with `count()==1` uniqueness asserts avoided the Edit-tool cache-desync class of failure entirely). Full browser suite **383/383** headless (382 pre-existing + 1 new); the four Phase 0 checksums (`1821834511`/`725244334`/`568040165`/`362651077`) confirmed UNCHANGED and passing.
+  - In-game seam observations: NOT performed this run (sandboxed, headless-only environment per agent-notes §7 — no live renderer). The acceptance gate's in-game eyeball items (torch-behind-water-at-a-border reads equally dim from both sides; cave-under-canopy-crossing-a-border shows no brightness step; no dark 1-cell rim of neighbor torch light after streaming re-light) are OPEN, for the user's own hands-on session.
+  - Deviations: none from the CCR's #2.1-#2.5 text. No git operations performed (sandbox note honored).
 - Phase 3: <before/after hitch numbers; soak result>
 - Phase 4: <deviations>
 - Follow-ups spawned: CCR-LIGHT-005 (full-recalc edge re-import), heightmap CCR (only if numbers demand), watchdog demotion (after soak per D5)
