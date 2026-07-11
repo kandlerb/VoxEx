@@ -59,7 +59,10 @@ VoxEx/
 │   │                             #   ?test=1 seam (window.VoxEx); serve over localhost
 │   ├── voxex-texture-tests.html  # Visual texture atlas tests (own local tile set + checks)
 │   ├── terrain-visualizer.html   # Terrain debugger (delegates to game via ?test=1)
-│   ├── terrain-parameter-editor.html / voxelEditor.html / KeyFrame_editor.html
+│   ├── terrain-parameter-editor.html  # Gen-params editor (delegates via ?test=1; edits the
+│   │                             #   REAL GEN_PARAM_SCHEMA params; exports genParams JSON;
+│   │                             #   caves preview removed — CCR-WORLDGEN-UI-001)
+│   ├── voxelEditor.html / KeyFrame_editor.html
 │   ├── voxex-sound-formula.html  # Sound synthesis designer
 │   ├── docs-viewer.html          # Documentation viewer
 │   └── scratch/                  # GITIGNORED one-off probes — never commit replicas
@@ -247,9 +250,9 @@ Biomes configured in `BIOME_CONFIG`; missing fields inherit from `BIOME_DEFAULTS
 - Full design + as-built record (concrete deviations from the original design, what shipped vs. was deferred): `magicSystem.md` §15 (Phases 0-5) + `CCR-MAGIC-006-spell-polish.md`'s per-phase As-built sections (Phases A-C: true-aim range/power scaling, channeled Laser/Freeze, deterministic fireball + cracked variants).
 
 ### World Creation System
-- **UI**: world name, seed input, biome selector grid, terrain presets, advanced sliders.
-- **Presets**: Default, Amplified, Flat, Archipelago, Superflat, Caves.
-- **Customization**: tree/cave density, terrain amplitude, sea level, biome size, noise persistence/lacunarity, spawn coords. The knobs work through LIVE getters on `worldConfig`; the active world's params live in `activeWorldGenParams` (applied via `applyGenParams`, persisted as `savePacket.genParams` v3, restored BEFORE generation). In-session loads must `rebuildChunkWorkerPoolForActiveWorld()` (worker bakes config at pool creation). Details: agent-notes §3.
+- **UI** (CCR-WORLDGEN-UI-001): world name, seed input, biome selector grid, terrain presets, and SCHEMA-DRIVEN option sections — `GEN_PARAM_SCHEMA` (one entry per `DEFAULT_GEN_PARAMS` key) generates collapsed `.ui-collapse` sections of free-form text inputs via `populateGenParamControls()`. NO sliders, NO clamping: any finite number is accepted (`parseGenParamInput`); values outside the schema's `tested` range get a soft amber `.genparam-warn` + tooltip (and badge the preview label); NaN/empty falls back to the default. One delegated `change` listener on `#genparam-sections` handles all controls. An 📥 button imports a `genParams` JSON (the terrain editor's export format).
+- **Presets**: Default, Amplified, Flat, Archipelago, Superflat, Caves (`WORLD_PRESETS`, also seam-exported read-only to the terrain editor).
+- **Customization**: tree/cave density, terrain amplitude, sea level, biome size, noise persistence/lacunarity, spawn coords — ALL live on the default terrain path since CCR-WORLDGEN-UI-001 Phase D: amplitude is wired into `WORLD_CONFIG.terrainAmplitudeMultiplier` in `applyGenParams` (was dead — the missing "Step 11"); `seaLevel` reaches the worker via an injected `WORLD_DIMS.seaLevel` override baked at pool creation (the hand-maintained template literal stays 60 — see Lockstep Registry); spawn X/Z actually place the player + center pre-gen (`findAndSetSpawnPosition(spawnBX, spawnBZ)`); the dead `usePathBasedRivers` key was REMOVED (genParams is now 13 keys, still "v3" — old saves carrying the key load fine, it's just never read). The knobs work through LIVE getters on `worldConfig`; the active world's params live in `activeWorldGenParams` (applied via `applyGenParams`, persisted as `savePacket.genParams`, restored BEFORE generation). In-session loads must `rebuildChunkWorkerPoolForActiveWorld()` (worker bakes config at pool creation). Details: agent-notes §3.
 - **Preview**: real-time terrain preview (`WorldPreviewRenderer`) delegating directly to the game's own `blendedHeight()`/`getBiomeParams()` (no separate noise copy to keep in sync). **Management**: rename, duplicate, import/export, storage stats, clear cache.
 
 ### Persistence
@@ -381,7 +384,7 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 10. **Worker Parity**: terrain/tree/mesh functions are SINGLE-SOURCE on the main thread; `buildChunkWorkerCode()` injects their `Function.toString()` source between the `/* __TERRAIN_FUNCS_START__ */`, `/* __TREE_FUNCS_START__ */`, and `/* __TERRAIN_PASS_START__ */` marker pairs. Edit ONLY the main-thread sources — the worker copies are generated. Markers MUST stay intact (`parity-check.mjs` verifies). The worker template ALSO hand-maintains copies of `WORLD_DIMS`, `BIOME_CONFIG`, `TREE_CONFIG`, `SeededRandom`, `fadeFast`, `GRAD2D`/`grad`, and the `_nd2`/`_fd2`/`_ed2` scratches — see [Lockstep Registry](#lockstep-registry).
 
 ### Common Search Patterns
-- **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`, `SETTINGS_PROFILES`, `activeWorldGenParams`, `applyGenParams`
+- **Config**: `const WORLD_CONFIG`, `const SETTINGS`, `const DEFAULTS`, `SETTINGS_PROFILES`, `activeWorldGenParams`, `applyGenParams`, `GEN_PARAM_SCHEMA`, `parseGenParamInput`, `populateGenParamControls`
 - **Block Types**: `const AIR`, `const GRASS`, `const LEAVES`, `BLOCK_CONFIG`, `BLOCK_IS_SOLID`, `BLOCK_IS_OPAQUE`
 - **Biomes**: `BIOME_CONFIG`, `BIOME_DEFAULTS`, `getBiomeParams`, `getBiomeCellDirect`, `HEIGHT_FUNCS`
 - **Terrain (new path)**: `terrainSurface`, `computeSurfaceHeight`, `resolveBiome`, `erosionParam`, `noise2Dd`, `SWISS_WARP`
@@ -440,7 +443,7 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 | `GRAD2D` + `grad()` | main thread + worker template | byte-identical (worker `blendedHeight` byte-parity depends on it) |
 | `fadeFast` | main (arrow) + worker template (function) | identical formula |
 | `_nd2`/`_fd2`/`_ed2` scratches | main + worker template | identical literals |
-| `WORLD_DIMS` (incl. `yOffset`!) | main + worker template | identical values (a yOffset drift of 64 once silently killed ALL worker tree generation) |
+| `WORLD_DIMS` (incl. `yOffset`!) | main + worker template | identical values (a yOffset drift of 64 once silently killed ALL worker tree generation). NOTE: `seaLevel` is additionally RUNTIME-OVERRIDDEN in the worker by an injected `WORLD_DIMS.seaLevel = <live value>` line baked at pool creation (CCR-WORLDGEN-UI-001 #11) — both literals stay 60; never "fix" a custom sea level by editing either literal |
 | `BIOME_CONFIG` | main + worker template | biome sets + numeric fields identical |
 | `TREE_CONFIG` | main + worker template | identical values |
 | Injection markers (×6) | `__TERRAIN_FUNCS__`, `__TREE_FUNCS__`, `__TERRAIN_PASS__` pairs | exactly one standalone occurrence each |

@@ -188,18 +188,39 @@ can tell whether circumstances actually changed.
   `0.00001`. This is the hook point for any future per-block movement effect (mud,
   honey, etc.) — don't build a parallel friction system.
 
-### World-gen params persistence (VOXEX-CCR-UI-001 item 4/4b)
+### World-gen params persistence (VOXEX-CCR-UI-001 item 4/4b + CCR-WORLDGEN-UI-001)
 - `worldConfig` has LIVE getters (biomeFrequency, biomeSizeMultiplier,
-  persistence, lacunarity, enableRivers, forceSingleBiome) — it was a static
-  snapshot once, which is why create-world knobs used to be dead.
+  persistence, lacunarity, enableRivers, forceSingleBiome,
+  terrainAmplitudeMultiplier) — it was a static snapshot once, which is why
+  create-world knobs used to be dead.
+- **Two of those getters were STILL half-dead until CCR-WORLDGEN-UI-001 Phase D
+  (build 2026-07-11.1)**: `WORLD_CONFIG.terrainAmplitudeMultiplier` had a getter,
+  a worker bake, and a reader in `terrainSurface` but NO writer ("Step 11" was
+  never done — `applyGenParams` now assigns it), and `seaLevel` reached only the
+  main thread (the worker's hand-maintained `WORLD_DIMS` literal is 60; an
+  injected `WORLD_DIMS.seaLevel = <live>` line now overrides it at pool
+  creation — the LITERALS on both sides deliberately stay 60 for parity-check).
+  Lesson: a live getter + worker bake proves NOTHING about a knob being wired —
+  trace the WRITER before trusting a create-world control.
 - `activeWorldGenParams` is the single source of truth for the ACTIVE world
-  (NOT `customWorldSettings` — that's create-world UI state). `applyGenParams(p)`
-  applies + rebuilds `worldConfig.biomes` (shallow copy — BIOME_CONFIG edits
-  need the rebuild). Persisted as `savePacket.genParams` (v3), restored BEFORE
-  generation.
-- The chunk worker bakes `worldConfig` + biomes ONCE at pool creation. In-session
-  loads (pause-menu Load, F9) must call `rebuildChunkWorkerPoolForActiveWorld()`
-  to re-bake; title-screen loads get it free via `location.reload()`.
+  (NOT `customWorldSettings` — that's create-world UI state, now initialized
+  wholesale from `DEFAULT_GEN_PARAMS`). `applyGenParams(p)` applies + rebuilds
+  `worldConfig.biomes` (shallow copy — BIOME_CONFIG edits need the rebuild).
+  Persisted as `savePacket.genParams` (13 keys since `usePathBasedRivers` — a
+  flag with ZERO readers — was removed; still called v3, old saves load fine).
+  CAUTION: `applyGenParams` resets every OMITTED key to its default (`??`
+  fallbacks) — always pass complete objects (bit the terrain editor's design).
+- `GEN_PARAM_SCHEMA` (beside `DEFAULT_GEN_PARAMS`) is the machine-readable
+  registry both the create-world UI and tools/terrain-parameter-editor.html
+  build their controls from — add a gen param there or it has no UI anywhere.
+  Free-form text inputs, soft warn outside `tested` range, NEVER clamp
+  (owner decision).
+- The chunk worker bakes `worldConfig` + biomes + the seaLevel override ONCE at
+  pool creation. In-session loads (pause-menu Load, F9) must call
+  `rebuildChunkWorkerPoolForActiveWorld()` to re-bake; title-screen loads get it
+  free via `location.reload()`.
+- Spawn X/Z are REAL since Phase D (`findAndSetSpawnPosition(spawnBX, spawnBZ)`,
+  pre-gen centers on the spawn chunk); before that they only panned the preview.
 
 ### World-gen performance (CCR-PERF-013)
 - Spawn generation is MAIN-THREAD bound, not worker bound (trace: 71 s to

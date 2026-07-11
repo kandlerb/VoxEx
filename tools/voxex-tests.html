@@ -3250,6 +3250,151 @@ async function runAllTests() {
         });
     });
 
+    describe("WorldGen Params (CCR-WORLDGEN-UI-001)", () => {
+        // Every test below that mutates shared iframe state (WORLD_CONFIG / WORLD_DIMS /
+        // BIOME_CONFIG / selectedBiome / biomeCellCache / treeMaskCache, all touched by
+        // applyGenParams) restores via VoxEx.applyGenParams(DGP) in a finally block, mirroring
+        // the WORLD_CONFIG.useNewTerrain / VoxEx.selectedBiome save-restore pattern used
+        // elsewhere in this suite (see the "terrain: new-path A/B" and biome-forcing describes
+        // above). No test here depends on another's leftover state.
+        const GPS = VoxEx.GEN_PARAM_SCHEMA;
+        const GPS_BY_KEY = VoxEx.GEN_PARAM_SCHEMA_BY_KEY;
+        const DGP = VoxEx.DEFAULT_GEN_PARAMS;
+
+        it("schema<->defaults strict parity + usePathBasedRivers regression (#12) + lookup map resolves every key", () => {
+            const defaultKeys = Object.keys(DGP);
+            const schemaKeys = GPS.map(e => e.key);
+            for (const e of GPS) { expect(defaultKeys.includes(e.key)).toBeTruthy(); }
+            for (const k of defaultKeys) { expect(schemaKeys.includes(k)).toBeTruthy(); }
+            // #12 regression: the dead usePathBasedRivers key must be gone from DEFAULT_GEN_PARAMS.
+            expect(defaultKeys.includes('usePathBasedRivers')).toBeFalsy();
+            for (const e of GPS) {
+                expect(GPS_BY_KEY[e.key]).toBeDefined();
+                expect(GPS_BY_KEY[e.key].key).toBe(e.key);
+            }
+        });
+
+        it("parseGenParamInput: percent conversion + int format, NaN/empty fallback, soft-warn only (no clamping)", () => {
+            const amp = GPS_BY_KEY.terrainAmplitudeMultiplier; // format: 'percent', tested [0,2]
+            const sea = GPS_BY_KEY.seaLevel;                   // format: 'int',     tested [40,80]
+
+            let r = VoxEx.parseGenParamInput(amp, '100');
+            expect(r.value).toBeCloseTo(1.0, 9); expect(r.warned).toBeFalsy(); expect(r.fellBack).toBeFalsy();
+
+            r = VoxEx.parseGenParamInput(amp, '500');
+            expect(r.value).toBeCloseTo(5.0, 9); expect(r.warned).toBeTruthy(); expect(r.fellBack).toBeFalsy(); // NOT clamped
+
+            r = VoxEx.parseGenParamInput(amp, 'abc');
+            expect(r.fellBack).toBeTruthy(); expect(r.value).toBe(DGP.terrainAmplitudeMultiplier);
+
+            r = VoxEx.parseGenParamInput(amp, '');
+            expect(r.fellBack).toBeTruthy(); expect(r.value).toBe(DGP.terrainAmplitudeMultiplier);
+
+            r = VoxEx.parseGenParamInput(sea, '63');
+            expect(r.value).toBe(63); expect(r.warned).toBeFalsy();
+
+            r = VoxEx.parseGenParamInput(sea, '300');
+            expect(r.value).toBe(300); expect(r.warned).toBeTruthy(); // NOT clamped
+        });
+
+        it("formatGenParam/parseGenParamInput round-trip for every number-kind schema entry", () => {
+            for (const e of GPS) {
+                if (e.kind !== 'number') continue;
+                const def = DGP[e.key];
+                const displayed = VoxEx.formatGenParam(e, def);
+                const parsed = VoxEx.parseGenParamInput(e, displayed);
+                expect(parsed.value).toBeCloseTo(def, 6);
+                expect(parsed.fellBack).toBeFalsy();
+            }
+        });
+
+        it("applyGenParams round-trip (#5 seam export): a custom seaLevel reaches WORLD_DIMS and restores cleanly", () => {
+            try {
+                VoxEx.applyGenParams({ ...DGP, seaLevel: 70 });
+                expect(WORLD_DIMS.seaLevel).toBe(70);
+            } finally {
+                VoxEx.applyGenParams(DGP);
+                expect(WORLD_DIMS.seaLevel).toBe(60);
+            }
+        });
+
+        it("#10 amplitude-0 collapses fractal relief (SPLINE_CONTINENTAL isn't seam-exported, so this checks the " +
+            "weaker-but-sufficient property the CCR's own fallback allows: determinism at amp0=0, plus variance " +
+            "collapse vs the amp0=1 default across a 16-point grid)", () => {
+            const SEED = "genparams_amp0_test";
+            const pts = [];
+            for (let i = 0; i < 4; i++) {
+                for (let j = 0; j < 4; j++) pts.push([i * 733 - 1400, j * 911 - 1400]);
+            }
+            try {
+                biomeCellCache.clear(); seedNoise(SEED);
+                VoxEx.applyGenParams(DGP); // amp0 = 1 (default) baseline
+                let min1 = Infinity, max1 = -Infinity;
+                for (const [gx, gz] of pts) {
+                    const h = terrainSurface(gx, gz);
+                    if (h < min1) min1 = h;
+                    if (h > max1) max1 = h;
+                }
+                const range1 = max1 - min1;
+                expect(range1).toBeGreaterThan(5); // sanity: the sample actually spans real relief
+
+                VoxEx.applyGenParams({ ...DGP, terrainAmplitudeMultiplier: 0 });
+                const first = {};
+                let min0 = Infinity, max0 = -Infinity;
+                for (const [gx, gz] of pts) {
+                    const h = terrainSurface(gx, gz);
+                    first[gx + ',' + gz] = h;
+                    if (h < min0) min0 = h;
+                    if (h > max0) max0 = h;
+                }
+                const range0 = max0 - min0;
+
+                // Determinism: re-applying the SAME amp0=0 params must reproduce identical heights.
+                VoxEx.applyGenParams({ ...DGP, terrainAmplitudeMultiplier: 0 });
+                for (const [gx, gz] of pts) {
+                    expect(terrainSurface(gx, gz)).toBe(first[gx + ',' + gz]);
+                }
+
+                // Variance collapse: amp0=0 removes ALL fractal relief, leaving only the smooth
+                // continental baseline -- range0 should be a small fraction of range1.
+                expect(range0).toBeLessThan(range1 * 0.2);
+            } finally {
+                VoxEx.applyGenParams(DGP);
+                biomeCellCache.clear();
+            }
+        });
+
+        it("#11 worker seaLevel bake (string-level check; see report for why not a live worker generate): " +
+            "buildChunkWorkerCode() injects a runtime WORLD_DIMS.seaLevel override matching the live value", () => {
+            try {
+                VoxEx.applyGenParams({ ...DGP, seaLevel: 75 });
+                const code75 = VoxEx.buildChunkWorkerCode();
+                expect(code75).toContain('WORLD_DIMS.seaLevel = 75;');
+            } finally {
+                VoxEx.applyGenParams(DGP);
+            }
+            const codeDefault = VoxEx.buildChunkWorkerCode();
+            expect(codeDefault).toContain('WORLD_DIMS.seaLevel = 60;');
+        });
+
+        it("WORLD_PRESETS export sanity: 6 presets, each with the full numeric + boolean field set", () => {
+            const presets = VoxEx.WORLD_PRESETS;
+            const names = Object.keys(presets);
+            expect(names).toHaveLength(6);
+            for (const name of names) {
+                const p = presets[name];
+                expect(typeof p.terrainAmplitude).toBe('number');
+                expect(typeof p.seaLevel).toBe('number');
+                expect(typeof p.caveDensity).toBe('number');
+                expect(typeof p.treeDensity).toBe('number');
+                expect(typeof p.biomeSize).toBe('number');
+                expect(typeof p.enableRivers).toBe('boolean');
+                expect(typeof p.enableTrees).toBe('boolean');
+                expect(typeof p.enableCaves).toBe('boolean');
+            }
+        });
+    });
+
     await runRegistered(updateProgress);
     renderResults();
     renderTerrainVisualizations();
