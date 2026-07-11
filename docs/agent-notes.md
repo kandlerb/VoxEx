@@ -221,6 +221,29 @@ can tell whether circumstances actually changed.
   free via `location.reload()`.
 - Spawn X/Z are REAL since Phase D (`findAndSetSpawnPosition(spawnBX, spawnBZ)`,
   pre-gen centers on the spawn chunk); before that they only panned the preview.
+- **GEN_TUNABLES (CCR-WORLDGEN-TUNABLES-001, build 2026-07-11.2)**: the shape/
+  climate/spline/river/ocean/cave constants moved into one registry, read via
+  `let` aliases (`syncGenTunableAliases()` refreshes them — a bare
+  `const NAME = GEN_TUNABLES.NAME` would freeze at boot). Object keys (AXIS_W,
+  BIOME_PARAMS, SPLINE_*) are mutated IN PLACE, never reassigned — readers hold
+  the reference. `applyGenTunables` is deliberately ASYMMETRIC with
+  `applyGenParams`: partial objects do NOT reset omitted keys. **Option B (build
+  2026-07-11.3): tunables ARE per-world** — `genParams` carries an optional
+  `tunables` DELTA and `applyGenParams` is TRI-STATE on it (absent → reset to
+  defaults; object → reset+apply; explicit `null` → leave registry untouched).
+  The `null` state exists because the terrain editor manages the registry itself
+  via `applyGenTunables` while ALSO calling `applyGenParams` per genparam edit —
+  without it every genparam tweak wiped the dialed tunables (caught in review;
+  the editor's `applyParamsToGame()` wrapper now passes its own delta). Any new
+  `applyGenParams` caller MUST decide its tunables intent explicitly.
+  Cave tunables ride the per-generate
+  `worldGenSettings` message (the cave code is the hand-maintained
+  `precalculateCaveNoise` pair — NOT injected — so message plumbing beats
+  template edits). LOCKSTEP: `tools/lib/extract-terrain.mjs` extracts the
+  registry and derives tunables from its `REGISTRY_KEYS` list — update it in the
+  same commit as any registry key add/rename, or terrain-node-checks fails
+  loudly ("const X not found"). No lava level exists (no LAVA block) — don't
+  re-guess that inventory.
 
 ### World-gen performance (CCR-PERF-013)
 - Spawn generation is MAIN-THREAD bound, not worker bound (trace: 71 s to
@@ -331,6 +354,20 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   Recovery that worked: truncate the mount file at the last good byte and append
   the correct tail (read via the authoritative Read tool), then re-run
   syntax/parity/suite. Verify the REAL file via Read afterward.
+  **2026-07-11 (CCR-WORLDGEN-TUNABLES-001): this recovery was needed FOUR times
+  in one session** (voxEx.html ×2, terrain-parameter-editor.html, voxex-tests.html)
+  — heavy Edit-tool sessions on large pre-existing files should EXPECT it. Refinements
+  that worked: (1) find the cut with `tail -c 300 <mount file>`, locate that text's
+  real line via Grep, truncate the mount after the last COMPLETE line using a
+  python3 `bytes.rfind(anchor)` on the full anchor line + terminator; (2) the tail
+  transcription goes to a NEW file in the outputs mount (new files sync fine),
+  normalized to the file's own line-ending style (check `tr -cd '\r' | wc -c`
+  on the byte-correct PREFIX — voxEx.html/voxex-tests.html are CRLF, the rewritten
+  terrain-parameter-editor.html is LF); (3) mid-file content can be VERIFIED
+  synced by comparing a distinctive-token count (bash grep -c vs Grep-tool count)
+  before assuming only the tail is missing; (4) a saved tail file remains valid
+  across LATER mid-file edits (content-anchored, not line-anchored) — reusable
+  for repeat recoveries in the same session.
   **The appended tail must preserve CRLF** — a Phase 1 recovery re-appended an
   LF-only tail into the otherwise-CRLF voxEx.html (caught in review, not by any
   gate). Check: `tr -cd '\r' < voxEx.html | wc -c` must equal `wc -l`. Fix:

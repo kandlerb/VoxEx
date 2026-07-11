@@ -10,6 +10,12 @@
 //   const api = buildTerrainApi('voxEx.html', 'my-seed');
 //   api.computeSurfaceHeight(gx, gz); api.blendedHeight(gx, gz, 0); ...
 //
+// CCR-WORLDGEN-TUNABLES-001: the shape/climate/river tunables moved from bare
+// `const NAME = value;` declarations into the GEN_TUNABLES registry (the game
+// reads them through `let` aliases). This extractor now extracts the REGISTRY
+// object and derives each tunable from it — extracting the aliases directly
+// would find `GEN_TUNABLES.NAME` references with no registry in the sandbox.
+//
 // NOTE: uses its own PRNG for the perm table — results are internally
 // consistent but not byte-identical to a specific in-game seed string.
 // If extraction throws, the code moved/renamed: update THIS file in the same
@@ -83,17 +89,22 @@ export function buildTerrainApi(file, seedStr) {
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
   ];
-  const CONSTS = [
-    'SPLINE_CONTINENTAL', 'SPLINE_EROSION',
-    'FIELD_GAIN', 'MAX_SURFACE_Y', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
+  // Registry-backed tunables (CCR-WORLDGEN-TUNABLES-001): derived from the
+  // extracted GEN_TUNABLES object below, NOT scanned as standalone consts.
+  const REGISTRY_KEYS = [
+    'SPLINE_CONTINENTAL', 'SPLINE_EROSION', 'BIOME_PARAMS', 'AXIS_W',
+    'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',
     'OCEAN_WARP_FREQ', 'OCEAN_WARP_AMP', 'OCEAN_WARP_VAR_FREQ', 'OCEAN_WARP_VAR_STRENGTH',
     'RIVER_WARP_FREQ', 'RIVER_WARP_AMP', 'RIVER_WARP_VAR_FREQ', 'RIVER_WARP_VAR_STRENGTH',
     'OCEAN_THRESHOLD_DEEP', 'OCEAN_THRESHOLD_SHALLOW',
+    'RIVER_DEPTH_SCALE', 'OCEAN_DEPTH_SCALE',
   ];
+  // still-bare consts scanned from source
+  const CONSTS = ['MAX_SURFACE_Y'];
   // multi-line object consts extracted with the arrow scanner
-  const OBJ_CONSTS = ['GRAD2D', 'BIOME_PARAMS', 'AXIS_W'];
+  const OBJ_CONSTS = ['GRAD2D'];
 
   let assembled = '"use strict";\n';
 
@@ -132,6 +143,13 @@ const lerpValue = (a, b, t) => a + t * (b - a);
     assembled += s + '\n';
   }
   assembled += 'const grad = (h, x, y) => { const g = GRAD2D[h & 15]; return g[0] * x + g[1] * y; };\n';
+
+  // GEN_TUNABLES registry (defaults = shipped values), then per-key aliases.
+  const registry = extractConstArrow('GEN_TUNABLES');
+  if (!registry) throw new Error('const GEN_TUNABLES not found');
+  assembled += registry + '\n';
+  for (const name of REGISTRY_KEYS) assembled += `const ${name} = GEN_TUNABLES.${name};\n`;
+
   for (const name of CONSTS) assembled += `const ${name} = ${extractConstValue(name)};\n`;
 
   // biomeByName stub: resolveBiome only needs .name/.tags/.trees here

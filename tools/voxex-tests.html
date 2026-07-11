@@ -3395,6 +3395,159 @@ async function runAllTests() {
         });
     });
 
+    describe("WorldGen Tunables (CCR-WORLDGEN-TUNABLES-001)", () => {
+        // Every mutating test below restores via VoxEx.resetGenTunables() in a finally block
+        // (re-clearing biomeCellCache + reseeding where terrain heights were sampled), mirroring
+        // the WorldGen Params suite's applyGenParams(DGP) restore pattern above. No test here
+        // depends on another test's leftover state.
+        const GTS = VoxEx.GEN_TUNABLE_SCHEMA;
+        const GT = VoxEx.GEN_TUNABLES;
+        const GTD = VoxEx.GEN_TUNABLE_DEFAULTS;
+        // The 4 object/array-valued tunables (control-point arrays + weight tables) -- every
+        // other registry key is a plain scalar number.
+        const JSON_KEYS = ['AXIS_W', 'BIOME_PARAMS', 'SPLINE_CONTINENTAL', 'SPLINE_EROSION'];
+
+        it("registry<->schema strict parity: every key both ways, kind split (json vs number), all rows 'both' (Option B)", () => {
+            const registryKeys = Object.keys(GT);
+            const schemaKeys = GTS.map(e => e.key);
+            for (const e of GTS) { expect(registryKeys.includes(e.key)).toBeTruthy(); }
+            for (const k of registryKeys) { expect(schemaKeys.includes(k)).toBeTruthy(); }
+            for (const e of GTS) {
+                expect(e.ui).toBe('both');
+                if (JSON_KEYS.includes(e.key)) { expect(e.kind).toBe('json'); }
+                else { expect(e.kind).toBe('number'); }
+            }
+            const jsonSchemaKeys = GTS.filter(e => e.kind === 'json').map(e => e.key).sort();
+            expect(jsonSchemaKeys).toEqual(JSON_KEYS.slice().sort());
+        });
+
+        it("applyGenParams tri-state tunables (Option B): plain object applies (reset-then-apply), null leaves untouched, absent resets", () => {
+            const DGP = VoxEx.DEFAULT_GEN_PARAMS;
+            try {
+                // (a) plain object -> resetGenTunables() then applyGenTunables(delta)
+                VoxEx.applyGenParams({ ...DGP, tunables: { RELIEF_AMPLITUDE: 555 } });
+                expect(GT.RELIEF_AMPLITUDE).toBe(555);
+
+                // (b) explicit null -> tunables left exactly as they are
+                VoxEx.applyGenParams({ ...DGP, tunables: null });
+                expect(GT.RELIEF_AMPLITUDE).toBe(555);
+
+                // (c) absent tunables field -> resetGenTunables()
+                VoxEx.applyGenParams({ ...DGP });
+                expect(GT.RELIEF_AMPLITUDE).toBe(GTD.RELIEF_AMPLITUDE);
+            } finally {
+                VoxEx.resetGenTunables();
+                VoxEx.applyGenParams(DGP);
+                biomeCellCache.clear();
+            }
+        });
+
+        it("defaults integrity: GEN_TUNABLE_DEFAULTS deep-equals GEN_TUNABLES at boot, and is frozen", () => {
+            expect(JSON.stringify(GTD)).toBe(JSON.stringify(GT));
+            expect(Object.isFrozen(GTD)).toBeTruthy();
+        });
+
+        it("applyGenTunables round-trip + partial semantics: a partial update doesn't reset omitted keys, and the " +
+            "hot-path alias sync reaches terrainSurface (proving RELIEF_AMPLITUDE isn't frozen-at-boot)", () => {
+            const preRelief = GT.RELIEF_AMPLITUDE;
+            const prePeak = GT.PEAK_AMP;
+            const SEED = "gentunables_roundtrip";
+            // Several scattered sample points -- avoids a false negative from landing exactly on
+            // a fractal zero-crossing at one lone point.
+            const pts = [[500, 500], [-733, 211], [1500, -900], [222, 1800], [-1200, -400]];
+            let before;
+            try {
+                biomeCellCache.clear(); seedNoise(SEED);
+                before = pts.map(([gx, gz]) => terrainSurface(gx, gz));
+
+                VoxEx.applyGenTunables({ RELIEF_AMPLITUDE: 999 });
+                expect(GT.RELIEF_AMPLITUDE).toBe(999);
+                expect(GT.PEAK_AMP).toBe(prePeak); // partial must NOT reset an omitted key
+
+                biomeCellCache.clear(); seedNoise(SEED);
+                const after = pts.map(([gx, gz]) => terrainSurface(gx, gz));
+                let maxDiff = 0;
+                for (let i = 0; i < pts.length; i++) maxDiff = Math.max(maxDiff, Math.abs(after[i] - before[i]));
+                expect(maxDiff).toBeGreaterThan(1); // alias sync reached terrainSurface's hot path
+            } finally {
+                VoxEx.resetGenTunables();
+                expect(GT.RELIEF_AMPLITUDE).toBe(preRelief);
+                biomeCellCache.clear(); seedNoise(SEED);
+                const restored = pts.map(([gx, gz]) => terrainSurface(gx, gz));
+                for (let i = 0; i < pts.length; i++) expect(restored[i]).toBe(before[i]);
+                expect(JSON.stringify(GT)).toBe(JSON.stringify(GTD));
+            }
+        });
+
+        it("SWISS_WARP hard cap: applyGenTunables({SWISS_WARP: 20}) clamps to 13.9 (owner-approved hard bound < 14)", () => {
+            try {
+                VoxEx.applyGenTunables({ SWISS_WARP: 20 });
+                expect(GT.SWISS_WARP).toBeLessThan(14);
+                expect(GT.SWISS_WARP).toBeCloseTo(13.9, 9);
+            } finally {
+                VoxEx.resetGenTunables();
+                expect(GT.SWISS_WARP).toBe(GTD.SWISS_WARP);
+            }
+        });
+
+        it("applyGenTunables ignores an unknown key without throwing; registry stays byte-identical to defaults", () => {
+            expect(() => VoxEx.applyGenTunables({ TOTALLY_FAKE_KEY: 5 })).not.toThrow();
+            expect(GT.TOTALLY_FAKE_KEY).toBeUndefined();
+            expect(JSON.stringify(GT)).toBe(JSON.stringify(GTD));
+        });
+
+        it("object-key tunables (SPLINE_CONTINENTAL) are mutated IN PLACE, never reassigned", () => {
+            const ref = VoxEx.GEN_TUNABLES.SPLINE_CONTINENTAL;
+            try {
+                VoxEx.applyGenTunables({ SPLINE_CONTINENTAL: [[-1, -45], [1, 14]] });
+                expect(VoxEx.GEN_TUNABLES.SPLINE_CONTINENTAL).toBe(ref); // same object identity
+                expect(VoxEx.GEN_TUNABLES.SPLINE_CONTINENTAL.length).toBe(2);
+            } finally {
+                VoxEx.resetGenTunables();
+                expect(VoxEx.GEN_TUNABLES.SPLINE_CONTINENTAL).toBe(ref);
+                expect(VoxEx.GEN_TUNABLES.SPLINE_CONTINENTAL.length).toBe(GTD.SPLINE_CONTINENTAL.length);
+            }
+        });
+
+        it("worker bake sentinel: buildChunkWorkerCode() emits the LIVE RELIEF_AMPLITUDE, reverts to the default after reset", () => {
+            try {
+                VoxEx.applyGenTunables({ RELIEF_AMPLITUDE: 777.5 });
+                const code = VoxEx.buildChunkWorkerCode();
+                expect(code).toContain('RELIEF_AMPLITUDE = 777.5;');
+            } finally {
+                VoxEx.resetGenTunables();
+            }
+            const codeDefault = VoxEx.buildChunkWorkerCode();
+            expect(codeDefault).toContain('RELIEF_AMPLITUDE = ' + JSON.stringify(GTD.RELIEF_AMPLITUDE) + ';');
+        });
+
+        it("cave tunables propagate to window.worldGenSettings (CAVE_SCALE -> caveScale, syncGenTunableCaveSettings)", () => {
+            const gameWindow = VoxEx._doc.defaultView;
+            try {
+                VoxEx.applyGenTunables({ CAVE_SCALE: 0.05 });
+                expect(gameWindow.worldGenSettings.caveScale).toBe(0.05);
+            } finally {
+                VoxEx.resetGenTunables();
+                expect(gameWindow.worldGenSettings.caveScale).toBe(0.02);
+            }
+        });
+
+        it("RIVER_DEPTH_SCALE is a pure output multiplier: applyGenTunables({RIVER_DEPTH_SCALE: 2}) exactly doubles getRiverDepth's return", () => {
+            const SEED = "gentunables_riverdepth";
+            try {
+                biomeCellCache.clear(); seedNoise(SEED);
+                const baseline = VoxEx.getRiverDepth(0, 100, 100, VoxEx.worldSeed, 1.0);
+                expect(baseline).toBeGreaterThan(0);
+
+                VoxEx.applyGenTunables({ RIVER_DEPTH_SCALE: 2 });
+                const scaled = VoxEx.getRiverDepth(0, 100, 100, VoxEx.worldSeed, 1.0);
+                expect(scaled).toBe(baseline * 2);
+            } finally {
+                VoxEx.resetGenTunables();
+            }
+        });
+    });
+
     await runRegistered(updateProgress);
     renderResults();
     renderTerrainVisualizations();
