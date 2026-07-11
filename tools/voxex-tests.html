@@ -1071,6 +1071,75 @@ async function runAllTests() {
         });
     });
 
+    describe("lighting: full-recalc edge re-import (CCR-LIGHT-005)", () => {
+        it("reimportNeighborLight: border transfer + inward spread reach a full-recalc target chunk via the real chunks registry", () => {
+            const { chunkDataPool, reimportNeighborLight, RENDER_PASS } = VoxEx;
+            const bi = (x, y, z) => x + z * 16 + y * 256; // matches blockIndex's local-coord formula
+            const CX = 39000, CZ = 39000;
+            const KEY_B = getChunkKey(CX, CZ);       // target: full-recalc'd with ZERO torches
+            const KEY_A = getChunkKey(CX - 1, CZ);   // source (west neighbor): has the one torch
+
+            // Both chunks: flat stone floor to y=99, open air above -- same flat shape used by
+            // the Phase 0/2 fixtures. A has a TORCH 2 cells in from its EAST border (lx=13,
+            // border is lx=15) so its own in-chunk BFS carries it to the shared border; B has
+            // no emitters at all, mirroring a chunk that just went through a chunk-local-only
+            // full recalc (calculateChunkSunlight/calculateBlockLight) with no neighbor import.
+            function makeFlatBlocks() {
+                const blocks = new Uint8Array(CHUNK_DATA_SIZE);
+                for (let y = 0; y <= 99; y++) for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) blocks[bi(x, y, z)] = STONE;
+                return blocks;
+            }
+            const aBlocks = makeFlatBlocks();
+            aBlocks[bi(13, 100, 8)] = TORCH;
+            const A = { blocks: aBlocks, skyLight: new Uint8Array(CHUNK_DATA_SIZE), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData() };
+            const B = { blocks: makeFlatBlocks(), skyLight: new Uint8Array(CHUNK_DATA_SIZE), blockLight: new Uint8Array(CHUNK_DATA_SIZE), sections: createSectionData() };
+
+            // The exact chunk-local full recalc every CCR-LIGHT-005 orchestration site runs
+            // BEFORE ever calling reimportNeighborLight -- calculateChunkSunlight/calculateBlockLight,
+            // nothing cross-chunk yet.
+            calculateChunkSunlight(A, 16, 320);
+            calculateBlockLight(A, 16, 320);
+            calculateChunkSunlight(B, 16, 320);
+            calculateBlockLight(B, 16, 320);
+
+            // Precondition (documents the setup): A's own in-chunk BFS carries the torch
+            // (level 15 at lx=13) across 2 steps of open air to ITS OWN east border:
+            // 15 - 1 - 1 = 13 at (lx=15, y=100, z=8). B's blockLight is all zero (no emitters).
+            expect(A.blockLight[bi(15, 100, 8)]).toBe(13);
+            expect(B.blockLight[bi(0, 100, 8)]).toBe(0);
+
+            chunkDataPool.chunks.set(KEY_A, A);
+            chunkDataPool.chunks.set(KEY_B, B);
+            try {
+                // THE FIX UNDER TEST: reimportNeighborLight reads the real module-level `chunks`
+                // map (chunkDataPool.chunks IS that map, same object reference) to find A as B's
+                // west neighbor, exactly the path a full-recalc orchestration site now takes.
+                reimportNeighborLight(B, CX, CZ);
+
+                // HAND-COMPUTED SPOT VALUE: the border transfer costs 1 (travel) + 0 (BLOCKLIGHT_
+                // ATTENUATION[AIR], the ENTERED/target cell) -- A's border value (13) minus 1 = 12.
+                // Before this fix existed, NOTHING called propagateLightFromNeighbors for a
+                // full-recalc'd chunk, so this cell would still read the pre-import 0.
+                expect(B.blockLight[bi(0, 100, 8)]).toBe(12);
+
+                // HAND-COMPUTED SPOT VALUE: propagateLightFromEdgesInward then spreads the
+                // imported border value inward through open air (0 attenuation, -1 per step) --
+                // lx=1 -> 11, lx=2 -> 10. Depth >= 2 lit proves the INWARD spread half of the fix,
+                // not just a single-cell border transfer.
+                expect(B.blockLight[bi(1, 100, 8)]).toBe(11);
+                expect(B.blockLight[bi(2, 100, 8)]).toBe(10);
+                expect(B.blockLight[bi(2, 100, 8)]).toBeGreaterThan(0);
+
+                // reimportNeighborLight also marks the chunk as edge-lit, same as the streaming
+                // path's recalculateEdgeLighting does.
+                expect((B.renderState & RENDER_PASS.EDGE_LIGHTING) !== 0).toBe(true);
+            } finally {
+                chunkDataPool.chunks.delete(KEY_A);
+                chunkDataPool.chunks.delete(KEY_B);
+            }
+        });
+    });
+
     // ---- analyzeChunkSections ----
     describe("analyzeChunkSections", () => {
         it("all-air chunk -> all empty", () => { const ch = { blocks: new Uint8Array(CHUNK_DATA_SIZE).fill(AIR), sections: createSectionData() }; analyzeChunkSections(ch); ch.sections.forEach(s => { expect(s.isEmpty).toBe(true); expect(s.isFullySolid).toBe(false); expect(s.analyzed).toBe(true); }); });

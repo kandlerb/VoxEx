@@ -4301,7 +4301,7 @@
             // BUILD INFO — printed unconditionally at boot (NOT logDebug: visible with
             // debug mode off). UPDATE BOTH CONSTANTS with every change round.
             // =====================================================
-            const VOXEX_BUILD = "2026-07-10.6"; // CCR-LIGHT-004 Phase 4: calculateBlockLight seeds from BLOCK_LIGHT_EMISSION (shared with getBlockEmission); blockLight init zero-fill consistency
+            const VOXEX_BUILD = "2026-07-10.9"; // CCR-LIGHT-007: consolidated edgeLightingPassCount + chunk._edgeMeshDirty + lastEdgeRemeshMs into one edgeLightState map -- bookkeeping only, no light-value changes
             // Bump SETTINGS_VERSION ONLY when DEFAULTS change, to force every device back to defaults
             // on next load (CCR-DEFAULTS-001 D-4). Distinct from VOXEX_BUILD (which bumps every deploy).
             const SETTINGS_VERSION = 5; // VOXEX-CCR-FIRE-002: bumped 4→5; FIRE-001 changed DEFAULTS but missed version bump
@@ -4310,6 +4310,9 @@
             // Distinct from CURRENT_CACHE_VERSION (which controls lighting recalculation only).
             const TERRAIN_GEN_VERSION = 31; // bumped 30→31: CCR-TERRAIN-011 — beach sand gated by WATER PROXIMITY (oceanCache/riverFactor), no more Y-band sand fields
             const VOXEX_RECENT_CHANGES = [
+                "CCR-LIGHT-007: consolidated per-chunk edge-lighting state (build 2026-07-10.9). Three transient bookkeeping containers -- edgeLightingPassCount (Map, convergence pass counter), chunk._edgeMeshDirty (an expando on the chunk object, deferred-remesh flag), and lastEdgeRemeshMs (Map, remesh debounce timestamp) -- drifted independently and carried three separate cleanup obligations; lastEdgeRemeshMs in particular was NEVER purged on chunk eviction, a small per-evicted-key leak. Replaced with a single const edgeLightState = new Map() storing one { passCount, meshDirty, lastRemeshMs } record per chunk key, plus a getEdgeLightState(key) accessor that lazily creates a zeroed record. The PERSISTED renderState RENDER_PASS.EDGE_LIGHTING bit is untouched -- it round-trips through the chunk cache and is a different kind of state (durable render-pass marker, not transient scratch). Mechanical substitution at every site: queueAdjacentChunksForUpdate's neighbor re-queue (reset passCount to 0 via a plain get, since a missing record has nothing to reset; set meshDirty via the allocating getter, matching the old expando-create-on-write semantics) and processEdgeLightingUpdates (one edgeState = getEdgeLightState(key) resolved once per chunk near the top of the loop body and reused for the cap check, the convergence reset, both meshDirty writes, the debounce read/write, and the cap-flush branch). The neighbor-side pass-count read in the re-queue loop deliberately stays a raw edgeLightState.get(nKey)?.passCount || 0 rather than the allocating getter -- reading a neighbor for a threshold check must not fabricate a record for a chunk that may not even be loaded. purgeChunkData now does a full edgeLightState.delete(key) (this is where the lastEdgeRemeshMs leak is actually fixed) instead of the old passCount-only delete; the three CCR-LIGHT-005 orchestration sites (recalculateAffectedChunks, rebuildTorchLightingForActiveChunks, rebuildSkylightForActiveChunks) reset passCount to 0 the same way queueAdjacentChunksForUpdate does, since they are re-queue sites, not eviction sites. Eviction-lifecycle equivalence: the old _edgeMeshDirty expando died implicitly when its chunk object was evicted; the new map entry is kept alive independently but purgeChunkData deletes it in the same call that removes the chunk from every other tracking structure, so the effective lifecycle is unchanged. No changes to the light kernel, calculators, edge propagators, LightTask, or any point-query function -- bookkeeping only, values are byte-identical by construction. tools/voxex-tests.html untouched (its edge-pipeline test calls propagateEdgeLighting/propagateLightFromEdgesInward directly and never touched this bookkeeping). No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump. Verified: syntax+parity green; full browser suite green, all pre-existing fixtures byte-identical (see this CCR's As-built for the exact count).",
+                "CCR-LIGHT-006: computeDirectSkyLight direct-index fast path (build 2026-07-10.8). The hot point-query helper (called from computeNeighborSunlight, itself hot in the incremental sunlight remove BFS -- 6 boundary reads per removal node) walked its ~320-row column via a getBlock(x, cy, z) call PER CELL, each paying a string-keyed chunk-map lookup. Rewritten to resolve the (x,z) column chunk ONCE and direct-index the blocks array, mirroring the exact pattern VOXEX-CCR-LIGHT-002 already shipped in primeSunlightColumn: cx = x >> 4, cz = z >> 4, chunkKey = getChunkKey(cx, cz), chunk = chunkDataPool.get(chunkKey) (or voxelWorld.chunks.get as fallback), then colBase = (x & 15) + ((z & 15) << 4) and idx = colBase + ((cy + WORLD_DIMS.yOffset) << 8) per row. Three semantics were preserved exactly, not copied from primeSunlightColumn unmodified: (1) unloaded chunk (!chunk) now returns 15 directly -- the old getBlock()-per-cell walk returned undefined for every cell in this case, so every cell hit the skip-unloaded-slices branch and light never moved off its 15 seed; (2) legacy raw-array chunk falls back to const blocks = chunk.blocks ? chunk.blocks : chunk (getBlock own fallback), UNLIKE primeSunlightColumn which early-returns on this case -- that function is an edit-path helper that can safely no-op, but computeDirectSkyLight is a point query that must keep answering; (3) the blockId === undefined skip is kept for the legacy-array case even though it is now unreachable for normal object-format chunks. Deliberately does NOT call chunkDataPool.touch() -- same omission as primeSunlightColumn, a light query should not itself bump LRU recency; this is the one observable side effect versus the old walk (cache eviction ordering only) and has zero effect on the light value returned. computeNeighborSunlight/computeNeighborBlockLight bodies are UNCHANGED -- their own 6-neighbor reads span multiple chunks and are out of scope for this CCR (considered and deferred, see CCR-LIGHT-006-direct-sky-fastpath.md). No heightmap built -- that remains a separate, measurement-gated CCR per CCR-LIGHT-004's own Approach section, pending Kandler's in-game dumpLogs('magic') carve-cost numbers. computeDirectSkyLight is main-only (absent from every worker injection list) -- no worker parity impact. Version impact: VOXEX_BUILD only, byte-identical output by construction (same rule, same floors, same loop bound, only the accessor changed) -- confirmed by re-running the full browser suite with zero fixture/checksum changes across every lighting test, including the edit-script checksums that exercise this function via the remove BFS. Verified: syntax+parity green; full browser suite green with all pre-existing fixtures byte-identical (see this CCR's As-built for the exact count). NEXT: CCR-LIGHT-007 (edge-state consolidation).",
+                "CCR-LIGHT-005: full-recalc paths now re-import neighbor border light (build 2026-07-10.7). Follow-up to CCR-LIGHT-004, explicitly deferred until Phase 2 made the edge functions physics-correct. Three orchestration paths recalculated chunk-local light with no neighbor re-import afterward, truncating cross-chunk light at borders: LightTask.bailoutToFullRecalc (via recalculateAffectedChunks) after a big carve bails out; rebuildTorchLightingForActiveChunks and rebuildSkylightForActiveChunks on a torch-intensity or skylight settings change. New shared helper reimportNeighborLight(chunk, cx, cz) (placed next to recalculateEdgeLighting, which already does the identical sequence for the streaming path) calls propagateLightFromNeighbors then propagateLightFromEdgesInward (both channels) and sets RENDER_PASS.EDGE_LIGHTING. recalculateAffectedChunks now runs a SECOND loop over its rebuild targets after the existing recalc loop completes -- two-pass discipline is load-bearing (see the helper's own JSDoc): importing while a neighbor in the same batch is still stale would re-import the very values the first loop just replaced. rebuildTorchLightingForActiveChunks and rebuildSkylightForActiveChunks got the identical second-loop treatment, placed before rebuildAllVisibleChunks(). All three sites also delete each touched chunk's edgeLightingPassCount entry and add it to edgeLightingUpdateQueue so the normal background convergence pass still catches light crossing MORE than one border (diagonal neighbors etc.) that a single re-import pass can't reach. No propagateLightFromNeighbors/propagateLightFromEdgesInward/kernel/calculator changes -- pure orchestration, values at any given chunk are computed by the SAME already-correct functions the streaming path uses, just invoked from three more call sites. RENDER_PASS and reimportNeighborLight added to the window.VoxEx seam export. New test (tools/voxex-tests.html, describe 'lighting: full-recalc edge re-import (CCR-LIGHT-005)'): two adjacent synthetic chunks registered into the real chunkDataPool.chunks map (the same registry propagateLightFromNeighbors reads via chunks.get) -- source chunk A gets a torch 2 cells from its shared border, target chunk B is recalculated with zero blockLight (no torches); calling the exported reimportNeighborLight(B, cx, cz) directly asserts B's border cell equals A's border value minus 1 (travel) minus the entered cell's own attenuation, AND that light has spread at least 2 cells inland (proving the inward-spread half of the fix, not just the single-cell border transfer). Version impact: VOXEX_BUILD only -- this is a runtime orchestration fix (WHEN/whether neighbor light gets re-imported), not a change to any baked-at-generation-time value or propagation rule, so no CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump. Verified: syntax+parity green; full browser suite green (386 pre-existing + 1 new); all six pre-existing lighting checksum fixtures (full-recalc sunlight/blockLight, edge-pipeline sky/block, edit-script sky/block) and the Phase 4 emission spot test held byte-identical -- none of the three touched call sites are exercised by any existing test. NEEDS VERIFICATION (in-game, Kandler, headless sandbox cannot perform): a power-5 explosion's post-bailout border seams are gone (no dark strip at the chunk edge after the carve); changing the torch-intensity slider no longer kills cross-border torch light in neighboring chunks.",
                 "CCR-LIGHT-004 PHASE 4: shared emission-table seeding + blockLight zero-fill hygiene (build 2026-07-10.6, final phase of CCR-LIGHT-004's buildable scope). calculateBlockLight's full-recalc seed loop previously hardcoded TORCH/FIRE (b === FIRE ? fireLevel : (b === TORCH ? torchLevel : 0)), ignoring BLOCK_LIGHT_EMISSION -- so any future emissive block would light correctly on placement (via updateBlockLightAt/getBlockEmission) but go dark on the next full recalc (audit finding #4 / D7). Fixed to b === TORCH ? torchLevel : BLOCK_LIGHT_EMISSION[b], exactly getBlockEmission()'s rule; the early-out (if (torchLevel <= 0 && fireLevel <= 0) return;) was dropped entirely rather than generalized -- the seed scan is cheap relative to the BFS, and the emission table can gain new entries without the loop needing to be re-taught about them. Added a Lockstep Registry row (CLAUDE.md) plus matching comments at both getBlockEmission and the seed loop. VoxelWorld.setBlock's three blockLight: ...fill(1) sites (new-chunk create, legacy-format upgrade, missing-array backfill) changed to a plain zero-filled Uint8Array -- 0 = 'no torch light' everywhere else; these arrays are always recomputed before use, so no observable behavior change. BLOCK_LIGHT_EMISSION added to the window.VoxEx seam export (previously seam-invisible) to support a new headless test. tools/voxex-tests.html: new test in the calculateBlockLight describe -- temporarily sets BLOCK_LIGHT_EMISSION[GLASS] = 10, seeds a GLASS block, asserts the seeded cell reads 10 and its air neighbor reads 9, restores the table entry in a finally block. No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump (seeding of blocks that do not exist yet + a zero-fill of arrays that were always recomputed before use). This completes CCR-LIGHT-004's buildable scope; remaining items are Kandler's in-game gates (Phase 2 border eyeballs, Phase 3A hitch-vs-baseline + 10-minute soak, Phase 3B torch-beside-water eyeball) and deferred follow-ups (CCR-LIGHT-005 full-recalc edge re-import orchestration, a measurement-gated heightmap CCR, watchdog demotion after soak per D5).",
                 "CCR-LIGHT-004 PHASE 3B: incremental ADD loops charge entered-cell attenuation, drift #7 fix (build 2026-07-10.5). The last two hand-copied propagation-rule sites converge on the shared kernel rule: stepLightTask's two ADD branches (sky and block) previously charged only the -1 travel cost and skipped the entered cell's SUNLIGHT_ATTENUATION/BLOCKLIGHT_ATTENUATION -- light added incrementally through WATER/LEAVES/ICE arrived too bright until some later full recalc silently corrected it. New shared helper lightRuleEnter(traveled, attenuation, floor) is a pure extraction of propagateLightBFS's inline expression (attenuation > 0 ? (traveled > attenuation ? traveled - attenuation : floor) : traveled), inserted next to the kernel and added to the WORKER_LIGHTING_ENABLED injection list; the kernel body now calls it instead of repeating the ternary (byte-identical, worker parity gates this). LightTask's constructor gains this.attenTable (SUNLIGHT_ATTENUATION for 'sky', BLOCKLIGHT_ATTENUATION for 'block'), added in 3B specifically (not 3A) so the field never sat around unused. stepLightTask's sky ADD branch: traveled = level > 1 ? level - 1 : 1; propagated = lightRuleEnter(traveled, task.attenTable[nId], 1). Block ADD branch: traveled = level > 0 ? level - 1 : 0; propagated = lightRuleEnter(traveled, task.attenTable[nId], 0). REMOVE branches untouched (their computeNeighborSunlight/computeNeighborBlockLight desired-value queries were always attenuation-aware). CURRENT_CACHE_VERSION 7 -> 8: edited/cached chunks may carry over-bright baked light from the old add rule, so existing worlds relight once on load to correct it (expected one-time cost, not a bug). Test fixtures (tools/voxex-tests.html): the incremental edit-script checksums (CCR-LIGHT-004 Phase 0) moved -- sky 568040165 -> 1768186114, block 362651077 -> 1948544033 -- but only after EXTENDING the script: the original 4-step script (torch place/break far from water; stone place/break directly over the water pool) turned out NOT to move either checksum on the first characterization run -- a genuine coverage gap per the CCR's own (if it does not move, extend it) instruction, not a pass. Root cause: the torch place+break fully self-cancels via the (already attenuation-aware) REMOVE path, and the stone-over-water edit's effect is dominated by the pool's other 15 columns, which stay continuously open to full sun the whole time and were correctly lit by the (unaffected) full-recalc kernel from the very first calculateChunkSunlight call. Fixed by adding two small SEALED pockets to the same script (same isolation design as the new spot tests below) that persist their effect to the final checksum: a 2-deep WATER pocket beside a torch opening (left in place, not broken) and a WATER pocket behind a 2-thick removable wall (mined open, not resealed). With those two extra steps, both checksums genuinely move. The four OTHER fixtures (full-recalc sunlight 1821834511 / blockLight 725244334, edge-pipeline sky 1889740755 / block 787091577) are BYTE-IDENTICAL and unedited -- those paths were untouched by this phase. New describe ('lighting: incremental ADD attenuation fix (CCR-LIGHT-004 Phase 3B -- drift #7)'): two hand-computed spot-value tests via the same registered-chunks pattern as the Phase 0 edit-script test -- (1) block channel: a TORCH placed beside a 2-deep WATER column, the pair FULLY ENCLOSED by STONE on every face except the single torch-side opening; torch cell = 15 (emission E), first water cell = E - 1 - 2 = 12, second (vertical) water cell = first - 3 = 9; (2) sky channel: a WATER cell sealed by a roof + 3 walls + a 2-THICK removable east wall, mined open via two incremental edits (outer layer, then inner), landing at 15 - 1 (travel) - 1 (SUNLIGHT_ATTENUATION[WATER]) = 13, not the pre-3B 14. Both designs went through one characterization-time correction each (documented in-test): the block test's first draft used only single-cell side walls, which let light reach the second water cell via a cheaper indirect path (up through open air, then sideways into the pool, paying WATER's attenuation only once instead of twice) that legitimately beat the straight-through value under monotone-max BFS -- full enclosure on every face fixed it. The sky test's first draft used a single-cell plug directly under open sky and broke it in one edit, which produced NO propagation at all: calculateChunkSunlight/primeSunlightColumn store the light ARRIVING at a cell (TER-2), which for a lone solid block under open sky already equals 15 whether or not that block is solid, so breaking a single plug registers no detectable value change to enqueue -- a 2-thick wall mined in two real edits (mirroring actual incremental gameplay) reproduces a genuine transition. Neither correction implicated the production fix itself; both were test-geometry bugs caught by the characterization discipline (actuals compared against hand computation before baking anything in). The Phase 0 edit-script fixture ALSO needed extending for the same reason as the block test's first draft: its original 4 steps (torch far from water, place/break stone over the already-open pool) didn't move either checksum -- the torch place+break self-cancels via the (already attenuation-aware) REMOVE path, and the stone-over-water edit's effect was dominated by the pool's other 15 columns, continuously open to full sun since the very first (unaffected) full-recalc call. Added two small sealed pockets (steps 5-7, same isolation design as the spot tests) whose effects persist to the final checksum -- both checksums now genuinely move. Verified: syntax+parity green; full browser suite 385/385 headless (383 pre-existing + 2 new); worker sunlight byte-parity green (kernel was touched, gate confirms the pure-extraction refactor stayed byte-identical). NEEDS VERIFICATION (in-game, Kandler): a torch placed beside water / under a leaf canopy now reads dimmer through the medium IMMEDIATELY on placement (previously only after a reload or full recalc corrected it); first load of an existing save takes one-time longer (relight pass) then behaves normally. NEXT: CCR-LIGHT-004 Phase 4 (shared seeding via BLOCK_LIGHT_EMISSION, blockLight zero-fill consistency).",
                 "CCR-LIGHT-004 PHASE 3A: block light joins the budgeted LightTask machinery (build 2026-07-10.4). Renamed SunlightTask -> LightTask (constructor gains a channel param, 'sky'|'block', storing this.channel/this.floor/this.dedupe); sunlightWorkQueue -> lightWorkQueue; stepSunlightTask -> stepLightTask; finalizeSunlightTask -> finalizeLightTask -- all internal only, the seam-exported keys (updateSunlightAt, updateBlockLightAt, processSunlightQueue, sunlightWorkQueueLength) keep their names per D9 so existing tests are untouched. updateBlockLightAt's old fully-synchronous, unbudgeted inline BFS (no caps, no bailout, no task queue) is gone: it now constructs a LightTask(...,'block') and returns it; its wasSource/isSource/transparent decision tree is byte-for-byte unchanged (the removing-a-source comment is load-bearing), only the seeding target changed (task.enqueueAdd/enqueueRemove instead of local arrays), and its tail now mirrors updateSunlightAt (initial burst stepLightTask(task, SUNLIGHT_STEPS_PER_FRAME*0.5), then ensureQueued()+checkPressure() if not done). stepLightTask branches on task.channel inline per neighbor in both the remove and add loops -- no function indirection in the hot path; the block branches are copied VERBATIM from the old inline loops, including the previously-unfixed missing-attenuation bug in the add branch (level>0?level-1:0, no attenuation of the entered cell) -- that fix is Phase 3B's job, not this one (D8: never mix a byte-identical mechanical move with a deliberate value change in the same gate). New LightTask semantics knob: this.dedupe (true only for 'sky') -- resolveVisit skips the per-chunk Uint8Array visit-map allocation/check entirely for block tasks (the old block loop never had one, and adding one is not value-neutral: a deduped re-raised cell can strand its neighbors at a stale-lower value) while keeping the Y-bounds check, touchedChunks tracking, and tracker.mark for both channels. New module helper markLightChunkAt(task, x, z) replaces the old per-call markBlockLightChunk closure, called at the exact same pre-check position (before the loaded/transparent checks) so the tracker gets marked for every scanned neighbor, not just successfully-propagated ones. applyLocalizedRelight now holds a tiny two-task completion refcount (pending++/onComplete for whichever of sunTask/blockTask are still in flight) so the light tracker only finalizes once BOTH channels are done, instead of only ever waiting on sunTask. D6: isCriticalLightJob's player-chunk exemption is now capped -- new const CRITICAL_LIGHT_JOBS_PER_FRAME=4; processLightQueue tracks criticalProcessed and breaks once a critical job has run past both its own cap AND the ordinary per-frame limit, so a carve at the player's feet can no longer process an unbounded number of queued jobs in one frame; jobs beyond the cap simply wait a frame (FIFO, no starvation). VALUES UNCHANGED BY DESIGN (D4/D8): this phase is scheduling-only. Verified: syntax+parity green; ALL SIX existing checksum fixtures byte-identical (Phase 0's sunlight/blockLight/edit-script-sky/edit-script-block + Phase 2's edge-pipeline sky/block) with ZERO test-file edits; worker parity green (nothing touched here is injected -- confirmed via the WORKER_LIGHTING_ENABLED injection list, which still only lists propagateLightBFS/_chunkLocalLightCtx/the 4 ctx accessors/calculateChunkSunlight). No CURRENT_CACHE_VERSION/TERRAIN_GEN_VERSION/SETTINGS_VERSION bump (mechanical move, no output change -- Phase 3B carries the deliberate value-changing fix and its own cache bump). NEEDS VERIFICATION (in-game, Kandler): torch place/break in a large open cave shows no visible hitch vs the Phase 0 baseline; power-5 explosion carve ms via dumpLogs('magic') compared against baseline; a 10-minute streaming soak with zero watchdog force-clears (dumpLogs filter ChunkUpdate). NEXT: CCR-LIGHT-004 Phase 3B (incremental ADD loops charge entered-cell attenuation, CURRENT_CACHE_VERSION 7->8).",
@@ -18124,15 +18127,24 @@
 
             // Queue for chunks needing edge lighting updates after neighbors generate
             const edgeLightingUpdateQueue = new Set();
-            // Track how many edge lighting passes each chunk has had (to prevent infinite reprocessing)
-            const edgeLightingPassCount = new Map();
+            // CCR-LIGHT-007: ONE record per chunk for all transient edge-lighting bookkeeping
+            // (convergence pass count, deferred-remesh flag, remesh debounce timestamp).
+            // Replaces edgeLightingPassCount + chunk._edgeMeshDirty + lastEdgeRemeshMs, which
+            // drifted independently and had three separate cleanup obligations (lastEdgeRemeshMs
+            // was never purged on eviction at all -- a small leak this consolidation fixes).
+            // The PERSISTED renderState EDGE_LIGHTING bit is deliberately NOT in here.
+            const edgeLightState = new Map(); // key -> { passCount, meshDirty, lastRemeshMs }
+            function getEdgeLightState(key) {
+                let s = edgeLightState.get(key);
+                if (!s) { s = { passCount: 0, meshDirty: false, lastRemeshMs: 0 }; edgeLightState.set(key, s); }
+                return s;
+            }
             const MAX_EDGE_LIGHTING_PASSES = 3; // Maximum number of edge lighting passes per chunk
             // Edge-lighting remesh churn controls (Item 3): a pass that brightened only a trivial
             // number of cells should count toward convergence instead of resetting the pass cap,
             // and a chunk should not be remeshed for edge light more than once per debounce window.
             const EDGE_LIGHT_RESET_MIN_CELLS = 8;   // below this changed-cell count, don't reset the convergence cap
             const EDGE_REMESH_DEBOUNCE_MS = 150;    // min ms between edge-lighting remeshes of the same chunk
-            const lastEdgeRemeshMs = new Map();     // chunkKey -> last edge-lighting remesh time (ms)
             // Queue for adjacent chunk updates - chunks that need to be updated after a neighbor is built
             const adjacentChunkUpdateQueue = new Set();
             // Track chunks that have been fully generated but not yet had neighbor updates applied
@@ -18176,14 +18188,15 @@
                             }
                             // Reset pass count so dark chunks at render distance edge can be reprocessed
                             // This fixes chunks that were edge-lit before all neighbors existed
-                            edgeLightingPassCount.delete(nKey);
+                            const nState = edgeLightState.get(nKey);
+                            if (nState) nState.passCount = 0;
                             // GUARANTEED BORDER REMESH: meshes built before this chunk
                             // existed sampled light 15 (and UNLOADED_BLOCK) along the
                             // shared border — visible as bright lines at chunk borders
                             // in caves. In dark areas the neighbor's arrival changes NO
                             // light values, so the convergence remesh would never fire;
                             // flag it explicitly so exactly one remesh happens.
-                            neighborChunk._edgeMeshDirty = true;
+                            getEdgeLightState(nKey).meshDirty = true;
                             queueChunkForLightingUpdate(ncx, ncz, nKey);
                         }
                     }
@@ -18444,6 +18457,25 @@
 
                 // Recalculate edge lighting to account for neighboring chunks
                 recalculateEdgeLighting(chunk, cx, cz, chunkSize, chunkHeight);
+            }
+
+            /**
+             * Re-imports neighbor border light into a freshly-recalculated chunk and spreads it
+             * inward -- BOTH channels. Used by every full-recalc path (LightTask bailout, the
+             * torch/skylight settings rebuilds) so chunk-local recalcs don't strand dark seams
+             * at borders (CCR-LIGHT-005). Callers must recalc ALL chunks in their target set
+             * FIRST, then re-import for each -- importing while neighbors are still stale
+             * re-imports the very values being replaced.
+             * @param {Object} chunk - chunk data ({blocks, skyLight, blockLight, ...})
+             * @param {ChunkCoord} cx - chunk X
+             * @param {ChunkCoord} cz - chunk Z
+             * @returns {void}
+             */
+            function reimportNeighborLight(chunk, cx, cz) {
+                propagateLightFromNeighbors(chunk, cx, cz, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
+                if (!chunk.renderState) chunk.renderState = 0;
+                chunk.renderState |= RENDER_PASS.EDGE_LIGHTING;
             }
 
             // Recalculate lighting at chunk edges to account for neighboring chunks
@@ -18717,18 +18749,20 @@
                     // ignored late-arriving light. Symptom: caves crossing a chunk
                     // border stayed dark until a manual block edit triggered the
                     // global relight path.
-                    const passCount = (edgeLightingPassCount.get(key) || 0) + 1;
-                    edgeLightingPassCount.set(key, passCount);
+                    // CCR-LIGHT-007: one consolidated record per chunk for this whole pass
+                    const edgeState = getEdgeLightState(key);
+                    const passCount = edgeState.passCount + 1;
+                    edgeState.passCount = passCount;
                     if (passCount > MAX_EDGE_LIGHTING_PASSES) {
                         // Converged (cap reached). Safety flush (Item 3): if accumulated edge light
                         // never reached the mesh — e.g. a drip of sub-threshold changes that kept
                         // incrementing the cap without a clean no-change convergence pass — force the
                         // single remesh now (debounced) so the border isn't left dark.
-                        if (chunk._edgeMeshDirty && isChunkMeshed(key)) {
+                        if (edgeState.meshDirty && isChunkMeshed(key)) {
                             const nowMs = performance.now();
-                            if (nowMs - (lastEdgeRemeshMs.get(key) || 0) >= EDGE_REMESH_DEBOUNCE_MS) {
-                                chunk._edgeMeshDirty = false;
-                                lastEdgeRemeshMs.set(key, nowMs);
+                            if (nowMs - edgeState.lastRemeshMs >= EDGE_REMESH_DEBOUNCE_MS) {
+                                edgeState.meshDirty = false;
+                                edgeState.lastRemeshMs = nowMs;
                                 const capCC = parseChunkKeySimple(key);
                                 scheduleChunkUpdate(capCC.cx, capCC.cz, true, "edge-lighting-capflush", { bypassLighting: true, reason: DIRTY_REASON.LIGHT });
                             }
@@ -18781,7 +18815,7 @@
                         // streamed chunks settle and remesh once instead of churning 2-3×. The
                         // cap-drop safety flush above guarantees the accumulated light still reaches
                         // the mesh even if no clean no-change pass is hit before the cap.
-                        if (edgeChanged > EDGE_LIGHT_RESET_MIN_CELLS) { edgeLightingPassCount.set(key, 0); }
+                        if (edgeChanged > EDGE_LIGHT_RESET_MIN_CELLS) { edgeState.passCount = 0; }
 
                         // CRITICAL: Spread edge light into chunk interior via BFS
                         // Without this, edge values from neighbors penetrate only one
@@ -18791,7 +18825,7 @@
                         // Defer the (expensive, forced) remesh until light CONVERGES —
                         // remeshing on every intermediate brightening created a rebuild
                         // storm during initial streaming that starved fresh chunk loads
-                        chunk._edgeMeshDirty = true;
+                        edgeState.meshDirty = true;
 
                         // Ensure we revisit this chunk so the converged pass below can
                         // fire the single remesh (neighbors may be capped and never
@@ -18800,7 +18834,7 @@
                     } else if (!hasValidEdgeLighting || !lightingLooksValid) {
                         // First pass after a recalc: spread own edge light inward once
                         propagateLightFromEdgesInward(chunk, WORLD_DIMS.chunkSize, WORLD_DIMS.chunkHeight);
-                        chunk._edgeMeshDirty = true;
+                        edgeState.meshDirty = true;
                     }
 
                     // Mark as having edge lighting
@@ -18812,15 +18846,15 @@
                     // IMPORTANT: Check for BOTH terrain mesh (key) AND water mesh (key + "_WATER")
                     // Water-only chunks have no terrain mesh but still need rebuilding!
                     const hasTerrainMesh = isChunkMeshed(key); // covers banded keys + water-only chunks
-                    if (edgeChanged === 0 && chunk._edgeMeshDirty && hasTerrainMesh) {
+                    if (edgeChanged === 0 && edgeState.meshDirty && hasTerrainMesh) {
                         // Debounce (Item 3): don't remesh the same chunk for edge light more than
                         // once per window. The first convergence of every chunk always passes (no
                         // prior timestamp); a second convergence within the window is skipped, since
                         // the recent remesh already captured essentially-final lighting.
                         const nowMs = performance.now();
-                        if (nowMs - (lastEdgeRemeshMs.get(key) || 0) >= EDGE_REMESH_DEBOUNCE_MS) {
-                            chunk._edgeMeshDirty = false;
-                            lastEdgeRemeshMs.set(key, nowMs);
+                        if (nowMs - edgeState.lastRemeshMs >= EDGE_REMESH_DEBOUNCE_MS) {
+                            edgeState.meshDirty = false;
+                            edgeState.lastRemeshMs = nowMs;
                             scheduleChunkUpdate(cx, cz, true, "edge-lighting", { bypassLighting: true, reason: DIRTY_REASON.LIGHT });
                         }
                     }
@@ -18847,7 +18881,7 @@
                         const nKey = getChunkKey(ncx, ncz);
                         const neighborChunk = chunks.get(nKey);
                         // Only re-queue if neighbor exists, has lighting, and hasn't exceeded pass limit
-                        const neighborPassCount = edgeLightingPassCount.get(nKey) || 0;
+                        const neighborPassCount = edgeLightState.get(nKey)?.passCount || 0; // read-only: must not allocate a record for a chunk that may not exist
                         if (neighborChunk && neighborChunk.skyLight && !toProcess.includes(nKey) && neighborPassCount < MAX_EDGE_LIGHTING_PASSES) {
                             // Check if this chunk's edge has propagatable light (value > 2)
                             // We only re-queue if there's meaningful light to propagate
@@ -18905,7 +18939,7 @@
                 // Clean up from render state tracking
                 pendingLightChunks.delete(key); // FIX (CCR-LIGHT-001): evicted chunks leaked pending-light markers
                 edgeLightingUpdateQueue.delete(key);
-                edgeLightingPassCount.delete(key);
+                edgeLightState.delete(key); // CCR-LIGHT-007: full record removal (fixes the old lastEdgeRemeshMs eviction leak)
                 // Notify ChunkDataPool that chunk data was removed
                 chunkDataPool.unregister(key);
             }
@@ -25927,11 +25961,37 @@
                 // attenuation. TER-2: matches calculateChunkSunlight phase 1, which stores the
                 // light ARRIVING at a cell — the cell's own attenuation applies only to light
                 // continuing past it, never to its own stored value.
+                // CCR-LIGHT-006 (direct-index fast path, same accessor-bypass pattern as
+                // VOXEX-CCR-LIGHT-002's primeSunlightColumn): this is a hot point QUERY --
+                // computeNeighborSunlight calls it once per boundary cell in the incremental
+                // sunlight remove BFS -- so resolve the (x,z) column's chunk ONCE and
+                // direct-index the blocks array instead of paying a string-keyed getBlock()
+                // (chunk-map lookup + key alloc) per cell of a ~320-row column walk.
+                // Deliberately does NOT call chunkDataPool.touch() to bump LRU recency --
+                // same omission as primeSunlightColumn, since a light query should not
+                // itself churn cache eviction order. That is the one observable side effect
+                // versus the old getBlock()-per-cell walk; it has zero effect on the light
+                // VALUE returned.
+                const cx = x >> 4, cz = z >> 4;
+                const chunkKey = getChunkKey(cx, cz);
+                const chunk = (typeof chunkDataPool !== 'undefined' ? chunkDataPool.get(chunkKey)
+                                                                    : voxelWorld.chunks.get(chunkKey));
+                // Unloaded chunk: the old per-cell getBlock() returned undefined for every
+                // cell in the column, so every cell hit the "skip unloaded slices" branch
+                // below and light never moved off its 15 seed -- preserve that exactly.
+                if (!chunk) return 15;
+                // Legacy raw-array chunk: getBlock() falls back to chunk[idx] when
+                // chunk.blocks is absent. Unlike primeSunlightColumn (an edit-path helper
+                // that may safely no-op on this case), this is a point QUERY that must keep
+                // answering for legacy chunks.
+                const blocks = chunk.blocks ? chunk.blocks : chunk;
+                const colBase = (x & 15) + ((z & 15) << 4);
                 const maxY = WORLD_DIMS.chunkHeight - WORLD_DIMS.yOffset - 1;
                 let light = 15;
                 for (let cy = maxY; cy > y; cy--) {
-                    const blockId = getBlock(x, cy, z);
-                    if (blockId === undefined) continue; // Skip unloaded slices
+                    const idx = colBase + ((cy + WORLD_DIMS.yOffset) << 8);
+                    const blockId = blocks[idx];
+                    if (blockId === undefined) continue; // Skip unloaded slices (short legacy array)
                     const attenuation = SUNLIGHT_ATTENUATION[blockId] ?? 0;
                     if (attenuation >= 15) { return 1; } // Fully blocked above this point
                     if (attenuation > 0) { light = light > attenuation ? light - attenuation : 1; }
@@ -26325,6 +26385,23 @@
                         calculateChunkSunlight(chunk, this.chunkSize, this.chunkHeight);
                         calculateBlockLight(chunk, this.chunkSize, this.chunkHeight);
                         rebuildTargets.push(key);
+                    });
+                    // CCR-LIGHT-005: re-import neighbor border light AFTER every target chunk has
+                    // been recalculated above -- a chunk-local recalc alone truncates cross-chunk
+                    // light at borders (dark seams after a bailout-triggered carve). Two-pass
+                    // discipline is load-bearing (see reimportNeighborLight's JSDoc): importing
+                    // while a neighbor in this same batch is still stale would re-import the very
+                    // values the first loop just replaced.
+                    rebuildTargets.forEach((key) => {
+                        const chunk = chunks.get(key);
+                        if (!chunk) return;
+                        const [cx, cz] = parseChunkKey(key);
+                        reimportNeighborLight(chunk, cx, cz);
+                        // Queue for the normal background edge-lighting pass so light crossing
+                        // MORE than one border (diagonal neighbors, etc.) still converges.
+                        const edgeState = edgeLightState.get(key);
+                        if (edgeState) edgeState.passCount = 0;
+                        edgeLightingUpdateQueue.add(key);
                     });
                     return rebuildTargets;
                 }
@@ -26958,6 +27035,19 @@
                     if (!chunk || !chunk.blocks) return;
                     calculateBlockLight(chunk, chunkSize, chunkHeight);
                 });
+                // CCR-LIGHT-005: re-import neighbor border light AFTER every active chunk above
+                // has been recalculated (two-pass discipline, see reimportNeighborLight's JSDoc) --
+                // without this, a torch-intensity setting change strands cross-border torch light
+                // dark in every neighboring chunk until some later background edge-lighting pass.
+                activeChunks.forEach((key) => {
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks) return;
+                    const [cx, cz] = parseChunkKey(key);
+                    reimportNeighborLight(chunk, cx, cz);
+                    const edgeState = edgeLightState.get(key);
+                    if (edgeState) edgeState.passCount = 0;
+                    edgeLightingUpdateQueue.add(key);
+                });
                 rebuildAllVisibleChunks();
             }
             function rebuildSkylightForActiveChunks() {
@@ -26968,6 +27058,19 @@
                     const chunk = chunks.get(key);
                     if (!chunk || !chunk.blocks) return;
                     calculateChunkSunlight(chunk, chunkSize, chunkHeight);
+                });
+                // CCR-LIGHT-005: re-import neighbor border light AFTER every active chunk above
+                // has been recalculated (two-pass discipline, see reimportNeighborLight's JSDoc) --
+                // without this, a skylight setting change strands cross-border daylight (e.g. a
+                // cave crossing a chunk seam) dark until some later background edge-lighting pass.
+                activeChunks.forEach((key) => {
+                    const chunk = chunks.get(key);
+                    if (!chunk || !chunk.blocks) return;
+                    const [cx, cz] = parseChunkKey(key);
+                    reimportNeighborLight(chunk, cx, cz);
+                    const edgeState = edgeLightState.get(key);
+                    if (edgeState) edgeState.passCount = 0;
+                    edgeLightingUpdateQueue.add(key);
                 });
                 rebuildAllVisibleChunks();
             }
@@ -50100,6 +50203,8 @@ self.onmessage = async (e) => {
                     BLOCK_LIGHT_EMISSION, // CCR-LIGHT-004 Phase 4: seam export for the emission-table-seeding characterization test
                     // --- CCR-LIGHT-004 Phase 2: edge-lighting pipeline (characterization tests) ---
                     propagateEdgeLighting, propagateLightFromEdgesInward,
+                    // --- CCR-LIGHT-005: full-recalc edge re-import (characterization test) ---
+                    reimportNeighborLight, RENDER_PASS,
                     // --- table init (data-driven from BLOCK_CONFIG) ---
                     initBlockLookupTables, initBlockOptimization,
                     // --- raycast / classes ---
