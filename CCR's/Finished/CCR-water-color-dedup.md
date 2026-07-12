@@ -3,7 +3,7 @@
 **ID:** VOXEX-CCR-REFACTOR-001
 **File:** `voxEx.html` (single-file rule honored)
 **Date:** 2026-06-27
-**Status:** 🔴 Proposed
+**Status:** 🟢 Shipped (verified already-implemented, see As-built 2026-07-11)
 **GitHub:** #524
 **Scope:** `writeFaceColorsWater` and `writeFaceColorsWaterIndexed` duplicate the full water vertex-color computation (~45 shared lines). Extract the shared math into one helper; both functions keep only their (different) vertex-write layout.
 
@@ -162,9 +162,31 @@ And (`writeFaceColorsWaterIndexed`, ~40193–40253 — head+tail shown):
 ---
 
 ## Safety Checks
-- [ ] Shared math copied **verbatim** from `writeFaceColorsWater` (not retyped); both wrappers byte-identical to before.
-- [ ] No new per-call allocation: `_waterColorScratch` is module-scope and reused; no closures created in the hot path.
-- [ ] `computeWaterFaceColor` added to `meshFuncs`; `_waterColorScratch` emitted into worker (`meshCode +=`).
-- [ ] No external closure capture in the helper (only `SETTINGS`, `waterHash`, `Math`, params) — `Function.toString()` injection stays valid.
-- [ ] `/* __MESH_FUNCS_START__/END__ */` markers intact; worker round-trip test green.
-- [ ] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES`.
+- [x] Shared math copied **verbatim** from `writeFaceColorsWater` (not retyped); both wrappers byte-identical to before.
+- [x] No new per-call allocation: `_waterColorScratch` is module-scope and reused; no closures created in the hot path.
+- [x] `computeWaterFaceColor` added to `meshFuncs`; `_waterColorScratch` emitted into worker (`meshCode +=`).
+- [x] No external closure capture in the helper (only `SETTINGS`, `waterHash`, `Math`, params) — `Function.toString()` injection stays valid.
+- [x] `/* __MESH_FUNCS_START__/END__ */` markers intact; worker round-trip test green.
+- [x] Update `VOXEX_BUILD` + `VOXEX_RECENT_CHANGES`.
+
+---
+
+## As-built (2026-07-11)
+
+**Status update:** on re-audit, this CCR was found ALREADY IMPLEMENTED in `voxEx.html` — matching the "After" spec verbatim, byte-for-byte:
+- `computeWaterFaceColor(ao, lightLevel, waterDepth, wx, wy, wz, nx, ny, nz)` exists at the module scope (grep anchor, ~line 42515) holding the full shared fog/caustics/foam/depth-gradient/base-color/per-vertex-variation math, terminating in the `_waterColorScratch[0..6]` writes exactly as specified.
+- `const _waterColorScratch = new Float32Array(7);` module-scope scratch present (~line 42511).
+- `writeFaceColorsWaterIndexed` (~line 42736) is a thin wrapper: calls `computeWaterFaceColor(...)`, reads the 7 scratch slots, writes its 4-vertex/12-float layout — unchanged signature, unchanged call sites (`addFaceWaterIndexed`).
+- The non-indexed `writeFaceColorsWater`/`addFaceWater` had ALREADY been removed as dead code under a separate tombstone (`[TOMBSTONE TER-11] Removed dead non-indexed writeFaceColorsWater() + writeFaceUVs() — superseded by the *Indexed variants; zero callers.`, ~line 42612) — this predates and is independent of this CCR; there is now only ONE water-color write path (indexed), so the CCR's original two-wrapper plan is moot but its goal (single source of truth for the shared math) is fully met.
+- Worker injection confirmed correct: `computeWaterFaceColor` is present in the `meshFuncs` array (~line 20426, alongside `writeFaceColorsWaterIndexed`), and `meshCode += '    const _waterColorScratch = new Float32Array(7);\n';` is emitted (~line 20415) right next to the `_aoResult`/`_lightResult` scratch lines, mirroring the CCR's prescribed pattern.
+- `VOXEX_RECENT_CHANGES` already carries the citation: `"Refactor: dedup water vertex-color math into computeWaterFaceColor (REFACTOR-001 #524)"` (~line 4438). No further `VOXEX_BUILD`/`VOXEX_RECENT_CHANGES` action taken this pass (per instructions: byte-identical refactors don't bump; a later pass bumps `VOXEX_BUILD`).
+
+**This pass's action:** no code edit was needed (nothing to change) — did full re-verification and closed out the doc/tracker bookkeeping that was still outstanding.
+
+**Verification results (2026-07-11):**
+- `node tools/parity-check.mjs` — GREEN (all 15 lockstep checks + marker checks pass).
+- `node tools/terrain-node-checks.mjs voxEx.html 12345` / `777` / `424242` — ALL HARD CHECKS GREEN on all three seeds.
+- `tools/terrain-probe.mjs height 100 100`, `height -250 480`, `height 3000 -1200` — outputs IDENTICAL before and after this pass (surface/blended height, riverFactor, oceanFactor, biome, tree-soil all unchanged; expected, since no bytes were changed in this pass).
+- `node tools/syntax-check.mjs` — fails only on the pre-existing EOF mount truncation (`</html>` check + one unterminated `<script>` from ~line 4209), per the known environment note in agent-notes §7; not a regression from this work. Targeted verification: extracted `computeWaterFaceColor` + `writeFaceColorsWaterIndexed` (lines ~42509-42744) into an isolated file with stubbed `SETTINGS`/`waterHash`, ran `node --check` (syntax OK) and a smoke invocation (executes without error, returns finite numbers).
+- Confirmed on-disk via grep: `computeWaterFaceColor`/`_waterColorScratch` appear at all four expected sites (helper definition, module scratch, `meshFuncs` array entry, worker scratch emission line) plus the `VOXEX_RECENT_CHANGES` entry.
+- `tools/lib/extract-terrain.mjs` — confirmed it does not reference `writeFaceColorsWater`/`computeWaterFaceColor` (mesh/water-color functions are out of its terrain-only extraction scope); no update needed there.
