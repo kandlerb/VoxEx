@@ -27,8 +27,9 @@
 // browser suite's "worker MESH/blendedHeight byte-parity" tests.
 // ============================================================================
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const file = process.argv[2] || new URL('../voxEx.html', import.meta.url).pathname;
+const file = process.argv[2] || fileURLToPath(new URL('../voxEx.html', import.meta.url));
 const src = readFileSync(file, 'utf8');
 const lines = src.split('\n');
 

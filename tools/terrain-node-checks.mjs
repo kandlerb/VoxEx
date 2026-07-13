@@ -18,10 +18,19 @@
 // NOTE: uses its own PRNG for the perm table — results are internally
 // consistent but not byte-identical to a specific in-game seed string.
 // ============================================================================
+import { fileURLToPath } from 'node:url';
 import { buildTerrainApi } from './lib/extract-terrain.mjs';
 
-const file = process.argv[2] || new URL('../voxEx.html', import.meta.url).pathname;
-const seedStr = process.argv[3] || 'node-checks';
+const rawArgs = process.argv.slice(2);
+const jsonMode = rawArgs.includes('--json');
+const positional = rawArgs.filter((a) => !a.startsWith('--'));
+const file = positional[0] || fileURLToPath(new URL('../voxEx.html', import.meta.url));
+const seedStr = positional[1] || 'node-checks';
+// --json (CCR-WORLDGEN-PIPELINE-001 Phase 0): emit [{id,label,pass,detail}] for
+// autonomous tuning agents; human text stays the default. Exit code unchanged.
+const results = [];
+const idOf = (label) => (label.match(/^(\w+)/) || [null, label])[1];
+const record = (label, pass, detail) => results.push({ id: idOf(label), label, pass, detail: detail ?? null });
 
 let api;
 try {
@@ -36,8 +45,13 @@ const SEA = 60;
 // --- checks ------------------------------------------------------------------
 let failures = 0;
 const check = (ok, label, detail) => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ' — ' + detail : ''}`);
+  record(label, ok, detail);
+  if (!jsonMode) console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ' — ' + detail : ''}`);
   if (!ok) failures++;
+};
+const info = (label, detail) => {
+  record(label, null, detail);
+  if (!jsonMode) console.log(`INFO  ${label}${detail ? ' — ' + detail : ''}`);
 };
 
 // T1 determinism
@@ -89,7 +103,7 @@ const check = (ok, label, detail) => {
       } else if (h < 78 && prevHi > -1e8 && x - prevHi <= 160) lowAt = x;
     }
   }
-  console.log(`INFO  T4 notch metric: ${notches} (browser suite bar: <=6 per seed over its own region — treat >10 here as suspicious)`);
+  info('T4 notch metric', `${notches} (browser suite bar: <=6 per seed over its own region — treat >10 here as suspicious)`);
 }
 // T5 river flood integrity: channel cores on low ground must flood
 {
@@ -125,7 +139,7 @@ const check = (ok, label, detail) => {
     }
   }
   for (const [, c] of counts) pinned = Math.max(pinned, c);
-  console.log(`INFO  T6 valley-floor pans: ${n} cols, mode-height share ${(n ? (pinned / n) * 100 : 0).toFixed(1)}% (dead-flat pan signature; pure-vf^2 clamp would push this toward 100), mean relief +${(n ? sumRel / n : 0).toFixed(1)} blocks above sea`);
+  info('T6 valley-floor pans', `${n} cols, mode-height share ${(n ? (pinned / n) * 100 : 0).toFixed(1)}% (dead-flat pan signature; pure-vf^2 clamp would push this toward 100), mean relief +${(n ? sumRel / n : 0).toFixed(1)} blocks above sea`);
 }
 // T7 tree-soil elevation gradient (informational + monotonic-ish sanity)
 {
@@ -141,5 +155,6 @@ const check = (ok, label, detail) => {
   check(declines, 'T7 tree-soil gradient declines with altitude', line);
 }
 
-console.log(failures === 0 ? '\nALL HARD CHECKS GREEN' : `\n${failures} HARD CHECK(S) FAILED`);
+if (jsonMode) process.stdout.write(JSON.stringify(results) + '\n');
+else console.log(failures === 0 ? '\nALL HARD CHECKS GREEN' : `\n${failures} HARD CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

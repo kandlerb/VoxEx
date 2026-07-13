@@ -304,6 +304,21 @@ can tell whether circumstances actually changed.
 - Blocky shadows default ON, but Kandler personally prefers the soft-shadow look.
 - Wet-shoreline damp edge stays CRISP/blocky (deliberately kept in the merge key).
 - Menus: consistency over cleverness (one dropdown pattern everywhere).
+- **Biome-driven terrain pipeline is the shipping default** (CCR-WORLDGEN-PIPELINE-001,
+  build 2026-07-12.4, `TERRAIN_GEN_VERSION` 33): a softmax classifier over
+  T/H/Cn/R picks the biome label AND (via `styleBlend`) the height style, so
+  label and shape agree by construction. `AXIS_W.r = 18.0` is MEASURED, not
+  arbitrary — the CCR's originally-proposed `r = 2.4` gave only ~68% M3
+  label/shape agreement against the ≥95% ★ mandate; don't re-litigate it
+  downward without re-running `tools/biome-pipeline-checks.mjs` M3 on ≥3
+  seeds. `SPLINE_RELIEF` is a Phase-0-TUNED curve, deliberately distinct from
+  `SPLINE_EROSION` (raises real relief amplitude — this is what the Phase 4
+  `TERRAIN_GEN_VERSION` bump regenerates). Style biases (`GEN_TUNABLES.BIOME_STYLE`)
+  ship all-zero DELIBERATELY, pending a dedicated tuning pass — once any bias
+  goes non-zero, `BIOME_STYLE_ACTIVE` flips on and costs ~2.3x per column on
+  non-cache callers (trees/preview/Node tools; the block-fill path stays
+  amortized via `biomeIdCache`) — measure before tuning, don't just flip
+  values.
 
 ## 6. Verification thresholds (the numbers the suites enforce)
 
@@ -395,3 +410,32 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   The download is ~160 MB — run it under nohup and poll if the shell has a
   per-command timeout. `ldd <chrome> | grep "not found"` tells you which libs
   (if any) still need the apt-get download + dpkg -x treatment.
+
+## 8. Node tooling cross-platform gotchas (Windows-specific — NOT part of the sandbox-only §7 above)
+
+- **`new URL(...).pathname` is NOT a valid Windows file path.** On Windows,
+  `new URL(import.meta.url).pathname` yields `/D:/Projects/voxex/tools/foo.mjs`
+  (leading slash + drive letter baked in) — pass that to `fs.readFileSync`/
+  `path.join` and you get `D:\D:\Projects\...` → ENOENT. ALWAYS use
+  `fileURLToPath(new URL(...))` from `node:url` instead. Found 2026-07-12
+  (CCR-WORLDGEN-PIPELINE-001 Phase 4 gate-completion) when the owner ran the
+  full gate stack NATIVELY on Windows for the first time in this CCR — fixed
+  in five tools: `syntax-check.mjs`, `parity-check.mjs`,
+  `terrain-node-checks.mjs`, `terrain-probe.mjs`,
+  `scratch/biome-pipeline-proto.mjs`. Sandbox (Linux) behavior was unaffected
+  either way — this bug is Windows-only, so it hid until a native run finally
+  exercised it.
+- **`tools/voxex-tests.html`'s tunables suite has a registry↔schema parity
+  list (`JSON_KEYS`) that must grow whenever a new object/array-valued
+  `GEN_TUNABLES` key is added** — it enumerates which keys are JSON-shaped
+  (vs primitives) for the parity comparison; missing an entry there silently
+  mis-compares instead of failing loudly. CCR-WORLDGEN-PIPELINE-001 Phase 1
+  added `BIOME_CENTROIDS`/`BIOME_STYLE`/`SPLINE_RELIEF` and tripped this —
+  same "grow it in the same commit" discipline as `REGISTRY_KEYS` in
+  `tools/lib/extract-terrain.mjs`.
+- **The `voxex-tests.html` `expect()` harness implements NO `.not`,
+  `.toThrow()`, or `.toBeUndefined()` matchers.** A pre-existing "unknown key"
+  test used those matchers and had never actually been runnable — the
+  harness doesn't have them. Write assertions as try/catch instead (`try {
+  ...; fail('should have thrown'); } catch (e) { assert(...); }`). Found and
+  fixed during the same Phase 1 gate-completion pass.

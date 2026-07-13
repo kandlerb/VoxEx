@@ -29,8 +29,21 @@ import { readFileSync } from 'node:fs';
  * @param {string} seedStr - seed string for the internal perm-table PRNG
  * @returns {object} terrain functions (computeSurfaceHeight, blendedHeight, ...)
  */
-export function buildTerrainApi(file, seedStr) {
+export function buildTerrainApi(file, seedStr, opts = {}) {
   const src = readFileSync(file, 'utf8');
+  // CCR-WORLDGEN-PIPELINE-001 Phase 2 (P2-R4) + Phase 4 (THE FLIP): opts.biomeDrivenTerrain flips
+  // the flag in the assembled worldConfig. Phase 4 changed the DEFAULT from hardcoded-false to the
+  // LIVE WORLD_CONFIG.biomeDrivenTerrain value parsed from the source file, so no-opts harnesses
+  // (terrain-node-checks) automatically track the shipping default. An explicit boolean override
+  // (true OR false) still wins -- false forces the legacy path for A/B cost/byte-identity baselines.
+  // Anchor to a line-start object-property declaration (`  biomeDrivenTerrain: true,`) so the
+  // VOXEX_RECENT_CHANGES narrative text (which contains literal `biomeDrivenTerrain:false`
+  // describing Phase 1, EARLIER in the file) can never win the parse.
+  const _liveBiomeDrivenMatch = src.match(/^[ \t]*biomeDrivenTerrain:\s*(true|false)\b/m);
+  const _liveBiomeDriven = _liveBiomeDrivenMatch ? _liveBiomeDrivenMatch[1] === 'true' : false;
+  const biomeDriven = (opts && typeof opts.biomeDrivenTerrain === 'boolean')
+    ? opts.biomeDrivenTerrain
+    : _liveBiomeDriven;
 
   // --- extraction helpers ------------------------------------------------------
   function lastIndexOfDef(needle) {
@@ -85,14 +98,25 @@ export function buildTerrainApi(file, seedStr) {
     'continentalHeight', 'continentalness', 'erosionParam', 'weirdness',
     'peaksValleys', 'temperature', 'humidity',
     'terrainSurface', 'computeSurfaceHeight', 'resolveBiome',
+    // CCR-WORLDGEN-PIPELINE-001 Phase 1 biome-driven classifier (inert until Phase 2)
+    'reliefParam', 'classifyBiome', 'styleBlend', 'featureAt', 'recomputeBiomeStyleActive',
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
+    // CCR-WORLDGEN-PIPELINE-001 Phase 3 (P3-R6): REAL chunk block output for M9/M10/M11.
+    // generateTerrainPass runs the actual surface-material cascade; precalculateTerrainCaches
+    // builds the caches it reads (incl. featureCache/climCache/biomeIdCache); caves are
+    // disabled by the caller (caveDensityMultiplier 0) so precalculateCaveNoise/noise3D only
+    // need to not crash interpolateCaveNoise (threshold 0 => no carve).
+    'grad3D', 'noise3D', 'interpolateCaveNoise', 'precalculateCaveNoise',
+    'precalculateTerrainCaches', 'generateTerrainPass', 'fillWaterPass',
   ];
   // Registry-backed tunables (CCR-WORLDGEN-TUNABLES-001): derived from the
   // extracted GEN_TUNABLES object below, NOT scanned as standalone consts.
   const REGISTRY_KEYS = [
     'SPLINE_CONTINENTAL', 'SPLINE_EROSION', 'BIOME_PARAMS', 'AXIS_W',
+    // CCR-WORLDGEN-PIPELINE-001 Phase 1 classifier tunables (AXIS_W.r rides on AXIS_W above)
+    'SPLINE_RELIEF', 'BIOME_SOFTMAX_TAU', 'BIOME_CENTROIDS', 'BIOME_STYLE',
     'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',
@@ -102,9 +126,14 @@ export function buildTerrainApi(file, seedStr) {
     'RIVER_DEPTH_SCALE', 'OCEAN_DEPTH_SCALE',
   ];
   // still-bare consts scanned from source
-  const CONSTS = ['MAX_SURFACE_Y'];
-  // multi-line object consts extracted with the arrow scanner
-  const OBJ_CONSTS = ['GRAD2D'];
+  // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
+  const CONSTS = ['MAX_SURFACE_Y',
+    'AIR', 'GRASS', 'DIRT', 'STONE', 'BEDROCK', 'SAND', 'WATER', 'SNOW', 'GRAVEL'];
+  // multi-line object/array consts extracted with the arrow scanner.
+  // BIOME_ID_ORDER (CCR-WORLDGEN-PIPELINE-001): classifyBiome/styleBlend iterate it; the
+  // extractConstArrow's lastIndexOfDef picks the real declaration (the worker-emission line,
+  // which is EARLIER in the file, is skipped because it isn't the last occurrence).
+  const OBJ_CONSTS = ['GRAD2D', 'BIOME_ID_ORDER'];
 
   let assembled = '"use strict";\n';
 
@@ -132,7 +161,13 @@ const worldConfig = {
   useNewTerrain: true, persistence: 0.5, lacunarity: 2.0,
   biomeSizeMultiplier: 1, enableRivers: true, forceSingleBiome: null,
   terrainAmplitudeMultiplier: 1.0,
+  biomeDrivenTerrain: ${biomeDriven}, // CCR-WORLDGEN-PIPELINE-001 Phase 2 (P2-R4)
 };
+// Phase-2 style-path bindings terrainSurface references (mirror the module decls near
+// terrainSurface + recomputeBiomeStyleActive; all-zero styles keep BIOME_STYLE_ACTIVE false).
+let BIOME_STYLE_ACTIVE = false;
+const _tsWeights = new Float32Array(6);
+const _tsStyle = { ridgeMixBias: 0, roughnessBias: 0, warpBias: 0, baseBias: 0, soilDepth: 0 };
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
@@ -164,11 +199,20 @@ const biomeByName = new Map(Object.keys(BIOME_PARAMS).map((n) => [n,
     if (!s) throw new Error(`function ${name} not found in ${file}`);
     assembled += s + '\n';
   }
-  // getBiomeParams: new-terrain dispatch only (legacy body needs the biome-cell system)
-  assembled += 'function getBiomeParams(gx, gz) { return resolveBiome(gx, gz); }\n';
+  // CCR-WORLDGEN-PIPELINE-001 Phase 2: seed BIOME_STYLE_ACTIVE from the live styles
+  // (a bench mutating GEN_TUNABLES.BIOME_STYLE can re-call the exported recomputeBiomeStyleActive).
+  assembled += 'recomputeBiomeStyleActive();\n';
+  // getBiomeParams: new-terrain dispatch only (legacy body needs the biome-cell system).
+  // Phase 3 (P3-R2/R6): pass outClimate through so the flag-ON reroute (resolveBiome ->
+  // classifyBiome) drives biomeCache in precalculateTerrainCaches and tempCache gets raw t.
+  assembled += 'function getBiomeParams(gx, gz, outClimate) { return resolveBiome(gx, gz, outClimate); }\n';
   assembled += `return { computeSurfaceHeight, blendedHeight, terrainSurface, getRiverFactor,
   getPreRiverHeight, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, noise2D,
-  resolveBiome, getRiverDepth, erosionParam, continentalness, temperature, humidity };\n`;
+  resolveBiome, getBiomeParams, getRiverDepth, erosionParam, continentalness, temperature, humidity,
+  spline, paramFreq, GEN_TUNABLES,
+  reliefParam, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
+  precalculateTerrainCaches, precalculateCaveNoise, generateTerrainPass, fillWaterPass, interpolateCaveNoise,
+  BLOCKS: { AIR, GRASS, DIRT, STONE, BEDROCK, SAND, WATER, SNOW, GRAVEL } };\n`;
 
   try {
     return new Function('SEED_STR', assembled)(seedStr);

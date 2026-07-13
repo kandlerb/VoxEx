@@ -11,7 +11,7 @@
 // Usage:
 //   node tools/terrain-probe.mjs height <gx> <gz>              point query
 //   node tools/terrain-probe.mjs transect <x0> <z0> <x1> <z1> [samples=200]
-//   node tools/terrain-probe.mjs stats [centerX centerZ size=4000]
+//   node tools/terrain-probe.mjs stats [centerX centerZ size=4000] [--json]
 //   node tools/terrain-probe.mjs hillshade <centerX> <centerZ> <size> [out.png]
 // Common flags: --seed=<string> (default 'probe') --file=<voxEx.html>
 //
@@ -23,21 +23,25 @@
 // ============================================================================
 import { writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
+import { fileURLToPath } from 'node:url';
 import { buildTerrainApi } from './lib/extract-terrain.mjs';
 
 const argv = process.argv.slice(2);
 const flags = {};
 const pos = [];
 for (const a of argv) {
-  const m = a.match(/^--([^=]+)=(.*)$/);
-  if (m) flags[m[1]] = m[2]; else pos.push(a);
+  const m = a.match(/^--([^=]+)(?:=(.*))?$/);
+  if (m) flags[m[1]] = m[2] ?? true; else pos.push(a); // bare --json supported
 }
 const cmd = pos.shift();
-const file = flags.file || new URL('../voxEx.html', import.meta.url).pathname;
+const file = flags.file || fileURLToPath(new URL('../voxEx.html', import.meta.url));
 const seed = flags.seed || 'probe';
 const SEA = 60;
 
-const api = buildTerrainApi(file, seed);
+// CCR-WORLDGEN-PIPELINE-001 Phase 2 (Gate D): --biome-driven flips the flag-ON height path
+// (SPLINE_RELIEF relief + style biases) so hillshade/stats render the biome-driven terrain.
+const biomeDriven = flags['biome-driven'] === true || flags.biomeDriven === true;
+const api = buildTerrainApi(file, seed, { biomeDrivenTerrain: biomeDriven });
 const { computeSurfaceHeight, blendedHeight, getRiverFactor, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, resolveBiome } = api;
 
 const num = (v, name) => { const n = Number(v); if (!Number.isFinite(n)) { console.error(`bad number for ${name}: ${v}`); process.exit(2); } return n; };
@@ -106,6 +110,16 @@ if (cmd === 'stats') {
       const worst = Math.max(dx, dz);
       if (worst > maxStep) { maxStep = worst; maxStepAt = [x, z]; }
     }
+  }
+  if (flags.json) {
+    // --json (CCR-WORLDGEN-PIPELINE-001 Phase 0): machine-parseable stats block.
+    process.stdout.write(JSON.stringify({
+      minH: min, meanH: sum / n, maxH: max,
+      pctBelowSea: (below / n) * 100, pctAbove150: (high / n) * 100,
+      meanDX: dxSum / dn, meanDZ: dzSum / dn, anisotropy: dzSum / dxSum,
+      maxAdjStep: maxStep, maxAdjStepAt: maxStepAt,
+    }) + '\n');
+    process.exit(0);
   }
   console.log(`stats over ${size}x${size} @ (${cx},${cz}), step ${step}, ${n} columns, seed="${seed}"`);
   console.log(`  height        : min ${min}  mean ${(sum / n).toFixed(1)}  max ${max}`);
