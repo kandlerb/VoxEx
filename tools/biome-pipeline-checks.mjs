@@ -16,10 +16,18 @@
 // GEN_TUNABLES DEFAULTS if a metric fails, per P2-R5).
 //
 //   node tools/biome-pipeline-checks.mjs [--seed=S] [--seeds=a,b,c]
-//        [--json] [--size=..] [--step=..] [--file=voxEx.html]
+//        [--json] [--size=..] [--step=..] [--file=voxEx.html] [--hydro]
 //
-// Exit 0 iff all GATING metrics pass on ALL seeds (M14 monitor-only; M9-M11 are
-// deferred non-gating stubs — Phase 3 material cascade).
+// Exit 0 iff all GATING metrics pass on ALL seeds (M14 monitor-only when hydroRivers is
+// off; M9-M11 are deferred non-gating stubs — Phase 3 material cascade).
+// M21 (CCR-WORLDGEN-PIPELINE-002 WS3, Q6): forced-shape agreement — builds its OWN
+// 6 forceSingleBiome api instances per seed (one per BIOME_ID_ORDER biome) via
+// buildProto's carried-through file/seed; gating.
+// --hydro (CCR-WORLDGEN-PIPELINE-002 WS6): bakes worldConfig.hydroRivers = true into every
+// buildProto instance this run, activating M14's gating fork (>=99% springs reach an
+// outlet) plus the M15 (monotonic-descent invariant), M16 (cross-region determinism/seam),
+// and M17 (basin extent <= HYDRO_HALO) hydro-only gates — all four auto-skip (deferred,
+// non-gating) without this flag, so the default run (no --hydro) is unaffected.
 // ============================================================================
 import { buildTerrainApi } from './lib/extract-terrain.mjs';
 import { runAllMetrics } from './lib/biome-metrics.mjs';
@@ -33,6 +41,11 @@ const seeds = flags.seeds ? String(flags.seeds).split(',') : [String(flags.seed 
 const sampleOpts = {};
 if (flags.size !== undefined) sampleOpts.size = Number(flags.size);
 if (flags.step !== undefined) sampleOpts.step = Number(flags.step);
+// CCR-WORLDGEN-PIPELINE-002 WS6: bare --hydro activates the hydrological river system
+// (worldConfig.hydroRivers baked true into every buildProto instance this run) so M14's
+// gating fork and the M15/M16/M17 hydro-only metrics stop auto-skipping. Omitted (default)
+// = hydroRivers false everywhere, byte-identical to every pre-WS6 run of this tool.
+const hydroOn = !!flags.hydro;
 
 /**
  * Real-mode metrics adapter: exposes the interface biome-metrics.mjs expects
@@ -42,7 +55,7 @@ if (flags.step !== undefined) sampleOpts.step = Number(flags.step);
  * @returns {object} proto adapter.
  */
 function buildProto(seed) {
-  const api = buildTerrainApi(file, String(seed), { biomeDrivenTerrain: true });
+  const api = buildTerrainApi(file, String(seed), { biomeDrivenTerrain: true, hydroRivers: hydroOn });
   const GT = api.GEN_TUNABLES;
   const names = api.BIOME_ID_ORDER;
   const CENTROIDS = GT.BIOME_CENTROIDS;
@@ -78,7 +91,11 @@ function buildProto(seed) {
     }
     return { ok: true };
   }
-  return { api, names, CENTROIDS, AXIS_W, TAU, climateAxes, classifyBiome, selfTestIdentity };
+  // file/seed carried through so real-mode-only metrics (M21, CCR-WORLDGEN-PIPELINE-002
+  // WS3; M16, CCR-WORLDGEN-PIPELINE-002 WS6) can build their OWN api instances from the
+  // same source/seed. hydroRivers carried through so M14's fork and M15/M16/M17 know
+  // whether to engage (CCR-WORLDGEN-PIPELINE-002 WS6).
+  return { api, names, CENTROIDS, AXIS_W, TAU, climateAxes, classifyBiome, selfTestIdentity, file, seed: String(seed), hydroRivers: hydroOn };
 }
 
 const perSeed = [];
@@ -99,7 +116,7 @@ if (flags.json) {
 
 // --- human table -------------------------------------------------------------
 const cfg0 = perSeed.length ? buildProto(perSeed[0].seed) : null;
-if (cfg0) console.log(`config[REAL flag-ON]: tau=${cfg0.TAU}  AXIS_W.r=${cfg0.AXIS_W.r}  seeds=${seeds.join(',')}  sample=${(sampleOpts.size ?? 16384)}x/${(sampleOpts.step ?? 64)}  file=${file}`);
+if (cfg0) console.log(`config[REAL flag-ON]: tau=${cfg0.TAU}  AXIS_W.r=${cfg0.AXIS_W.r}  seeds=${seeds.join(',')}  sample=${(sampleOpts.size ?? 16384)}x/${(sampleOpts.step ?? 64)}  file=${file}  hydroRivers=${hydroOn}`);
 for (const { seed, metrics } of perSeed) {
   console.log(`\n=== seed ${seed} ===`);
   for (const mtr of metrics) {

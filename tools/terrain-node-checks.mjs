@@ -39,7 +39,7 @@ try {
   console.error(e.message);
   process.exit(2);
 }
-const { computeSurfaceHeight, blendedHeight, getRiverFactor, computePreRiverHeight, isTreeSoilSurface } = api;
+const { computeSurfaceHeight, blendedHeight, riverFactorAt, computePreRiverHeight, isTreeSoilSurface } = api;
 const SEA = 60;
 
 // --- checks ------------------------------------------------------------------
@@ -106,13 +106,20 @@ const info = (label, detail) => {
   info('T4 notch metric', `${notches} (browser suite bar: <=6 per seed over its own region — treat >10 here as suspicious)`);
 }
 // T5 river flood integrity: channel cores on low ground must flood
+// CCR-WORLDGEN-PIPELINE-002 WS6: routed through riverFactorAt (not the bare ribbon
+// getRiverFactor) so this check measures whichever river system is actually active on
+// the file under test (worldConfig.hydroRivers) — forwards verbatim to getRiverFactor
+// when off, so the flag-OFF result is unchanged.
 {
   let chan = 0, dry = 0;
-  for (let gx = -20000; gx < 20000; gx += 23) {
-    for (let gz = -20000; gz < 20000; gz += 1013) {
+  // CCR-WORLDGEN-PIPELINE-002 WS6: extent ±9216 (was ±20000), denser x-step — keeps channel-col
+  // counts comparable while avoiding a ~1300-cold-hydro-region build sweep (~30-40 s) when the
+  // file under test has hydroRivers active. Percent gate unaffected.
+  for (let gx = -9216; gx < 9216; gx += 11) {
+    for (let gz = -9216; gz < 9216; gz += 1013) {
       const pre = computePreRiverHeight(gx, gz, 0);
       if (pre.height <= SEA || pre.height >= 80) continue;
-      const rf = getRiverFactor(gx, gz, 0, pre.height);
+      const rf = riverFactorAt(gx, gz, 0, pre.height);
       if (rf < 0.35) { chan++; if (blendedHeight(gx, gz, 0) >= SEA) dry++; }
     }
   }
@@ -126,11 +133,12 @@ const info = (label, detail) => {
 {
   let n = 0, pinned = 0, sumRel = 0;
   const counts = new Map();
-  for (let gx = -20000; gx < 20000; gx += 37) {
-    for (let gz = -20000; gz < 20000; gz += 1511) {
+  // CCR-WORLDGEN-PIPELINE-002 WS6: extent narrowed with T5 (same cold-region rationale).
+  for (let gx = -9216; gx < 9216; gx += 17) {
+    for (let gz = -9216; gz < 9216; gz += 1511) {
       const pre = computePreRiverHeight(gx, gz, 0);
       if (pre.height <= SEA + 2 || pre.height >= 85) continue;
-      const rf = getRiverFactor(gx, gz, 0, pre.height);
+      const rf = riverFactorAt(gx, gz, 0, pre.height);
       if (rf < 0.5 || rf >= 1) continue; // valley floor beyond the sand/shore lip
       const h = blendedHeight(gx, gz, 0);
       if (h < SEA) continue;

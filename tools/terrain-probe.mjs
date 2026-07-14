@@ -14,6 +14,8 @@
 //   node tools/terrain-probe.mjs stats [centerX centerZ size=4000] [--json]
 //   node tools/terrain-probe.mjs hillshade <centerX> <centerZ> <size> [out.png]
 // Common flags: --seed=<string> (default 'probe') --file=<voxEx.html>
+//   --biome-driven (force the biome-driven climate+spline path) --hydro (force
+//   worldConfig.hydroRivers true — CCR-WORLDGEN-PIPELINE-002 WS6 hydrological rivers)
 //
 // Reading the outputs:
 //   stats: anisotropy(Z/X) far from 1.0 => axis-biased noise (see agent-notes §4);
@@ -41,8 +43,12 @@ const SEA = 60;
 // CCR-WORLDGEN-PIPELINE-001 Phase 2 (Gate D): --biome-driven flips the flag-ON height path
 // (SPLINE_RELIEF relief + style biases) so hillshade/stats render the biome-driven terrain.
 const biomeDriven = flags['biome-driven'] === true || flags.biomeDriven === true;
-const api = buildTerrainApi(file, seed, { biomeDrivenTerrain: biomeDriven });
-const { computeSurfaceHeight, blendedHeight, getRiverFactor, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, resolveBiome } = api;
+// CCR-WORLDGEN-PIPELINE-002 WS6: --hydro forces worldConfig.hydroRivers true (independent of
+// whatever the live file default is) so hillshades/height/transect probes can render/compare
+// the hydrological river system explicitly, mirroring --biome-driven's override pattern.
+const hydroRivers = flags.hydro === true;
+const api = buildTerrainApi(file, seed, { biomeDrivenTerrain: biomeDriven, hydroRivers });
+const { computeSurfaceHeight, blendedHeight, riverFactorAt, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, resolveBiome } = api;
 
 const num = (v, name) => { const n = Number(v); if (!Number.isFinite(n)) { console.error(`bad number for ${name}: ${v}`); process.exit(2); } return n; };
 
@@ -51,7 +57,7 @@ if (cmd === 'height') {
   const gx = num(pos[0], 'gx'), gz = num(pos[1], 'gz');
   const pre = computePreRiverHeight(gx, gz, 0);
   const h = blendedHeight(gx, gz, 0);
-  const rf = getRiverFactor(gx, gz, 0, pre.height);
+  const rf = riverFactorAt(gx, gz, 0, pre.height);
   const of_ = getOceanFactor(gx, gz, 0);
   let biome = '';
   try { const b = resolveBiome(gx, gz); biome = typeof b === 'object' ? (b.name ?? '?') : String(b); } catch { biome = 'n/a'; }

@@ -25,6 +25,12 @@ can tell whether circumstances actually changed.
 | **Global always-on banded meshing** (made lazy, Phase 3.5) | Don't re-enable eagerly | `meshProfile()` A/B showed always-on banding ~doubled streaming mesh load (146 vs 81 ms/s) — first builds pay banding's 4× overhead for zero benefit. Banding only helps EDITS, so chunks band lazily on first edit (`markChunkBanded`). `setEagerBanding(true)` exists for A/B only. |
 | **World-axis camera snap for soft shadows** (fixed build 2026-06-20.14) | Never retry | Snapping the shadow camera on world axes can't align with the LIGHT-space texel grid (rotated by the sun) — sub-texel swim persists. Snap in the light basis (see §3 Shadows). Also: re-rounding the light POSITION after computing the snapped target re-introduces the swim. |
 | **Render-time per-block damage overlay** (rejected, CCR-MAGIC-006 C3) | Never retry | Meshing is one atlas tile per face with no per-block metadata layer — there is no seam to inject a "this specific block instance is damaged" overlay at render time without inventing a whole new metadata system. The generic `CRACKED_` mechanism moves the same idea to TEXTURE-GEN time (one `drawCrackOverlay` stamp, baked into 3 dedicated block IDs at `initTextures` time) + a plain block-ID swap at scar sites — same structural wall that forced FIRE's neighbor-derived orientation instead of a per-instance state. |
+| **Symmetric hi-frequency detail added on top of terrainSurface** (measured, CCR-WORLDGEN-PIPELINE-002 WS1) | Never retry | Tried as a terracing fix: adding a relief-scaled fine noise term on top of the existing fractal (`terrainSurface(x,z) + reliefParam(x,z)*D*noise(x*fHi,z*fHi)`). Measured NO CHANGE to `wideTerrace` (tread-area fraction) at any tested amplitude (±0.005) — a flat quantization step floors to the same integer regardless of what smooth sub-block detail rides on top of it; the extra octave doesn't change which samples land on the SAME floor value. Root lesson (WS1's core finding): *tread area on a slope is conserved under quantization of any equally-smooth field — only a steeper gradient or a coordinate-space warp that breaks contour straightness reduces the visual.* |
+| **Dither-before-floor for terracing** (measured, CCR-WORLDGEN-PIPELINE-002 WS1) | Never retry | Tried adding sub-block noise before `Math.floor()` to break up flat runs (ordered/random dither, Bayer-style). Measured SLIGHTLY WORSE than baseline on `wideTerrace` — dithering a smooth slope doesn't remove the flooring artifact, it just randomizes WHICH neighbor a tread cell rounds to, occasionally creating MORE apparent tread-cluster boundaries (visually noisier, not less terraced). Floor-adjacent dither is a fix for banding in continuous-value contexts (e.g. color gradients), not for INTEGER voxel height quantization. |
+| **Reducing fractal amplitude/face-contrast to fight terracing** (measured, CCR-WORLDGEN-PIPELINE-002 WS1) | Never retry | Counter-intuitive but measured: LOWERING the fractal amplitude/gain (the opposite of WS1's adopted "increase contrast" lever) BACKFIRES — `wideTerrace` measured 0.22 baseline → 0.33-0.41 (worse) at reduced-amplitude settings. A gentler surface has MORE of its area sitting near any given integer floor value (shallower local gradient = wider flat-looking bands after flooring), so reducing amplitude increases tread area rather than shrinking it. The two real levers are the OPPOSITE direction: steeper gradient (`k=1.15-1.30` face-contrast increase, OD1 fallback) or a contour-breaking domain warp (WS1's adopted-for-measurement lever) — never amplitude-down. |
+| **Map-based cache eviction via `keys().next().value`** (fixed, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B, `hydroRegionCache`) | Not an LRU — don't assume it is | `keys().next().value` evicts in INSERTION order, i.e. a FIFO, not a recency-based LRU. Under a query working set that approaches the cache's cap, a FIFO thrashes: still-hot entries get evicted while genuinely-cold ones survive, because eviction order tracks "when inserted" not "when last read." Measured cost of the mistake: ~25ms per unnecessary rebuild on a region cache, on nearly every query once the working set neared `HYDRO_REGION_CACHE_CAP=64`. Fix is cheap and general: on every cache HIT, `delete` the key and `.set()` it again — a plain `Map`'s insertion order then doubles as recency order, giving a true LRU with no extra data structure. Apply this to ANY bounded module-scope `Map` cache that assumes "oldest key = coldest key" (`treePositionsCache`/`biomeCellCache` already do the distance-eviction thing correctly; a straight `keys().next()` evictor anywhere else should be treated as suspect). |
+| **String-templated keys in per-column hot-path caches/indexes** (fixed, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B, `riverFactorAt`'s segment bucket index + region-neighborhood memo) | Avoid — use numeric packed keys | Building a template-literal key (e.g. `` `${bx},${bz}` ``) per lookup was measured to itself dominate `riverFactorAt`'s warm per-call cost once real production segment density (~450 segs/region, ~10x the prototype's ~45) was exercised — the string allocation/hashing overhead was bigger than the actual work being cached. Switching to a numeric packed key (`bx*2097152+bz`, one multiply-add, no allocation) was one of three steps that took the function from ~30x to 1.54x the baseline cost it was gated against. Lesson: in any hot path doing thousands of Map lookups per chunk/column, prefer a single packed integer key over a template-literal string key — the string path can dominate even when the "real" computation being memoized is itself cheap. |
+| **Trusting a small-N prototype's measured cost/behavior as a production gate without re-measuring at real scale** (found, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B) | Re-measure at production density before declaring a gate met | WS6's P0 prototype measured `riverFactorAt` cost and M10 sand-water-proximity against ~45 segments/region and small (~18-column) samples respectively. Both looked fine at that scale and both broke once the real system ran at production density: per-call cost was ~30x over budget at ~450 segs/region (a 10x density jump the prototype never exercised), and M10 flipped from "83% pass" (18 cols, noise) to "a genuine 157-column material bug" once the sample grew to 1210 columns. Neither failure was a coding bug in the port — both were the prototype's small scale silently hiding a real cost/behavior curve that only shows up at production density/sample size. Lesson: treat a prototype's measured numbers as a DIRECTION, not a proof, and re-run the same measurement at real generation scale (real segment density, real sample sizes) before treating a CCR's prototype-derived gate as satisfied. |
 
 ## 2. Three.js / browser gotchas (version-specific, verified r160)
 
@@ -387,6 +393,37 @@ These apply ONLY to agents running in the Cowork Linux sandbox with
   LF-only tail into the otherwise-CRLF voxEx.html (caught in review, not by any
   gate). Check: `tr -cd '\r' < voxEx.html | wc -c` must equal `wc -l`. Fix:
   `sed -i 's/\r\?$/\r/'` (safe — restores the pre-truncation byte state).
+- **NEW (2026-07-13, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B): mount staleness is
+  not always confined to the tail — a naive truncate-and-append recovery can
+  ERASE a recent Edit-tool change.** The standard recovery above assumes the
+  mount's PREFIX (everything before the cut) is byte-correct and only the tail
+  is missing; that assumption held on every prior occurrence in this file's
+  history but is NOT guaranteed. If the mount's staleness window happens to
+  extend far enough back to cover a MID-FILE region you just edited, truncating
+  at "the last complete line the mount shows" and reattaching a tail can silently
+  reproduce the OLD (pre-edit) content in that region — a real content loss, not
+  just a parse error, and `syntax-check.mjs` cannot catch it (the stale text is
+  still syntactically valid, just wrong). Caught in time this session (no loss)
+  by the same "distinctive-token count, bash grep vs Grep-tool" check from the
+  2026-07-11 refinement above — but that check must specifically include the
+  token(s) belonging to your MOST RECENT mid-file edit, not just any token from
+  the file. **Rule: before trusting a truncate-and-append recovery, grep the
+  mount's prefix bytes for your newest mid-file edit's own distinctive text; if
+  it's missing or wrong, the prefix itself is stale and needs to be replaced
+  from the Read tool, not just the tail. Re-verify the recovered file via the
+  Read tool afterward** (not just `syntax-check.mjs`), the same lesson the WS1
+  as-built already drew for LOGIC bugs introduced by a bad tail reconstruction —
+  this is the mirror-image failure mode (bad PREFIX instead of bad tail).
+- **`/tmp` does NOT survive a VM restart/outage.** A session that hits a VM
+  guest disconnect (see the `mcp__workspace__bash` "VM guest is not connected"
+  failure mode a few bullets below) comes back with an EMPTY `/tmp` — any
+  cached Chromium download, extracted libs, or scratch snapshot living there is
+  gone and must be re-bootstrapped from scratch. Hit twice in one
+  CCR-WORLDGEN-PIPELINE-002 session (Bump A's session and again in the
+  WS6/Bump B session) — budget time for a full Chromium re-download
+  (`npx @puppeteer/browsers install chromium@latest --path /tmp/br` + the
+  `libxdamage1` apt-get/dpkg step below) rather than assuming a prior session's
+  `/tmp/br*`/`/tmp/libs` cache is still there.
 - **Each bash call runs in its own bwrap PID sandbox — background jobs
   (`nohup`/`setsid`/`&`) do NOT survive across calls** (2026-07-10). Long steps
   (Chromium download, browser suite) must complete within one call's timeout;

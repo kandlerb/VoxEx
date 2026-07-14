@@ -44,6 +44,18 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
   const biomeDriven = (opts && typeof opts.biomeDrivenTerrain === 'boolean')
     ? opts.biomeDrivenTerrain
     : _liveBiomeDriven;
+  // CCR-WORLDGEN-PIPELINE-002 WS3: opts.forceSingleBiome bakes a forced biome name into the
+  // assembled worldConfig (mirrors the biomeDrivenTerrain opt above) so M21 can build one API
+  // instance per forced biome without touching voxEx.html. null/omitted = unforced (default).
+  const forcedBiome = (opts && typeof opts.forceSingleBiome === 'string') ? opts.forceSingleBiome : null;
+  // CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1): opts.hydroRivers overrides the live worldConfig.hydroRivers
+  // flag (mirrors the biomeDrivenTerrain opt above) so the harness can build BOTH a flag-OFF
+  // (default, byte-identity regression) and a flag-ON (--hydro, M14-M17 gating) api from the SAME
+  // file/seed. Default false when omitted (the shipping default — flag-ON is a harness-only ask
+  // pending the Bump-B flip).
+  const _liveHydroMatch = src.match(/^[ \t]*hydroRivers:\s*(true|false)\b/m);
+  const _liveHydro = _liveHydroMatch ? _liveHydroMatch[1] === 'true' : false;
+  const hydroRivers = (opts && typeof opts.hydroRivers === 'boolean') ? opts.hydroRivers : _liveHydro;
 
   // --- extraction helpers ------------------------------------------------------
   function lastIndexOfDef(needle) {
@@ -99,10 +111,12 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'peaksValleys', 'temperature', 'humidity',
     'terrainSurface', 'computeSurfaceHeight', 'resolveBiome',
     // CCR-WORLDGEN-PIPELINE-001 Phase 1 biome-driven classifier (inert until Phase 2)
-    'reliefParam', 'classifyBiome', 'styleBlend', 'featureAt', 'recomputeBiomeStyleActive',
+    'reliefParam', 'classifyBiomeFromFields', 'classifyBiome', 'styleBlend', 'featureAt', 'recomputeBiomeStyleActive',
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
+    // CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1): hydrological rivers (inert unless opts.hydroRivers).
+    'hydroRegionOf', 'hydroLatticeH', 'floodSpill', 'buildHydroRegion', 'riverFactorAt',
     // CCR-WORLDGEN-PIPELINE-001 Phase 3 (P3-R6): REAL chunk block output for M9/M10/M11.
     // generateTerrainPass runs the actual surface-material cascade; precalculateTerrainCaches
     // builds the caches it reads (incl. featureCache/climCache/biomeIdCache); caves are
@@ -117,6 +131,27 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'SPLINE_CONTINENTAL', 'SPLINE_EROSION', 'BIOME_PARAMS', 'AXIS_W',
     // CCR-WORLDGEN-PIPELINE-001 Phase 1 classifier tunables (AXIS_W.r rides on AXIS_W above)
     'SPLINE_RELIEF', 'BIOME_SOFTMAX_TAU', 'BIOME_CENTROIDS', 'BIOME_STYLE',
+    // CCR-WORLDGEN-PIPELINE-002 WS4: climate field frequencies (temperature/humidity/erosion
+    // fbm base freqs + continentalHeight's bare-literal base/erosion freqs).
+    'FREQ_TEMPERATURE', 'FREQ_HUMIDITY', 'FREQ_EROSION',
+    'FREQ_CONTINENTAL_BASE', 'FREQ_CONTINENTAL_EROSION',
+    // CCR-WORLDGEN-PIPELINE-002 WS1: terracing contour-break warp (0 amp = inert default).
+    'TERRACE_WARP_AMP', 'TERRACE_WARP_FREQ', 'TERRACE_WARP_RELIEF_MIN',
+    // CCR-WORLDGEN-PIPELINE-002 WS6: hydrological river tunables (inert unless opts.hydroRivers).
+    'HYDRO_REGION', 'HYDRO_STEP', 'HYDRO_HALO', 'HYDRO_SPRING_H', 'FLOW_WIDTH_SCALE',
+    // CCR-WORLDGEN-PIPELINE-002 WS6-P3: organic-shape tunables (owner defect fix — meander/bank
+    // warp + join-termination; inert unless opts.hydroRivers, same as the WS6 tunables above).
+    'HYDRO_MEANDER_SUBDIV', 'HYDRO_MEANDER_AMP', 'HYDRO_MEANDER_FREQ', 'HYDRO_BANK_AMP', 'HYDRO_BANK_FREQ',
+    // CCR-WORLDGEN-PIPELINE-002 WS6-P4: plains-meander + channel-width tunables (owner defect #2
+    // fix — rivers still ran near-straight through plains; channels read thin). Same inert-unless-
+    // opts.hydroRivers gating as the WS6/WS6-P3 tunables above.
+    'HYDRO_MEANDER_MACRO_FREQ', 'HYDRO_MEANDER_MACRO_AMP', 'HYDRO_CHANNEL_HALF_WIDTH',
+    // CCR-WORLDGEN-PIPELINE-002 WS6-P5: erosion-look tunables (owner defect #3 — "too many arms,
+    // too straight, not erosion-based"). Same inert-unless-opts.hydroRivers gating as above.
+    'HYDRO_VALLEY_SNAP', 'HYDRO_SPRING_KEEP',
+    // CCR-WORLDGEN-PIPELINE-002 WS6-P7: elevation-progressive width tunables (owner defect #5 —
+    // rivers read as thin dry ravines, not water). Same inert-unless-opts.hydroRivers gating.
+    'HYDRO_LOWLAND_WIDEN', 'HYDRO_HEADWATER_TAPER',
     'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',
@@ -159,15 +194,34 @@ const WORLD_DIMS = { seaLevel: 60, chunkSize: 16, chunkHeight: 320, yOffset: 0 }
 const worldConfig = {
   get seed() { return numericSeed; },
   useNewTerrain: true, persistence: 0.5, lacunarity: 2.0,
-  biomeSizeMultiplier: 1, enableRivers: true, forceSingleBiome: null,
+  biomeSizeMultiplier: 1, enableRivers: true, forceSingleBiome: ${forcedBiome ? JSON.stringify(forcedBiome) : 'null'},
   terrainAmplitudeMultiplier: 1.0,
   biomeDrivenTerrain: ${biomeDriven}, // CCR-WORLDGEN-PIPELINE-001 Phase 2 (P2-R4)
+  hydroRivers: ${hydroRivers}, // CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1)
 };
 // Phase-2 style-path bindings terrainSurface references (mirror the module decls near
 // terrainSurface + recomputeBiomeStyleActive; all-zero styles keep BIOME_STYLE_ACTIVE false).
 let BIOME_STYLE_ACTIVE = false;
-const _tsWeights = new Float32Array(6);
+const _tsWeights = new Float32Array(9); // CCR-WORLDGEN-PIPELINE-002 Bump A: sized for the 9-name
+// BIOME_ID_ORDER post-activation (mirrors the main-file _tsWeights sizing, WS5); a size-6 sink would
+// silently drop desert/tundra/snowy_peaks softmax weights once BIOME_STYLE_ACTIVE is true on a 9-name file.
 const _tsStyle = { ridgeMixBias: 0, roughnessBias: 0, warpBias: 0, baseBias: 0, soilDepth: 0 };
+// CCR-WORLDGEN-PIPELINE-002 WS2 (cut-2): step-8 T/H style memo (mirror the module decls near terrainSurface).
+const _styleThCache = new Map();
+const _STYLE_TH_CAP = 16384;
+// CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1): hydrology region cache + 8-neighbor lattice offsets
+// (mirror the module decls near getRiverFactor/getPreRiverHeight in the main file).
+const hydroRegionCache = new Map();
+const HYDRO_REGION_CACHE_CAP = 64;
+const HYDRO_NB = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [-1, 1], [1, -1], [1, 1]];
+// CCR-WORLDGEN-PIPELINE-002 WS6 (Bump-B perf fix): riverFactorAt's 3x3 neighborhood memo
+// scratches (mirror the module decls beside hydroRegionCache in the main file).
+let _hydroNbKey = null;
+let _hydroNbSeed = null;
+const _hydroNb = new Array(9);
+// CCR-WORLDGEN-PIPELINE-002 Bump A (C5): fused-pass distance cache for classifyBiomeFromFields (mirror
+// the module decl near _tsWeights in the main file).
+const _classifyDistScratch = new Float32Array(9);
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
@@ -187,10 +241,19 @@ const lerpValue = (a, b, t) => a + t * (b - a);
 
   for (const name of CONSTS) assembled += `const ${name} = ${extractConstValue(name)};\n`;
 
-  // biomeByName stub: resolveBiome only needs .name/.tags/.trees here
+  // biomeByName stub: resolveBiome/materials only need .name/.tags/.trees here.
+  // CCR-WORLDGEN-PIPELINE-002 WS5: keyed off the UNION of BIOME_PARAMS (legacy classifier) and
+  // BIOME_ID_ORDER (new softmax classifier) so desert/tundra/snowy_peaks — which live ONLY in
+  // BIOME_CENTROIDS/BIOME_ID_ORDER, not BIOME_PARAMS — are visible to the Node harness after Bump A
+  // activation (else classifyBiome('desert') would fall back to plains and the new biomes would be
+  // invisible). snowy_peaks fabricates the mountain tag; desert/tundra fabricate density 0 (treeless).
   assembled += `
-const biomeByName = new Map(Object.keys(BIOME_PARAMS).map((n) => [n,
-  { name: n, tags: n === 'mountains' ? ['mountain'] : [], trees: { density: 0.1 } }]));
+const __biomeUnionNames = Array.from(new Set([...Object.keys(BIOME_PARAMS), ...BIOME_ID_ORDER]));
+const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
+  name: n,
+  tags: (n === 'mountains' || n === 'snowy_peaks') ? ['mountain'] : [],
+  trees: { density: (n === 'desert' || n === 'tundra') ? 0 : 0.1 },
+}]));
 `;
 
   for (const name of FUNCS) {
@@ -209,9 +272,10 @@ const biomeByName = new Map(Object.keys(BIOME_PARAMS).map((n) => [n,
   assembled += `return { computeSurfaceHeight, blendedHeight, terrainSurface, getRiverFactor,
   getPreRiverHeight, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, noise2D,
   resolveBiome, getBiomeParams, getRiverDepth, erosionParam, continentalness, temperature, humidity,
-  spline, paramFreq, GEN_TUNABLES,
-  reliefParam, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
+  spline, paramFreq, GEN_TUNABLES, worldConfig,
+  reliefParam, classifyBiomeFromFields, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
   precalculateTerrainCaches, precalculateCaveNoise, generateTerrainPass, fillWaterPass, interpolateCaveNoise,
+  hydroRegionOf, hydroLatticeH, floodSpill, buildHydroRegion, riverFactorAt,
   BLOCKS: { AIR, GRASS, DIRT, STONE, BEDROCK, SAND, WATER, SNOW, GRAVEL } };\n`;
 
   try {
