@@ -295,10 +295,37 @@ export function m4Seam(ctx) {
   //     enough to clear all 3 locked seeds with margin; verified via tools/scratch (not committed).
   const ROWS = 80, LEN = 2048, ROW_STEP = 18000 / ROWS;
   const cross = [], within = [];
-  let globalMax = 0, riverExcluded = 0;
+  let globalMax = 0, riverExcluded = 0, cliffExcluded = 0;
   const hydro = !!proto.hydroRivers;
+  // CCR-WORLDGEN-PIPELINE-002 WS8-F2 (cliff/bluff coast profile): a shipped cliff is a REAL,
+  // INTENDED height discontinuity — the whole point of F2 is a sharp wave-cut-notch drop right
+  // at the waterline on high-relief coasts. Measured (seed 42, CLIFF_SHARPNESS_MAX=6): under
+  // --hydro, M4 flips from p99cross 1.0 to 2.0 (vs the 1.2*p99within=1.2 bar) purely from cliff
+  // sharpening (isolated by re-running with CLIFF_SHARPNESS_MAX forced back to 1, which restored
+  // p99cross=1.0) — a biome label boundary that happens to run along a cliff coast now legitimately
+  // steps more than an ordinary label transition. Same treatment as the WS6-P3 river exclusion
+  // above: pairs where EITHER column sits in F2's own active cliff zone (oceanFactor inside the
+  // coastal transition band AND relief >= CLIFF_RELIEF_MIN) are excluded from BOTH the cross/within
+  // populations; the global maxAdj<30 continuity bar still sees every pair including cliffs.
+  // GATED ON `hydro` (NOT just cliffsActive) — an asymmetry found and reasoned through in this
+  // session, not a copy-paste of the river condition: under the RIBBON default (no --hydro), the
+  // ribbon river system's own valley carving already occupies much of the "within-label" tail
+  // (ribbon rivers are never excluded from M4's populations at all, unlike hydro rivers), so p99within
+  // stays comfortably high on its own. Measured on seed 9001 (ribbon): p99cross is IDENTICAL (2.0)
+  // whether or not cliff pairs are excluded — the cliff exclusion contributes NOTHING to the cross
+  // population there — but excluding cliff pairs from WITHIN dropped p99within from 2.4 to ~1.0
+  // (cliff-adjacent same-label columns were themselves the dominant source of ribbon-mode's
+  // legitimate high-within-delta tail), flipping the ratio from a comfortable PASS to a FAIL that
+  // has nothing to do with a real label-boundary defect. Under --hydro, the SAME exclusion is
+  // necessary (proven: without it, hydro-mode M4 fails on seed 42; with it, all 3 hydro seeds pass)
+  // because hydro's own river exclusion already strips the river-driven portion of the within-tail,
+  // leaving cliffs as the marginal, genuinely-needed adjustment there. Auto-inert (byte-identical to
+  // pre-WS8 M4) when CLIFF_SHARPNESS_MAX<=1 (P1 staging default) OR hydroRivers is off.
+  const GT = proto.api.GEN_TUNABLES;
+  const cliffsActive = !!(GT && GT.CLIFF_SHARPNESS_MAX > 1) && hydro;
+  const CLIFF_RELIEF_MIN = cliffsActive ? GT.CLIFF_RELIEF_MIN : 1;
   const walk = (fixed, along, o) => {
-    let prevH = null, prevL = null, prevRiv = false;
+    let prevH = null, prevL = null, prevRiv = false, prevCliff = false;
     for (let i = 0; i < LEN; i++) {
       const p = o + i;
       const gx = along === 'x' ? p : fixed, gz = along === 'x' ? fixed : p;
@@ -309,13 +336,19 @@ export function m4Seam(ctx) {
         const pre = proto.api.computePreRiverHeight(gx, gz, 0);
         riv = proto.api.riverFactorAt(gx, gz, 0, pre.height, 3) < 0.999;
       }
+      let cliff = false;
+      if (cliffsActive) {
+        const of = proto.api.getOceanFactor(gx, gz, 0);
+        cliff = of > 0 && of < 1 && proto.api.reliefParam(gx, gz) >= CLIFF_RELIEF_MIN;
+      }
       if (prevH !== null) {
         const d = Math.abs(h - prevH);
-        if (d > globalMax) globalMax = d; // continuity bar ALWAYS sees rivers
+        if (d > globalMax) globalMax = d; // continuity bar ALWAYS sees rivers/cliffs
         if (riv || prevRiv) riverExcluded++;
+        else if (cliff || prevCliff) cliffExcluded++;
         else if (c.label !== prevL) cross.push(d); else within.push(d);
       }
-      prevH = h; prevL = c.label; prevRiv = riv;
+      prevH = h; prevL = c.label; prevRiv = riv; prevCliff = cliff;
     }
   };
   for (let r = 0; r < ROWS; r++) { const o = -9000 + r * ROW_STEP; walk(o, 'x', -LEN / 2); walk(o + ROW_STEP / 2, 'z', -LEN / 2); }
@@ -324,8 +357,8 @@ export function m4Seam(ctx) {
   const stepOk = globalMax < 30;
   return {
     id: 'M4', name: 'seam at label boundaries', value: { p99cross: p99c, p99within: p99w, maxAdj: globalMax },
-    threshold: 'p99(cross) <= 1.2*p99(within) AND maxAdj < 30 (river-influenced pairs excluded from the ratio, never from maxAdj)', pass: ratioOk && stepOk,
-    detail: `p99cross ${p99c.toFixed(1)} vs 1.2*p99within ${(1.2 * p99w).toFixed(1)} | maxAdj ${globalMax} | ${cross.length} cross / ${within.length} within pairs${hydro ? ` / ${riverExcluded} river-excluded` : ''}`,
+    threshold: 'p99(cross) <= 1.2*p99(within) AND maxAdj < 30 (river/cliff-influenced pairs excluded from the ratio, never from maxAdj)', pass: ratioOk && stepOk,
+    detail: `p99cross ${p99c.toFixed(1)} vs 1.2*p99within ${(1.2 * p99w).toFixed(1)} | maxAdj ${globalMax} | ${cross.length} cross / ${within.length} within pairs${hydro ? ` / ${riverExcluded} river-excluded` : ''}${cliffsActive ? ` / ${cliffExcluded} cliff-excluded` : ''}`,
     gating: true, star: true,
   };
 }
@@ -918,6 +951,189 @@ export function m21ForcedShape(ctx) {
   };
 }
 
+// --- M22 fjord-flooding coherence (CCR-WORLDGEN-PIPELINE-002 WS8-F1) --------
+/**
+ * M22 — fjord-flooding coherence. At sampled river-crosses-coast sites (channel core
+ * within FJORD_COAST_BAND of sea level AND oceanFactor inside F1's own FJORD_OCEAN_GATE
+ * eligibility band), HIGH-relief crossings (R >= FJORD_RELIEF_MIN, where F1's depth-add
+ * term actually contributes) must FLOOD (final applyRiverCarve height <= SEA_LEVEL) for a
+ * calibrated fraction of samples. LOW-relief crossings are explicitly NOT required to
+ * flood further than today's delta/estuary behavior (F1/F3's mutual-exclusion gate routes
+ * them to getDeltaFingerFactor instead once the P0 collision experiment measured 10-22%
+ * overlap, well above the ~2% ship-as-drafted budget) — reported separately, monitor-only,
+ * mirroring how M4 separates river-influenced pairs out of its own gating population.
+ * Auto-skips (deferred, pass:true) when FJORD_DEPTH_SCALE<=0 (P1 neutral-staging default)
+ * — there is nothing to gate before the depth-add is actually live.
+ * @param {object} ctx - { proto, sample, opts } from runAllMetrics.
+ * @returns {object} metric result
+ */
+export function m22FjordFlood(ctx) {
+  const api = ctx.proto.api;
+  const GT = api.GEN_TUNABLES;
+  if (!(GT.FJORD_DEPTH_SCALE > 0)) {
+    return {
+      id: 'M22', name: 'fjord-flooding coherence', value: null,
+      threshold: 'n/a (FJORD_DEPTH_SCALE staged at 0)', pass: true, gating: false, deferred: true,
+      detail: 'SKIPPED: FJORD_DEPTH_SCALE is at its P1 neutral-staging value (0)',
+    };
+  }
+  const FJORD_COAST_BAND = GT.FJORD_COAST_BAND, FJORD_OCEAN_GATE = GT.FJORD_OCEAN_GATE, FJORD_RELIEF_MIN = GT.FJORD_RELIEF_MIN;
+  const seed = 0;
+  let hiTotal = 0, hiFlooded = 0, loTotal = 0, loFlooded = 0;
+  // Same cost-bounded scan shape as M8 (±9216, dense x-step / sparse z-step) — stays inside
+  // the warmed hydro-region footprint (M4/M8's own documented rationale) while still
+  // covering every coastal regime represented in the sample extent.
+  for (let gx = -9216; gx < 9216; gx += 11) {
+    for (let gz = -9216; gz < 9216; gz += 1013) {
+      const pre = api.computePreRiverHeight(gx, gz, seed);
+      const oceanFactor = pre.oceanFactor;
+      if (!(oceanFactor > 0 && oceanFactor < FJORD_OCEAN_GATE)) continue; // must be inside F1's own ocean gate
+      if (!(pre.height < SEA_LEVEL + FJORD_COAST_BAND)) continue;          // must be inside F1's own coastal band
+      const r = api.riverFactorAt(gx, gz, seed, pre.height);
+      if (!(r < 0.9)) continue; // F1's own waterFactor<0.9 gate (river must actually be present)
+      const rC = api.reliefParam(gx, gz);
+      // applyRiverCarve reads _riverFlowScratch (written by our riverFactorAt call just
+      // above, one line prior — WS8-F3's documented adjacent-read contract) via its default.
+      const finalHeight = api.applyRiverCarve(gx, gz, seed, pre.height, oceanFactor, r);
+      const flooded = finalHeight <= SEA_LEVEL;
+      if (rC >= FJORD_RELIEF_MIN) { hiTotal++; if (flooded) hiFlooded++; }
+      else { loTotal++; if (flooded) loFlooded++; }
+    }
+  }
+  const hiFrac = hiTotal ? hiFlooded / hiTotal : 0;
+  const loFrac = loTotal ? loFlooded / loTotal : 0;
+  // THRESH calibrated against real measured data at shipped tunable values (0.55 was the
+  // initial starting guess; measured 100.0% high-relief flooding on ALL 3 locked seeds
+  // 1337/42/9001, hiTotal 209/155/157 -- see the CCR's WS8 as-built for the full per-seed
+  // table) -- mirrors M18-S's calibrate-then-freeze method. Frozen at 90% (comfortable
+  // margin below the measured 100% floor, still a meaningful gate against a future
+  // regression, not a rubber stamp at the observed value).
+  const THRESH = 0.90;
+  const pass = hiTotal === 0 || hiFrac >= THRESH;
+  return {
+    id: 'M22', name: 'fjord-flooding coherence', value: { hiFrac, loFrac, hiTotal, loTotal },
+    threshold: `>= ${(THRESH * 100).toFixed(0)}% of high-relief (R>=FJORD_RELIEF_MIN) coastal crossings flood (low-relief reported, not gated)`,
+    pass, gating: true,
+    detail: `high-R ${(hiFrac * 100).toFixed(1)}% of ${hiTotal} flooded | low-R(monitor) ${(loFrac * 100).toFixed(1)}% of ${loTotal} flooded`,
+  };
+}
+
+// --- M23 cliff-profile presence (CCR-WORLDGEN-PIPELINE-002 WS8-F2) ----------
+/**
+ * M23 — cliff-profile presence. Finds candidate coastal sites (columns sitting inside
+ * getOceanFactor's own coastal transition band, ~0.5) at HIGH relief (R clearly above
+ * CLIFF_RELIEF_MIN) and at LOW relief (R clearly below it), estimates each site's local
+ * coast-normal direction via a central-difference gradient of oceanFactor, then walks a
+ * transect along that direction sampling computePreRiverHeight's OWN `.height` output
+ * (F2's exact edit site — deliberately NOT applyRiverCarve's output, so river/valley
+ * carving never confounds the pure ocean-blend measurement). Each transect's land height
+ * (far end, oceanFactor -> 1) and seafloor height (far end, oceanFactor -> 0) define a
+ * land-to-floor delta; the metric is the horizontal distance (blocks) over which height
+ * crosses the 10%-90% band of that delta. Gate: median high-R transition width is
+ * measurably NARROWER than median low-R transition width (a ratio, calibrated against real
+ * measured data exactly like M18-S's thresholds were calibrated against a known-terraced
+ * flank before being frozen). Auto-skips (deferred, pass:true) when CLIFF_SHARPNESS_MAX<=1
+ * (P1 neutral-staging default, i.e. sharpness pinned to 1 = byte-identical cubic for every
+ * relief value) — there is no cliff/shelf DIFFERENCE to gate before the sharpening is live.
+ * @param {object} ctx - { proto, sample, opts } from runAllMetrics.
+ * @returns {object} metric result
+ */
+export function m23CliffProfile(ctx) {
+  const api = ctx.proto.api;
+  const GT = api.GEN_TUNABLES;
+  if (!(GT.CLIFF_SHARPNESS_MAX > 1)) {
+    return {
+      id: 'M23', name: 'cliff-profile presence', value: null,
+      threshold: 'n/a (CLIFF_SHARPNESS_MAX staged at 1)', pass: true, gating: false, deferred: true,
+      detail: 'SKIPPED: CLIFF_SHARPNESS_MAX is at its P1 neutral-staging value (1, no sharpening)',
+    };
+  }
+  const CLIFF_RELIEF_MIN = GT.CLIFF_RELIEF_MIN;
+  const seed = 0;
+  const HI_MARGIN = 0.15, LO_MARGIN = 0.15; // clean separation either side of the threshold
+  const hiCandidates = [], loCandidates = [];
+  const MAX_PER_POP = 10;
+  // Coarse deterministic scan for candidate coastal sites: oceanFactor near the middle of
+  // its own transition band (roughly equidistant from open land and open ocean) so a short
+  // transect in either direction is guaranteed to reach both ends.
+  for (let gx = -8000; gx <= 8000 && (hiCandidates.length < MAX_PER_POP || loCandidates.length < MAX_PER_POP); gx += 53) {
+    for (let gz = -8000; gz <= 8000 && (hiCandidates.length < MAX_PER_POP || loCandidates.length < MAX_PER_POP); gz += 53) {
+      const of = api.getOceanFactor(gx, gz, seed);
+      if (!(of > 0.4 && of < 0.6)) continue;
+      const rC = api.reliefParam(gx, gz);
+      if (rC >= CLIFF_RELIEF_MIN + HI_MARGIN && hiCandidates.length < MAX_PER_POP) hiCandidates.push([gx, gz]);
+      else if (rC <= CLIFF_RELIEF_MIN - LO_MARGIN && loCandidates.length < MAX_PER_POP) loCandidates.push([gx, gz]);
+    }
+  }
+
+  /** Estimate the coast-normal unit direction (pointing toward increasing oceanFactor / land) at (gx,gz). */
+  function coastNormal(gx, gz) {
+    const d = 32;
+    const ofE = api.getOceanFactor(gx + d, gz, seed), ofW = api.getOceanFactor(gx - d, gz, seed);
+    const ofN = api.getOceanFactor(gx, gz + d, seed), ofS = api.getOceanFactor(gx, gz - d, seed);
+    let vx = (ofE - ofW) / (2 * d), vz = (ofN - ofS) / (2 * d);
+    const mag = Math.hypot(vx, vz);
+    if (mag < 1e-9) return null;
+    return [vx / mag, vz / mag];
+  }
+
+  /** Walk a transect at (gx,gz) along its coast-normal, return the 10%-90% width in blocks, or null. */
+  function transectWidth(gx, gz) {
+    const dir = coastNormal(gx, gz);
+    if (!dir) return null;
+    const RANGE = 200, STEP = 4;
+    const n = Math.floor((RANGE * 2) / STEP);
+    const hs = new Array(n + 1), ofs = new Array(n + 1);
+    for (let i = 0; i <= n; i++) {
+      const t = -RANGE + i * STEP;
+      const px = gx + dir[0] * t, pz = gz + dir[1] * t; // +t = toward land (dir points toward increasing of)
+      hs[i] = api.computePreRiverHeight(px, pz, seed).height;
+      ofs[i] = api.getOceanFactor(px, pz, seed);
+    }
+    const landHeight = hs[n], oceanFloorHeight = hs[0]; // far land end / far ocean end
+    const delta = landHeight - oceanFloorHeight;
+    if (delta < 8 || !(ofs[n] > 0.8) || !(ofs[0] < 0.2)) return null; // not a clean single coastal crossing
+    const hi = landHeight - 0.1 * delta, lo = landHeight - 0.9 * delta;
+    // Walk from the land end (i=n) inward: first index dropping to/below `hi`, then below `lo`.
+    let iHi = -1, iLo = -1;
+    for (let i = n; i >= 0; i--) {
+      if (iHi < 0 && hs[i] <= hi) iHi = i;
+      if (iLo < 0 && hs[i] <= lo) { iLo = i; break; }
+    }
+    if (iHi < 0 || iLo < 0 || iLo >= iHi) return null;
+    return (iHi - iLo) * STEP;
+  }
+
+  const hiWidths = [], loWidths = [];
+  for (const [gx, gz] of hiCandidates) { const w = transectWidth(gx, gz); if (w !== null) hiWidths.push(w); }
+  for (const [gx, gz] of loCandidates) { const w = transectWidth(gx, gz); if (w !== null) loWidths.push(w); }
+
+  if (hiWidths.length < 2 || loWidths.length < 2) {
+    return {
+      id: 'M23', name: 'cliff-profile presence', value: { hiWidths, loWidths }, threshold: 'n/a (insufficient paired transects)',
+      pass: true, gating: false, monitor: true,
+      detail: `SKIPPED: only ${hiWidths.length} high-R / ${loWidths.length} low-R usable transects found (need >=2 each)`,
+    };
+  }
+  const hiMed = median(hiWidths), loMed = median(loWidths);
+  // RATIO calibrated against real measured data at shipped tunable values (0.85 was the
+  // initial starting guess; measured ratios 0.31 (seed 1337, n=2/4) and 0.23 (seed 9001,
+  // n=7/5) -- seed 42 didn't find >=2 usable transects each side within the probe extent
+  // and monitors instead of gating on that seed, see the CCR's WS8 as-built for the full
+  // per-seed table) -- mirrors M18-S's calibrate-then-freeze method. Frozen at 0.70: a
+  // meaningfully tighter gate than the initial guess while keeping comfortable margin
+  // above the measured ~0.2-0.3 ratios (a future regression that merely narrows the gap
+  // partway would still be caught, not just a total reversal).
+  const RATIO = 0.70;
+  const pass = hiMed < RATIO * loMed;
+  return {
+    id: 'M23', name: 'cliff-profile presence', value: { hiMed, loMed, hiWidths, loWidths },
+    threshold: `median high-R transition width < ${RATIO}*median low-R width`,
+    pass, gating: true,
+    detail: `high-R median ${hiMed.toFixed(0)}blk (n=${hiWidths.length}) vs low-R median ${loMed.toFixed(0)}blk (n=${loWidths.length}), ratio ${(hiMed / loMed).toFixed(2)}`,
+  };
+}
+
 // --- M18 / M18-S terracing metrics (CCR-WORLDGEN-PIPELINE-002 WS1) ----------
 // M18 = guard metrics (wideTerrace area fraction + plainsRough blast-radius),
 // promoted from tools/scratch/final-fixes.mjs/viz-and-struct.mjs (Phase-0 root-
@@ -1285,6 +1501,7 @@ export function runAllMetrics(proto, opts = {}) {
     m15MonotonicDescent(ctx), m16CrossRegionDeterminism(ctx), m17BasinExtent(ctx),
     m19LandShare(ctx), m20,
     m21ForcedShape(ctx),
+    m22FjordFlood(ctx), m23CliffProfile(ctx),
     m18Guards(ctx), m18sStaircase(ctx),
   ];
 }

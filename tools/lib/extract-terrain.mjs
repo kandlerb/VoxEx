@@ -152,6 +152,10 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // CCR-WORLDGEN-PIPELINE-002 WS6-P7: elevation-progressive width tunables (owner defect #5 —
     // rivers read as thin dry ravines, not water). Same inert-unless-opts.hydroRivers gating.
     'HYDRO_LOWLAND_WIDEN', 'HYDRO_HEADWATER_TAPER',
+    // CCR-WORLDGEN-PIPELINE-002 WS6-P10: stream-capture tunable (owner defect #6 — "bear claws",
+    // parallel rivers eroding adjacent strips with untouched ridges between). Same inert-unless-
+    // opts.hydroRivers gating as the WS6 tunables above.
+    'HYDRO_CAPTURE_RADIUS',
     'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',
@@ -159,6 +163,11 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'RIVER_WARP_FREQ', 'RIVER_WARP_AMP', 'RIVER_WARP_VAR_FREQ', 'RIVER_WARP_VAR_STRENGTH',
     'OCEAN_THRESHOLD_DEEP', 'OCEAN_THRESHOLD_SHALLOW',
     'RIVER_DEPTH_SCALE', 'OCEAN_DEPTH_SCALE',
+    // CCR-WORLDGEN-PIPELINE-002 WS8: coastal erosion (fjords, cliff/bluff coast profile,
+    // flow-driven deltas). FJORD_DEPTH_SCALE/CLIFF_SHARPNESS_MAX/DELTA_FLOW_SCALE ship
+    // staging-neutral (0/1/0) at P1; real values land at the P2 flip.
+    'FJORD_COAST_BAND', 'FJORD_OCEAN_GATE', 'FJORD_RELIEF_MIN', 'FJORD_DEPTH_SCALE',
+    'CLIFF_RELIEF_MIN', 'CLIFF_SHARPNESS_MAX', 'DELTA_FLOW_SCALE',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -219,6 +228,11 @@ const HYDRO_NB = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [-1, 1], [1, -1], 
 let _hydroNbKey = null;
 let _hydroNbSeed = null;
 const _hydroNb = new Array(9);
+// CCR-WORLDGEN-PIPELINE-002 WS8 (F3): zero-alloc transport scratch riverFactorAt writes on every
+// return and applyRiverCarve/precalculateTerrainCaches read adjacent to their own riverFactorAt call
+// (mirror the module-scope decl beside hydroRegionCache in the main file). Declared here pre-emptively
+// so the harness never ReferenceErrors regardless of which WS8 phase voxEx.html is at.
+const _riverFlowScratch = { flow: 1 };
 // CCR-WORLDGEN-PIPELINE-002 Bump A (C5): fused-pass distance cache for classifyBiomeFromFields (mirror
 // the module decl near _tsWeights in the main file).
 const _classifyDistScratch = new Float32Array(9);
@@ -276,6 +290,9 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   reliefParam, classifyBiomeFromFields, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
   precalculateTerrainCaches, precalculateCaveNoise, generateTerrainPass, fillWaterPass, interpolateCaveNoise,
   hydroRegionOf, hydroLatticeH, floodSpill, buildHydroRegion, riverFactorAt,
+  // CCR-WORLDGEN-PIPELINE-002 WS8: exposed for the P0 collision experiment + M22/M23 (harness-only;
+  // applyRiverCarve/getDeltaFingerFactor were extracted into FUNCS all along, just not returned).
+  applyRiverCarve, getDeltaFingerFactor,
   BLOCKS: { AIR, GRASS, DIRT, STONE, BEDROCK, SAND, WATER, SNOW, GRAVEL } };\n`;
 
   try {
