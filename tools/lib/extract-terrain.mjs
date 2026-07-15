@@ -56,6 +56,13 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
   const _liveHydroMatch = src.match(/^[ \t]*hydroRivers:\s*(true|false)\b/m);
   const _liveHydro = _liveHydroMatch ? _liveHydroMatch[1] === 'true' : false;
   const hydroRivers = (opts && typeof opts.hydroRivers === 'boolean') ? opts.hydroRivers : _liveHydro;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001: opts.continentalOceans overrides the live
+  // worldConfig.continentalOceans flag (mirrors hydroRivers/biomeDrivenTerrain above) so the harness
+  // can build BOTH a flag-ON (live default) and a flag-OFF (byte-identity regression) api from the
+  // SAME file/seed. Default tracks the live WORLD_CONFIG value when omitted.
+  const _liveContinentalMatch = src.match(/^[ \t]*continentalOceans:\s*(true|false)\b/m);
+  const _liveContinental = _liveContinentalMatch ? _liveContinentalMatch[1] === 'true' : false;
+  const continentalOceans = (opts && typeof opts.continentalOceans === 'boolean') ? opts.continentalOceans : _liveContinental;
 
   // --- extraction helpers ------------------------------------------------------
   function lastIndexOfDef(needle) {
@@ -112,6 +119,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'terrainSurface', 'computeSurfaceHeight', 'resolveBiome',
     // CCR-WORLDGEN-PIPELINE-001 Phase 1 biome-driven classifier (inert until Phase 2)
     'reliefParam', 'classifyBiomeFromFields', 'classifyBiome', 'styleBlend', 'featureAt', 'recomputeBiomeStyleActive',
+    'oceanFactorFromC', // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 (getOceanFactor's dispatch target)
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
@@ -168,6 +176,14 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // staging-neutral (0/1/0) at P1; real values land at the P2 flip.
     'FJORD_COAST_BAND', 'FJORD_OCEAN_GATE', 'FJORD_RELIEF_MIN', 'FJORD_DEPTH_SCALE',
     'CLIFF_RELIEF_MIN', 'CLIFF_SHARPNESS_MAX', 'DELTA_FLOW_SCALE',
+    // CCR-WORLDGEN-CONTINENTAL-OCEANS-001: continents-&-oceans tunables. SPLINE_CONTINENTAL_OCEAN is
+    // object-valued (array of [x,y] pairs) — the CONTINENTAL_* set feeds continentalHeight
+    // unconditionally (byte-identical at defaults); the rest gate on worldConfig.continentalOceans.
+    'SPLINE_CONTINENTAL_OCEAN', 'COAST_THRESHOLD_C', 'COAST_SHELF_C',
+    'SEAFLOOR_DETAIL', 'SEAFLOOR_FADE_C', 'SEAFLOOR_CLIFF_SHARP', 'SEAFLOOR_CLIFF_BAND',
+    'CONTINENTAL_SEA_BIAS', 'CONTINENTAL_BASE_WEIGHT', 'CONTINENTAL_EROSION_WEIGHT',
+    'CONTINENTAL_BASE_OCTAVES', 'CONTINENTAL_EROSION_OCTAVES', 'CONTINENTAL_SCALE',
+    'CONTINENTAL_ISLAND_AMP', 'CONTINENTAL_ISLAND_FREQ', 'HYDRO_HALO_CONTINENTAL',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -207,6 +223,7 @@ const worldConfig = {
   terrainAmplitudeMultiplier: 1.0,
   biomeDrivenTerrain: ${biomeDriven}, // CCR-WORLDGEN-PIPELINE-001 Phase 2 (P2-R4)
   hydroRivers: ${hydroRivers}, // CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1)
+  continentalOceans: ${continentalOceans}, // CCR-WORLDGEN-CONTINENTAL-OCEANS-001
 };
 // Phase-2 style-path bindings terrainSurface references (mirror the module decls near
 // terrainSurface + recomputeBiomeStyleActive; all-zero styles keep BIOME_STYLE_ACTIVE false).
@@ -289,7 +306,7 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   spline, paramFreq, GEN_TUNABLES, worldConfig,
   reliefParam, classifyBiomeFromFields, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
   precalculateTerrainCaches, precalculateCaveNoise, generateTerrainPass, fillWaterPass, interpolateCaveNoise,
-  hydroRegionOf, hydroLatticeH, floodSpill, buildHydroRegion, riverFactorAt,
+  hydroRegionOf, hydroLatticeH, floodSpill, buildHydroRegion, riverFactorAt, oceanFactorFromC,
   // CCR-WORLDGEN-PIPELINE-002 WS8: exposed for the P0 collision experiment + M22/M23 (harness-only;
   // applyRiverCarve/getDeltaFingerFactor were extracted into FUNCS all along, just not returned).
   applyRiverCarve, getDeltaFingerFactor,

@@ -31,6 +31,9 @@ can tell whether circumstances actually changed.
 | **Map-based cache eviction via `keys().next().value`** (fixed, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B, `hydroRegionCache`) | Not an LRU — don't assume it is | `keys().next().value` evicts in INSERTION order, i.e. a FIFO, not a recency-based LRU. Under a query working set that approaches the cache's cap, a FIFO thrashes: still-hot entries get evicted while genuinely-cold ones survive, because eviction order tracks "when inserted" not "when last read." Measured cost of the mistake: ~25ms per unnecessary rebuild on a region cache, on nearly every query once the working set neared `HYDRO_REGION_CACHE_CAP=64`. Fix is cheap and general: on every cache HIT, `delete` the key and `.set()` it again — a plain `Map`'s insertion order then doubles as recency order, giving a true LRU with no extra data structure. Apply this to ANY bounded module-scope `Map` cache that assumes "oldest key = coldest key" (`treePositionsCache`/`biomeCellCache` already do the distance-eviction thing correctly; a straight `keys().next()` evictor anywhere else should be treated as suspect). |
 | **String-templated keys in per-column hot-path caches/indexes** (fixed, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B, `riverFactorAt`'s segment bucket index + region-neighborhood memo) | Avoid — use numeric packed keys | Building a template-literal key (e.g. `` `${bx},${bz}` ``) per lookup was measured to itself dominate `riverFactorAt`'s warm per-call cost once real production segment density (~450 segs/region, ~10x the prototype's ~45) was exercised — the string allocation/hashing overhead was bigger than the actual work being cached. Switching to a numeric packed key (`bx*2097152+bz`, one multiply-add, no allocation) was one of three steps that took the function from ~30x to 1.54x the baseline cost it was gated against. Lesson: in any hot path doing thousands of Map lookups per chunk/column, prefer a single packed integer key over a template-literal string key — the string path can dominate even when the "real" computation being memoized is itself cheap. |
 | **Trusting a small-N prototype's measured cost/behavior as a production gate without re-measuring at real scale** (found, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B) | Re-measure at production density before declaring a gate met | WS6's P0 prototype measured `riverFactorAt` cost and M10 sand-water-proximity against ~45 segments/region and small (~18-column) samples respectively. Both looked fine at that scale and both broke once the real system ran at production density: per-call cost was ~30x over budget at ~450 segs/region (a 10x density jump the prototype never exercised), and M10 flipped from "83% pass" (18 cols, noise) to "a genuine 157-column material bug" once the sample grew to 1210 columns. Neither failure was a coding bug in the port — both were the prototype's small scale silently hiding a real cost/behavior curve that only shows up at production density/sample size. Lesson: treat a prototype's measured numbers as a DIRECTION, not a proof, and re-run the same measurement at real generation scale (real segment density, real sample sizes) before treating a CCR's prototype-derived gate as satisfied. |
+| **A separate `terrainSurfaceDebug()` wrapper that re-runs the surface math to expose intermediates** (rejected, CCR-WORLDGEN-UI-002) | Never retry | Proposed as the way to feed the terrain editor's `surface.*` per-pass sub-views the function-local `base`/`amplitude`/`hf`/`warpMag` scalars. A wrapper that re-implements (or re-runs a forked copy of) `terrainSurface`'s math is a single-source violation of exactly the kind the Lockstep Registry exists to prevent — the wrapper and the real function drift, and the debug view then silently LIES about what the game generates. The house idiom is an optional out-param on the REAL function (`terrainSurface(gx, gz, outDbg)`, see §3), guarded by `if (outDbg)` so the no-arg path stays byte-identical/allocation-free and the debug values come from the ONE real computation. Applies to any "instrument an injected/single-source function for a debug view" need: extend the real function with a guarded out-param, never clone it. |
+| **A `[−1,1]`-domain ocean/continental spline** (rejected, CCR-WORLDGEN-CONTINENTAL-OCEANS-001 P0) | Never retry | The first draft `SPLINE_CONTINENTAL_OCEAN` was authored over the nominal `[−1,1]` C domain, but continentalness's REAL range is only ~[−0.16, 0.73] (measured), so every knot below the real min was a DEAD KNOT that never activated — the whole deep-ocean half of the curve authored a seafloor no column ever reached. Author any climate-field-keyed spline over the field's MEASURED histogram range (the shipped ocean spline is over ~[−0.06, 1.05]). See §4. |
+| **Lowering `CONTINENTAL_SEA_BIAS` to "activate" deep ocean spline knots** (rejected, CCR-WORLDGEN-CONTINENTAL-OCEANS-001 P0) | Never retry | Tempting when the deep knots look dead (see above) — but `CONTINENTAL_SEA_BIAS` re-centers the ENTIRE C field, shifting every knot's activation point in lockstep; it never selectively "reveals" the low knots relative to the coast. `COAST_THRESHOLD_C` already sets where water begins, making the bias redundant for that purpose. Fix dead knots by re-authoring the spline over C's real domain, not by dialing the bias. |
 
 ## 2. Three.js / browser gotchas (version-specific, verified r160)
 
@@ -270,6 +273,32 @@ can tell whether circumstances actually changed.
   two independent flex columns, never CSS multicol, never 2-cell grid;
   settings = sidebar + sub-tabs + group cards).
 
+### Terrain parameter editor — per-pass views (CCR-WORLDGEN-UI-002, build 2026-07-15.1)
+- `terrainSurface(gx, gz)` gained an OPTIONAL third out-param `outDbg`: when passed,
+  the function writes its function-local intermediate scalars (`base`/`relief`/
+  `amplitude`/`lift`/`hf`/`ridgeMix`/`gain`/`warpAmp`/`warpMag`/`surface`) into the
+  supplied object and returns the SAME value. This is the house scratch-out-param
+  idiom (like `_nd2`/`_fd2` and `applyRiverCarve`'s `_riverFlowScratch`) — the whole
+  write block is inside `if (outDbg)`, so the no-arg call path (every production +
+  worker site) is byte-identical and allocation-free. `terrainSurface` is INJECTED
+  (`__TERRAIN_FUNCS__`), so worker calls pass 2 args and never run the block — output
+  byte-parity is proven by the browser suite's worker↔main `blendedHeight` test.
+  `TERRAIN_GEN_VERSION` was NOT bumped (output-neutral). `warpMag = Math.hypot(wx-gx,
+  wz-gz)` is the DOMAIN-warp displacement (note the top-of-function TERRACE_WARP guard,
+  default-off, can pre-displace `gx`/`gz` before `wx`/`wz` are derived).
+- `computePreRiverHeight` + `applyRiverCarve` are now on the `?test=1` browser seam
+  (`window.VoxEx`) — added ONLY to the seam object, not injected/hand-copied, so no
+  lockstep obligation. The editor's `preRiver`/`carved`/diff passes use them directly.
+- The editor's per-pass machinery is a data-driven `PASS_REGISTRY` (19 passes) driving
+  a generic `renderField` + bespoke `renderFn`s, a diff view (`divergingColor` ramp,
+  after−before), an A/B cached-grid toggle, and a 19-thumb commit-time filmstrip. EVERY
+  sample still routes through `VX.*` — the editor holds NO hand-copied terrain math and
+  MUST NOT gain any: a new pass that needs an intermediate is a NEW seam export (or a
+  new `outDbg` field), never a re-implementation in the editor.
+- Phase 4 (a real per-column material-cascade view) is DEFERRED: `generateTerrainPass`
+  is injected + lockstep-mirrored with `isTreeSoilSurface`, so exposing it needs the
+  full parity-gate treatment — out of scope for a UI-only CCR.
+
 ## 4. Terrain lessons (beyond the ledger)
 
 - **"Directional-looking" ≠ anisotropic.** The corduroy mountain ribbing measured
@@ -298,6 +327,30 @@ can tell whether circumstances actually changed.
   The instruments are first-class now: `tools/terrain-probe.mjs` (point queries,
   transects with max-step, per-axis anisotropy stats, hillshade PNG renders).
   Baseline the metric/render BEFORE the change, re-run AFTER, cite both.
+- **Splines that key off a climate field must be authored over that field's REAL
+  measured range, not its nominal [−1,1]** (CCR-WORLDGEN-CONTINENTAL-OCEANS-001 P0).
+  Continentalness `C` (`continentalHeight`, `+CONTINENTAL_SEA_BIAS 0.30` bias) has a
+  REAL domain of only ~[−0.16, 0.73] — so a spline authored over [−1,1] has DEAD KNOTS
+  below C's real min that NEVER activate (the P0 draft `SPLINE_CONTINENTAL_OCEAN` wasted
+  every knot below ~−0.06 authoring a seafloor no column ever reaches). The shipped ocean
+  spline is authored over the real ~[−0.06, 1.05] domain. Corollary: **lowering
+  `CONTINENTAL_SEA_BIAS` to "activate" deeper knots is REDUNDANT with `COAST_THRESHOLD_C`**
+  — the coast threshold already sets where water begins; moving the bias just re-centers
+  the whole C field (shifting every knot's activation point in lockstep), it doesn't
+  "reveal" the dead knots. Measure a field's real histogram before authoring a spline over it.
+- **Ocean CAN key off continentalness** (CCR-WORLDGEN-CONTINENTAL-OCEANS-001, TGV 43) —
+  this REVERSES PIPELINE-002's finding #5 ("ocean cannot key off C"). That finding's error
+  was trying to *correlate* an independent noise ocean to C (keeps two fields that still
+  disagree at the coast); the fix was to RETIRE the noise ocean entirely and let C author
+  ocean placement AND depth in one heightmap (`SPLINE_CONTINENTAL_OCEAN` base + the
+  `oceanFactorFromC` dispatch), the same "label and shape agree by construction" move
+  PIPELINE-001 made for biomes. A superseded finding in an old CCR is not a law — re-derive it.
+- **`HYDRO_HALO_CONTINENTAL = 40` is LOAD-BEARING flag-ON** (not a round-number default):
+  the deeper C-authored basins measure basin extent 34 on seed 9001, above the base
+  `HYDRO_HALO` of 32 — so `floodSpill`'s bounded priority-flood needs the 40 halo or a
+  perfectly seam-safe basin false-fails M17 (and, worse, could strand an unbreached pit).
+  Any metric that verifies the basin-extent bound must compare against `HYDRO_HALO_CONTINENTAL`
+  flag-ON, not the base halo (this bit M17 in the Phase 3 recalibration).
 
 ## 5. Product/aesthetic decisions (user-settled; don't re-litigate)
 

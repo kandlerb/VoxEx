@@ -46,6 +46,11 @@ if (flags.step !== undefined) sampleOpts.step = Number(flags.step);
 // gating fork and the M15/M16/M17 hydro-only metrics stop auto-skipping. Omitted (default)
 // = hydroRivers false everywhere, byte-identical to every pre-WS6 run of this tool.
 const hydroOn = !!flags.hydro;
+// CCR-WORLDGEN-CONTINENTAL-OCEANS-001: bare --legacy-ocean (or env VOXEX_CO_OFF=1) forces
+// worldConfig.continentalOceans = false into every buildProto instance, so the pre-CCR noise-ocean
+// terrain can be A/B'd against the (live default) C-authored ocean — used to separate feature-induced
+// metric shifts (coast/sand/roughness) from pre-existing state. Omitted = the live default (ON).
+const legacyOcean = !!flags['legacy-ocean'] || process.env.VOXEX_CO_OFF === '1';
 
 /**
  * Real-mode metrics adapter: exposes the interface biome-metrics.mjs expects
@@ -55,7 +60,7 @@ const hydroOn = !!flags.hydro;
  * @returns {object} proto adapter.
  */
 function buildProto(seed) {
-  const api = buildTerrainApi(file, String(seed), { biomeDrivenTerrain: true, hydroRivers: hydroOn });
+  const api = buildTerrainApi(file, String(seed), { biomeDrivenTerrain: true, hydroRivers: hydroOn, ...(legacyOcean ? { continentalOceans: false } : {}) });
   const GT = api.GEN_TUNABLES;
   const names = api.BIOME_ID_ORDER;
   const CENTROIDS = GT.BIOME_CENTROIDS;
@@ -95,7 +100,10 @@ function buildProto(seed) {
   // WS3; M16, CCR-WORLDGEN-PIPELINE-002 WS6) can build their OWN api instances from the
   // same source/seed. hydroRivers carried through so M14's fork and M15/M16/M17 know
   // whether to engage (CCR-WORLDGEN-PIPELINE-002 WS6).
-  return { api, names, CENTROIDS, AXIS_W, TAU, climateAxes, classifyBiome, selfTestIdentity, file, seed: String(seed), hydroRivers: hydroOn };
+  // continentalOceans carried through so the metric-recalibration branches (M4/M5/M6/M10/M17/
+  // M18/M20/M22/M23) can select the C-authored-ocean thresholds vs the legacy-ocean calibration
+  // (CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3). !legacyOcean == the live default (flag ON).
+  return { api, names, CENTROIDS, AXIS_W, TAU, climateAxes, classifyBiome, selfTestIdentity, file, seed: String(seed), hydroRivers: hydroOn, continentalOceans: !legacyOcean };
 }
 
 const perSeed = [];

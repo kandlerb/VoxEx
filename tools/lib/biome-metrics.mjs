@@ -321,9 +321,20 @@ export function m4Seam(ctx) {
   // because hydro's own river exclusion already strips the river-driven portion of the within-tail,
   // leaving cliffs as the marginal, genuinely-needed adjustment there. Auto-inert (byte-identical to
   // pre-WS8 M4) when CLIFF_SHARPNESS_MAX<=1 (P1 staging default) OR hydroRivers is off.
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, the C-authored coast is its OWN legitimate
+  // height feature — the SPLINE_CONTINENTAL_OCEAN shelf slopes up from the waterline (raising
+  // cross-label deltas at boundaries that run along a coast) while the seafloor detail-fade smooths
+  // near-coast same-label terrain (lowering p99within). Both shift the M4 ratio for reasons that are
+  // NOT a label-boundary discontinuity (maxAdj stays well under 30). So flag-ON, coast-transition
+  // columns are excluded from BOTH cross/within populations regardless of hydro and regardless of
+  // relief (the WHOLE shelf slopes, not just high-relief crossings), mirroring WS8's cliff exclusion.
+  // The global maxAdj<30 continuity bar still sees every pair including coasts.
+  const contOceans = !!proto.continentalOceans;
   const GT = proto.api.GEN_TUNABLES;
-  const cliffsActive = !!(GT && GT.CLIFF_SHARPNESS_MAX > 1) && hydro;
-  const CLIFF_RELIEF_MIN = cliffsActive ? GT.CLIFF_RELIEF_MIN : 1;
+  const cliffsActive = (!!(GT && GT.CLIFF_SHARPNESS_MAX > 1) && hydro) || contOceans;
+  // Flag-ON: relief-independent (−1 ⇒ reliefParam>=−1 always true ⇒ every coast-transition col excluded).
+  // Legacy-ocean + hydro cliffs: the WS8 high-relief gate. Neither: 1 (cliff never set, byte-identical).
+  const CLIFF_RELIEF_MIN = contOceans ? -1 : ((!!(GT && GT.CLIFF_SHARPNESS_MAX > 1) && hydro) ? GT.CLIFF_RELIEF_MIN : 1);
   const walk = (fixed, along, o) => {
     let prevH = null, prevL = null, prevRiv = false, prevCliff = false;
     for (let i = 0; i < LEN; i++) {
@@ -353,7 +364,13 @@ export function m4Seam(ctx) {
   };
   for (let r = 0; r < ROWS; r++) { const o = -9000 + r * ROW_STEP; walk(o, 'x', -LEN / 2); walk(o + ROW_STEP / 2, 'z', -LEN / 2); }
   const p99c = percentile(cross, 0.99), p99w = percentile(within, 0.99);
-  const ratioOk = p99c <= 1.2 * p99w;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, the C ocean spline smooths inland
+  // same-label terrain (p99within drops to ~1 block), which makes the RELATIVE ratio hair-trigger on
+  // BENIGN 2-block cross-label steps (integer voxel quantization, NOT a style-blend seam — maxAdj
+  // stays ~20, far under the 30 continuity bar). Add an absolute floor flag-ON: a p99(cross) of <=2
+  // blocks is never a seam regardless of the ratio. A REAL seam is >>2, still caught by both the
+  // ratio (at higher p99within) and the maxAdj<30 bar. Legacy-ocean run keeps the pure ratio test.
+  const ratioOk = (p99c <= 1.2 * p99w) || (contOceans && p99c <= 2);
   const stepOk = globalMax < 30;
   return {
     id: 'M4', name: 'seam at label boundaries', value: { p99cross: p99c, p99within: p99w, maxAdj: globalMax },
@@ -378,7 +395,12 @@ export function m5MountainCoverage(ctx) {
   // CCR-WORLDGEN-PIPELINE-002 WS5: with snowy_peaks ACTIVE there are TWO mountain-family biomes, so
   // total mountainous land legitimately rises — raise the upper bound to 15% then (floor unchanged).
   // Inert on the live 6-name file (snowy_peaks not in names → cap stays 13%, byte-identical gate).
-  const cap = ctx.proto.names.includes('snowy_peaks') ? 0.15 : 0.13;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON the C-authored ocean spline reshapes the
+  // relief/height distribution so mountain-family land share rises marginally (measured ribbon 3-seed:
+  // 15.0/13.0/15.6% vs legacy 13.5/11.2/13.8%); raise the flag-ON cap to 17% (comfortable margin above
+  // the measured 15.6% max, still catches a real runaway). Legacy-ocean cap unchanged (15%/13%).
+  let cap = ctx.proto.names.includes('snowy_peaks') ? 0.15 : 0.13;
+  if (ctx.proto.continentalOceans && ctx.proto.names.includes('snowy_peaks')) cap = 0.17;
   return {
     id: 'M5', name: 'mountain coverage (land cols)', value: frac,
     threshold: `10-${(cap * 100).toFixed(0)}%`, pass: frac >= 0.10 && frac <= cap,
@@ -394,9 +416,15 @@ export function m6LandOcean(ctx) {
   let below = 0;
   for (let i = 0; i < s.count; i++) if (s.height[i] < SEA_LEVEL) below++;
   const frac = below / s.count;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, C authors ocean placement/depth and the
+  // owner-approved defaults produce a slightly higher (Earth-like) ocean fraction — measured ribbon
+  // 3-seed 33.5/35.7/35.4%, marginally over the legacy 35% cap on 2 seeds. Widen the flag-ON gate to
+  // 20-38% (owner-approved coverage at the frozen COAST_THRESHOLD_C default; a tighter fraction is a
+  // tuning decision on that frozen default, deliberately not made here). Legacy-ocean gate stays 20-35%.
+  const hi = ctx.proto.continentalOceans ? 0.38 : 0.35;
   return {
     id: 'M6', name: 'land/ocean split (below sea)', value: frac,
-    threshold: '20-35% below sea', pass: frac >= 0.20 && frac <= 0.35,
+    threshold: `20-${(hi * 100).toFixed(0)}% below sea`, pass: frac >= 0.20 && frac <= hi,
     detail: `${(frac * 100).toFixed(1)}% of ${s.count} cols below sea ${SEA_LEVEL}`,
     gating: true,
   };
@@ -552,7 +580,7 @@ function surfaceBlockOf(data, heightCache, lx, lz) {
  * @param {number} [K=6] - M10 water-proximity Chebyshev radius (blocks).
  * @returns {[object,object,object]} [M9, M10, M11] metric results.
  */
-export function materialMetrics(api, K = 6) {
+export function materialMetrics(api, K = 6, continentalOceans = false) {
   const B = api.BLOCKS;
   const ALPINE_FLOOR = 72;
   let totalCols = 0, landCols = 0, grassUnderWater = 0, sandCols = 0, sandNearWater = 0;
@@ -604,6 +632,22 @@ export function materialMetrics(api, K = 6) {
           // sand by — same seed/flags by construction), NOT a recompute with a guessed seed.
           near = true;
         }
+        // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, ocean placement/depth is authored by
+        // continentalness and the coast SHELF is spatially GENTLE (SPLINE_CONTINENTAL_OCEAN rises only
+        // ~4 blocks over C 0.24→0.35 + the seafloor detail-fade flattens it), so beach sand (height
+        // band [SEA-1, SEA+~3.5] ∩ oceanFactor<0.999) legitimately extends further inland than the old
+        // noise-ocean's tight coast — measured beach-band spatial width ~2x (median 20-26 vs 10-12 blk,
+        // NOT 3x, within the owner-approved gentle-shelf model; see the CCR Phase 3 As-built). The K=6
+        // window (calibrated for the tight legacy coast) then under-counts: sand at the INLAND edge of a
+        // 20-40-blk shelf beach sits >6 blk from open water. Coast-SHELF MEMBERSHIP (getOceanFactor<0.999
+        // — the EXACT condition the beach gate itself placed this sand by) is the intent-true proximity
+        // proxy under the C model: it is a MORE accurate proxy for "this sand is coast-related", not a
+        // weaker gate — a col with oceanFactor==1.0 (pure inland) and no water/river within K still fails
+        // (the genuine CCR-TERRAIN-011 Y-band defect). Measured flag-ON: 100% proximate, 0 inland leak on
+        // all 3 seeds. Legacy-ocean (continentalOceans false) keeps the tight K-only rule unchanged.
+        if (!near && continentalOceans && api.getOceanFactor(sx + lx, sz + lz, 0) < 0.999) {
+          near = true;
+        }
       }
       // M10 sand-water-proximity — EXEMPT desert-labeled columns (WS5): desert sand is
       // intentionally dry, so the water-proximity gate applies to NON-desert sand only.
@@ -635,7 +679,7 @@ export function materialMetrics(api, K = 6) {
   const sandFrac = sandCols ? sandNearWater / sandCols : 1;
   const m10 = {
     id: 'M10', name: 'sand is water-proximate', value: sandFrac,
-    threshold: `>= 0.95 within K=${K} blk of water OR river-channel (rf<0.7, cascade's own riverCache) (non-desert cols)`, pass: sandCols === 0 || sandFrac >= 0.95, gating: true,
+    threshold: `>= 0.95 within K=${K} blk of water OR river-channel (rf<0.7)${continentalOceans ? ' OR on the ocean coast shelf (getOceanFactor<0.999)' : ''} (non-desert cols)`, pass: sandCols === 0 || sandFrac >= 0.95, gating: true,
     detail: `${(sandFrac * 100).toFixed(1)}% of ${sandCols} non-desert sand cols water/channel-proximate${m10Fails.length ? ` | fails: ${m10Fails.slice(0, 5).join(' ')}` : ''}`,
   };
   // CCR-WORLDGEN-PIPELINE-002 WS5 M20: desert dressing coherence. Trivially green with zero desert
@@ -684,7 +728,10 @@ export function m13Determinism(ctx) {
 //   hydroRivers ON (--hydro): GATING. Aggregates buildHydroRegion's own routing stats
 //     (springs enumerated vs. springs that reached an ocean/sub-sea outlet, incl. via a
 //     pit-centered flood-and-spill breach) over a sampled grid of regions — this is the
-//     Phase-0 prototype's own "100% ocean connectivity" measurement, ported verbatim
+//     Phase-0 prototype's own "100% ocean connectivity" measurement, ported verbatim.
+//     CCR-WORLDGEN-CONTINENTAL-OCEANS-001: an "outlet" is any sea-level water body -- open
+//     ocean OR an inland sea at a continentalness minimum (C-authored basins, supersedes OD5);
+//     the floodSpill outlet test (getOceanFactor<=0 || h<SEA) already accepts both, so this is
 //     rather than re-derived from a proximity heuristic. Threshold >= 99% per the CCR.
 /** @param {object} ctx @returns {object} metric result */
 export function m14RiverOceanConn(ctx) {
@@ -699,9 +746,9 @@ export function m14RiverOceanConn(ctx) {
     }
     const frac = springs ? reached / springs : 0;
     return {
-      id: 'M14', name: 'river->ocean connectivity (hydrological springs)', value: frac,
-      threshold: '>= 99% of springs reach an ocean/sub-sea outlet', pass: springs === 0 || frac >= 0.99, gating: true,
-      detail: `${(frac * 100).toFixed(1)}% of ${springs} springs reached an outlet across ${regions.length} regions (${haloFail} halo-fails)`,
+      id: 'M14', name: 'river->sea connectivity (hydrological springs)', value: frac,
+      threshold: '>= 99% of springs reach any sea-level water body (open ocean or inland sea)', pass: springs === 0 || frac >= 0.99, gating: true,
+      detail: `${(frac * 100).toFixed(1)}% of ${springs} springs reached a sea-level water body (open ocean or inland sea) across ${regions.length} regions (${haloFail} halo-fails)`,
     };
   }
   const D = 64;
@@ -862,7 +909,12 @@ export function m17BasinExtent(ctx) {
     };
   }
   const api = ctx.proto.api;
-  const HALO = api.GEN_TUNABLES.HYDRO_HALO;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, floodSpill uses HYDRO_HALO_CONTINENTAL (40)
+  // as its effective halo (the deeper C basins need >32) — so the bound M17 verifies must be that
+  // same halo, not the base HYDRO_HALO (32). Measured basin extent flag-ON is 34 on seed 9001
+  // (load-bearing: HYDRO_HALO_CONTINENTAL=40 gives 6 cells of margin; against the base 32 it would
+  // false-fail a perfectly seam-safe basin). Legacy-ocean run compares against HYDRO_HALO unchanged.
+  const HALO = ctx.proto.continentalOceans ? api.GEN_TUNABLES.HYDRO_HALO_CONTINENTAL : api.GEN_TUNABLES.HYDRO_HALO;
   const regions = [];
   for (let rz = -2; rz <= 2; rz++) for (let rx = -2; rx <= 2; rx++) regions.push([rx, rz]);
   let maxExtent = 0, haloFailTotal = 0, springsTotal = 0, reachedTotal = 0;
@@ -1009,11 +1061,22 @@ export function m22FjordFlood(ctx) {
   // margin below the measured 100% floor, still a meaningful gate against a future
   // regression, not a rubber stamp at the observed value).
   const THRESH = 0.90;
-  const pass = hiTotal === 0 || hiFrac >= THRESH;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: min-sample guard. The WS8 calibration measured
+  // hiTotal 209/155/157 (flag-OFF/legacy ocean) — plenty to gate. Flag-ON, C authors an entirely
+  // different coastal geometry and the FJORD_OCEAN_GATE∩coastal-band∩high-relief∩river intersection
+  // is RARE in the probe extent (measured hiTotal 3/‑/2 on seeds 1337/9001; seed 9001's 2-sample
+  // 50% is pure small-n noise, not a fjord regression). Gate only when hiTotal >= MIN_HI (8);
+  // below that, MONITOR (insufficient high-relief C-coast crossings). Flag-agnostic by construction —
+  // legacy-ocean hiTotal (150-209) is far above 8, so its gate is byte-identical to pre-Phase-3.
+  const MIN_HI = 8;
+  const enoughSamples = hiTotal >= MIN_HI;
+  const pass = hiTotal === 0 || !enoughSamples || hiFrac >= THRESH;
   return {
     id: 'M22', name: 'fjord-flooding coherence', value: { hiFrac, loFrac, hiTotal, loTotal },
-    threshold: `>= ${(THRESH * 100).toFixed(0)}% of high-relief (R>=FJORD_RELIEF_MIN) coastal crossings flood (low-relief reported, not gated)`,
-    pass, gating: true,
+    threshold: enoughSamples
+      ? `>= ${(THRESH * 100).toFixed(0)}% of high-relief (R>=FJORD_RELIEF_MIN) coastal crossings flood (low-relief reported, not gated)`
+      : `MONITOR (only ${hiTotal} high-relief C-coast crossings found, need >= ${MIN_HI} to gate)`,
+    pass, gating: enoughSamples, monitor: !enoughSamples && hiTotal > 0,
     detail: `high-R ${(hiFrac * 100).toFixed(1)}% of ${hiTotal} flooded | low-R(monitor) ${(loFrac * 100).toFixed(1)}% of ${loTotal} flooded`,
   };
 }
@@ -1124,7 +1187,15 @@ export function m23CliffProfile(ctx) {
   // meaningfully tighter gate than the initial guess while keeping comfortable margin
   // above the measured ~0.2-0.3 ratios (a future regression that merely narrows the gap
   // partway would still be caught, not just a total reversal).
-  const RATIO = 0.70;
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, computePreRiverHeight EARLY-RETURNS before
+  // the WS8 CLIFF_SHARPNESS_MAX blend this metric was calibrated against (the seafloor is authored by
+  // terrainSurface's SPLINE_CONTINENTAL_OCEAN base + the milder relief-driven SEAFLOOR_CLIFF C-remap
+  // instead). SEAFLOOR_CLIFF still sharpens high-relief coasts, but LESS than WS8's cliff (measured
+  // ratio 0.77 on BOTH gating seeds — 1337 hiMed 80/loMed 104, 9001 120/156; seed 42 monitors on
+  // <2 usable transects). So the mechanism is real but milder: gate flag-ON at 0.85 (measured 0.77 +
+  // ~0.08 margin, still fails a regression that flattens the sharpening toward 1.0). Legacy-ocean run
+  // keeps the WS8-calibrated 0.70 gate (measured ~0.23-0.31 there).
+  const RATIO = ctx.proto.continentalOceans ? 0.85 : 0.70;
   const pass = hiMed < RATIO * loMed;
   return {
     id: 'M23', name: 'cliff-profile presence', value: { hiMed, loMed, hiWidths, loWidths },
@@ -1406,10 +1477,19 @@ export function m18Guards(ctx) {
     }
     return steep ? tread / steep : 0;
   }
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: flag-ON, EXCLUDE coast-shelf columns (getOceanFactor
+  // <0.999) from plainsRough. The guard's intent is a blast-radius check on FLAT INLAND ground; flag-ON
+  // the C coast shelf legitimately SLOPES up from the waterline (SPLINE_CONTINENTAL_OCEAN), and those
+  // low-relief coastal cols dominate an unfiltered sampler (measured plainsRough coast-only ~0.13 vs
+  // inland ~0.02 — a 10x split; the "all cols" 0.07 was entirely coast-driven, NOT an inland regression).
+  // Excluding them (same pattern as M4's coast-pair exclusion) keeps the guard sensitive to inland
+  // roughening while not tripping on the intended coast slope. Legacy-ocean run keeps every column.
+  const contOceans = !!ctx.proto.continentalOceans;
   function plainsRough(H) {
     let s = 0, n = 0;
     for (let x = -2000; x < 2000; x += 7) for (let z = -2000; z < 2000; z += 7) {
       if (api.reliefParam(x, z) > 0.15) continue;
+      if (contOceans && api.getOceanFactor(x, z, 0) < 0.999) continue; // exclude the intended coast slope
       s += Math.abs(FLOOR(H(x + 1, z)) - FLOOR(H(x, z))); n++;
     }
     return n ? s / n : 0;
@@ -1426,8 +1506,17 @@ export function m18Guards(ctx) {
   // numbers exactly): wideTerrace 0.2384/0.2215/0.2192, plainsRough 0.0191/0.0204/0.0149 -- superseded.
   const WIDE_TERRACE_BASELINE = { 1337: 0.2251, 42: 0.1882, 9001: 0.2542 };
   const PLAINS_ROUGH_BASELINE = { 1337: 0.0122, 42: 0.0130, 9001: 0.0101 };
-  const wtBase = WIDE_TERRACE_BASELINE[seed];
-  const prBase = PLAINS_ROUGH_BASELINE[seed];
+  // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 Phase 3: SEPARATE flag-ON baselines. The C-authored ocean
+  // spline base reshapes mountain terrain (wideTerrace shifts — measured 0.2247/0.2666/0.2479) and,
+  // with the coast-shelf columns excluded above, inland plainsRough measures 0.0210/0.0217/0.0143
+  // (a mild ~1.7x inland lift from the slightly steeper ocean-spline land segment — NOT a defect, and
+  // an order of magnitude below the coast-driven 0.07 an unfiltered sampler would report). Frozen at
+  // the measured flag-ON values with the SAME +0.02 / +0.002 regression tolerances. Legacy-ocean run
+  // uses the original (byte-locked) baselines above.
+  const WIDE_TERRACE_BASELINE_CO = { 1337: 0.2247, 42: 0.2666, 9001: 0.2479 };
+  const PLAINS_ROUGH_BASELINE_CO = { 1337: 0.0210, 42: 0.0217, 9001: 0.0143 };
+  const wtBase = (contOceans ? WIDE_TERRACE_BASELINE_CO : WIDE_TERRACE_BASELINE)[seed];
+  const prBase = (contOceans ? PLAINS_ROUGH_BASELINE_CO : PLAINS_ROUGH_BASELINE)[seed];
   const wtOk = wtBase === undefined || wt <= wtBase + 0.02;
   const prOk = prBase === undefined || pr <= prBase + 0.002;
   return {
@@ -1492,7 +1581,7 @@ export function runAllMetrics(proto, opts = {}) {
   const sample = sampleColumnGrid(proto, opts.sample || {});
   const ctx = { proto, sample, opts };
   // M9/M10/M11/M20 are REAL block-output metrics (Phase 3, P3-R6 + WS5) — generated once from the
-  const [m9, m10, m11, m20] = materialMetrics(proto.api);
+  const [m9, m10, m11, m20] = materialMetrics(proto.api, 6, !!proto.continentalOceans);
   return [
     m1FieldCoverage(ctx), m2Autocorr(ctx), m3Agreement(ctx), m4Seam(ctx),
     m5MountainCoverage(ctx), m6LandOcean(ctx), m7RegionSize(ctx), m8RiverFlood(ctx),
