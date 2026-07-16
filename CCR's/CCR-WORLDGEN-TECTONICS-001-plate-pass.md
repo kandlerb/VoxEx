@@ -38,7 +38,7 @@ Exact formulas: port from tect_core.mjs — plate hash mix, query warp (2-octave
 
 ## New GEN_TUNABLES section 'Tectonics' (defaults = P0-calibrated; ui:'both'; all into REGISTRY_KEYS; spline into JSON_KEYS)
 
-PLATE_SIZE 12000 [8000,16000] · PLATE_JITTER 0.42 [0.25,0.5] · PLATE_OCEANIC_FRACTION 0.68 [0.5,0.8] · PLATE_DRIFT_SCALE 1.0 [0.5,2] · BOUNDARY_WIGGLE_AMP 350 [100,700] · BOUNDARY_WIGGLE_FREQ 0.0004 [0.0002,0.001] · BOUNDARY_INFLUENCE 2600 [1000,3000] · TECT_CONV_THRESH 0.08 · TECT_DIV_THRESH 0.25 · TECT_SHEAR_MIN 0.3 · TECTONIC_DETAIL_WEIGHT 0.35 [0.1,0.6] · R_BASELINE_CAP 0.55 [0.4,0.8] · CONT_BASE_C_MIN 0.35 · CONT_BASE_C_MAX 0.55 · OCEAN_BASE_C_MIN 0.15 · OCEAN_BASE_C_AGE 0.15 · TECT_INTERIOR_FALLOFF 0.15 · OROGEN_WIDTH 2600 [600,3000] · OROGEN_AMP 1.40 [0.5,1.6] · TRENCH_DEPTH_C 0.30 [0.1,0.5] · TRENCH_OFFSET 250 · TRENCH_WIDTH 350 · ANDEAN_AMP 1.35 · ARC_INLAND_OFFSET 600 · ARC_WIDTH 1200 · ARC_C_LIFT 0.42 [0.2,0.6] · ARC_OFFSET 500 · ARC_WIDTH_ISL 750 · ISLAND_ARC_AMP 1.25 · BACKARC_DEPTH_C 0.16 · BACKARC_OFFSET 1400 · BACKARC_WIDTH 800 · RIFT_DEPTH_C 0.70 [0.4,0.9] · RIFT_WIDTH 600 [400,1000] · RIFT_SHOULDER_AMP 0.30 · RIFT_SILL_LIFT_C 0.30 · RIFT_SILL_DEPTH_KEEP 0.35 · RIFT_LAKE_BLEND 0.28 · RIFT_LAKE_PROB 0.42 · RIFT_LAKE_DEEPEN_C 0.55 · RIFT_SEG_LEN 4200 · RIDGE_LIFT_C 0.18 · RIDGE_WIDTH 800 · TRANSFORM_AMP 0.10 · TRANSFORM_WIDTH 350 · OBDUCTION_PROB 0.05 · OBDUCTION_AMP 0.9 · JUNCTION_RADIUS 900 · ARC_PEAK_DENSITY 0.02 · RIFT_VENT_DENSITY 0.01 · COAST_THRESHOLD_TECT 0.10 [0,0.2] · COAST_SHELF_TECT 0.05 [0.02,0.15] · SPLINE_TECTONIC_OCEAN (json) = [[-0.62,-150],[-0.52,-98],[-0.42,-64],[-0.3,-40],[-0.2,-26],[-0.1,-15],[-0.02,-6],[0.04,-3],[0.1,0],[0.18,4],[0.32,8],[0.5,12],[0.72,16]]
+PLATE_SIZE 1200 [600,16000] (master zoom — all boundary widths/offsets scale linearly, authored at reference 12000) · PLATE_JITTER 0.42 [0.25,0.5] · PLATE_OCEANIC_FRACTION 0.68 [0.5,0.8] · PLATE_DRIFT_SCALE 1.0 [0.5,2] · BOUNDARY_WIGGLE_AMP 350 [100,700] · BOUNDARY_WIGGLE_FREQ 0.0004 [0.0002,0.001] · BOUNDARY_INFLUENCE 2600 [1000,3000] · TECT_CONV_THRESH 0.08 · TECT_DIV_THRESH 0.25 · TECT_SHEAR_MIN 0.3 · TECTONIC_DETAIL_WEIGHT 0.35 [0.1,0.6] · R_BASELINE_CAP 0.55 [0.4,0.8] · CONT_BASE_C_MIN 0.35 · CONT_BASE_C_MAX 0.55 · OCEAN_BASE_C_MIN 0.15 · OCEAN_BASE_C_AGE 0.15 · TECT_INTERIOR_FALLOFF 0.15 · OROGEN_WIDTH 2600 [600,3000] · OROGEN_AMP 1.40 [0.5,1.6] · TRENCH_DEPTH_C 0.30 [0.1,0.5] · TRENCH_OFFSET 250 · TRENCH_WIDTH 350 · ANDEAN_AMP 1.35 · ARC_INLAND_OFFSET 600 · ARC_WIDTH 1200 · ARC_C_LIFT 0.42 [0.2,0.6] · ARC_OFFSET 500 · ARC_WIDTH_ISL 750 · ISLAND_ARC_AMP 1.25 · BACKARC_DEPTH_C 0.16 · BACKARC_OFFSET 1400 · BACKARC_WIDTH 800 · RIFT_DEPTH_C 0.70 [0.4,0.9] · RIFT_WIDTH 600 [400,1000] · RIFT_SHOULDER_AMP 0.30 · RIFT_SILL_LIFT_C 0.30 · RIFT_SILL_DEPTH_KEEP 0.35 · RIFT_LAKE_BLEND 0.28 · RIFT_LAKE_PROB 0.42 · RIFT_LAKE_DEEPEN_C 0.55 · RIFT_SEG_LEN 4200 · RIDGE_LIFT_C 0.18 · RIDGE_WIDTH 800 · TRANSFORM_AMP 0.10 · TRANSFORM_WIDTH 350 · OBDUCTION_PROB 0.05 · OBDUCTION_AMP 0.9 · JUNCTION_RADIUS 900 · ARC_PEAK_DENSITY 0.02 · RIFT_VENT_DENSITY 0.01 · COAST_THRESHOLD_TECT 0.10 [0,0.2] · COAST_SHELF_TECT 0.05 [0.02,0.15] · SPLINE_TECTONIC_OCEAN (json) = [[-0.62,-150],[-0.52,-98],[-0.42,-64],[-0.3,-40],[-0.2,-26],[-0.1,-15],[-0.02,-6],[0.04,-3],[0.1,0],[0.18,4],[0.32,8],[0.5,12],[0.72,16]]
 
 (Where tect_core.mjs param names differ, keep tect_core VALUES, use the names above in the registry.)
 
@@ -166,3 +166,15 @@ the 'New GEN_TUNABLES section' table), one kept at its prior default.
   `R_BASELINE_CAP` — verified holding under all three sweeps above. All mountain-grade relief is therefore
   boundary-driven after this tuning pass; the prior "mountains feel random" complaint was TRANSFORM_AMP leakage
   into non-scarp terrain plus convergent-boundary rarity at the old TECT_CONV_THRESH, not a lack of interior cap.
+
+### Phase 2d — plate-size rescale (2026-07-16, build .5)
+
+Owner play-tested PLATE_SIZE 12000 as "absurdly massive" and dialing it straight down to 1200 made whole plates
+mountainous, because every boundary distance (BOUNDARY_INFLUENCE 2600, OROGEN_WIDTH, etc.) was still an absolute
+constant larger than the new plate size — the whole plate fell inside the boundary-influence band. Fix: derive
+`const S = PLATE_SIZE / 12000` inside `plateLookup` and `tectonicFeatureAt` (injected, so the worker copy and the
+editor's live-dial both stay coherent with the main-thread source); every width/offset/junction-radius/segment-length
+constant is scaled by `S`, wiggle amplitude scales by `S`, wiggle frequency scales by `1/S`. `TECT_INTERIOR_FALLOFF`
+is already plate-relative (a fraction of plate size, not an absolute distance) and was left untouched. Default
+PLATE_SIZE changed 12000 → 1200. Flag-OFF stays byte-unchanged (gates green). Sanity check: a 12000-block transect
+now crosses 17 distinct plates (previously ~1-2 at the old default).
