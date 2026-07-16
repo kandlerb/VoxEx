@@ -63,6 +63,14 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
   const _liveContinentalMatch = src.match(/^[ \t]*continentalOceans:\s*(true|false)\b/m);
   const _liveContinental = _liveContinentalMatch ? _liveContinentalMatch[1] === 'true' : false;
   const continentalOceans = (opts && typeof opts.continentalOceans === 'boolean') ? opts.continentalOceans : _liveContinental;
+  // CCR-WORLDGEN-TECTONICS-001: opts.tectonicPlates overrides the live worldConfig.tectonicPlates
+  // flag (mirrors continentalOceans/hydroRivers/biomeDrivenTerrain above) so the harness can build
+  // BOTH a flag-ON (editor/tectonics-gate ask) and a flag-OFF (default, byte-identity regression)
+  // api from the SAME file/seed. Default tracks the live WORLD_CONFIG value when omitted (default
+  // OFF while this CCR soaks).
+  const _liveTectonicMatch = src.match(/^[ \t]*tectonicPlates:\s*(true|false)\b/m);
+  const _liveTectonic = _liveTectonicMatch ? _liveTectonicMatch[1] === 'true' : false;
+  const tectonicPlates = (opts && typeof opts.tectonicPlates === 'boolean') ? opts.tectonicPlates : _liveTectonic;
 
   // --- extraction helpers ------------------------------------------------------
   function lastIndexOfDef(needle) {
@@ -120,6 +128,10 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // CCR-WORLDGEN-PIPELINE-001 Phase 1 biome-driven classifier (inert until Phase 2)
     'reliefParam', 'classifyBiomeFromFields', 'classifyBiome', 'styleBlend', 'featureAt', 'recomputeBiomeStyleActive',
     'oceanFactorFromC', // CCR-WORLDGEN-CONTINENTAL-OCEANS-001 (getOceanFactor's dispatch target)
+    // CCR-WORLDGEN-TECTONICS-001: plate field + boundary-regime tectonics (inert unless
+    // opts.tectonicPlates / worldConfig.tectonicPlates).
+    'plateHash32', 'plateLookup', 'tectonicDeltaC', 'tectonicUpliftR', 'tectonicReliefBlend',
+    'tectonicFeatureAt', 'tectRegimeAt',
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
@@ -184,6 +196,23 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'CONTINENTAL_SEA_BIAS', 'CONTINENTAL_BASE_WEIGHT', 'CONTINENTAL_EROSION_WEIGHT',
     'CONTINENTAL_BASE_OCTAVES', 'CONTINENTAL_EROSION_OCTAVES', 'CONTINENTAL_SCALE',
     'CONTINENTAL_ISLAND_AMP', 'CONTINENTAL_ISLAND_FREQ', 'HYDRO_HALO_CONTINENTAL',
+    // CCR-WORLDGEN-TECTONICS-001: plate field + boundary-regime tunables (inert unless
+    // worldConfig.tectonicPlates). SPLINE_TECTONIC_OCEAN is object-valued (array of [x,y]
+    // pairs), handled the same way as SPLINE_CONTINENTAL_OCEAN above -- a plain REGISTRY_KEYS
+    // entry works for object-valued GEN_TUNABLES properties too (extractConstArrow pulls the
+    // whole registry literal; each key here just aliases GEN_TUNABLES.<key>).
+    'PLATE_SIZE', 'PLATE_JITTER', 'PLATE_OCEANIC_FRACTION', 'PLATE_DRIFT_SCALE',
+    'BOUNDARY_WIGGLE_AMP', 'BOUNDARY_WIGGLE_FREQ', 'BOUNDARY_INFLUENCE',
+    'TECT_CONV_THRESH', 'TECT_DIV_THRESH', 'TECT_SHEAR_MIN', 'TECTONIC_DETAIL_WEIGHT',
+    'R_BASELINE_CAP', 'CONT_BASE_C_MIN', 'CONT_BASE_C_MAX', 'OCEAN_BASE_C_MIN', 'OCEAN_BASE_C_AGE',
+    'TECT_INTERIOR_FALLOFF', 'OROGEN_WIDTH', 'OROGEN_AMP', 'TRENCH_DEPTH_C', 'TRENCH_OFFSET',
+    'TRENCH_WIDTH', 'ANDEAN_AMP', 'ARC_INLAND_OFFSET', 'ARC_WIDTH', 'ARC_C_LIFT', 'ARC_OFFSET',
+    'ARC_WIDTH_ISL', 'ISLAND_ARC_AMP', 'BACKARC_DEPTH_C', 'BACKARC_OFFSET', 'BACKARC_WIDTH',
+    'RIFT_DEPTH_C', 'RIFT_WIDTH', 'RIFT_SHOULDER_AMP', 'RIFT_SILL_LIFT_C', 'RIFT_SILL_DEPTH_KEEP',
+    'RIFT_LAKE_BLEND', 'RIFT_LAKE_PROB', 'RIFT_LAKE_DEEPEN_C', 'RIFT_SEG_LEN',
+    'RIDGE_LIFT_C', 'RIDGE_WIDTH', 'TRANSFORM_AMP', 'TRANSFORM_WIDTH',
+    'OBDUCTION_PROB', 'OBDUCTION_AMP', 'JUNCTION_RADIUS', 'ARC_PEAK_DENSITY', 'RIFT_VENT_DENSITY',
+    'COAST_THRESHOLD_TECT', 'COAST_SHELF_TECT', 'SPLINE_TECTONIC_OCEAN',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -224,6 +253,7 @@ const worldConfig = {
   biomeDrivenTerrain: ${biomeDriven}, // CCR-WORLDGEN-PIPELINE-001 Phase 2 (P2-R4)
   hydroRivers: ${hydroRivers}, // CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1)
   continentalOceans: ${continentalOceans}, // CCR-WORLDGEN-CONTINENTAL-OCEANS-001
+  tectonicPlates: ${tectonicPlates}, // CCR-WORLDGEN-TECTONICS-001
 };
 // Phase-2 style-path bindings terrainSurface references (mirror the module decls near
 // terrainSurface + recomputeBiomeStyleActive; all-zero styles keep BIOME_STYLE_ACTIVE false).
@@ -253,6 +283,12 @@ const _riverFlowScratch = { flow: 1 };
 // CCR-WORLDGEN-PIPELINE-002 Bump A (C5): fused-pass distance cache for classifyBiomeFromFields (mirror
 // the module decl near _tsWeights in the main file).
 const _classifyDistScratch = new Float32Array(9);
+// CCR-WORLDGEN-TECTONICS-001 Phase 1: plate lookup's seed-qualified site cache + single-slot memo
+// (mirror the module decls near getOceanFactor in the main file). plateLookup ReferenceErrors without
+// these whenever worldConfig.tectonicPlates/opts.tectonicPlates is true.
+const _plateSiteCache = new Map();
+let _plateMemoKey = null;
+let _plateMemoVal = null;
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
@@ -307,6 +343,10 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   reliefParam, classifyBiomeFromFields, classifyBiome, styleBlend, featureAt, BIOME_ID_ORDER, recomputeBiomeStyleActive,
   precalculateTerrainCaches, precalculateCaveNoise, generateTerrainPass, fillWaterPass, interpolateCaveNoise,
   hydroRegionOf, hydroLatticeH, floodSpill, buildHydroRegion, riverFactorAt, oceanFactorFromC,
+  // CCR-WORLDGEN-TECTONICS-001: plate field + boundary-regime tectonics (harness-only; inert
+  // unless worldConfig.tectonicPlates / opts.tectonicPlates).
+  plateHash32, plateLookup, tectonicDeltaC, tectonicUpliftR, tectonicReliefBlend,
+  tectonicFeatureAt, tectRegimeAt,
   // CCR-WORLDGEN-PIPELINE-002 WS8: exposed for the P0 collision experiment + M22/M23 (harness-only;
   // applyRiverCarve/getDeltaFingerFactor were extracted into FUNCS all along, just not returned).
   applyRiverCarve, getDeltaFingerFactor,
