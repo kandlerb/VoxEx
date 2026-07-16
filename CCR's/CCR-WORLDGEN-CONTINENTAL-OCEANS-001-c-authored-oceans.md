@@ -150,3 +150,38 @@ Added `'Continents & Oceans'` (+ `'Splines'` where the C authoring is spline-sha
 ### Gate ladder (Phase 3)
 
 syntax-check GREEN · parity-check GREEN · terrain-node-checks ×3 GREEN · biome-pipeline-checks (ribbon + `--hydro` + `--legacy-ocean`) GREEN except pre-existing M21 · run-browser-tests 405/405 · flag-OFF byte-identity spot re-check GREEN · editor headless boot GREEN. (See W5 in the session report for verbatim outputs.)
+
+## Follow-up: per-world Continental Oceans toggle (build `2026-07-15.3`, NO `TERRAIN_GEN_VERSION` bump)
+
+Resolves the W2 "Flagged for owner" item above — the owner approved building the small per-world opt-out toggle so the Flat/Superflat presets stay dry+flat. W2's finding stands: `terrainAmplitudeMultiplier` scales only the fractal DETAIL, so with the C-ocean flag ON, amplitude 0 can no longer flatten the `SPLINE_CONTINENTAL_OCEAN` base (which authors basins down to ~height 0 and continental relief up to ~71 regardless of amplitude). There is NO amplitude/seaLevel preset fix; the fix is the `continentalOceans:false` opt-out, now plumbed as a per-world genParam.
+
+**What shipped (edits by anchor in `voxEx.html`):**
+- **`DEFAULT_GEN_PARAMS`** — new 14th key `continentalOceans: true` (after `seaLevel`).
+- **`GEN_PARAM_SCHEMA`** — new `'Terrain Shape'` `kind:'toggle'` row `{ key:'continentalOceans', label:'Continental Oceans', … }` with an explanatory `note`; `GEN_PARAM_TOGGLE_ICONS` gains `continentalOceans:'🌎'`. The browser suite's schema↔defaults strict-parity test stays satisfied (14/14 both ways; verified statically — key sets equal, kind `toggle`).
+- **`applyGenParams(p)`** — `WORLD_CONFIG.continentalOceans = p.continentalOceans !== false;` (after the sea-level line). Absent/undefined → `true`, preserving old saves and the tri-state reset-to-default contract. The live `worldConfig` getter + the worker bake at pool creation were already in place from Phases 1-2; every create/load flow calls `applyGenParams` before pool create/rebuild, so no new worker code.
+- **`collectGenParamsFromUI()`** — emits `continentalOceans` into the created world's genParams (the object is an explicit literal, so the key had to be added there for the preset choice to persist).
+- **`applyPreset()`** — carries the flag UNCONDITIONALLY (`customWorldSettings.continentalOceans = preset.continentalOceans !== false`) so switching Flat/Superflat → any other preset resets oceans back ON instead of stranding a stale `false`.
+- **`WORLD_PRESETS`** — `flat` and `superflat` gain `continentalOceans: false`. `default`/`amplified`/`archipelago`/`caves` untouched (W2: all fine).
+- **Version constants** — `VOXEX_BUILD` → `2026-07-15.3` + a `VOXEX_RECENT_CHANGES` entry. **NO `TERRAIN_GEN_VERSION` bump**: the flag already existed and defaulted on; default-path output for any given genParams is unchanged — this only adds per-world control.
+- **Editor (`tools/terrain-parameter-editor.html`)** — NO edit needed; it is schema-driven (`buildToggleRow` on any `kind:'toggle'` row, `currentParams` round-trip, `applyGenParams` re-apply, export/import now 14 keys).
+
+**Preset probe after fix (seed 1337, extraction over a 3840-block grid, 25600 cols):**
+
+Two measurement methods, both reported honestly because the code makes `base = WORLD_DIMS.seaLevel + spline(…)` — the continental base TRACKS sea level:
+
+| Method | Preset | flag-ON (regression) | flag-OFF (fix) | flag-OFF range | flag-ON range |
+|---|---|---|---|---|---|
+| **CCR W2 (gen held at native sea 60, compare vs preset sea)** | flat (sea 55) | 26.3% | 17.5% | [27,67] | [1,73] |
+| | superflat (sea 30) | 10.0% | **0.4%** | [27,67] | [1,73] |
+| **Faithful (bakes the preset's real seaLevel into the base, as the game does)** | flat (sea 55) | 33.1% | 27.4% | [22,62] | [1,68] |
+| | superflat (sea 30) | 33.1% | 27.4% | [-3,37] | [1,43] |
+
+The **structural proof the fix works** is the RANGE, which is method-independent: flag-OFF the terrain collapses back into the shallow legacy band (top ≈ 62–67, no un-flattenable deep basins), while flag-ON bakes deep C-basins reaching height ~0–1 that amplitude 0 cannot remove. That is exactly the "flat presets flood" regression, and `continentalOceans:false` removes it. By the CCR's own W2 method the numbers reproduce (superflat flag-OFF ~0.4% ≈ W2's 0.9%, flag-ON ~10% ≈ W2's 11.6%; flat in the same direction — the modest % differences are just the sampled region/extent, which W2 did not pin down).
+
+**Honest caveat (base tracks seaLevel):** because `base = seaLevel + spline`, a probe that bakes superflat's real seaLevel (30) sees the whole terrain — including the legacy noise-ocean floor (`seaLevel − oceanDepth`) — shift down with it, so "% below sea" for superflat stays governed by noise-ocean COVERAGE (~27% in this region), the same as flat. W2's dramatic 0.9% is specific to generating at sea 60 while comparing against 30. Either way the fix delivers the owner's actual goal — flag-OFF land sits flat just above the (custom) sea line with only modest legacy-noise-ocean patches, instead of flag-ON's deep C-authored basins that make an "amplitude 0" world non-flat. Owner in-game eyeball on Flat/Superflat remains the final gate.
+
+**Default worlds unchanged:** spot `blendedHeight` at seed 1337 — (0,0)=63.00, (512,512)=29.00, (−800,300)=63.00, (1500,−1200)=74.00, (240,−2000)=42.00 — with the default flag ON (unchanged, no terrain function touched); default below-sea 28.4% consistent with M6.
+
+### Gate ladder (follow-up)
+
+syntax-check GREEN · parity-check GREEN · terrain-node-checks ×3 (1337/42/9001) GREEN (default path untouched) · schema↔defaults strict-parity verified statically (14/14 both ways, `continentalOceans` kind `toggle`). **run-browser-tests + headless editor screenshot (`co4_toggle.png`) NOT runnable in this Cowork sandbox — no Chrome/Chromium/Edge binary present; the browser suite + editor boot must be run on the Windows host / CI.** Gates were run against a reconstructed full file (`/tmp/voxfull.html` = coherent mount prefix + authoritative tail) because the sandbox FUSE mount served a stale/truncated read of the last ~60 lines (agent-notes §7); the real on-disk file is intact (Read tool confirms `</html>` at EOF) and all edits sit far above the truncation point.
