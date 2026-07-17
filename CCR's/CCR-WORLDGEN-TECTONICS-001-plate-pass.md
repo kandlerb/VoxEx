@@ -10,7 +10,7 @@ Continentalness is a noise blob; the owner wants continents that FORM: plates wh
 
 ## Approach
 
-Seeded jittered-lattice Voronoi plate field over a domain-warped query point; per-plate type/age/drift from hashes; boundary regime classification from relative drift; regimes emit deltaC (continentalness modification) and upliftR (relief). Plate C REPLACES the fbm-blob C flag-ON (fbm survives as interior detail at TECTONIC_DETAIL_WEIGHT); uplift screen-blends into relief: `R_eff = R_noise_capped + (1-R_noise_capped)*R_tect` with `R_noise_capped = min(R_noise, R_BASELINE_CAP)`. Trenches/arcs/rifts flow through C → SPLINE_TECTONIC_OCEAN → height AND through C → oceanFactor, so ocean mask and depth always agree (single-authority, the C-oceans lesson).
+[v2 pivot: crust fbm authors C shape; plates tint + segment features — see Phase 2g] Seeded jittered-lattice Voronoi plate field over a domain-warped query point; per-plate type/age/drift from hashes; boundary regime classification from relative drift; regimes emit deltaC (continentalness modification) and upliftR (relief). Plate C REPLACES the fbm-blob C flag-ON (fbm survives as interior detail at TECTONIC_DETAIL_WEIGHT); uplift screen-blends into relief: `R_eff = R_noise_capped + (1-R_noise_capped)*R_tect` with `R_noise_capped = min(R_noise, R_BASELINE_CAP)`. Trenches/arcs/rifts flow through C → SPLINE_TECTONIC_OCEAN → height AND through C → oceanFactor, so ocean mask and depth always agree (single-authority, the C-oceans lesson).
 
 ## Flags / plumbing (WS6-P8 four-site rule — CRITICAL)
 
@@ -38,7 +38,7 @@ Exact formulas: port from tect_core.mjs — plate hash mix, query warp (2-octave
 
 ## New GEN_TUNABLES section 'Tectonics' (defaults = P0-calibrated; ui:'both'; all into REGISTRY_KEYS; spline into JSON_KEYS)
 
-PLATE_SIZE 1200 [600,16000] (master zoom — all boundary widths/offsets scale linearly, authored at reference 12000) · PLATE_JITTER 0.42 [0.25,0.5] · PLATE_OCEANIC_FRACTION 0.68 [0.5,0.8] · PLATE_DRIFT_SCALE 1.0 [0.5,2] · BOUNDARY_WIGGLE_AMP 350 [100,700] · BOUNDARY_WIGGLE_FREQ 0.0004 [0.0002,0.001] · BOUNDARY_INFLUENCE 2600 [1000,3000] · TECT_CONV_THRESH 0.08 · TECT_DIV_THRESH 0.25 · TECT_SHEAR_MIN 0.3 · TECTONIC_DETAIL_WEIGHT 0.35 [0.1,0.6] · R_BASELINE_CAP 0.55 [0.4,0.8] · CONT_BASE_C_MIN 0.35 · CONT_BASE_C_MAX 0.55 · OCEAN_BASE_C_MIN 0.15 · OCEAN_BASE_C_AGE 0.15 · TECT_INTERIOR_FALLOFF 0.15 · OROGEN_WIDTH 2600 [600,3000] · OROGEN_AMP 1.40 [0.5,1.6] · TRENCH_DEPTH_C 0.30 [0.1,0.5] · TRENCH_OFFSET 250 · TRENCH_WIDTH 350 · ANDEAN_AMP 1.35 · ARC_INLAND_OFFSET 600 · ARC_WIDTH 1200 · ARC_C_LIFT 0.42 [0.2,0.6] · ARC_OFFSET 500 · ARC_WIDTH_ISL 750 · ISLAND_ARC_AMP 1.25 · BACKARC_DEPTH_C 0.16 · BACKARC_OFFSET 1400 · BACKARC_WIDTH 800 · RIFT_DEPTH_C 0.70 [0.4,0.9] · RIFT_WIDTH 600 [400,1000] · RIFT_SHOULDER_AMP 0.30 · RIFT_SILL_LIFT_C 0.30 · RIFT_SILL_DEPTH_KEEP 0.35 · RIFT_LAKE_BLEND 0.28 · RIFT_LAKE_PROB 0.42 · RIFT_LAKE_DEEPEN_C 0.55 · RIFT_SEG_LEN 4200 · RIDGE_LIFT_C 0.18 · RIDGE_WIDTH 800 · TRANSFORM_AMP 0.10 · TRANSFORM_WIDTH 350 · OBDUCTION_PROB 0.05 · OBDUCTION_AMP 0.9 · JUNCTION_RADIUS 900 · ARC_PEAK_DENSITY 0.02 · RIFT_VENT_DENSITY 0.01 · COAST_THRESHOLD_TECT 0.10 [0,0.2] · COAST_SHELF_TECT 0.05 [0.02,0.15] · SPLINE_TECTONIC_OCEAN (json) = [[-0.62,-150],[-0.52,-98],[-0.42,-64],[-0.3,-40],[-0.2,-26],[-0.1,-15],[-0.02,-6],[0.04,-3],[0.1,0],[0.18,4],[0.32,8],[0.5,12],[0.72,16]]
+PLATE_SIZE 3000 [600,16000] (master zoom — all boundary widths/offsets scale linearly, authored at reference 12000; crust decoupled — plate size no longer dictates continent size, only belt spacing/plate identity) · PLATE_JITTER 0.42 [0.25,0.5] · PLATE_OCEANIC_FRACTION 0.68 [0.5,0.8] · PLATE_DRIFT_SCALE 1.0 [0.5,2] · BOUNDARY_WIGGLE_AMP 350 [100,700] · BOUNDARY_WIGGLE_FREQ 0.0004 [0.0002,0.001] · BOUNDARY_INFLUENCE 2600 [1000,3000] · TECT_CONV_THRESH 0.08 · TECT_DIV_THRESH 0.25 · TECT_SHEAR_MIN 0.3 · TECTONIC_DETAIL_WEIGHT 0.35 [0.1,0.6] (DEPRECATED ui:'hidden' — unused since crust-field pivot; in tests' hidden-keys list) · TECT_CRUST_AMP 1.0 [0.5,1.5] · TECT_CRUST_BIAS 0.05 [-0.1,0.3] (ocean amount) · TECT_CRUST_FREQ_MULT 0.08 [0.1,1] (continent size) · TECT_PLATE_TINT 0.2 [0,0.6] · TECT_FEATURE_KEEP 0.45 [0.1,1] · TECT_FEATURE_SEG_LEN 3000 [1000,8000] · R_BASELINE_CAP 0.55 [0.4,0.8] · CONT_BASE_C_MIN 0.35 · CONT_BASE_C_MAX 0.55 · OCEAN_BASE_C_MIN 0.15 · OCEAN_BASE_C_AGE 0.15 · TECT_INTERIOR_FALLOFF 0.15 (DEPRECATED — superseded by TECT_SMEAR, schema ui:'hidden', key kept for save-compat) · TECT_SMEAR 0.55 [0.15,1.5] (plate-baseline bleed — kernel radius as fraction of PLATE_SIZE over all 5×5 sites; low = crisp Voronoi cells, high = rolling continents; boundary belts stay sharp) · TECT_QUIET_LO 0.12 [0,0.3] · TECT_QUIET_HI 0.50 [0.2,1.0] (boundary features scale by smoothstep(LO,HI, |convergence|+shear/2) — lazy seams go quiet) · TECT_SEG_FLOOR 0.15 [0,0.6] (per-segment strength floor; was hardcoded 0.35-0.65 range) · OROGEN_WIDTH 2600 [600,3000] · OROGEN_AMP 1.40 [0.5,1.6] · TRENCH_DEPTH_C 0.30 [0.1,0.5] · TRENCH_OFFSET 250 · TRENCH_WIDTH 350 · ANDEAN_AMP 1.35 · ARC_INLAND_OFFSET 600 · ARC_WIDTH 1200 · ARC_C_LIFT 0.42 [0.2,0.6] · ARC_OFFSET 500 · ARC_WIDTH_ISL 750 · ISLAND_ARC_AMP 1.25 · BACKARC_DEPTH_C 0.16 · BACKARC_OFFSET 1400 · BACKARC_WIDTH 800 · RIFT_DEPTH_C 0.70 [0.4,0.9] · RIFT_WIDTH 600 [400,1000] · RIFT_SHOULDER_AMP 0.30 · RIFT_SILL_LIFT_C 0.30 · RIFT_SILL_DEPTH_KEEP 0.35 · RIFT_LAKE_BLEND 0.28 · RIFT_LAKE_PROB 0.42 · RIFT_LAKE_DEEPEN_C 0.55 · RIFT_SEG_LEN 4200 · RIDGE_LIFT_C 0.18 · RIDGE_WIDTH 800 · TRANSFORM_AMP 0.10 · TRANSFORM_WIDTH 350 · OBDUCTION_PROB 0.05 · OBDUCTION_AMP 0.9 · JUNCTION_RADIUS 900 · ARC_PEAK_DENSITY 0.02 · RIFT_VENT_DENSITY 0.01 · COAST_THRESHOLD_TECT 0.10 [0,0.2] · COAST_SHELF_TECT 0.05 [0.02,0.15] · SPLINE_TECTONIC_OCEAN (json) = [[-0.62,-150],[-0.52,-98],[-0.42,-64],[-0.3,-40],[-0.2,-26],[-0.1,-15],[-0.02,-6],[0.04,-3],[0.1,0],[0.18,4],[0.32,8],[0.5,12],[0.72,16]]
 
 (Where tect_core.mjs param names differ, keep tect_core VALUES, use the names above in the registry.)
 
@@ -178,3 +178,45 @@ constant is scaled by `S`, wiggle amplitude scales by `S`, wiggle frequency scal
 is already plate-relative (a fraction of plate size, not an absolute distance) and was left untouched. Default
 PLATE_SIZE changed 12000 → 1200. Flag-OFF stays byte-unchanged (gates green). Sanity check: a 12000-block transect
 now crosses 17 distinct plates (previously ~1-2 at the old default).
+
+### Phase 2e — plate-baseline smear (2026-07-16, build .6)
+
+Owner asked for continentalness to act as a smearing pass so plates bleed across each other,
+preserving highs/lows but killing Voronoi grid-ness. Implemented as a distance-weighted kernel over
+all 25 plate sites (weight (1−d/SMEAR_R)², SMEAR_R = TECT_SMEAR×PLATE_SIZE) replacing the old narrow
+edge-band crossfade; C1-continuous by construction (weight + derivative vanish at radius); plate cores
+keep their own baseC (only the home site is in kernel range there) so extremes survive; boundary regime
+deltas untouched (belts/trenches sharp). Measured: baseline max adjacent |ΔC| 0.12 across a 6-plate
+transect (no cell-edge jumps); combined C max Δ 0.195 at an intentional belt edge. Old baseline block
+removed; TECT_INTERIOR_FALLOFF deprecated/hidden. Flag-OFF byte-unchanged, gates green.
+
+### Phase 2f — quiet boundaries (2026-07-16, build .7)
+
+Owner follow-through on dissolving Voronoi grid-ness — baseline smear (2e) alone was measured
+near-invisible at default (renders: 0.55 ≈ 0.20, mean pixel Δ <1/255) because the grid is drawn by
+boundary FEATURES tracing every seam, not the baseline. Fix: per-boundary activity modulation
+qf=smoothstep(TECT_QUIET_LO,TECT_QUIET_HI, |c|+shear/2) multiplying each boundary's deltaC and upliftR
+contributions at the single accumulation chokepoint (all regimes); regime CLASSIFICATION left
+unmodulated so the editor's plates pass still shows seam types where features are quiet; segStrength
+floor 0.35→tunable TECT_SEG_FLOOR 0.15 (range now floor..1.0). Measured (seed 1337, 8192²): deltaC
+feature mass −6.6% at defaults, maxima at active points unchanged (qf≈1 there); modest at defaults —
+the owner dials LO/HI up for stronger dissolution. Test suite: TECT_INTERIOR_FALLOFF added to the
+hidden-keys parity list in voxex-tests.html (405/405 restored).
+
+### Phase 2g — crust-field pivot (2026-07-16, build .9)
+
+Owner verdict on v1 with renders: "game board with pieces stitched together; continents too geometric;
+mountains don't form along ENTIRE plate lines... there are SOME across all those things; I want actual
+continents like Earth's." Root cause: v1 made continents == plate polygons (plateBaseC dominated C).
+
+v2: organic crust fbm field (own low-freq samples, TECT_CRUST_FREQ_MULT) authors continent shape;
+plates contribute only a faint identity tint (TECT_PLATE_TINT 0.2) + boundary features; ALL regime
+features (except rift, which self-segments via its lake/sill machinery — exempted to avoid
+double-gating) now gate per-boundary-segment (TECT_FEATURE_KEEP 0.45, TECT_FEATURE_SEG_LEN, smooth
+cross-fades) so belts appear along SOME stretches of a collision line. Measured at defaults, seed 1337:
+ocean 67.4% (no calibration needed), interior crust max adjacent |ΔC| ≤0.018 (smooth), segmentation
+confirmed as on/off runs along boundaries (20/30 near-zero, 10/30 substantial). This supersedes v1's
+"Plate C REPLACES the fbm-blob C" premise — see the bracketed note in the Approach section above.
+
+Crust-scale sweep (build .10): FREQ_MULT 0.35→0.08 (largest landmass 214→440 km² seed-avg, islands
+1077→761, ocean mean 63%), BIAS 0.06→0.05; owner-reported "all islands, no continents" resolved.
