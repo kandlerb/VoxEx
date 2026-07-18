@@ -132,6 +132,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // opts.tectonicPlates / worldConfig.tectonicPlates).
     'plateHash32', 'plateLookup', 'tectonicDeltaC', 'tectonicUpliftR', 'tectonicReliefBlend',
     'tectonicFeatureAt', 'tectRegimeAt',
+    'tectonicRangeHeight', // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range term
+    'buildOrogenRegion', 'tectonicErosionAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
@@ -213,6 +215,13 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'RIDGE_LIFT_C', 'RIDGE_WIDTH', 'TRANSFORM_AMP', 'TRANSFORM_WIDTH',
     'OBDUCTION_PROB', 'OBDUCTION_AMP', 'JUNCTION_RADIUS', 'ARC_PEAK_DENSITY', 'RIFT_VENT_DENSITY',
     'COAST_THRESHOLD_TECT', 'COAST_SHELF_TECT', 'SPLINE_TECTONIC_OCEAN',
+    // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range tunables (tectonicRangeHeight).
+    'RANGE_H', 'RANGE_JAG', 'RANGE_RELIEF_SWAP', 'RANGE_SPUR_AMP', 'RANGE_SPUR_FREQ',
+    'RANGE_PEAK_WAVELEN', 'RANGE_SADDLE_WAVELEN', 'RANGE_WIDTH_VARY_FREQ',
+    'SUBRANGE_OFFSET', 'SUBRANGE_WIDTH', 'SUBRANGE_AMP',
+    // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion-bake tunables (buildOrogenRegion).
+    'OROGEN_REGION', 'OROGEN_HALO', 'EROSION_CELL', 'EROSION_ITERS', 'EROSION_K',
+    'EROSION_CAP', 'EROSION_TALUS', 'EROSION_KT', 'EROSION_UPLIFT',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -289,6 +298,12 @@ const _classifyDistScratch = new Float32Array(9);
 const _plateSiteCache = new Map();
 let _plateMemoKey = null;
 let _plateMemoVal = null;
+// CCR-WORLDGEN-TECTONICS-002 Phase B: orogen erosion-bake cache + recursion guard (mirror the
+// module decls beside _plateSiteCache in the main file). tectonicErosionAt/buildOrogenRegion
+// ReferenceError without these whenever the tectonics flag is on.
+const _orogenRegionCache = new Map();
+const OROGEN_REGION_CACHE_CAP = 12;
+let _orogenBaking = false;
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
@@ -347,6 +362,9 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   // unless worldConfig.tectonicPlates / opts.tectonicPlates).
   plateHash32, plateLookup, tectonicDeltaC, tectonicUpliftR, tectonicReliefBlend,
   tectonicFeatureAt, tectRegimeAt,
+  tectonicRangeHeight, // CCR-WORLDGEN-TECTONICS-002 Phase A
+  buildOrogenRegion, tectonicErosionAt, // CCR-WORLDGEN-TECTONICS-002 Phase B
+
   // CCR-WORLDGEN-PIPELINE-002 WS8: exposed for the P0 collision experiment + M22/M23 (harness-only;
   // applyRiverCarve/getDeltaFingerFactor were extracted into FUNCS all along, just not returned).
   applyRiverCarve, getDeltaFingerFactor,

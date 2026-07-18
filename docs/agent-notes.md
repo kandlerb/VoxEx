@@ -34,6 +34,9 @@ can tell whether circumstances actually changed.
 | **A separate `terrainSurfaceDebug()` wrapper that re-runs the surface math to expose intermediates** (rejected, CCR-WORLDGEN-UI-002) | Never retry | Proposed as the way to feed the terrain editor's `surface.*` per-pass sub-views the function-local `base`/`amplitude`/`hf`/`warpMag` scalars. A wrapper that re-implements (or re-runs a forked copy of) `terrainSurface`'s math is a single-source violation of exactly the kind the Lockstep Registry exists to prevent — the wrapper and the real function drift, and the debug view then silently LIES about what the game generates. The house idiom is an optional out-param on the REAL function (`terrainSurface(gx, gz, outDbg)`, see §3), guarded by `if (outDbg)` so the no-arg path stays byte-identical/allocation-free and the debug values come from the ONE real computation. Applies to any "instrument an injected/single-source function for a debug view" need: extend the real function with a guarded out-param, never clone it. |
 | **A `[−1,1]`-domain ocean/continental spline** (rejected, CCR-WORLDGEN-CONTINENTAL-OCEANS-001 P0) | Never retry | The first draft `SPLINE_CONTINENTAL_OCEAN` was authored over the nominal `[−1,1]` C domain, but continentalness's REAL range is only ~[−0.16, 0.73] (measured), so every knot below the real min was a DEAD KNOT that never activated — the whole deep-ocean half of the curve authored a seafloor no column ever reached. Author any climate-field-keyed spline over the field's MEASURED histogram range (the shipped ocean spline is over ~[−0.06, 1.05]). See §4. |
 | **Lowering `CONTINENTAL_SEA_BIAS` to "activate" deep ocean spline knots** (rejected, CCR-WORLDGEN-CONTINENTAL-OCEANS-001 P0) | Never retry | Tempting when the deep knots look dead (see above) — but `CONTINENTAL_SEA_BIAS` re-centers the ENTIRE C field, shifting every knot's activation point in lockstep; it never selectively "reveals" the low knots relative to the coast. `COAST_THRESHOLD_C` already sets where water begins, making the bias redundant for that purpose. Fix dead knots by re-authoring the spline over C's real domain, not by dialing the bias. |
+| **Tunables-only "crest line" faking from `upliftR`** (4 prototype variants, CCR-WORLDGEN-TECTONICS-002 investigation 2026-07-17) | Never retry | `upliftR` is a bump-profile ENVELOPE — it plateaus across the belt and carries no center-line information, so every attempt to reconstruct a summit line from it (masked low-freq ridged add, envelope blend, gradient-of-uplift crest detector) stays blobby or jittery. The crest coordinates (signed cross-boundary `d`, along-boundary `fAlong`) exist inside `plateLookup`'s boundary loop — surface them from the kernel (shipped: `rangeD/rangeAlong/rangeW/rangeAmp` in the memo) instead of faking them downstream. |
+| **Raising `R_BASELINE_CAP` to get more mountains** (V4 recipe, rejected by owner 2026-07-17) | Never retry as a mountain dial | 0.55→0.70 tripled mountain area but the mountains are amplified ISOTROPIC fbm — "squiggly patches", explicitly rejected. The owner-approved mountain source is the crest-line term + erosion bake (CCR-002); R_BASELINE_CAP is only a mild interior-hills dial (shipped 0.60). |
+| **Vectorized single-pass flow accumulation** (burned twice, CCR-WORLDGEN-TECTONICS-002 prototyping) | Never retry | A one-shot scatter (`np.add.at`-style, or any "gather once, scatter once" pass) does NOT cascade drainage — every cell donates only its own area, rivers never gain power, and erosion silently no-ops (two "eroded" renders came back visually unchanged before this was caught). Flow accumulation MUST walk cells sequentially in descending height order (stable sort, index tie-break for determinism), pushing accumulated area to each receiver. Also from the same sessions: sanity-check erosion COEFFICIENT scale against "blocks removed per iteration where a valley should form" (~0.5-1.0) — a 250× under-scaled K looks exactly like a no-op, not like weak erosion. |
 
 ## 2. Three.js / browser gotchas (version-specific, verified r160)
 
@@ -298,6 +301,29 @@ can tell whether circumstances actually changed.
 - Phase 4 (a real per-column material-cascade view) is DEFERRED: `generateTerrainPass`
   is injected + lockstep-mirrored with `isTreeSoilSurface`, so exposing it needs the
   full parity-gate treatment — out of scope for a UI-only CCR.
+
+### Tectonic crest-line ranges + regional erosion bake (CCR-WORLDGEN-TECTONICS-002, build 2026-07-17.1)
+
+- Flag-ON mountain source is now `tectonicRangeHeight` (crest envelope from `plateLookup`'s
+  new memo fields `rangeD/rangeAlong/rangeW/rangeAmp`) + `tectonicErosionAt` (bilinear sample of
+  `buildOrogenRegion`'s per-region stream-power erosion bake, Δh cached in `_orogenRegionCache`).
+  Both added in `terrainSurface` AFTER the fractal assembly (never amplitude-scaled; range term
+  ×amp0 only). `tectonicReliefBlend`'s uplift amplification is demoted by `RANGE_RELIEF_SWAP`.
+- RECURSION GUARD: `_orogenBaking` — the bake samples `terrainSurface`, whose `tectonicErosionAt`
+  call returns 0 while baking. Never remove; without it the bake input includes a previous bake.
+- Determinism is a PARITY REQUIREMENT: each worker + the main thread bake independently and must
+  agree byte-for-byte (LCG jitter from region key, stable sort with index tie-break, no
+  Math.random/Date in the bake). Any nondeterminism = chunk seams.
+- Bake cost measured 4.0s per 426² region (EROSION_CELL 24) on first demand per region per
+  context — a knowing deviation from the CCR's 300ms budget. `EROSION_CELL` 32-48 trades valley
+  fineness for speed; beltless regions skip via an 8×8 `rangeAmp` pre-scan. Region-border seam
+  measured 0.8 blk max (halo 1024; budget 2.0).
+- Grid-axis furrow aliasing (D8 drainage aligning to the bake grid) is suppressed by the
+  center-weighted 3×3 Δh smoothing + the domain-warped sampling in `tectonicErosionAt` — don't
+  remove either without re-checking the belt zoom render.
+- Acceptance reference: `CCR's/CCR-TECTONICS-002-acceptance-target.png`; sim reference:
+  `tools/scratch/tect002-erosion-sim.mjs`. Flag still default OFF — no TGV bump; the flip (with
+  spawn land-search fix + endorheic rivers, per CCR-001 gates) carries it.
 
 ## 4. Terrain lessons (beyond the ledger)
 
