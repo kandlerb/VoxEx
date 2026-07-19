@@ -134,6 +134,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'tectonicFeatureAt', 'tectRegimeAt',
     'tectonicRangeHeight', // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range term
     'buildOrogenRegion', 'tectonicErosionAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake
+    'tectonicMarginFactor', 'tectonicConeHeight', // CCR-WORLDGEN-TECTONICS-005
+    'tectonicRiverFactor', // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
     'getDeltaFingerFactor', 'computePreRiverHeight', 'applyRiverCarve',
     'blendedHeight', 'getPreRiverHeight', 'isTreeSoilSurface',
@@ -222,6 +224,17 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion-bake tunables (buildOrogenRegion).
     'OROGEN_REGION', 'OROGEN_HALO', 'EROSION_CELL', 'EROSION_ITERS', 'EROSION_K',
     'EROSION_CAP', 'EROSION_TALUS', 'EROSION_KT', 'EROSION_UPLIFT',
+    // CCR-WORLDGEN-TECTONICS-003: fold train + transverse notches (tectonicRangeHeight).
+    'RANGE_NOTCH_SPACING', 'RANGE_NOTCH_DEPTH',
+    'FOLD_WAVELEN', 'FOLD_ALONG_LEN', 'FOLD_EXTENT_MULT', 'FOLD_AMP',
+    // CCR-WORLDGEN-TECTONICS-005.
+    'ANDEAN_ASYM', 'CONE_LATTICE', 'CONE_KEEP', 'CONE_RADIUS', 'CONE_H',
+    'CLIFF_COAST_H', 'CLIFF_COAST_BAND', 'CLIFF_MARGIN_REACH',
+    // CCR-WORLDGEN-TECTONICS-006: flag-ON surface calibration.
+    'TECT_BAND_LIFT', 'TECT_WEAR_SOFTEN', 'TECT_PATCH_FREQ', 'TECT_SAND_FREQ',
+    'TERRACE_WARP_AMP_TECT',
+    // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers (tectonicRiverFactor).
+    'FLOW_RIVER_MIN', 'FLOW_RIVER_SPAN',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -364,6 +377,8 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   tectonicFeatureAt, tectRegimeAt,
   tectonicRangeHeight, // CCR-WORLDGEN-TECTONICS-002 Phase A
   buildOrogenRegion, tectonicErosionAt, // CCR-WORLDGEN-TECTONICS-002 Phase B
+  tectonicMarginFactor, tectonicConeHeight, // CCR-WORLDGEN-TECTONICS-005
+  tectonicRiverFactor, // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
 
   // CCR-WORLDGEN-PIPELINE-002 WS8: exposed for the P0 collision experiment + M22/M23 (harness-only;
   // applyRiverCarve/getDeltaFingerFactor were extracted into FUNCS all along, just not returned).

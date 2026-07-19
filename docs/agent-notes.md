@@ -324,6 +324,40 @@ can tell whether circumstances actually changed.
 - Acceptance reference: `CCR's/CCR-TECTONICS-002-acceptance-target.png`; sim reference:
   `tools/scratch/tect002-erosion-sim.mjs`. Flag still default OFF — no TGV bump; the flip (with
   spawn land-search fix + endorheic rivers, per CCR-001 gates) carries it.
+- **CCR-003 (build 2026-07-18.1)**: plates are the SOLE mountain author flag-ON
+  (`R_BASELINE_CAP` 0.45 = E-field makes hills only — do not "fix" flat interiors by raising it
+  back without owner sign-off); `tectonicRangeHeight(gx, gz, seed, cOpt)` gained a LAND GATE on
+  continentalness (terrainSurface passes its own C; seam callers omit cOpt → fallback eval) and
+  a FOLD TRAIN (`FOLD_*`) replacing the deprecated `SUBRANGE_*` twin ridge, plus transverse
+  wind-gap notches (`RANGE_NOTCH_*`). Acceptance: `CCR's/CCR-TECTONICS-003-target.png`.
+  Bake at `EROSION_CELL` 20 measured 5.8s/512² region — the deliberate look-over-speed default.
+  Next in the arc: CCR-004 erosion-coupled rivers (export the bake's flow raster; rivers derive
+  from it — see the CCR doc before touching river code in belts).
+- **CCR-005 (build 2026-07-18.2)**: regime-differentiated morphology. `plateLookup`'s memo gained
+  `rangeRegime` (which regime won the crest) + `upliftLocal` (rift/transform bucket, regimes 4/6 —
+  consumed by `tectonicReliefBlend` WITHOUT the `RANGE_RELIEF_SWAP` demotion; do not merge it back
+  into `upliftR` or rifts vanish again under `R_BASELINE_CAP` 0.45). Crest capture now includes
+  island arcs (regime 3, `rangeD` offset by `ARC_OFFSET·S`); Andean belts (regime 2) are asymmetric
+  via `ANDEAN_ASYM` (trench side `W/1.9`, inland `W·1.15`). New injected `tectonicConeHeight`
+  (volcano lattice, subduction/arc only) and `tectonicMarginFactor` (0..1 active-margin field →
+  cliff coasts). AUDIT NOTE: `tectonicMarginFactor`'s smooth `rangeAmp` fade ((amp−0.08)/0.17) is
+  LOAD-BEARING — a hard gate produces straight seams where the dominant regime flips. The cliff
+  lift is BAND-shaped over C (not a flat +H — that read as an artificial plateau); the beach-sand
+  gate + `isTreeSoilSurface` mirror carry a `marginFactor>0.5` exception (cliff coasts get no
+  sand; all other coasts keep beaches — owner requirement).
+- **CCR-006 (build 2026-07-18.2)**: flag-ON material calibration, ALL gated on
+  `tectonicPlates===true` (`_tbl`/`_tws`/`_pnf`/sand-noise ternaries). The five altitude bands
+  shift up by `TECT_BAND_LIFT` flag-ON; the beach-sand 'camo' fix is `TECT_SAND_FREQ` (dedicated
+  low-freq coastNoise field replacing terrain-frequency surfaceNoise in BOTH sand conditions +
+  the mirror). Every band/sand change MUST hit `generateTerrainPass` and `isTreeSoilSurface` in
+  the same edit — the mirror's conjunction is `worldConfig.useNewTerrain &&` + the same `_tbl`.
+- **CCR-004 (build 2026-07-18.2)**: `buildOrogenRegion` also returns `flow` (√area raster, same
+  grid as `dh`); new injected `tectonicRiverFactor` samples it (same warp/cache/guard pattern as
+  `tectonicErosionAt`) and `riverFactorAt`'s ribbon dispatch returns
+  `min(ribbon rf, tectonicRiverFactor)` flag-ON — belt rivers ARE the erosion bake's drainage
+  channels. `FLOW_RIVER_MIN` 200 / `FLOW_RIVER_SPAN` 220 calibrated from measured belt flow
+  percentiles (p97=199, p99.5=422); rf floors at 0.05, never 0 (downstream width/delta math).
+  hydroRivers-ON path untouched. Bake-twice determinism check must now cover `flow` too.
 
 ## 4. Terrain lessons (beyond the ledger)
 

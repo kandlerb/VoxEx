@@ -178,6 +178,31 @@ is adopted, `terrainSurface`'s call site changes too (also injected — main-onl
 - [ ] Bake time re-measured at cell 20; recorded in as-built
 - [ ] Version constants per "Version impact"; CLAUDE.md/agent-notes updated if staled
 
-## As-built (fill in AFTER implementation)
+## As-built (2026-07-18, build 2026-07-18.1 — container-verified)
 
-<pending>
+Implemented as specified (rev 2, all six changes) with these notes:
+
+- **C pass-through adopted**: `tectonicRangeHeight(gx, gz, seed, cOpt)`; `terrainSurface` passes
+  its own `C`, seam/probe callers omit it and fall back to `continentalness(gx, gz)`.
+  Behavior-identical either way (verified: implementation renders match the prototype renders
+  and metrics exactly — zoom mtn 10.5%, 16k mtn 5.3%, water 57.0%).
+- **Fold-train structure**: the fold block replaced BOTH subrange branches; it runs inside the
+  existing `prof > 0` guard's tail scope restructure exactly as the prototype (fold zone
+  evaluated whenever `ad < foldExtent`, then the notch cut, then return).
+- **Deprecations**: `SUBRANGE_OFFSET/WIDTH/AMP` schema rows → `ui:'hidden'` + DEPRECATED notes,
+  `SUBRANGE_AMP` default → 0; keys/aliases/emission retained (save-compat, no reader).
+- **Gates (container-run)**: syntax GREEN; parity GREEN; terrain-node-checks ALL HARD GREEN;
+  flag-OFF sha256 fingerprint IDENTICAL (22815f15…2de0, 3 seeds — same constant as CCR-002,
+  i.e. no TGV bump needed); bake deterministic (twice byte-identical). Normalized diff vs the
+  shipped 002 build: 122 changed/added lines, all at the six intended sites + changelog.
+- **Bake cost at the new default**: 5.8s per 512² region (`EROSION_CELL` 20) — inside the
+  predicted 6-8s window; the deliberate look-over-speed default, owner dials `EROSION_CELL` up
+  for speed.
+- **Staleness incident (process note)**: the pre-implementation `device_stage_files` snapshot of
+  all three files served PARTIALLY STALE content (old bytes at some offsets despite new sizes) —
+  the §7 mount-staleness bug. Caught by sha256-comparing the device files via `device_bash`
+  against the session's shipped copies (identical → disk was fine, snapshot was lying).
+  Implementation proceeded from the hash-verified copies. Rule reinforced: NEVER trust a staged
+  re-read of a large repo file without a device-side hash check.
+- **PENDING (owner/local)**: browser worker-parity suite over localhost (owed since CCR-002);
+  owner editor eyeball vs `CCR-TECTONICS-003-target.png`; git commit.

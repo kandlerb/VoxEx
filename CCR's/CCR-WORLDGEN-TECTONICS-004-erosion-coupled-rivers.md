@@ -117,6 +117,41 @@ Determinism note: rivers derive from the deterministic bake — worker/main agre
 - [ ] New tunables full lockstep; orogen cache clear covers the flow raster (same object)
 - [ ] Memory: cached region size re-measured with flow raster; cap 12 still sane
 
-## As-built (fill in AFTER implementation)
+## As-built (build 2026-07-18.2)
 
-<pending>
+Shipped in **build 2026-07-18.2** (batched with CCR-005 + CCR-006). NO TERRAIN_GEN_VERSION bump
+— `tectonicPlates` still default OFF; flag-OFF sha256 fingerprint re-verified IDENTICAL
+(`22815f15a583ce58c80a08b08f0087260e80453a6043eeb5c92d7d1339212de0`, 3 seeds).
+
+**As-built (implemented as drafted; three changes):**
+
+1. **Flow raster export** — `buildOrogenRegion` adds
+   `const flow = new Float32Array(N2); for (let c = 0; c < N2; c++) flow[c] = Math.sqrt(area[c]);`
+   and returns `{ n, x0, z0, cell, dh: out, flow }`. Bake cost unchanged (√ of an already-computed
+   array); cache entry ~2× floats; `_orogenRegionCache` (cap 12) + both clear sites cover it
+   since dh and flow live in the same object.
+2. **`tectonicRiverFactor(gx, gz, seed)`** — NEW injected function; identical domain-warped
+   bilinear sample pattern to `tectonicErosionAt` (same cache entries, same `_orogenBaking`
+   recursion guard, wAmp = cell·0.55, freq ~1/140). Mapping:
+   `if (F <= FLOW_RIVER_MIN) return 1; let rf = 1 - (F - FLOW_RIVER_MIN)/FLOW_RIVER_SPAN; return rf < 0.05 ? 0.05 : rf;`
+   — floored at 0.05, never 0 (keeps downstream width/delta math finite).
+3. **Dispatcher** — `riverFactorAt`'s ribbon path (hydroRivers OFF):
+   `const rf = getRiverFactor(gx, gz, seed, preHeight, widthMult); if (worldConfig.tectonicPlates === true) return Math.min(rf, tectonicRiverFactor(gx, gz, seed)); return rf;`
+   — belt drainage channels become rivers; legacy ribbon rivers outside belts unchanged;
+   hydroRivers-ON path untouched.
+
+2 new tunables **FLOW_RIVER_MIN 200 / FLOW_RIVER_SPAN 220**, calibrated against measured belt
+flow percentiles (p97 = 199, p99.5 = 422, 3 seeds) — full lockstep (registry / schema /
+aliases / sync / worker-emission / extract-terrain); `tectonicRiverFactor` added to the worker
+terrainFuncs list + window.VoxEx seam + extract-terrain FUNCS + return object.
+
+**Gates (measured):** syntax + parity + terrain-node-checks GREEN ("ALL HARD CHECKS GREEN");
+bake-twice byte-identical INCLUDING the flow raster ("bake deterministic (dh+flow) true");
+flag-OFF fingerprint identical; 440 channel columns (rf < 0.6) in a 1024² belt sample rendering
+as dendritic drainage following the erosion valleys (acceptance render CCR's/CCR-TECTONICS-004-rivers-acceptance.png — rivers
+now sit in the exact valleys the CCR-002 bake carved, per the owner's 'rivers should be eroding
+the land' directive).
+
+**PENDING:** `tools/voxex-tests.html` browser worker-parity suite over localhost (owed since
+CCR-002); owner editor eyeball.
+
