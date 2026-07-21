@@ -71,6 +71,12 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
   const _liveTectonicMatch = src.match(/^[ \t]*tectonicPlates:\s*(true|false)\b/m);
   const _liveTectonic = _liveTectonicMatch ? _liveTectonicMatch[1] === 'true' : false;
   const tectonicPlates = (opts && typeof opts.tectonicPlates === 'boolean') ? opts.tectonicPlates : _liveTectonic;
+  // Game-faithful seed option (opts.gameSeed): when true, worldConfig.seed AND the perm table are
+  // derived from the STRING seed EXACTLY as voxEx.html does (SeededRandom deadbeef/Knuth string hash
+  // -> first next() draw -> Fisher-Yates consuming the next 256 draws), instead of the internal
+  // internal-consistency stub PRNG below. Byte-faithful to an in-game world for that seed string.
+  // Folded into opts (least invasive: no new positional param, mirrors the other flags above).
+  const gameSeed = !!(opts && opts.gameSeed);
 
   // --- extraction helpers ------------------------------------------------------
   function lastIndexOfDef(needle) {
@@ -260,8 +266,34 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
 
   let assembled = '"use strict";\n';
 
-  // --- environment stubs -------------------------------------------------------
-  assembled += `
+  // Seed/perm derivation source, chosen by opts.gameSeed. Interpolated into `assembled` below so
+  // the DEFAULT (stub) path stays byte-for-byte unchanged when gameSeed is false.
+  const _seedCode = gameSeed ? `
+// GAME-FAITHFUL seed derivation - ported character-for-character from voxEx.html
+// (class SeededRandom string-hash constructor + next(); seedMainThreadNoise's first next()
+// draw for worldConfig.seed, then Fisher-Yates over the next 256 draws for the perm table).
+class _GameSeededRandom {
+  constructor(seed) {
+    if (typeof seed === "string") {
+      let h = 0xdeadbeef;
+      for (let i = 0; i < seed.length; i++) { h = Math.imul(h ^ seed.charCodeAt(i), 2.654435761e9); h = (h ^ (h >>> 16)) >>> 0; }
+      this.seed = h;
+    } else { this.seed = seed >>> 0; }
+  }
+  next() {
+    let t = (this.seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4.294967296e9;
+  }
+}
+const _gameRng = new _GameSeededRandom(SEED_STR);
+const numericSeed = _gameRng.next();
+const perm = new Uint8Array(512);
+{ const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  for (let i = 0; i < 256; i++) { const r = Math.floor(_gameRng.next() * (256 - i)) + i; const t = p[i]; p[i] = p[r]; p[r] = t; perm[i] = perm[i + 256] = p[i]; } }
+` : `
 // deterministic perm from the seed string (internal-consistency PRNG; not the
 // game's SeededRandom — checks don't require byte-parity with in-game worlds)
 let s0 = 0;
@@ -272,6 +304,11 @@ const perm = new Uint8Array(512);
   for (let i = 255; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; const t = p[i]; p[i] = p[j]; p[j] = t; }
   for (let i = 0; i < 512; i++) perm[i] = p[i & 255]; }
 const numericSeed = rnd() * 1000;
+`;
+
+  // --- environment stubs -------------------------------------------------------
+  assembled += `
+${_seedCode}
 
 // derivative-noise out-param scratches (CCR-TERRAIN-007)
 const _nd2 = { dx: 0, dz: 0 };

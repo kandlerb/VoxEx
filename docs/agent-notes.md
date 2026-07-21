@@ -39,6 +39,8 @@ can tell whether circumstances actually changed.
 | **Vectorized single-pass flow accumulation** (burned twice, CCR-WORLDGEN-TECTONICS-002 prototyping) | Never retry | A one-shot scatter (`np.add.at`-style, or any "gather once, scatter once" pass) does NOT cascade drainage — every cell donates only its own area, rivers never gain power, and erosion silently no-ops (two "eroded" renders came back visually unchanged before this was caught). Flow accumulation MUST walk cells sequentially in descending height order (stable sort, index tie-break for determinism), pushing accumulated area to each receiver. Also from the same sessions: sanity-check erosion COEFFICIENT scale against "blocks removed per iteration where a valley should form" (~0.5-1.0) — a 250× under-scaled K looks exactly like a no-op, not like weak erosion. |
 | **Deferred block-mutating talus / slump pass** (rejected, CCR-WORLDGEN-REGIONFIELD-001 Design C) | Never retry | A talus relaxation that MUTATES placed blocks (a slump in a NEIGHBOR_UPDATE window) desyncs cross-chunk agreement: tree `groundY` reads pure `blendedHeight` (±6 slack) and per-chunk `heightPad` borders are computed from the pure height chain — a block-level slump a neighbor chunk applied differently → visible seams at chunk borders + mis-placed/floating trees. Any post-erosion relaxation must be a PURE-HEIGHT raster sampled in the height chain (shipped: `talusDh` + `tectonicTalusAt`, bilinear like `tectonicErosionAt`), never a deferred block edit. |
 | **Folding the hydro + orogen bakes onto ONE shared region grid** (rejected scope, CCR-WORLDGEN-REGIONFIELD-001) | Not for that CCR | The tiers run at DIFFERENT cells (orogen `EROSION_CELL 20`, hydro `HYDRO_STEP 32`) and spans (`OROGEN_REGION 8192` = 8× `HYDRO_REGION 1024`); a single shared bake grid would force one tier onto the other's resolution. Unify the ABSTRACTION (both run on `RegionField`), not the grid. A shared grid is a possible future step but was explicitly out of scope — "unified tier" does NOT mean "unified grid". |
+| **Canonicalizing `fAlong` at its SOURCE in plateLookup** (sign-flip the raw along-coord before the segment math; CCR-WORLDGEN-TECTONICS-007 attempt 1) | Never retry | Raw `fAlong` feeds `fSegF/fSegIdx/fFrac` -> the `segMix` per-segment keep phase. Sign-flipping it at source shifts that phase so a segment GAP lands on the boundary -> `rangeAmp` collapses (0.91->0.32) -> NEW 100-124 blk walls at regime-2 transitions (seed 2024). The along-coord may only be reframed AFTER the segment math has consumed the raw value. |
+| **Global Option-A `rangeAlong` memo canon at the winner block** (`(s1.plateId<s.plateId)?fAlong:-fAlong`; CCR-WORLDGEN-TECTONICS-007) | Never retry as a global canon | Fixes crest-sign-flip SAME-PAIR walls in isolation (62/45->1, verified) but re-phases the winning crest BELT-WIDE wherever the winning pair is reverse-ordered -> WORSENS pre-existing TRANSITION walls (seed 2024 (11239,9572) 143->174). Superseded by the thin-strip flip-line HEIGHT blend (S3): same same-pair fix via symmetric averaging, zero change away from flip strips, no transition worsening. |
 
 ## 2. Three.js / browser gotchas (version-specific, verified r160)
 
@@ -371,6 +373,34 @@ Both per-region bake tiers run on ONE injected `class RegionField(cap, bake, evi
 - **Talus `talusDh`** (Phase 3, flag-ON only): a standalone angle-of-repose pass (`TALUS_SWEEPS=4` at `EROSION_TALUS`/`EROSION_KT`) over a COPY of the post-erosion surface, computed strictly AFTER `dh`/`flow` are snapshotted (those provably untouched — a Phase-3 gate re-checks their checksums), same haloed grid + center-weighted 3×3 smoothing + interior-only borders as `dh`. NARROW by construction: only over-steep macro slopes relax (measured 0.3% of interior cells, max 1.17 blk on ridge-crest/scarp lines). Rides the same `tectonicPlates===true && !forcedCentroid` gate as `tectonicErosionAt`.
 - **Lockstep:** the class is single-sourced (worker via `RegionField.toString()`); only the `new RegionField(...)` construction lines are hand-typed in 3 places (main, worker-injection, `extract-terrain.mjs`) — parity **P10** enforces they match. Durable gates: `tools/scratch/regionfield-evict-test.mjs` (eviction semantics, self-contained), `tools/flagoff-fingerprint.mjs` (flag-OFF sha256 byte-identity).
 - **Same-change-rule breach caught by the first browser-suite run since CCR-002 (build 2026-07-21.1):** CCR-WORLDGEN-TECTONICS-002..006 introduced a third UI mode `ui:'editor'` (32 Tectonics knobs) and flipped 3 `SUBRANGE_*` foothill knobs to `ui:'hidden'` (7→10) but never updated `voxex-tests.html`'s "registry↔schema strict parity" test (its `toContain` allow-list + the exact-set locks). Masked the whole time: `toContain(['both','hidden'])` threw on the first `ui:'editor'` row *before* the hidden lock ran, and this owner-reserved suite (owed since CCR-002) had never executed — so BOTH the editor-mode acceptance and the stale 7-key hidden lock stayed hidden. `voxEx.html` is CORRECT (the schema authors the UI, ui distribution byte-identical pre/post-CCR-1); the TEST was corrected to the live `GTS` (accept `editor`, lock the 32 editor keys, hidden lock 7→10). Lesson: an "owed"/unrun authoritative suite silently accrues same-change-rule drift — run `run-browser-tests.mjs` every CCR, not just before release.
+
+### Flip-line crest-height blend (CCR-WORLDGEN-TECTONICS-007 F1a, build 2026-07-21.2)
+
+Generalizes CCR-001's "CONTINUOUS distance-weighted plate-baseline blend" from the plate BASELINE to
+the CREST term. Near a nearest-plate flip line the crest is evaluated from BOTH the true-nearest (s1)
+frame and the as-if-s2-nearest frame and the resulting HEIGHTS are blended (never the memo fields --
+`rangeAlong` from different pairs is not linearly blendable).
+- `plateLookup` inner closure `rangeWinnerFor(ref)` = FULL independent range-winner recompute relative
+  to `ref` (own bnds/fAlong/segMix/regime/winner; reuses NO s1 intermediate). Called for s2 only when in
+  the strip. Memo gains `rangeD2/rangeAlong2/rangeW2/rangeAmp2/rangeRegime2` + `rangeWS`.
+- `tectonicRangeHeight` factored into inner `crestHeightFromFields(rD,rAlong,rW,rAmp,rReg,gx,gz,C)`;
+  returns `(1-wS)*H1 + wS*H2` when `rangeWS>0`, else `H1` (byte-identical outside strips -- verified 2346/2346).
+- Weights: `g=sqrt(d2)-sqrt(d1)`; `wN0=0.5+0.5*smoothstep(0,BLEND_BAND,g)` (symmetric -> continuous at the
+  flip line by construction); `tj=smoothstep(0,BLEND_BAND,sqrt(d3)-sqrt(d2))` fades the SECOND frame to 0
+  near TRIPLE JUNCTIONS (where s2's identity itself swaps -> would seam); `wS=(1-wN0)*tj`.
+- `BLEND_BAND=64` is an INTERNAL const inside plateLookup (like OROGEN_DELTAC et al. -- NOT a registry
+  tunable; injects with the function). smoothstep already in scope. flag-ON only; NO TGV bump.
+- BLEND-ONLY (no global Option-A memo canon) was chosen -- see S1: the global canon worsens transitions.
+- FIXES: crest-sign-flip SAME-PAIR walls (field (1054,-896) 63->1, (997,-962) 49->1; 77777 -12500 belt
+  153->under 60). DOES NOT fix (scoped F1b): RELIEF/EROSION-COUPLED transition/junction walls 60-143 --
+  driven by upliftR/tectonicReliefBlend amplitude JUMP + the orogen bake carving the tall regime-2
+  envelope + two spatially-OFFSET genuinely-different-height ranges (arc regime-3 vs Andean regime-2);
+  plateBaseC is smooth (not a base-C jump). F1b = blend upliftR/relief + the erosion envelope across flips.
+- Gate harness: `tools/lib/extract-terrain.mjs buildTerrainApi(...,{gameSeed:true})` (game-faithful seed;
+  default derivation unchanged, fingerprint 7487c195 identical) + `tools/scratch/flip-derive.mjs`
+  (windowed +-12 max-adjacent-step wall metric; --step1/--step2/--file). Cost: computeSurfaceHeight +3.3% (<=5%).
+- OWED before push: browser worker-parity suite (sandbox cannot run it headless -- device 45s cap, cloud
+  headless hangs at load) + owner flag-ON eyeball.
 
 ## 4. Terrain lessons (beyond the ledger)
 
