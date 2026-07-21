@@ -414,7 +414,8 @@ Key abstractions: `isGameplayActive()` replaces raw `controls.isLocked` gameplay
 - **Terrain (C-authored oceans, CCR-WORLDGEN-CONTINENTAL-OCEANS-001, TGV 43, default ON)**: `continentalOceans` (flag), `oceanFactorFromC` (injected; `getOceanFactor` dispatches here flag-ON), `COAST_THRESHOLD_C`, `COAST_SHELF_C`, `SPLINE_CONTINENTAL_OCEAN`, `SEAFLOOR_DETAIL`, `SEAFLOOR_CLIFF_SHARP`, `CONTINENTAL_SEA_BIAS`, `HYDRO_HALO_CONTINENTAL` — all in the `'Continents & Oceans'` `GEN_TUNABLES` schema section
 - **Terrain (shared/legacy)**: `blendedHeight`, `continentalHeight`, `mountainsHeightFunc`, `plainsHeightFunc`, `precalculateTerrainCaches`
 - **Rivers**: `getRiverFactor` (ribbon, flag-OFF only), `riverFactorAt` (dispatcher — always call this, not `getRiverFactor`, unless you specifically mean the ribbon), `getRiverDepth`, `applyRiverCarve`, `computePreRiverHeight`
-- **Rivers (hydrological, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B)**: `hydroRivers`, `buildHydroRegion`, `floodSpill`, `hydroRegionOf`, `hydroLatticeH`, `hydroRegionCache`, `HYDRO_REGION`, `HYDRO_STEP`, `HYDRO_HALO`, `HYDRO_SPRING_H`, `FLOW_WIDTH_SCALE`
+- **Rivers (hydrological, CCR-WORLDGEN-PIPELINE-002 WS6/Bump B)**: `hydroRivers`, `buildHydroRegion`, `floodSpill`, `hydroRegionOf`, `hydroLatticeH`, `hydroField` (RegionField, true-LRU — was `hydroRegionCache` before CCR-WORLDGEN-REGIONFIELD-001), `HYDRO_REGION`, `HYDRO_STEP`, `HYDRO_HALO`, `HYDRO_SPRING_H`, `FLOW_WIDTH_SCALE`
+- **Region-bake tier (CCR-WORLDGEN-REGIONFIELD-001)**: `class RegionField` (single-sourced; worker built via `RegionField.toString()`), `orogenField` (clear-on-full), `hydroField` (true-LRU, delete-on-hit), `evictPolicy`, `sediment`/`climate` sockets (declared, empty). Orogen bake `buildOrogenRegion`→`tectonicErosionAt`; flow `tectonicRiverFactor`; talus `talusDh`→`tectonicTalusAt` (flag-ON, softens over-steep macro slopes on the `tectonicPlates===true && !forcedCentroid` path); recursion guard `_orogenBaking`
 - **Trees**: `getChunkTreePositions`, `wouldHaveValidTree`, `isTreeSiteViable`, `isTreeSoilSurface`, `generateTreeMaskForChunk`
 - **Gen**: `function generateChunkData`, `function calculateChunkSunlight`, `GEN_PASS`, `RENDER_PASS`
 - **Render/Meshing**: `function renderChunk`, `renderChunkAsync`, `processChunkQueue`, `WORKER_MESH_PIPELINE_ENABLED`, `chunkUsesBands`, `markChunkBanded`, `meshProfile`, `getMergeKey`
@@ -473,6 +474,7 @@ Things that exist in MORE THAN ONE hand-maintained copy, or as mirrored logic th
 | `TREE_CONFIG` | main + worker template | identical values |
 | Injection markers (×6) | `__TERRAIN_FUNCS__`, `__TREE_FUNCS__`, `__TERRAIN_PASS__` pairs | exactly one standalone occurrence each |
 | `NUM_TILES` | main + worker template | equal integer value (atlas strip width; drift = mis-sliced worker UVs) |
+| `RegionField` construction (`orogenField`/`hydroField`) | main + worker template + `extract-terrain.mjs` | `new RegionField(...)` arg-lists identical (parity **P10**; the class body itself is single-sourced via `RegionField.toString()`, so only the construction lines are hand-typed) |
 
 **Mirrored logic (review-enforced — comments exist at both sites):**
 

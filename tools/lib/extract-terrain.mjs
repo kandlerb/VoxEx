@@ -93,6 +93,18 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     }
     throw new Error(`unbalanced braces extracting ${name}`);
   }
+  function extractClass(name) {
+    const start = src.indexOf(`class ${name} {`);
+    if (start === -1) return null;
+    const braceStart = src.indexOf('{', start);
+    let depth = 0;
+    for (let i = braceStart; i < src.length; i++) {
+      const ch = src[i];
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+    }
+    throw new Error(`unbalanced braces extracting class ${name}`);
+  }
   function extractConstArrow(name) {
     const start = lastIndexOfDef(`const ${name} = `);
     if (start === -1) return null;
@@ -133,7 +145,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'plateHash32', 'plateLookup', 'tectonicDeltaC', 'tectonicUpliftR', 'tectonicReliefBlend',
     'tectonicFeatureAt', 'tectRegimeAt',
     'tectonicRangeHeight', // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range term
-    'buildOrogenRegion', 'tectonicErosionAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake
+    'buildOrogenRegion', 'tectonicErosionAt', 'tectonicTalusAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake; talus: REGIONFIELD-001 Phase 3
     'tectonicMarginFactor', 'tectonicConeHeight', // CCR-WORLDGEN-TECTONICS-005
     'tectonicRiverFactor', // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
     'getOceanFactor', 'getOceanDepth', 'getRiverFactor', 'getRiverDepth',
@@ -287,9 +299,9 @@ const _tsStyle = { ridgeMixBias: 0, roughnessBias: 0, warpBias: 0, baseBias: 0, 
 // CCR-WORLDGEN-PIPELINE-002 WS2 (cut-2): step-8 T/H style memo (mirror the module decls near terrainSurface).
 const _styleThCache = new Map();
 const _STYLE_TH_CAP = 16384;
-// CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1): hydrology region cache + 8-neighbor lattice offsets
-// (mirror the module decls near getRiverFactor/getPreRiverHeight in the main file).
-const hydroRegionCache = new Map();
+// CCR-WORLDGEN-PIPELINE-002 WS6 (P0/P1) + CCR-WORLDGEN-REGIONFIELD-001 Phase 2: hydrology region
+// cache cap + 8-neighbor lattice offsets (mirror the module decls near getRiverFactor in the main
+// file). The cache itself now lives in hydroField (a RegionField), constructed after the FUNCS block.
 const HYDRO_REGION_CACHE_CAP = 64;
 const HYDRO_NB = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [-1, 1], [1, -1], [1, 1]];
 // CCR-WORLDGEN-PIPELINE-002 WS6 (Bump-B perf fix): riverFactorAt's 3x3 neighborhood memo
@@ -314,7 +326,6 @@ let _plateMemoVal = null;
 // CCR-WORLDGEN-TECTONICS-002 Phase B: orogen erosion-bake cache + recursion guard (mirror the
 // module decls beside _plateSiteCache in the main file). tectonicErosionAt/buildOrogenRegion
 // ReferenceError without these whenever the tectonics flag is on.
-const _orogenRegionCache = new Map();
 const OROGEN_REGION_CACHE_CAP = 12;
 let _orogenBaking = false;
 const lerp = (t, a, b) => a + t * (b - a);
@@ -357,6 +368,15 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
     if (!s) throw new Error(`function ${name} not found in ${file}`);
     assembled += s + '\n';
   }
+  // CCR-WORLDGEN-REGIONFIELD-001: RegionField + orogenField, single-source. Constructed AFTER the FUNCS
+  // block so buildOrogenRegion is assembled (it hoists as a function decl); RegionField (a class) must
+  // precede its use, so it is appended immediately before the orogenField construction.
+  const _regionFieldSrc = extractClass('RegionField');
+  if (!_regionFieldSrc) throw new Error('class RegionField not found');
+  assembled += _regionFieldSrc + '\nconst orogenField = new RegionField(OROGEN_REGION_CACHE_CAP, buildOrogenRegion);\n';
+  // CCR-WORLDGEN-REGIONFIELD-001 Phase 2: hydroField on the same shared tier (TRUE-LRU). buildHydroRegion
+  // hoists (function decl, in FUNCS above); RegionField + HYDRO_REGION_CACHE_CAP are already assembled.
+  assembled += "const hydroField = new RegionField(HYDRO_REGION_CACHE_CAP, buildHydroRegion, 'lru');\n";
   // CCR-WORLDGEN-PIPELINE-001 Phase 2: seed BIOME_STYLE_ACTIVE from the live styles
   // (a bench mutating GEN_TUNABLES.BIOME_STYLE can re-call the exported recomputeBiomeStyleActive).
   assembled += 'recomputeBiomeStyleActive();\n';
@@ -376,7 +396,7 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   plateHash32, plateLookup, tectonicDeltaC, tectonicUpliftR, tectonicReliefBlend,
   tectonicFeatureAt, tectRegimeAt,
   tectonicRangeHeight, // CCR-WORLDGEN-TECTONICS-002 Phase A
-  buildOrogenRegion, tectonicErosionAt, // CCR-WORLDGEN-TECTONICS-002 Phase B
+  buildOrogenRegion, tectonicErosionAt, tectonicTalusAt, // CCR-WORLDGEN-TECTONICS-002 Phase B; talus: REGIONFIELD-001 Phase 3
   tectonicMarginFactor, tectonicConeHeight, // CCR-WORLDGEN-TECTONICS-005
   tectonicRiverFactor, // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
 

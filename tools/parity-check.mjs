@@ -178,5 +178,22 @@ for (const [tag, name] of [['P5', 'WORLD_DIMS'], ['P8', 'TREE_CONFIG']]) {
   }
 }
 
+// --- P10: RegionField single-source + field construction (CCR-WORLDGEN-REGIONFIELD-001) --------
+// class RegionField is single-sourced (worker gets it via RegionField.toString()), so it must
+// appear exactly ONCE. The orogenField/hydroField construction lines ARE hand-typed in both the
+// main-thread module scope and the worker-injection string, so those must agree arg-for-arg.
+{
+  const classDefs = (src.match(/class RegionField \{/g) || []).length;
+  check(classDefs === 1, 'P10a RegionField class single-sourced',
+    classDefs === 1 ? 'exactly one class def (worker built via toString)' : `found ${classDefs} (must be 1)`);
+  const calls = [...src.matchAll(/new RegionField\(([^)]*)\)/g)].map((m) => m[1].replace(/\s+/g, ' ').trim());
+  const orogen = calls.filter((c) => c.includes('buildOrogenRegion'));
+  const hydro = calls.filter((c) => c.includes('buildHydroRegion'));
+  check(orogen.length === 2 && orogen[0] === orogen[1], 'P10b orogenField construction (main vs worker)',
+    orogen.length === 2 ? (orogen[0] === orogen[1] ? orogen[0] : `"${orogen[0]}" vs "${orogen[1]}"`) : `found ${orogen.length} (expected 2)`);
+  check(hydro.length === 2 && hydro[0] === hydro[1], 'P10c hydroField construction (main vs worker)',
+    hydro.length === 2 ? (hydro[0] === hydro[1] ? hydro[0] : `"${hydro[0]}" vs "${hydro[1]}"`) : `found ${hydro.length} (expected 2)`);
+}
+
 console.log(failures === 0 ? '\nLOCKSTEP GREEN — hand-maintained copies in sync' : `\n${failures} LOCKSTEP CHECK(S) FAILED — fix BOTH copies before committing`);
 process.exit(failures === 0 ? 0 : 1);
