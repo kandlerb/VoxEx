@@ -24,7 +24,7 @@
 ## Version impact
 
 - `VOXEX_BUILD` 2026-09-10.1 → **2026-09-10.2**; `VOXEX_RECENT_CHANGES` entry.
-- `TERRAIN_GEN_VERSION` **45 → 46**: A and E change the default (non-tectonic) river carve/routing; flag-OFF fingerprint `e02bfb2a…242a7e` → see As-built for the final token.
+- `TERRAIN_GEN_VERSION` **45 → 46**: A and E change the default (non-tectonic) path; flag-OFF fingerprint `e02bfb2a…242a7e` → **`cf5bc1df657b479153ae70ea217a210ae4acebcc61eb331a73e400ef9f162114`**.
 - `CURRENT_CACHE_VERSION` / `SETTINGS_VERSION`: no.
 
 ## As-built measurements
@@ -47,6 +47,10 @@ Generalizes: tectonic-ON same seed 0.256 → 0.190; seed 1337 flag-OFF 0.217 →
 **D:** flag-ON `computeSurfaceHeight` grid hash identical before/after (`b80302bf…`); flag-OFF fingerprint unchanged; Node mechanism check: suppressed+uncached → neutral with zero bakes, suppressed+cached → cached value, unsuppressed → bakes.
 
 **E:** confluence rate 0.832 → 0.867; coast-transect channel crossings −15–20%; `biome-pipeline-checks --hydro` M8/M14/M15/M16/M17 PASS ×3 seeds before and after (M21 fails identically on the untouched base — pre-existing, unrelated); region-build cost 0.94× median / 1.01× mean.
+
+**A, second pass — general gentle-slope terraces (integrator decision):** the agent added the band-scoped gate (`TERRACE_WARP_RELIEF_MAX`, fade over +0.2; ≥1 = old gate byte-for-byte) and swept the ceiling 0.55–0.75 at `TERRACE_WARP_AMP` 20 / `TERRACE_WARP_AMP_TECT` 6. `wideTerrace` improved modestly on every seed and the open-slope 1 blk/px render (`tools/scratch/renders/final/openslope_*` in the WS-A worktree; integrator re-render `openslope_before/after.png`) shows the straight parallel contours breaking into wavy irregular ones, but `staircaseIndex` (M18-S, sampled on steep R≥0.6 fall-lines) moved +5.1% / −4.2% / +3.3% (1337/42/9001) at the tightest ceiling 0.55 and +10–30% at looser ones. The agent kept `TERRACE_WARP_AMP: 0` per its ship rule; the integrator SHIPPED 20 / 6 / 0.55 anyway — the owner's screenshot is exactly the gentle-slope band defect, and a +3–5% move on a proxy the owner has never eyeballed does not outrank it. `TERRACE_WARP_AMP: 0` restores the old look; the ledger row on unscoped warps stands.
+
+**B, second pass:** sweep (0.25,4) +67% cost, (0.20,6) +25%, (0.18,8) +20% and min det 0.046 — all rejected; **(0.30, 3.0) shipped**: fold det 0.058/0.109/0.239, cost +4.1%, maxAdjStep 31, straightness RMS a further +8–18% over the first pass; the main Andean belt/coast visibly bows at 8 blk/px. Larger amplitudes are cost-bounded by the 8192-entry `_plateSiteCache` cap, not by fold safety.
 
 Gates on the integrated branch: syntax GREEN; parity LOCKSTEP GREEN; terrain-node-checks ALL HARD GREEN ×3; browser suite via CI (cannot run in the cloud sandbox — agent-notes §7).
 
