@@ -20,7 +20,7 @@
 // ============================================================================
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, extname, normalize } from 'node:path';
@@ -71,16 +71,32 @@ const proc = spawn(chrome, [
   '--disable-extensions', '--no-first-run', 'about:blank',
 ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
+// Discover the DevTools endpoint two ways: the "DevTools listening on ws://..."
+// banner on stderr/stdout AND the DevToolsActivePort file Chrome writes into the
+// profile dir (line 1 = port, line 2 = browser target path). CI runners have been
+// seen keeping Chrome alive but silent past the old 20s banner-only wait (PR #585,
+// run 34492021739) — a cold first launch on a fresh runner image. 60s covers that.
+const DEVTOOLS_WAIT_MS = 60000;
+const portFile = join(profile, 'DevToolsActivePort');
 const wsUrl = await new Promise((resolve, reject) => {
   let buf = '';
+  let poll = null, deadline = null;
+  const settle = (fn, v) => { clearInterval(poll); clearTimeout(deadline); fn(v); };
   const onData = (d) => {
     buf += d;
     const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
-    if (m) resolve(m[1]);
+    if (m) settle(resolve, m[1]);
   };
   proc.stderr.on('data', onData); proc.stdout.on('data', onData);
-  proc.on('exit', (c) => reject(new Error(`browser exited early (code ${c})\n${buf.slice(-800)}`)));
-  setTimeout(() => reject(new Error(`no DevTools endpoint after 20s\n${buf.slice(-800)}`)), 20000);
+  proc.on('exit', (c) => settle(reject, new Error(`browser exited early (code ${c})\n${buf.slice(-800)}`)));
+  poll = setInterval(() => {
+    try {
+      const lines = readFileSync(portFile, 'utf8').split(/\r?\n/).filter(Boolean);
+      const port = Number(lines[0]);
+      if (port > 0 && lines[1] && lines[1].startsWith('/')) settle(resolve, `ws://127.0.0.1:${port}${lines[1]}`);
+    } catch { /* not written yet */ }
+  }, 250);
+  deadline = setTimeout(() => settle(reject, new Error(`no DevTools endpoint after ${DEVTOOLS_WAIT_MS / 1000}s (banner + DevToolsActivePort)\n${buf.slice(-800)}`)), DEVTOOLS_WAIT_MS);
 });
 
 // --- minimal CDP client -------------------------------------------------------------
