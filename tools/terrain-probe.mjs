@@ -14,8 +14,15 @@
 //   node tools/terrain-probe.mjs stats [centerX centerZ size=4000] [--json]
 //   node tools/terrain-probe.mjs hillshade <centerX> <centerZ> <size> [out.png]
 // Common flags: --seed=<string> (default 'probe') --file=<voxEx.html>
-//   --biome-driven (force the biome-driven climate+spline path) --hydro (force
-//   worldConfig.hydroRivers true — CCR-WORLDGEN-PIPELINE-002 WS6 hydrological rivers)
+//   --biome-driven / --no-biome-driven (force worldConfig.biomeDrivenTerrain) and
+//   --hydro / --no-hydro (force worldConfig.hydroRivers — CCR-WORLDGEN-PIPELINE-002 WS6
+//   hydrological rivers). OMITTED = the LIVE file default (both ship ON). Before
+//   CCR-WORLDGEN-TECTONICS-008 an omitted flag silently forced the path OFF, so a bare
+//   `hillshade` rendered the legacy-relief + ribbon-river world the game never ships.
+//   --tectonic (force worldConfig.tectonicPlates true — CCR-WORLDGEN-TECTONICS-001 plate
+//   field; implies continentalOceans) --no-tectonic (force it false)
+//   --game-seed (derive the seed/perm table EXACTLY as the game does for --seed's string,
+//   so probes match an in-game world of that seed; default = the harness stub PRNG)
 //
 // Reading the outputs:
 //   stats: anisotropy(Z/X) far from 1.0 => axis-biased noise (see agent-notes §4);
@@ -42,12 +49,23 @@ const SEA = 60;
 
 // CCR-WORLDGEN-PIPELINE-001 Phase 2 (Gate D): --biome-driven flips the flag-ON height path
 // (SPLINE_RELIEF relief + style biases) so hillshade/stats render the biome-driven terrain.
-const biomeDriven = flags['biome-driven'] === true || flags.biomeDriven === true;
-// CCR-WORLDGEN-PIPELINE-002 WS6: --hydro forces worldConfig.hydroRivers true (independent of
-// whatever the live file default is) so hillshades/height/transect probes can render/compare
-// the hydrological river system explicitly, mirroring --biome-driven's override pattern.
-const hydroRivers = flags.hydro === true;
-const api = buildTerrainApi(file, seed, { biomeDrivenTerrain: biomeDriven, hydroRivers });
+// CCR-WORLDGEN-PIPELINE-002 WS6: --hydro forces worldConfig.hydroRivers true so hillshades/
+// height/transect probes can render/compare the hydrological river system explicitly.
+// CCR-WORLDGEN-TECTONICS-008: every path flag is now TRI-STATE — `--x` forces ON, `--no-x`
+// forces OFF, and an OMITTED flag leaves the option undefined so buildTerrainApi tracks the
+// live WORLD_CONFIG default (previously `flags.x === true` passed a hard `false`, forcing the
+// biome-driven path and hydro rivers OFF on every bare probe). --game-seed = game-faithful seed.
+const apiOpts = {};
+const triState = (name, key) => {
+  if (flags[name] === true) apiOpts[key] = true;
+  if (flags['no-' + name] === true) apiOpts[key] = false;
+};
+triState('biome-driven', 'biomeDrivenTerrain');
+if (flags.biomeDriven === true) apiOpts.biomeDrivenTerrain = true; // legacy camelCase spelling
+triState('hydro', 'hydroRivers');
+triState('tectonic', 'tectonicPlates');
+if (flags['game-seed'] === true) apiOpts.gameSeed = true;
+const api = buildTerrainApi(file, seed, apiOpts);
 const { computeSurfaceHeight, blendedHeight, riverFactorAt, computePreRiverHeight, isTreeSoilSurface, getOceanFactor, resolveBiome } = api;
 
 const num = (v, name) => { const n = Number(v); if (!Number.isFinite(n)) { console.error(`bad number for ${name}: ${v}`); process.exit(2); } return n; };
