@@ -199,6 +199,9 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // parallel rivers eroding adjacent strips with untouched ridges between). Same inert-unless-
     // opts.hydroRivers gating as the WS6 tunables above.
     'HYDRO_CAPTURE_RADIUS',
+    // CCR-WORLDGEN-TECTONICS-008b: lateral attraction (owner defect — "piedmont comb", parallel
+    // channels down a smooth mountain-front slope never within stream-capture's single-hop reach).
+    'HYDRO_ATTRACT_RADIUS', 'HYDRO_ATTRACT_SLOPE_MAX',
     'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',

@@ -20554,6 +20554,8 @@
                 injectedCode += '    const HYDRO_WIDEN_FLOW_LOG2 = ' + JSON.stringify(GEN_TUNABLES.HYDRO_WIDEN_FLOW_LOG2) + ';\n'; // CCR-WORLDGEN-TECTONICS-008
                 // CCR-WORLDGEN-PIPELINE-002 WS6-P10: stream-capture tunable (owner defect #6, "bear claws").
                 injectedCode += '    const HYDRO_CAPTURE_RADIUS = ' + JSON.stringify(GEN_TUNABLES.HYDRO_CAPTURE_RADIUS) + ';\n';
+                injectedCode += '    const HYDRO_ATTRACT_RADIUS = ' + JSON.stringify(GEN_TUNABLES.HYDRO_ATTRACT_RADIUS) + ';\n';
+                injectedCode += '    const HYDRO_ATTRACT_SLOPE_MAX = ' + JSON.stringify(GEN_TUNABLES.HYDRO_ATTRACT_SLOPE_MAX) + ';\n';
                 // CCR-WORLDGEN-TECTONICS-001 Phase 1: tectonic plate tunables read by the injected
                 // plateLookup/tectonic* functions (INERT until worldConfig.tectonicPlates flips).
                 injectedCode += '    const PLATE_SIZE = ' + JSON.stringify(GEN_TUNABLES.PLATE_SIZE) + ';\n';
@@ -22781,6 +22783,16 @@
                 // traces landing on the exact same lattice cell).
                 { key: 'HYDRO_CAPTURE_RADIUS', label: 'Stream Capture Radius (cells)', section: 'Rivers', kind: 'number', tested: [0, 2], format: 'raw', ui: 'both',
                   note: 'TERRAIN-CHANGING. Chebyshev lattice-cell search radius: before each trace step, a trace looks this far around its current cell for an already-claimed, same-or-lower trace to merge into, so parallel channels 1-2 lattice cells apart join into one instead of eroding separate untouched strips. 0 = off (pre-P10 behavior).' },
+                // CCR-WORLDGEN-TECTONICS-008b -- "piedmont comb" fix: parallel channels down a
+                // smooth mountain-front slope, too far apart (3-5 lattice cells) for a capture-radius
+                // bump alone to reach without an artificial long jump. Re-ranks which already-legal
+                // downhill neighbor a trace takes, biasing toward whichever one is closer to a
+                // nearby already-claimed trace, so parallel traces drift together and the existing
+                // join-termination/stream-capture catches them naturally a few steps later.
+                { key: 'HYDRO_ATTRACT_RADIUS', label: 'Lateral Attraction Radius (cells)', section: 'Rivers', kind: 'number', tested: [0, 8], format: 'raw', ui: 'both',
+                  note: 'TERRAIN-CHANGING. Chebyshev lattice-cell search radius for the nearest already-claimed trace a step may steer toward on near-planar ground (never overrides monotonic descent -- only re-ranks among already-downhill neighbors). 0 = off (byte-identical).' },
+                { key: 'HYDRO_ATTRACT_SLOPE_MAX', label: 'Lateral Attraction Slope Max (blk)', section: 'Rivers', kind: 'number', tested: [0, 40], format: 'raw', ui: 'both',
+                  note: 'TERRAIN-CHANGING. Max best-neighbor height drop (blocks) for a descent step to count as "near-planar" and qualify for lateral attraction steering; steep mountain terrain is left to valley-snap instead. 0 disables attraction on every step (same effective result as Lateral Attraction Radius 0).' },
                 // --- Caves (CCR-WORLDGEN-TUNABLES-001 #7) ---
                 { key: 'CAVE_SCALE',              label: 'Cave Noise Scale (XZ)',     section: 'Caves', kind: 'number', tested: [0.01, 0.03], format: 'raw', ui: 'both',
                   note: 'Horizontal frequency of the 3D noise sampled onto the cave-cache grid. Higher = tighter/more frequent tunnel windings; lower = broader, more spread-out caverns. Paired with Cave Noise Scale (Y) -- raising both together keeps caves isotropic.' },
@@ -23649,6 +23661,8 @@
                 HYDRO_HEADWATER_TAPER = GEN_TUNABLES.HYDRO_HEADWATER_TAPER;
                 HYDRO_WIDEN_FLOW_LOG2 = GEN_TUNABLES.HYDRO_WIDEN_FLOW_LOG2; // CCR-WORLDGEN-TECTONICS-008
                 HYDRO_CAPTURE_RADIUS = GEN_TUNABLES.HYDRO_CAPTURE_RADIUS; // CCR-WORLDGEN-PIPELINE-002 WS6-P10
+                HYDRO_ATTRACT_RADIUS = GEN_TUNABLES.HYDRO_ATTRACT_RADIUS; // CCR-WORLDGEN-TECTONICS-008b
+                HYDRO_ATTRACT_SLOPE_MAX = GEN_TUNABLES.HYDRO_ATTRACT_SLOPE_MAX; // CCR-WORLDGEN-TECTONICS-008b
                 // CCR-WORLDGEN-TECTONICS-001 Phase 1 (inert until tectonicPlates is on).
                 // SPLINE_TECTONIC_OCEAN is a const alias pointing AT the live array (mutated in
                 // place) — not synced here, same as SPLINE_CONTINENTAL_OCEAN.
@@ -41668,6 +41682,27 @@ self.onmessage = async (e) => {
                 // (see buildHydroRegion's trace loop). Never captures uphill (M15-safe by
                 // construction). 0 = off (byte-identical pre-P10 behavior).
                 HYDRO_CAPTURE_RADIUS: 1, // 0..2 (schema tested range); Chebyshev lattice-cell search radius around the current cell for an existing claimed/lower-or-equal trace to merge into
+                // CCR-WORLDGEN-TECTONICS-008b -- owner defect: "piedmont comb", parallel hydro
+                // channels descending a smooth uniform slope (a mountain-front piedmont) in
+                // adjacent strips that never come within HYDRO_CAPTURE_RADIUS's single-hop reach
+                // of each other (springs there sit 3-5 lattice cells, ~100-150 blk, apart -- too
+                // far for a capture-radius bump alone without an artificial long jump). Lateral
+                // attraction: at each normal 8-neighbor descent step, among the STRICTLY-downhill
+                // candidates (same descent invariant the plain best-height pick already uses --
+                // never overrides monotonic descent, M15-safe by construction), steer toward
+                // whichever candidate minimizes EUCLIDEAN (not Chebyshev -- Chebyshev's max(dx,dz)
+                // is insensitive to a lateral nudge when the along-flow axis dominates, measured
+                // to cut the redirect rate roughly in half) distance to the nearest already-
+                // `claimed` lattice cell (an earlier-completed trace of the same region build, at
+                // or below the current cell's own height) within HYDRO_ATTRACT_RADIUS cells. This
+                // only RE-RANKS which already-legal downhill neighbor is taken; it never invents a
+                // new direction the height field doesn't already allow, and reuses the EXISTING F3
+                // join-termination / stream-capture to terminate the trace once it walks close
+                // enough -- no separate merge/rendering path needed. Gated to near-planar ground
+                // via HYDRO_ATTRACT_SLOPE_MAX so steep mountain terrain (whose real shape already
+                // bends the routing via valley-snap) is left alone. 0 = off (byte-identical).
+                HYDRO_ATTRACT_RADIUS: 6, // 0..8 (schema tested range); Chebyshev lattice-cell search radius for the nearest claimed trace to steer toward
+                HYDRO_ATTRACT_SLOPE_MAX: 20, // 0..40 (schema tested range); max best-neighbor height drop (blk) to qualify a step as "near-planar" for attraction steering
                 // Tectonic plate field (CCR-WORLDGEN-TECTONICS-001 Phase 1 — see plateLookup +
                 // the tectonic* functions near getOceanFactor). ENTIRELY INERT until
                 // worldConfig.tectonicPlates is true (default OFF; soak-gated). Defaults follow the
@@ -42944,6 +42979,8 @@ self.onmessage = async (e) => {
             let HYDRO_WIDEN_FLOW_LOG2 = GEN_TUNABLES.HYDRO_WIDEN_FLOW_LOG2; // CCR-008: flow (log2) for full lowland widening (0 = flow-independent)
             // CCR-WORLDGEN-PIPELINE-002 WS6-P10: stream-capture search radius (owner defect #6, "bear claws").
             let HYDRO_CAPTURE_RADIUS = GEN_TUNABLES.HYDRO_CAPTURE_RADIUS; // Chebyshev lattice-cell radius; 0 = off
+            let HYDRO_ATTRACT_RADIUS = GEN_TUNABLES.HYDRO_ATTRACT_RADIUS; // CCR-WORLDGEN-TECTONICS-008b: Chebyshev lattice-cell radius; 0 = off
+            let HYDRO_ATTRACT_SLOPE_MAX = GEN_TUNABLES.HYDRO_ATTRACT_SLOPE_MAX; // CCR-WORLDGEN-TECTONICS-008b: max best-neighbor drop (blk) counted as "near-planar"
             // CCR-WORLDGEN-REGIONFIELD-001 Phase 2: buildHydroRegion(rx,rz,seed) is a pure function of
             // its inputs (regions never change values -- every trace is a pure function of its spring
             // cell). It is now memoized by hydroField (a RegionField, constructed below beside
@@ -43309,6 +43346,56 @@ self.onmessage = async (e) => {
                                 const nki = cki + HYDRO_NB[d][0], nkj = ckj + HYDRO_NB[d][1];
                                 const nh = hAt(nki, nkj);
                                 if (nh < bh) { bh = nh; bki = nki; bkj = nkj; }
+                            }
+                            // CCR-WORLDGEN-TECTONICS-008b (owner defect: "piedmont comb" -- parallel
+                            // hydro channels descending a smooth mountain-front slope in adjacent
+                            // strips, springs too far apart (3-5 lattice cells) for a single-hop
+                            // stream-capture reach to ever bridge). LATERAL ATTRACTION: on a
+                            // near-planar step (this cell's best-neighbor drop <= HYDRO_ATTRACT_
+                            // SLOPE_MAX -- steep mountain terrain, whose real shape already bends the
+                            // routing via valley-snap, is left alone), re-rank which of the STRICTLY-
+                            // downhill neighbors (nh < h0, the identical invariant the plain best-
+                            // height pick above already uses -- this never authorizes a step the
+                            // height field doesn't already allow, so monotonic descent/M15 holds by
+                            // construction) is taken: prefer whichever minimizes distance to the
+                            // nearest already-`claimed` lattice cell (an earlier-completed trace of
+                            // this SAME region build, at or below this cell's own height -- same
+                            // "never attract uphill" contract stream capture above already keeps)
+                            // within HYDRO_ATTRACT_RADIUS cells. Reuses the EXISTING F3 join-
+                            // termination / stream-capture to end the trace once it walks close
+                            // enough over a few steps -- no separate merge/rendering path needed.
+                            // Distance is EUCLIDEAN, not Chebyshev: Chebyshev's max(dx,dz) is
+                            // insensitive to a lateral nudge whenever the along-flow axis already
+                            // dominates the gap to the target, which is exactly the piedmont case and
+                            // measured to roughly halve the redirect rate versus Euclidean. Pure
+                            // function of already-known integers (claimed/hAt) with a fixed scan
+                            // order (dj outer, di inner, matching the stream-capture scan above) ->
+                            // deterministic/cross-region-safe like every other buildHydroRegion output.
+                            // 0 = off (byte-identical; verified against the pre-008b baseline).
+                            if (HYDRO_ATTRACT_RADIUS > 0 && bh < h0 && (h0 - bh) <= HYDRO_ATTRACT_SLOPE_MAX) {
+                                let tKi = 0, tKj = 0, tDist = Infinity, hasTarget = false;
+                                for (let tdj = -HYDRO_ATTRACT_RADIUS; tdj <= HYDRO_ATTRACT_RADIUS; tdj++) {
+                                    for (let tdi = -HYDRO_ATTRACT_RADIUS; tdi <= HYDRO_ATTRACT_RADIUS; tdi++) {
+                                        if (tdi === 0 && tdj === 0) continue;
+                                        const tnKi = cki + tdi, tnKj = ckj + tdj;
+                                        const tKey = tnKi + ',' + tnKj;
+                                        if (!claimed.has(tKey)) continue;
+                                        if (hAt(tnKi, tnKj) > h0) continue;
+                                        const dist = Math.max(Math.abs(tdi), Math.abs(tdj)); // Chebyshev box scan is fine here -- just bounding the search
+                                        if (!hasTarget || dist < tDist) { hasTarget = true; tDist = dist; tKi = tnKi; tKj = tnKj; }
+                                    }
+                                }
+                                if (hasTarget) {
+                                    let aki = bki, akj = bkj, aDist = Math.hypot(bki - tKi, bkj - tKj);
+                                    for (let d = 0; d < 8; d++) {
+                                        const nki = cki + HYDRO_NB[d][0], nkj = ckj + HYDRO_NB[d][1];
+                                        const nh = hAt(nki, nkj);
+                                        if (nh >= h0) continue; // strictly-downhill candidates only (same invariant as the best-height pick)
+                                        const dist = Math.hypot(nki - tKi, nkj - tKj); // EUCLIDEAN -- see comment above
+                                        if (dist < aDist) { aDist = dist; aki = nki; akj = nkj; }
+                                    }
+                                    bki = aki; bkj = akj; bh = hAt(aki, akj);
+                                }
                             }
                             let didSpill = false;
                             if (bki === cki && bkj === ckj) {
