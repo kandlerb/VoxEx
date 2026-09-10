@@ -194,6 +194,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // CCR-WORLDGEN-PIPELINE-002 WS6-P7: elevation-progressive width tunables (owner defect #5 —
     // rivers read as thin dry ravines, not water). Same inert-unless-opts.hydroRivers gating.
     'HYDRO_LOWLAND_WIDEN', 'HYDRO_HEADWATER_TAPER',
+    'HYDRO_WIDEN_FLOW_LOG2', // CCR-WORLDGEN-TECTONICS-008: flow-gated lowland widening
     // CCR-WORLDGEN-PIPELINE-002 WS6-P10: stream-capture tunable (owner defect #6 — "bear claws",
     // parallel rivers eroding adjacent strips with untouched ridges between). Same inert-unless-
     // opts.hydroRivers gating as the WS6 tunables above.
