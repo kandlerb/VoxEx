@@ -20693,6 +20693,10 @@
                 injectedCode += '    const OROGEN_REGION_CACHE_CAP = 12;\n';
                 injectedCode += '    const orogenField = new RegionField(OROGEN_REGION_CACHE_CAP, buildOrogenRegion);\n';
                 injectedCode += '    let _orogenBaking = false;\n';
+                // CCR-WORLDGEN-PREVIEW-NOBAKE-001: mirror the main-thread decl (see its comment) --
+                // the worker never previews, so this stays false, but the injected samplers reference
+                // the name and would throw ReferenceError without it.
+                injectedCode += '    let _orogenBakeSuppressed = false;\n';
                 injectedCode += "    const hydroField = new RegionField(HYDRO_REGION_CACHE_CAP, buildHydroRegion, 'lru');\n\n";
 
                 // Inject each function's source code
@@ -24267,25 +24271,60 @@
                     const heights = new Float32Array(width * height);
                     const tints = new Uint8Array(width * height * 3);
                     let minH = Infinity, maxH = -Infinity;
-                    for (let py = 0; py < height; py++) {
-                        for (let px = 0; px < width; px++) {
-                            const gx = spawnX + (px - width / 2) * scale;
-                            const gz = spawnZ + (py - height / 2) * scale;
-                            // Delegate directly to the game's blendedHeight — includes ocean,
-                            // river, delta-finger, and jagged-peak with correct noise/perm.
-                            const h = blendedHeight(gx, gz, worldConfig.seed);
-                            const idx = py * width + px;
-                            heights[idx] = h;
-                            if (h < minH) minH = h;
-                            if (h > maxH) maxH = h;
-                            // Biome hue (same resolver the game uses) so biome size / selection
-                            // are visible. Cell results are cached, so this is cheap.
-                            const bt = this.getBiomeTint(getBiomeParams(gx, gz).name);
-                            tints[idx * 3] = bt.r;
-                            tints[idx * 3 + 1] = bt.g;
-                            tints[idx * 3 + 2] = bt.b;
+                    // CCR-WORLDGEN-PREVIEW-NOBAKE-001: the preview must never trigger a synchronous
+                    // buildOrogenRegion bake (~3s each, main thread) — suppress it for the duration
+                    // of this height loop (tectonicErosionAt/tectonicTalusAt/tectonicRiverFactor read
+                    // the flag and fall back to their neutral value for any region not ALREADY cached).
+                    // A prior in-game bake (or a previous preview render) still gets sampled normally.
+                    _orogenBakeSuppressed = true;
+                    try {
+                        for (let py = 0; py < height; py++) {
+                            for (let px = 0; px < width; px++) {
+                                const gx = spawnX + (px - width / 2) * scale;
+                                const gz = spawnZ + (py - height / 2) * scale;
+                                // Delegate directly to the game's blendedHeight — includes ocean,
+                                // river, delta-finger, and jagged-peak with correct noise/perm.
+                                const h = blendedHeight(gx, gz, worldConfig.seed);
+                                const idx = py * width + px;
+                                heights[idx] = h;
+                                if (h < minH) minH = h;
+                                if (h > maxH) maxH = h;
+                                // Biome hue (same resolver the game uses) so biome size / selection
+                                // are visible. Cell results are cached, so this is cheap.
+                                const bt = this.getBiomeTint(getBiomeParams(gx, gz).name);
+                                tints[idx * 3] = bt.r;
+                                tints[idx * 3 + 1] = bt.g;
+                                tints[idx * 3 + 2] = bt.b;
+                            }
+                        }
+                    } finally {
+                        _orogenBakeSuppressed = false;
+                    }
+                    // Note when tectonic erosion/talus/river sampling was actually active for this
+                    // world AND at least one region the preview extent touches isn't baked yet (so
+                    // the suppressed samples above read neutral there) — unobtrusive label suffix,
+                    // never a clamp/error. Checked via orogenField.hasKey (no bake triggered).
+                    let missedOrogenRegion = false;
+                    if (worldConfig.tectonicPlates === true) {
+                        const biomeDriven = worldConfig.biomeDrivenTerrain === true;
+                        const forced = biomeDriven && BIOME_CENTROIDS[worldConfig.forceSingleBiome];
+                        const erosionActive = !forced; // mirrors terrainSurface's tectonicErosionAt/tectonicTalusAt gate
+                        const riverActive = !worldConfig.hydroRivers; // mirrors riverFactorAt's tectonicRiverFactor gate
+                        if (erosionActive || riverActive) {
+                            const size = OROGEN_REGION, seed = worldConfig.seed;
+                            const halfW = width / 2 * scale, halfH = height / 2 * scale;
+                            const corners = [
+                                [spawnX - halfW, spawnZ - halfH], [spawnX + halfW, spawnZ - halfH],
+                                [spawnX - halfW, spawnZ + halfH], [spawnX + halfW, spawnZ + halfH]
+                            ];
+                            for (const [gx, gz] of corners) {
+                                const rx = Math.floor(gx / size + 0.5), rz = Math.floor(gz / size + 0.5);
+                                if (!orogenField.hasKey(seed + ':' + rx + ':' + rz)) { missedOrogenRegion = true; break; }
+                            }
                         }
                     }
+                    const previewLabel = document.getElementById('world-preview-label');
+                    if (previewLabel) previewLabel.textContent = missedOrogenRegion ? 'Terrain Preview (erosion not previewed)' : 'Terrain Preview';
                     const range = Math.max(maxH - minH, 10);
                     const contourInterval = Math.max(5, Math.round(range / 20));
                     // Second pass: render with colors and contours
@@ -43035,6 +43074,15 @@ self.onmessage = async (e) => {
             const OROGEN_REGION_CACHE_CAP = 12;
             const orogenField = new RegionField(OROGEN_REGION_CACHE_CAP, buildOrogenRegion);
             let _orogenBaking = false;
+            // CCR-WORLDGEN-PREVIEW-NOBAKE-001: set for the duration of WorldPreviewRenderer.render()'s
+            // height loop. While true, tectonicErosionAt/tectonicTalusAt/tectonicRiverFactor return
+            // their neutral value (0/0/1) instead of triggering a synchronous ~3s buildOrogenRegion
+            // bake for any region not already cached -- an ALREADY-cached region (orogenField.hasKey)
+            // is still sampled normally. Declared here (module scope) so the three injected samplers
+            // can reference it; MUST be mirrored in the worker injection (buildChunkWorkerCode) and
+            // in tools/lib/extract-terrain.mjs's env stub (both always false -- the preview only runs
+            // on the main thread) or an injected sampler throws ReferenceError in those scopes.
+            let _orogenBakeSuppressed = false;
             // CCR-WORLDGEN-REGIONFIELD-001 Phase 2: hydro drainage bake on the shared RegionField tier
             // (TRUE-LRU eviction, delete-on-hit -- matches the old hydroRegionCache). buildHydroRegion
             // hoists (function decl); RegionField + HYDRO_REGION_CACHE_CAP are declared above.
@@ -44677,6 +44725,7 @@ self.onmessage = async (e) => {
                 if (_orogenBaking) return 0;
                 const size = OROGEN_REGION;
                 const rx = Math.floor(gx / size + 0.5), rz = Math.floor(gz / size + 0.5); // CCR-008: origin-centered grid (see buildOrogenRegion)
+                if (_orogenBakeSuppressed && !orogenField.hasKey(seed + ':' + rx + ':' + rz)) return 0; // CCR-WORLDGEN-PREVIEW-NOBAKE-001: preview must not bake
                 const reg = orogenField.get(rx, rz, seed);
                 if (reg === null) return 0;
                 const nGrid = reg.n, d = reg.dh;
@@ -44711,6 +44760,7 @@ self.onmessage = async (e) => {
                 if (_orogenBaking) return 0;
                 const size = OROGEN_REGION;
                 const rx = Math.floor(gx / size + 0.5), rz = Math.floor(gz / size + 0.5); // CCR-008: origin-centered grid (see buildOrogenRegion)
+                if (_orogenBakeSuppressed && !orogenField.hasKey(seed + ':' + rx + ':' + rz)) return 0; // CCR-WORLDGEN-PREVIEW-NOBAKE-001: preview must not bake
                 const reg = orogenField.get(rx, rz, seed);
                 if (reg === null || !reg.talusDh) return 0;
                 const nGrid = reg.n, d = reg.talusDh;
@@ -44745,6 +44795,7 @@ self.onmessage = async (e) => {
                 if (_orogenBaking) return 1;
                 const size = OROGEN_REGION;
                 const rx = Math.floor(gx / size + 0.5), rz = Math.floor(gz / size + 0.5); // CCR-008: origin-centered grid (see buildOrogenRegion)
+                if (_orogenBakeSuppressed && !orogenField.hasKey(seed + ':' + rx + ':' + rz)) return 1; // CCR-WORLDGEN-PREVIEW-NOBAKE-001: preview must not bake
                 const reg = orogenField.get(rx, rz, seed);
                 if (reg === null || !reg.flow) return 1;
                 const nGrid = reg.n, f = reg.flow;

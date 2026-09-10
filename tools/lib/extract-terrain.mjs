@@ -366,6 +366,10 @@ let _plateMemoVal = null;
 // ReferenceError without these whenever the tectonics flag is on.
 const OROGEN_REGION_CACHE_CAP = 12;
 let _orogenBaking = false;
+// CCR-WORLDGEN-PREVIEW-NOBAKE-001: mirror the main-thread/worker decl (see comment there). Always
+// false in this harness (it never renders the create-world preview) -- declared only so the three
+// injected samplers don't ReferenceError.
+let _orogenBakeSuppressed = false;
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
