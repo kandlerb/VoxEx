@@ -151,6 +151,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'plateHash32', 'plateLookup', 'tectonicDeltaC', 'tectonicUpliftR', 'tectonicReliefBlend',
     'tectonicFeatureAt', 'tectRegimeAt',
     'tectonicRangeHeight', // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range term
+    'orogenSampleRaster', // CCR-WORLDGEN-TECTONICS-009: shared dh/flow/talusDh domain-warped sampler
     'buildOrogenRegion', 'tectonicErosionAt', 'tectonicTalusAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake; talus: REGIONFIELD-001 Phase 3
     'tectonicMarginFactor', 'tectonicConeHeight', // CCR-WORLDGEN-TECTONICS-005
     'tectonicRiverFactor', // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
@@ -178,7 +179,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'FREQ_TEMPERATURE', 'FREQ_HUMIDITY', 'FREQ_EROSION',
     'FREQ_CONTINENTAL_BASE', 'FREQ_CONTINENTAL_EROSION',
     // CCR-WORLDGEN-PIPELINE-002 WS1: terracing contour-break warp (0 amp = inert default).
-    'TERRACE_WARP_AMP', 'TERRACE_WARP_FREQ', 'TERRACE_WARP_RELIEF_MIN',
+    'TERRACE_WARP_AMP', 'TERRACE_WARP_FREQ', 'TERRACE_WARP_RELIEF_MIN', 'TERRACE_WARP_RELIEF_MAX',
     // CCR-WORLDGEN-PIPELINE-002 WS6: hydrological river tunables (inert unless opts.hydroRivers).
     'HYDRO_REGION', 'HYDRO_STEP', 'HYDRO_HALO', 'HYDRO_SPRING_H', 'FLOW_WIDTH_SCALE',
     // CCR-WORLDGEN-PIPELINE-002 WS6-P3: organic-shape tunables (owner defect fix — meander/bank
@@ -199,6 +200,9 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     // parallel rivers eroding adjacent strips with untouched ridges between). Same inert-unless-
     // opts.hydroRivers gating as the WS6 tunables above.
     'HYDRO_CAPTURE_RADIUS',
+    // CCR-WORLDGEN-TECTONICS-008b: lateral attraction (owner defect — "piedmont comb", parallel
+    // channels down a smooth mountain-front slope never within stream-capture's single-hop reach).
+    'HYDRO_ATTRACT_RADIUS', 'HYDRO_ATTRACT_SLOPE_MAX',
     'FIELD_GAIN', 'RELIEF_AMPLITUDE', 'OCTAVES', 'BASE_GAIN',
     'GAIN_BY_RELIEF', 'WARP_FREQ', 'WARP_BASE', 'WARP_BY_RELIEF', 'PEAK_AMP',
     'NOTCH_LIFT', 'FRACT_FREQ0', 'HF_PIVOT', 'VALLEY_RATIO', 'SWISS_WARP', 'RIVER_BASE_WIDTH',
@@ -206,6 +210,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'RIVER_WARP_FREQ', 'RIVER_WARP_AMP', 'RIVER_WARP_VAR_FREQ', 'RIVER_WARP_VAR_STRENGTH',
     'OCEAN_THRESHOLD_DEEP', 'OCEAN_THRESHOLD_SHALLOW',
     'RIVER_DEPTH_SCALE', 'OCEAN_DEPTH_SCALE',
+    // CCR-WORLDGEN-VALLEY-TERRACE-001: valley-flank terrace-break (applyRiverCarve).
+    'RIVER_VALLEY_WARP_AMP', 'RIVER_VALLEY_WARP_FREQ', 'RIVER_VALLEY_WIGGLE_MULT',
     // CCR-WORLDGEN-PIPELINE-002 WS8: coastal erosion (fjords, cliff/bluff coast profile,
     // flow-driven deltas). FJORD_DEPTH_SCALE/CLIFF_SHARPNESS_MAX/DELTA_FLOW_SCALE ship
     // staging-neutral (0/1/0) at P1; real values land at the P2 flip.
@@ -236,6 +242,11 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'RIDGE_LIFT_C', 'RIDGE_WIDTH', 'TRANSFORM_AMP', 'TRANSFORM_WIDTH',
     'OBDUCTION_PROB', 'OBDUCTION_AMP', 'JUNCTION_RADIUS', 'ARC_PEAK_DENSITY', 'RIFT_VENT_DENSITY',
     'COAST_THRESHOLD_TECT', 'COAST_SHELF_TECT', 'SPLINE_TECTONIC_OCEAN',
+    // CCR-WORLDGEN-TECTONICS-009: blend-strip half-widths (promoted from internal consts) +
+    // multi-octave boundary domain warp.
+    'TECT_BLEND_BAND', 'TECT_BLEND_BAND_C',
+    'BOUNDARY_WIGGLE_MACRO_FREQ_MULT', 'BOUNDARY_WIGGLE_MACRO_AMP_MULT',
+    'BOUNDARY_WIGGLE_FINE_FREQ_MULT', 'BOUNDARY_WIGGLE_FINE_AMP_MULT',
     // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range tunables (tectonicRangeHeight).
     'RANGE_H', 'RANGE_JAG', 'RANGE_RELIEF_SWAP', 'RANGE_SPUR_AMP', 'RANGE_SPUR_FREQ',
     'RANGE_PEAK_WAVELEN', 'RANGE_SADDLE_WAVELEN', 'RANGE_WIDTH_VARY_FREQ',
@@ -254,6 +265,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'TERRACE_WARP_AMP_TECT',
     // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers (tectonicRiverFactor).
     'FLOW_RIVER_MIN', 'FLOW_RIVER_SPAN',
+    // CCR-WORLDGEN-TECTONICS-009: broad meander warp octave (orogenSampleRaster).
+    'OROGEN_WARP_BROAD_AMP_MULT', 'OROGEN_WARP_BROAD_FREQ',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -366,6 +379,10 @@ let _plateMemoVal = null;
 // ReferenceError without these whenever the tectonics flag is on.
 const OROGEN_REGION_CACHE_CAP = 12;
 let _orogenBaking = false;
+// CCR-WORLDGEN-PREVIEW-NOBAKE-001: mirror the main-thread/worker decl (see comment there). Always
+// false in this harness (it never renders the create-world preview) -- declared only so the three
+// injected samplers don't ReferenceError.
+let _orogenBakeSuppressed = false;
 const lerp = (t, a, b) => a + t * (b - a);
 const lerpValue = (a, b, t) => a + t * (b - a);
 `;
@@ -434,6 +451,7 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   plateHash32, plateLookup, tectonicDeltaC, tectonicUpliftR, tectonicReliefBlend,
   tectonicFeatureAt, tectRegimeAt,
   tectonicRangeHeight, // CCR-WORLDGEN-TECTONICS-002 Phase A
+  orogenSampleRaster, // CCR-WORLDGEN-TECTONICS-009: shared dh/flow/talusDh domain-warped sampler
   buildOrogenRegion, tectonicErosionAt, tectonicTalusAt, // CCR-WORLDGEN-TECTONICS-002 Phase B; talus: REGIONFIELD-001 Phase 3
   tectonicMarginFactor, tectonicConeHeight, // CCR-WORLDGEN-TECTONICS-005
   tectonicRiverFactor, // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
