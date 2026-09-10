@@ -209,6 +209,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'RIVER_WARP_FREQ', 'RIVER_WARP_AMP', 'RIVER_WARP_VAR_FREQ', 'RIVER_WARP_VAR_STRENGTH',
     'OCEAN_THRESHOLD_DEEP', 'OCEAN_THRESHOLD_SHALLOW',
     'RIVER_DEPTH_SCALE', 'OCEAN_DEPTH_SCALE',
+    // CCR-WORLDGEN-VALLEY-TERRACE-001: valley-flank terrace-break (applyRiverCarve).
+    'RIVER_VALLEY_WARP_AMP', 'RIVER_VALLEY_WARP_FREQ', 'RIVER_VALLEY_WIGGLE_MULT',
     // CCR-WORLDGEN-PIPELINE-002 WS8: coastal erosion (fjords, cliff/bluff coast profile,
     // flow-driven deltas). FJORD_DEPTH_SCALE/CLIFF_SHARPNESS_MAX/DELTA_FLOW_SCALE ship
     // staging-neutral (0/1/0) at P1; real values land at the P2 flip.

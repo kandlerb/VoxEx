@@ -20501,6 +20501,10 @@
                 injectedCode += '    const RIVER_WARP_VAR_STRENGTH = ' + JSON.stringify(GEN_TUNABLES.RIVER_WARP_VAR_STRENGTH) + ';\n';
                 injectedCode += '    const RIVER_DEPTH_SCALE = ' + JSON.stringify(GEN_TUNABLES.RIVER_DEPTH_SCALE) + ';\n';
                 injectedCode += '    const OCEAN_DEPTH_SCALE = ' + JSON.stringify(GEN_TUNABLES.OCEAN_DEPTH_SCALE) + ';\n\n';
+                // CCR-WORLDGEN-VALLEY-TERRACE-001: valley-flank terrace-break (applyRiverCarve).
+                injectedCode += '    const RIVER_VALLEY_WARP_AMP = ' + JSON.stringify(GEN_TUNABLES.RIVER_VALLEY_WARP_AMP) + ';\n';
+                injectedCode += '    const RIVER_VALLEY_WARP_FREQ = ' + JSON.stringify(GEN_TUNABLES.RIVER_VALLEY_WARP_FREQ) + ';\n';
+                injectedCode += '    const RIVER_VALLEY_WIGGLE_MULT = ' + JSON.stringify(GEN_TUNABLES.RIVER_VALLEY_WIGGLE_MULT) + ';\n\n';
                 // Coastal erosion (CCR-WORLDGEN-PIPELINE-002 WS8): read by computePreRiverHeight
                 // (F2), applyRiverCarve (F1/F3), getDeltaFingerFactor (F3) — all injected above.
                 injectedCode += '    const FJORD_COAST_BAND = ' + JSON.stringify(GEN_TUNABLES.FJORD_COAST_BAND) + ';\n';
@@ -22804,6 +22808,19 @@
                   note: 'TERRAIN-CHANGING. Chebyshev lattice-cell search radius for the nearest already-claimed trace a step may steer toward on near-planar ground (never overrides monotonic descent -- only re-ranks among already-downhill neighbors). 0 = off (byte-identical).' },
                 { key: 'HYDRO_ATTRACT_SLOPE_MAX', label: 'Lateral Attraction Slope Max (blk)', section: 'Rivers', kind: 'number', tested: [0, 40], format: 'raw', ui: 'both',
                   note: 'TERRAIN-CHANGING. Max best-neighbor height drop (blocks) for a descent step to count as "near-planar" and qualify for lateral attraction steering; steep mountain terrain is left to valley-snap instead. 0 disables attraction on every step (same effective result as Lateral Attraction Radius 0).' },
+                // CCR-WORLDGEN-VALLEY-TERRACE-001: TERRAIN-CHANGING valley-flank terrace-break
+                // tunables (owner defect: gentle river-valley flanks quantize into long parallel
+                // stepped terrace bands -- "ridges along slopes" / "armor plates" -- because
+                // applyRiverCarve's valley depression is a pure function of distance-to-channel and
+                // its old contour wiggle was too weak (peaked at only +/-0.125) to break contour-line
+                // parallelism. Applies inside applyRiverCarve, shared by BOTH the ribbon and
+                // hydrological river systems and both tectonicPlates states.
+                { key: 'RIVER_VALLEY_WARP_AMP', label: 'Valley Contour Warp Amount (blk)', section: 'Rivers', kind: 'number', tested: [0, 30], format: 'raw', ui: 'both',
+                  note: 'TERRAIN-CHANGING. Coordinate-space warp amplitude applied ONLY to the (gx,gz) point sampled for the valley-band distance factor -- breaks contour-line straightness near the channel and near the outer band edge, where the wiggle-strength knob below is naturally weakest. 0 = no warp (pre-fix straight parallel contours).' },
+                { key: 'RIVER_VALLEY_WARP_FREQ', label: 'Valley Contour Warp Frequency', section: 'Rivers', kind: 'number', tested: [0.003, 0.012], format: 'raw', ui: 'both',
+                  note: 'TERRAIN-CHANGING. Noise frequency for the valley contour warp -- lower = broad sweeping bends, higher = tighter wiggle. Kept low by design (wide sweeps, not swirly) per the settled clean-steps-not-noisy aesthetic.' },
+                { key: 'RIVER_VALLEY_WIGGLE_MULT', label: 'Valley Contour Wiggle Strength', section: 'Rivers', kind: 'number', tested: [0.5, 3], format: 'raw', ui: 'both',
+                  note: 'TERRAIN-CHANGING. Multiplier on the existing vfMid-weighted contour wiggle that perturbs the valley-band factor by value (strongest at mid-band, ~0 at both the channel edge and the outer band edge -- the warp above covers those extremes). Replaces the old hardcoded 0.5 factor; higher breaks up mid-band terrace bands into a more irregular pattern. 0.5 = pre-fix strength (still combines with any warp amount above).' },
                 // --- Caves (CCR-WORLDGEN-TUNABLES-001 #7) ---
                 { key: 'CAVE_SCALE',              label: 'Cave Noise Scale (XZ)',     section: 'Caves', kind: 'number', tested: [0.01, 0.03], format: 'raw', ui: 'both',
                   note: 'Horizontal frequency of the 3D noise sampled onto the cave-cache grid. Higher = tighter/more frequent tunnel windings; lower = broader, more spread-out caverns. Paired with Cave Noise Scale (Y) -- raising both together keeps caves isotropic.' },
@@ -23646,6 +23663,9 @@
                 RIVER_WARP_VAR_STRENGTH = GEN_TUNABLES.RIVER_WARP_VAR_STRENGTH;
                 RIVER_DEPTH_SCALE = GEN_TUNABLES.RIVER_DEPTH_SCALE;
                 OCEAN_DEPTH_SCALE = GEN_TUNABLES.OCEAN_DEPTH_SCALE;
+                RIVER_VALLEY_WARP_AMP = GEN_TUNABLES.RIVER_VALLEY_WARP_AMP; // CCR-WORLDGEN-VALLEY-TERRACE-001
+                RIVER_VALLEY_WARP_FREQ = GEN_TUNABLES.RIVER_VALLEY_WARP_FREQ;
+                RIVER_VALLEY_WIGGLE_MULT = GEN_TUNABLES.RIVER_VALLEY_WIGGLE_MULT;
                 FJORD_COAST_BAND = GEN_TUNABLES.FJORD_COAST_BAND; // CCR-WORLDGEN-PIPELINE-002 WS8
                 FJORD_OCEAN_GATE = GEN_TUNABLES.FJORD_OCEAN_GATE;
                 FJORD_RELIEF_MIN = GEN_TUNABLES.FJORD_RELIEF_MIN;
@@ -41402,14 +41422,34 @@ self.onmessage = async (e) => {
                 // — no cliff ring at the pinch (measured max adjacent delta 2).
                 const vStr = 1 - smoothstep(80, 93, preHeight);
                 if (riversOn && vStr > 0 && preHeight > WORLD_DIMS.seaLevel + 4) {
-                    const vfRaw = riverFactorAt(gx, gz, seed, preHeight, 3);
+                    // CCR-WORLDGEN-VALLEY-TERRACE-001: owner defect ("ridges along slopes" /
+                    // "armor plates") — the valley-band distance factor below (vfRaw) is a pure
+                    // function of distance-to-channel, so its integer-floored contour steps read
+                    // as long bands running PARALLEL to the river on wide, gentle valley flanks;
+                    // the existing vfMid-weighted wiggle a few lines down is too weak (peaks at
+                    // only ±0.125) to break that parallelism. Measured root cause + fix via
+                    // tools/scratch/valley-metrics.mjs's bandParallelism/meanAlongRunLen metrics
+                    // (real riverFactorAt/blendedHeight, not a replica) — see the CCR's as-built.
+                    // Fix has two parts, applied together because each covers a different part of
+                    // the band: (1) a coordinate-space warp of the (gx,gz) point SAMPLED for the
+                    // distance factor (RIVER_VALLEY_WARP_AMP/FREQ) — per the do-not-retry ledger,
+                    // only a coordinate warp (not value noise) breaks contour straightness, and it
+                    // is the only lever that still acts near the channel edge and the outer band
+                    // edge, where vfMid (and so the wiggle below) is naturally ~0. (2) a stronger
+                    // multiplier on the EXISTING vfMid wiggle (RIVER_VALLEY_WIGGLE_MULT, replaces
+                    // the old hardcoded 0.5) — strongest at mid-band, where it breaks the treads up
+                    // into a more irregular, less "armor-plate" pattern. 0/x/0.5 reproduces the
+                    // pre-fix behavior exactly (RIVER_VALLEY_WARP_AMP=0 skips the warp entirely).
+                    const _rvwx = gx + noise2D(gx * RIVER_VALLEY_WARP_FREQ + 11.3, gz * RIVER_VALLEY_WARP_FREQ - 7.1) * RIVER_VALLEY_WARP_AMP;
+                    const _rvwz = gz + noise2D(gx * RIVER_VALLEY_WARP_FREQ - 19.7, gz * RIVER_VALLEY_WARP_FREQ + 23.9) * RIVER_VALLEY_WARP_AMP;
+                    const vfRaw = riverFactorAt(_rvwx, _rvwz, seed, preHeight, 3);
                     if (vfRaw < 1.0) {
                         const vfMid = vfRaw * (1 - vfRaw);
                         // Same horizontal-perturb trick as the bank below: wiggle the
                         // valley-wall contours so they don't read as concentric rings.
                         const vf = Math.max(0, Math.min(1, vfRaw
                             + (noise2D(gx * 0.045 + seed, gz * 0.045 - seed)
-                               + 0.5 * noise2D(gx * 0.11 - seed, gz * 0.11 + seed)) * 0.5 * vfMid));
+                               + 0.5 * noise2D(gx * 0.11 - seed, gz * 0.11 + seed)) * RIVER_VALLEY_WIGGLE_MULT * vfMid));
                         // CCR-RIVER-003: keep 15% of the original relief even at the
                         // valley center — a pure vf^2 floor clamped everything near the
                         // channel to a dead-flat pan at seaLevel+2 (the "unnatural
@@ -41632,6 +41672,15 @@ self.onmessage = async (e) => {
                 OCEAN_WARP_FREQ: 0.0006, OCEAN_WARP_AMP: 360, OCEAN_WARP_VAR_FREQ: 0.0006, OCEAN_WARP_VAR_STRENGTH: 0.6,
                 RIVER_WARP_FREQ: 0.0006, RIVER_WARP_AMP: 120, RIVER_WARP_VAR_FREQ: 0.0006, RIVER_WARP_VAR_STRENGTH: 0.6,
                 RIVER_DEPTH_SCALE: 1.0, OCEAN_DEPTH_SCALE: 1.0,   // NEW output multipliers (default 1.0 = byte-identical)
+                // CCR-WORLDGEN-VALLEY-TERRACE-001: valley-flank terrace-break tunables (owner defect
+                // "ridges along slopes" / "armor plates" — see applyRiverCarve's valley-depression
+                // block for the full root-cause comment). Applies inside applyRiverCarve, shared by
+                // BOTH the ribbon and hydrological river systems and both tectonicPlates states.
+                // RIVER_VALLEY_WARP_AMP=0 skips the coordinate warp entirely (byte-identical to
+                // pre-fix); the shipped default is the measured-winning combination from
+                // tools/scratch/valley-metrics.mjs (bandParallelism -18 to -26%, meanAlongRunLen
+                // -21 to -34% across seeds/flag states vs the pre-fix baseline; see the CCR's as-built).
+                RIVER_VALLEY_WARP_AMP: 15, RIVER_VALLEY_WARP_FREQ: 0.006, RIVER_VALLEY_WIGGLE_MULT: 2.0,
                 // Coastal erosion (CCR-WORLDGEN-PIPELINE-002 WS8 — DONE, P2 flip shipped build
                 // 2026-07-14.3, TERRAIN_GEN_VERSION 42): fjords (drowned river valleys), relief-driven
                 // cliff/bluff coast profile, and flow-driven deltas. See applyRiverCarve (F1 fjord
@@ -42884,6 +42933,10 @@ self.onmessage = async (e) => {
             // by ONE multiplier, default 1.0 = byte-identical.
             let RIVER_DEPTH_SCALE = GEN_TUNABLES.RIVER_DEPTH_SCALE;
             let OCEAN_DEPTH_SCALE = GEN_TUNABLES.OCEAN_DEPTH_SCALE;
+            // CCR-WORLDGEN-VALLEY-TERRACE-001: valley-flank terrace-break (see applyRiverCarve).
+            let RIVER_VALLEY_WARP_AMP = GEN_TUNABLES.RIVER_VALLEY_WARP_AMP;
+            let RIVER_VALLEY_WARP_FREQ = GEN_TUNABLES.RIVER_VALLEY_WARP_FREQ;
+            let RIVER_VALLEY_WIGGLE_MULT = GEN_TUNABLES.RIVER_VALLEY_WIGGLE_MULT;
             // Coastal erosion (CCR-WORLDGEN-PIPELINE-002 WS8): fjords/cliffs/flow-driven deltas.
             let FJORD_COAST_BAND = GEN_TUNABLES.FJORD_COAST_BAND;
             let FJORD_OCEAN_GATE = GEN_TUNABLES.FJORD_OCEAN_GATE;
