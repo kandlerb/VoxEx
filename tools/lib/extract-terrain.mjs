@@ -179,7 +179,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'FREQ_TEMPERATURE', 'FREQ_HUMIDITY', 'FREQ_EROSION',
     'FREQ_CONTINENTAL_BASE', 'FREQ_CONTINENTAL_EROSION',
     // CCR-WORLDGEN-PIPELINE-002 WS1: terracing contour-break warp (0 amp = inert default).
-    'TERRACE_WARP_AMP', 'TERRACE_WARP_FREQ', 'TERRACE_WARP_RELIEF_MIN',
+    'TERRACE_WARP_AMP', 'TERRACE_WARP_FREQ', 'TERRACE_WARP_RELIEF_MIN', 'TERRACE_WARP_RELIEF_MAX',
     // CCR-WORLDGEN-PIPELINE-002 WS6: hydrological river tunables (inert unless opts.hydroRivers).
     'HYDRO_REGION', 'HYDRO_STEP', 'HYDRO_HALO', 'HYDRO_SPRING_H', 'FLOW_WIDTH_SCALE',
     // CCR-WORLDGEN-PIPELINE-002 WS6-P3: organic-shape tunables (owner defect fix — meander/bank
