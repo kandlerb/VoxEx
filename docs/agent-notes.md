@@ -515,6 +515,8 @@ Multi-seed rule: terrain acceptance = harness green on ≥3 seeds, not one.
 
 ## 7. Agent environment notes (Cowork sandbox — SKIP if running Claude Code on Windows)
 
+- **Cloud remote sessions cannot run the browser suite (CCR-WORLDGEN-TECTONICS-008 diagnosis, 2026-09-10):** `run-browser-tests.mjs` loads the page but the suite never starts (progress `""`, 600 s timeout). A CDP console capture shows the ONLY error is `ReferenceError: safeParseLocalStorage is not defined` from the classic `<script>`'s DOMContentLoaded handler followed by `window.VoxEx is missing` — i.e. the MODULE script never evaluated. Root cause is the importmap's CDN `three` import: headless Chromium in the sandbox cannot complete that fetch (the session proxy intercepts TLS; `--ignore-certificate-errors --proxy-server=$HTTPS_PROXY` and `--use-angle=swiftshader` were both tried and still hang). Not a game bug (the same head passed the suite in CI's real Chrome in 82 s). Do not burn time on local variants — rely on CI (`.github/workflows/checks.yml` runs the full suite on every push/PR) and cite the run.
+
 These apply ONLY to agents running in the Cowork Linux sandbox with
 `D:\Projects\voxex` FUSE-mounted; native Windows agents are unaffected.
 
