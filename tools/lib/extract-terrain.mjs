@@ -151,6 +151,7 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'plateHash32', 'plateLookup', 'tectonicDeltaC', 'tectonicUpliftR', 'tectonicReliefBlend',
     'tectonicFeatureAt', 'tectRegimeAt',
     'tectonicRangeHeight', // CCR-WORLDGEN-TECTONICS-002 Phase A: crest-line range term
+    'orogenSampleRaster', // CCR-WORLDGEN-TECTONICS-009: shared dh/flow/talusDh domain-warped sampler
     'buildOrogenRegion', 'tectonicErosionAt', 'tectonicTalusAt', // CCR-WORLDGEN-TECTONICS-002 Phase B: erosion bake; talus: REGIONFIELD-001 Phase 3
     'tectonicMarginFactor', 'tectonicConeHeight', // CCR-WORLDGEN-TECTONICS-005
     'tectonicRiverFactor', // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
@@ -254,6 +255,8 @@ export function buildTerrainApi(file, seedStr, opts = {}) {
     'TERRACE_WARP_AMP_TECT',
     // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers (tectonicRiverFactor).
     'FLOW_RIVER_MIN', 'FLOW_RIVER_SPAN',
+    // CCR-WORLDGEN-TECTONICS-009: broad meander warp octave (orogenSampleRaster).
+    'OROGEN_WARP_BROAD_AMP_MULT', 'OROGEN_WARP_BROAD_FREQ',
   ];
   // still-bare consts scanned from source
   // CCR-WORLDGEN-PIPELINE-001 Phase 3: block IDs the material cascade emits (simple `const X = N;`).
@@ -434,6 +437,7 @@ const biomeByName = new Map(__biomeUnionNames.map((n) => [n, {
   plateHash32, plateLookup, tectonicDeltaC, tectonicUpliftR, tectonicReliefBlend,
   tectonicFeatureAt, tectRegimeAt,
   tectonicRangeHeight, // CCR-WORLDGEN-TECTONICS-002 Phase A
+  orogenSampleRaster, // CCR-WORLDGEN-TECTONICS-009: shared dh/flow/talusDh domain-warped sampler
   buildOrogenRegion, tectonicErosionAt, tectonicTalusAt, // CCR-WORLDGEN-TECTONICS-002 Phase B; talus: REGIONFIELD-001 Phase 3
   tectonicMarginFactor, tectonicConeHeight, // CCR-WORLDGEN-TECTONICS-005
   tectonicRiverFactor, // CCR-WORLDGEN-TECTONICS-004: erosion-coupled rivers
